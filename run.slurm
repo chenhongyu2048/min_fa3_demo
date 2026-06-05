@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=fa_min_demo_h200
-#SBATCH --partition=gpu_h200
+#SBATCH --job-name=min_fa3_demo_h100
+#SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
@@ -29,8 +29,8 @@ echo "========================================================="
 python test_min_fa3.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 8 --d 128 --mode both
 python benchmark.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 8 --d 128 --mode both
 # echo "========================================================="
-# python test_min_fa3.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 32 --d 128 --mode both
-# python benchmark.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 32 --d 128 --mode both
+python test_min_fa3.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 32 --d 128 --mode both
+python benchmark.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 32 --d 128 --mode both
 echo "========================================================="
 
 echo "Running tests and benchmarks for variable-length FA3"
@@ -38,6 +38,6 @@ echo "========================================================="
 python test_min_fa3_varlen.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --mode both
 python benchmark_varlen.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --mode both
 # echo "========================================================="
-# python test_min_fa3_varlen.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 32 --headdim 128 --mode both
-# python benchmark_varlen.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 32 --headdim 128 --mode both
+python test_min_fa3_varlen.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 32 --headdim 128 --mode both
+python benchmark_varlen.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 32 --headdim 128 --mode both
 echo "========================================================="

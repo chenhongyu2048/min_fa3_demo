@@ -5,8 +5,7 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 this_dir = Path(__file__).resolve().parent
-repo_root = this_dir.parent.parent
-
+repo_root = this_dir
 
 def resolve_cutlass_include_dir() -> Path:
     env_value = os.environ.get("CUTLASS_DIR")
@@ -22,7 +21,7 @@ def resolve_cutlass_include_dir() -> Path:
             f"Got: {cutlass_path}"
         )
 
-    default_include_dir = repo_root / "csrc" / "cutlass" / "include"
+    default_include_dir = repo_root / "third_party" / "cutlass" / "include"
     if default_include_dir.is_dir():
         return default_include_dir
 
@@ -31,8 +30,8 @@ def resolve_cutlass_include_dir() -> Path:
         "or CUTLASS_DIR=/path/to/cutlass/include before building."
     )
 
-
 cutlass_include_dir = resolve_cutlass_include_dir()
+print(f"Using CUTLASS headers from: {cutlass_include_dir}")
 
 ext_modules = [
     CUDAExtension(

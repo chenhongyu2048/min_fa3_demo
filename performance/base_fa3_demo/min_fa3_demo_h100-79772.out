@@ -1,0 +1,402 @@
+Running tests and benchmarks for BSHD style FA3
+=========================================================
+case causal=False: ok (B=16, S=512, QH=32, KVH=8, D=128)
+case causal=True: ok (B=16, S=512, QH=32, KVH=8, D=128)
+case causal=False: ok (B=16, S=1024, QH=32, KVH=8, D=128)
+case causal=True: ok (B=16, S=1024, QH=32, KVH=8, D=128)
+case causal=False: ok (B=16, S=2048, QH=32, KVH=8, D=128)
+case causal=True: ok (B=16, S=2048, QH=32, KVH=8, D=128)
+case causal=False: ok (B=16, S=4096, QH=32, KVH=8, D=128)
+case causal=True: ok (B=16, S=4096, QH=32, KVH=8, D=128)
+case causal=False: skipped due to OOM (B=16, S=8192, QH=32, KVH=8, D=128) [CUDA out of memory. Tried to allocate 128.00 GiB. GPU 0 has a total capacity of 139.80 GiB of which 117.60 GiB is free. Including non-PyTorch memory, this process has 22.19 GiB memory in use. Of the allocated memory 15.53 GiB is allocated by PyTorch, and 6.00 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)]
+case causal=True: skipped due to OOM (B=16, S=8192, QH=32, KVH=8, D=128) [CUDA out of memory. Tried to allocate 128.00 GiB. GPU 0 has a total capacity of 139.80 GiB of which 123.35 GiB is free. Including non-PyTorch memory, this process has 16.44 GiB memory in use. Of the allocated memory 15.78 GiB is allocated by PyTorch, and 0 bytes is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)]
+Loaded min_fa3_op (minimal Hopper demo)
+Loaded flash_attn (FA2)
+Loaded flash_attn_interface (FA3)
+Config: B=16, qhead=32, kvhead=8, D=128, mode=both, num_iters=50, warmup_iters=10
+Seqlen: 512,1024,2048,4096,8192
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+
+====================================================================================================
+Benchmark Results
+====================================================================================================
+B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA            0.224        306.5
+FA2                     0.212        324.4
+FA3                     0.126        545.6
+min_fa3_demo            0.125        550.7
+----------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA            0.811        339.1
+FA2                     0.792        346.9
+FA3                     0.427        644.2
+min_fa3_demo            0.463        593.1
+----------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA            3.216        341.9
+FA2                     3.021        363.9
+FA3                     1.549        709.8
+min_fa3_demo            1.725        637.5
+----------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA           12.706        346.2
+FA2                    12.012        366.1
+FA3                     6.718        654.6
+min_fa3_demo            6.946        633.1
+----------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA           50.021        351.7
+FA2                    47.261        372.2
+FA3                    26.219        671.0
+min_fa3_demo           26.554        662.5
+----------------------------------------------------------------------------------------------------
+B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA            0.239        144.0
+FA2                     0.184        187.1
+FA3                     0.103        333.3
+min_fa3_demo            0.097        353.7
+----------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA            0.530        259.5
+FA2                     0.482        284.9
+FA3                     0.261        525.9
+min_fa3_demo            0.263        523.5
+----------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA            1.764        311.7
+FA2                     1.702        322.9
+FA3                     0.895        614.5
+min_fa3_demo            1.002        548.8
+----------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA            6.754        325.6
+FA2                     6.599        333.2
+FA3                     3.706        593.4
+min_fa3_demo            3.710        592.7
+----------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA           26.264        334.9
+FA2                    24.447        359.8
+FA3                    14.064        625.4
+min_fa3_demo           14.091        624.2
+----------------------------------------------------------------------------------------------------
+case causal=False: ok (B=16, S=512, QH=32, KVH=32, D=128)
+case causal=True: ok (B=16, S=512, QH=32, KVH=32, D=128)
+case causal=False: ok (B=16, S=1024, QH=32, KVH=32, D=128)
+case causal=True: ok (B=16, S=1024, QH=32, KVH=32, D=128)
+case causal=False: ok (B=16, S=2048, QH=32, KVH=32, D=128)
+case causal=True: ok (B=16, S=2048, QH=32, KVH=32, D=128)
+case causal=False: ok (B=16, S=4096, QH=32, KVH=32, D=128)
+case causal=True: ok (B=16, S=4096, QH=32, KVH=32, D=128)
+case causal=False: ok (B=16, S=8192, QH=32, KVH=32, D=128)
+case causal=True: ok (B=16, S=8192, QH=32, KVH=32, D=128)
+Loaded min_fa3_op (minimal Hopper demo)
+Loaded flash_attn (FA2)
+Loaded flash_attn_interface (FA3)
+Config: B=16, qhead=32, kvhead=32, D=128, mode=both, num_iters=50, warmup_iters=10
+Seqlen: 512,1024,2048,4096,8192
+Running B=16,S=512,QH=32,KVH=32,D=128,causal=False
+Running B=16,S=1024,QH=32,KVH=32,D=128,causal=False
+Running B=16,S=2048,QH=32,KVH=32,D=128,causal=False
+Running B=16,S=4096,QH=32,KVH=32,D=128,causal=False
+Running B=16,S=8192,QH=32,KVH=32,D=128,causal=False
+Running B=16,S=512,QH=32,KVH=32,D=128,causal=True
+Running B=16,S=1024,QH=32,KVH=32,D=128,causal=True
+Running B=16,S=2048,QH=32,KVH=32,D=128,causal=True
+Running B=16,S=4096,QH=32,KVH=32,D=128,causal=True
+Running B=16,S=8192,QH=32,KVH=32,D=128,causal=True
+
+====================================================================================================
+Benchmark Results
+====================================================================================================
+B=16,S=512,QH=32,KVH=32,D=128,causal=False
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA            0.227        302.5
+FA2                     0.216        318.2
+FA3                     0.131        523.0
+min_fa3_demo            0.128        535.7
+----------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=32,D=128,causal=False
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA            0.821        334.9
+FA2                     0.807        340.7
+FA3                     0.438        628.3
+min_fa3_demo            0.468        587.6
+----------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=32,D=128,causal=False
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA            3.257        337.6
+FA2                     3.047        360.8
+FA3                     1.764        623.4
+min_fa3_demo            1.743        630.7
+----------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=32,D=128,causal=False
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA           12.595        349.2
+FA2                    11.868        370.6
+FA3                     6.875        639.7
+min_fa3_demo            6.976        630.5
+----------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=32,D=128,causal=False
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA           50.260        350.0
+FA2                    47.552        370.0
+FA3                    26.483        664.3
+min_fa3_demo           26.797        656.5
+----------------------------------------------------------------------------------------------------
+B=16,S=512,QH=32,KVH=32,D=128,causal=True
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA            0.187        183.6
+FA2                     0.163        210.5
+FA3                     0.106        324.5
+min_fa3_demo            0.105        325.8
+----------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=32,D=128,causal=True
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA            0.517        265.8
+FA2                     0.480        286.6
+FA3                     0.274        501.7
+min_fa3_demo            0.282        488.2
+----------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=32,D=128,causal=True
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA            1.899        289.5
+FA2                     1.734        317.0
+FA3                     0.940        584.8
+min_fa3_demo            1.033        532.1
+----------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=32,D=128,causal=True
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA            6.819        322.5
+FA2                     6.367        345.4
+FA3                     4.064        541.0
+min_fa3_demo            3.771        583.1
+----------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=32,D=128,causal=True
+Method              Time (ms)       TFLOPS
+PyTorch_SDPA           26.087        337.2
+FA2                    24.604        357.5
+FA3                    14.237        617.9
+min_fa3_demo           14.260        616.8
+----------------------------------------------------------------------------------------------------
+=========================================================
+Running tests and benchmarks for variable-length FA3
+=========================================================
+varlen case causal=False: ok (B=16, S=512, QH=32, KVH=8, D=128)
+varlen case causal=True: ok (B=16, S=512, QH=32, KVH=8, D=128)
+varlen case causal=False: ok (B=16, S=1024, QH=32, KVH=8, D=128)
+varlen case causal=True: ok (B=16, S=1024, QH=32, KVH=8, D=128)
+varlen case causal=False: ok (B=16, S=2048, QH=32, KVH=8, D=128)
+varlen case causal=True: ok (B=16, S=2048, QH=32, KVH=8, D=128)
+varlen case causal=False: ok (B=16, S=4096, QH=32, KVH=8, D=128)
+varlen case causal=True: ok (B=16, S=4096, QH=32, KVH=8, D=128)
+varlen case causal=False: ok (B=16, S=8192, QH=32, KVH=8, D=128)
+varlen case causal=True: ok (B=16, S=8192, QH=32, KVH=8, D=128)
+Loaded min_fa3_op (minimal Hopper demo)
+Loaded flash_attn varlen (FA2)
+Loaded flash_attn_interface varlen (FA3)
+Config: B=16, qhead=32, kvhead=8, D=128, mode=both, num_iters=50, warmup_iters=10
+Seqlen: 512,1024,2048,4096,8192
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+
+====================================================================================================
+Varlen Benchmark Results
+====================================================================================================
+B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA              0.226        304.5
+FA2_varlen                0.208        329.7
+FA3_varlen                0.169        405.5
+min_fa3_varlen            0.204        336.5
+----------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA              0.811        338.8
+FA2_varlen                0.768        357.8
+FA3_varlen                0.513        535.7
+min_fa3_varlen            0.557        493.3
+----------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA              3.230        340.4
+FA2_varlen                2.999        366.7
+FA3_varlen                1.976        556.5
+min_fa3_varlen            1.882        584.1
+----------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA             12.707        346.1
+FA2_varlen               11.777        373.4
+FA3_varlen                7.555        582.1
+min_fa3_varlen            7.217        609.4
+----------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA             50.639        347.4
+FA2_varlen               46.488        378.4
+FA3_varlen               28.542        616.4
+min_fa3_varlen           27.596        637.5
+----------------------------------------------------------------------------------------------------
+B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA              0.229        149.9
+FA2_varlen                0.215        159.8
+FA3_varlen                0.133        258.5
+min_fa3_varlen            0.173        198.9
+----------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA              0.525        261.9
+FA2_varlen                0.511        269.1
+FA3_varlen                0.319        431.2
+min_fa3_varlen            0.358        384.1
+----------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA              1.752        313.8
+FA2_varlen                1.750        314.1
+FA3_varlen                1.073        512.3
+min_fa3_varlen            1.088        505.4
+----------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA              6.799        323.4
+FA2_varlen                6.579        334.2
+FA3_varlen                3.964        554.7
+min_fa3_varlen            3.815        576.4
+----------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA             26.297        334.5
+FA2_varlen               24.401        360.5
+FA3_varlen               14.356        612.7
+min_fa3_varlen           14.411        610.4
+----------------------------------------------------------------------------------------------------
+varlen case causal=False: ok (B=16, S=512, QH=32, KVH=32, D=128)
+varlen case causal=True: ok (B=16, S=512, QH=32, KVH=32, D=128)
+varlen case causal=False: ok (B=16, S=1024, QH=32, KVH=32, D=128)
+varlen case causal=True: ok (B=16, S=1024, QH=32, KVH=32, D=128)
+varlen case causal=False: ok (B=16, S=2048, QH=32, KVH=32, D=128)
+varlen case causal=True: ok (B=16, S=2048, QH=32, KVH=32, D=128)
+varlen case causal=False: ok (B=16, S=4096, QH=32, KVH=32, D=128)
+varlen case causal=True: ok (B=16, S=4096, QH=32, KVH=32, D=128)
+varlen case causal=False: ok (B=16, S=8192, QH=32, KVH=32, D=128)
+varlen case causal=True: ok (B=16, S=8192, QH=32, KVH=32, D=128)
+Loaded min_fa3_op (minimal Hopper demo)
+Loaded flash_attn varlen (FA2)
+Loaded flash_attn_interface varlen (FA3)
+Config: B=16, qhead=32, kvhead=32, D=128, mode=both, num_iters=50, warmup_iters=10
+Seqlen: 512,1024,2048,4096,8192
+Running B=16,S=512,QH=32,KVH=32,D=128,causal=False
+Running B=16,S=1024,QH=32,KVH=32,D=128,causal=False
+Running B=16,S=2048,QH=32,KVH=32,D=128,causal=False
+Running B=16,S=4096,QH=32,KVH=32,D=128,causal=False
+Running B=16,S=8192,QH=32,KVH=32,D=128,causal=False
+Running B=16,S=512,QH=32,KVH=32,D=128,causal=True
+Running B=16,S=1024,QH=32,KVH=32,D=128,causal=True
+Running B=16,S=2048,QH=32,KVH=32,D=128,causal=True
+Running B=16,S=4096,QH=32,KVH=32,D=128,causal=True
+Running B=16,S=8192,QH=32,KVH=32,D=128,causal=True
+
+====================================================================================================
+Varlen Benchmark Results
+====================================================================================================
+B=16,S=512,QH=32,KVH=32,D=128,causal=False
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA              0.225        304.8
+FA2_varlen                0.211        326.2
+FA3_varlen                0.153        449.9
+min_fa3_varlen            0.208        330.9
+----------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=32,D=128,causal=False
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA              0.806        341.1
+FA2_varlen                0.788        348.8
+FA3_varlen                0.483        568.8
+min_fa3_varlen            0.586        469.4
+----------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=32,D=128,causal=False
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA              3.260        337.3
+FA2_varlen                3.026        363.4
+FA3_varlen                1.904        577.6
+min_fa3_varlen            1.925        571.0
+----------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=32,D=128,causal=False
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA             12.708        346.1
+FA2_varlen               11.883        370.1
+FA3_varlen                7.312        601.5
+min_fa3_varlen            7.447        590.6
+----------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=32,D=128,causal=False
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA             50.425        348.9
+FA2_varlen               46.490        378.4
+FA3_varlen               27.793        633.0
+min_fa3_varlen           27.838        632.0
+----------------------------------------------------------------------------------------------------
+B=16,S=512,QH=32,KVH=32,D=128,causal=True
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA              0.194        177.0
+FA2_varlen                0.202        170.4
+FA3_varlen                0.116        297.4
+min_fa3_varlen            0.168        205.1
+----------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=32,D=128,causal=True
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA              0.521        263.9
+FA2_varlen                0.518        265.1
+FA3_varlen                0.308        445.5
+min_fa3_varlen            0.373        368.6
+----------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=32,D=128,causal=True
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA              1.873        293.5
+FA2_varlen                1.766        311.3
+FA3_varlen                0.999        550.6
+min_fa3_varlen            1.124        489.1
+----------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=32,D=128,causal=True
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA              6.808        323.0
+FA2_varlen                6.375        345.0
+FA3_varlen                4.580        480.1
+min_fa3_varlen            3.975        553.2
+----------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=32,D=128,causal=True
+Method                Time (ms)       TFLOPS
+PyTorch_SDPA             26.030        337.9
+FA2_varlen               24.514        358.8
+FA3_varlen               14.404        610.7
+min_fa3_varlen           14.460        608.3
+----------------------------------------------------------------------------------------------------
+=========================================================
