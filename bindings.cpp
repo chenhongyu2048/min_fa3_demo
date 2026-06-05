@@ -6,7 +6,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <optional>
 
+#include "min_fa3_launch_override.h"
 #include "min_fa3_params.h"
 #include "min_fa3_varlen_params.h"
 
@@ -14,6 +17,7 @@ namespace {
 
 using BshdParams = ::Flash_fwd_params;
 using VarlenParams = min_fa3_varlen_demo::Flash_fwd_params;
+namespace py = pybind11;
 
 int round_multiple(int x, int m) {
     return (x + m - 1) / m * m;
@@ -41,6 +45,26 @@ void check_cu_seqlens(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.dim() == 1, name, " must be 1D");
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
     TORCH_CHECK(t.numel() >= 2, name, " must have shape [B + 1] with B >= 1");
+}
+
+std::optional<int> parse_manual_block_count(py::object manual_block_count_obj) {
+    if (manual_block_count_obj.is_none()) {
+        return std::nullopt;
+    }
+    return min_fa3_detail::validate_manual_block_count(
+        manual_block_count_obj.cast<int64_t>(),
+        "manual_block_count");
+}
+
+uint32_t check_grid_dim_component(int64_t value, const char* name) {
+    TORCH_CHECK(
+        value >= 0 && value <= std::numeric_limits<uint32_t>::max(),
+        name,
+        " must be between 0 and ",
+        std::numeric_limits<uint32_t>::max(),
+        ". Got ",
+        value);
+    return static_cast<uint32_t>(value);
 }
 
 BshdParams make_bshd_params(const torch::Tensor& q,
@@ -198,7 +222,13 @@ VarlenParams make_varlen_params(const torch::Tensor& q,
     return params;
 }
 
-torch::Tensor forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, bool is_causal) {
+torch::Tensor forward(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool is_causal,
+    py::object manual_block_count_obj) {
+    auto manual_block_count = parse_manual_block_count(manual_block_count_obj);
     check_bshd(q, "q");
     check_bshd(k, "k");
     check_bshd(v, "v");
@@ -223,7 +253,7 @@ torch::Tensor forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, bool is
     auto semaphore = is_causal ? torch::zeros({1}, q.options().dtype(torch::kInt32)) : torch::Tensor();
 
     auto params = make_bshd_params(q, k, v, out, lse, semaphore, is_causal);
-    run_min_fa3_fwd(params, at::cuda::getDefaultCUDAStream(q.get_device()));
+    run_min_fa3_fwd(params, at::cuda::getDefaultCUDAStream(q.get_device()), manual_block_count);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
@@ -235,7 +265,9 @@ torch::Tensor forward_varlen(torch::Tensor q,
                              torch::Tensor cu_seqlens_k,
                              int64_t max_seqlen_q,
                              int64_t max_seqlen_k,
-                             bool is_causal) {
+                             bool is_causal,
+                             py::object manual_block_count_obj) {
+    auto manual_block_count = parse_manual_block_count(manual_block_count_obj);
     check_varlen_qkv(q, "q");
     check_varlen_qkv(k, "k");
     check_varlen_qkv(v, "v");
@@ -293,14 +325,67 @@ torch::Tensor forward_varlen(torch::Tensor q,
                                      lse,
                                      scheduler_metadata,
                                      is_causal);
-    min_fa3_varlen_demo::run_min_fa3_varlen_fwd(params, at::cuda::getDefaultCUDAStream(q.get_device()));
+    min_fa3_varlen_demo::run_min_fa3_varlen_fwd(
+        params,
+        at::cuda::getDefaultCUDAStream(q.get_device()),
+        manual_block_count);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
+}
+
+py::tuple debug_resolve_launch_grid_shape(
+    int64_t auto_grid_x,
+    int64_t auto_grid_y,
+    int64_t auto_grid_z,
+    py::object manual_block_count_obj) {
+    auto manual_block_count = parse_manual_block_count(manual_block_count_obj);
+    dim3 auto_grid_dims{
+        check_grid_dim_component(auto_grid_x, "auto_grid_x"),
+        check_grid_dim_component(auto_grid_y, "auto_grid_y"),
+        check_grid_dim_component(auto_grid_z, "auto_grid_z"),
+    };
+    dim3 resolved_grid_dims = min_fa3_detail::resolve_launch_grid_shape(auto_grid_dims, manual_block_count);
+    return py::make_tuple(resolved_grid_dims.x, resolved_grid_dims.y, resolved_grid_dims.z);
 }
 
 }  // namespace
 
 PYBIND11_MODULE(_min_fa3_op, m) {
-    m.def("forward", &forward, "Minimal Hopper forward-only FlashAttention demo");
-    m.def("forward_varlen", &forward_varlen, "Minimal Hopper varlen forward-only FlashAttention demo");
+    m.def(
+        "forward",
+        &forward,
+        py::arg("q"),
+        py::arg("k"),
+        py::arg("v"),
+        py::arg("is_causal"),
+        py::kw_only(),
+        py::arg("manual_block_count") = py::none(),
+        "Minimal Hopper forward-only FlashAttention demo.\n\n"
+        "manual_block_count is an optional grid.x thread-block count override. "
+        "When omitted, the launch grid is computed automatically by get_grid_shape(...).");
+    m.def(
+        "forward_varlen",
+        &forward_varlen,
+        py::arg("q"),
+        py::arg("k"),
+        py::arg("v"),
+        py::arg("cu_seqlens_q"),
+        py::arg("cu_seqlens_k"),
+        py::arg("max_seqlen_q"),
+        py::arg("max_seqlen_k"),
+        py::arg("is_causal"),
+        py::kw_only(),
+        py::arg("manual_block_count") = py::none(),
+        "Minimal Hopper varlen forward-only FlashAttention demo.\n\n"
+        "manual_block_count is an optional grid.x thread-block count override. "
+        "When omitted, the launch grid is computed automatically by get_grid_shape(...).");
+    m.def(
+        "_debug_resolve_launch_grid_shape",
+        &debug_resolve_launch_grid_shape,
+        py::arg("auto_grid_x"),
+        py::arg("auto_grid_y") = 1,
+        py::arg("auto_grid_z") = 1,
+        py::kw_only(),
+        py::arg("manual_block_count") = py::none(),
+        "Internal CPU-side helper for testing launch-grid override resolution.");
 }

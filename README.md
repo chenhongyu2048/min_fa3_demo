@@ -142,6 +142,7 @@ Parameterized test examples:
 cd hopper/min_fa3_demo
 python test_min_fa3.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --mode both
 python test_min_fa3.py --b 2 --seqlen 256 --qhead 16 --kvhead 8 --headdim 128 --mode causal
+python test_min_fa3.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --mode causal --manual-block-count 132
 ```
 
 ## Benchmark
@@ -167,6 +168,7 @@ cd hopper/min_fa3_demo
 python benchmark.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 32 --headdim 128 --mode both
 python benchmark.py --b 4 --seqlen 256 --qhead 16 --kvhead 8 --headdim 128 --mode causal
 python benchmark.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 32 --headdim 128 --mode noncausal
+python benchmark.py --b 4 --seqlen 1024 --qhead 32 --kvhead 32 --headdim 128 --mode causal --manual-block-count 132
 ```
 
 ## Slurm
@@ -190,6 +192,10 @@ v = torch.randn(1, 128, 8, 128, device="cuda", dtype=torch.bfloat16)
 
 o = min_fa3_op.forward(q, k, v, False)
 print(o.shape)
+
+# Optional: override the automatically computed grid.x thread-block count.
+o_manual = min_fa3_op.forward(q, k, v, False, manual_block_count=132)
+print(o_manual.shape)
 ```
 
 Varlen usage:
@@ -210,6 +216,19 @@ v = torch.randn(batch_size * seqlen, 8, 128, device="cuda", dtype=torch.bfloat16
 o = min_fa3_op.forward_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen, seqlen, False)
 print(o.shape)
 ```
+
+## Manual launch override
+
+Both `min_fa3_op.forward(...)` and `min_fa3_op.forward_varlen(...)` accept an optional keyword argument:
+
+- `manual_block_count`
+
+Behavior:
+
+- default: use the original automatic launch grid from `get_grid_shape(...)`
+- override: when provided, replace the current 1D persistent `grid.x` thread-block count
+- units: this is a thread-block count / grid dimension override, not a thread count
+- validation: the value must be a positive integer
 
 ## Current limitations
 

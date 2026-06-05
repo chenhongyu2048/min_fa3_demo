@@ -64,10 +64,7 @@ class Result:
     tflops: float
 
 
-Method = Callable[
-    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, bool, int, int],
-    float | None,
-]
+Method = Callable[..., float | None]
 
 
 def format_oom(exc: torch.OutOfMemoryError) -> str:
@@ -107,6 +104,12 @@ def parse_args() -> argparse.Namespace:
         choices=("noncausal", "causal", "both"),
         default="both",
         help="Benchmark noncausal, causal, or both modes",
+    )
+    parser.add_argument(
+        "--manual-block-count",
+        type=int,
+        default=None,
+        help="Optional grid.x thread-block count override for min_fa3_varlen. Defaults to the automatic get_grid_shape(...) result.",
     )
     parser.add_argument("--num-iters", type=int, default=50, help="Timing iterations")
     parser.add_argument("--warmup-iters", type=int, default=10, help="Warmup iterations")
@@ -254,6 +257,7 @@ def bench_min_fa3_varlen(
     is_causal: bool,
     warmup_iters: int,
     num_iters: int,
+    manual_block_count: int | None,
 ) -> float | None:
     if k.size(1) != v.size(1):
         return None
@@ -264,13 +268,23 @@ def bench_min_fa3_varlen(
     max_seqlen_q = (cu_seqlens_q[1] - cu_seqlens_q[0]).item()
     max_seqlen_k = (cu_seqlens_k[1] - cu_seqlens_k[0]).item()
     return median_time_ms(
-        lambda: min_fa3_op.forward_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, is_causal),
+        lambda: min_fa3_op.forward_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            is_causal,
+            manual_block_count=manual_block_count,
+        ),
         warmup_iters,
         num_iters,
     )
 
 
-def bench_case(case: Case, warmup_iters: int, num_iters: int) -> dict[str, Result | None]:
+def bench_case(case: Case, warmup_iters: int, num_iters: int, manual_block_count: int | None) -> dict[str, Result | None]:
     methods: list[tuple[str, Method]] = [
         ("PyTorch_SDPA", bench_pytorch),
         ("FA2_varlen", bench_fa2),
@@ -289,7 +303,31 @@ def bench_case(case: Case, warmup_iters: int, num_iters: int) -> dict[str, Resul
 
     for name, fn in methods:
         try:
-            time_ms = fn(q, k, v, cu_seqlens_q, cu_seqlens_k, case.batch_size, case.is_causal, warmup_iters, num_iters)
+            if name == "min_fa3_varlen":
+                time_ms = bench_min_fa3_varlen(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    case.batch_size,
+                    case.is_causal,
+                    warmup_iters,
+                    num_iters,
+                    manual_block_count,
+                )
+            else:
+                time_ms = fn(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    case.batch_size,
+                    case.is_causal,
+                    warmup_iters,
+                    num_iters,
+                )
             if time_ms is None:
                 results[name] = None
                 continue
@@ -346,14 +384,15 @@ def main() -> None:
     cases = parse_cases(args)
     print(
         f"Config: B={args.b}, qhead={args.qhead}, kvhead={args.kvhead}, D={args.headdim}, "
-        f"mode={args.mode}, num_iters={args.num_iters}, warmup_iters={args.warmup_iters}"
+        f"mode={args.mode}, num_iters={args.num_iters}, warmup_iters={args.warmup_iters}, "
+        f"manual_block_count={args.manual_block_count}"
     )
     print(f"Seqlen: {args.seqlen}")
 
     results_by_case: dict[Case, dict[str, Result | None]] = {}
     for case in cases:
         print(f"Running {format_case_key(case)}", flush=True)
-        results_by_case[case] = bench_case(case, args.warmup_iters, args.num_iters)
+        results_by_case[case] = bench_case(case, args.warmup_iters, args.num_iters, args.manual_block_count)
 
     print_table(results_by_case)
 

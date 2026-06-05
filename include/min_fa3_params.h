@@ -8,6 +8,7 @@
 
 #include <cuda.h>
 #include <cstdint>
+#include <optional>
 
 struct Qkv_params {
     using index_t = int64_t;
@@ -70,4 +71,9 @@ struct Flash_fwd_params : public Qkv_params {
     int num_sm;
 };
 
-void run_min_fa3_fwd(Flash_fwd_params& params, cudaStream_t stream);
+// By default the launch grid is computed from get_grid_shape(...).
+// When provided, manual_block_count overrides the 1D grid.x thread-block count.
+void run_min_fa3_fwd(
+    Flash_fwd_params& params,
+    cudaStream_t stream,
+    std::optional<int> manual_block_count = std::nullopt);

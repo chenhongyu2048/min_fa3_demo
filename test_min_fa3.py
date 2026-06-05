@@ -44,13 +44,14 @@ def run_case(
     kv_heads: int,
     head_dim: int,
     is_causal: bool,
+    manual_block_count: int | None,
 ) -> None:
     device = torch.device("cuda")
     q = torch.randn(batch_size, seqlen, q_heads, head_dim, device=device, dtype=torch.bfloat16)
     k = torch.randn(batch_size, seqlen, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
     v = torch.randn(batch_size, seqlen, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
 
-    out = min_fa3_op.forward(q, k, v, is_causal)
+    out = min_fa3_op.forward(q, k, v, is_causal, manual_block_count=manual_block_count)
     ref = reference_flash(q, k, v, is_causal)
 
     assert out.shape == q.shape, (out.shape, q.shape)
@@ -81,6 +82,12 @@ def parse_args() -> argparse.Namespace:
         default="both",
         help="Which attention mode to test.",
     )
+    parser.add_argument(
+        "--manual-block-count",
+        type=int,
+        default=None,
+        help="Optional grid.x thread-block count override. Defaults to the automatic get_grid_shape(...) result.",
+    )
     return parser.parse_args()
 
 
@@ -103,7 +110,7 @@ if __name__ == "__main__":
     for seqlen in seqlen_cases:
         if args.mode in ("noncausal", "both"):
             try:
-                run_case(args.b, seqlen, args.qhead, args.kvhead, args.headdim, False)
+                run_case(args.b, seqlen, args.qhead, args.kvhead, args.headdim, False, args.manual_block_count)
             except torch.OutOfMemoryError as exc:
                 torch.cuda.empty_cache()
                 print(
@@ -113,7 +120,7 @@ if __name__ == "__main__":
                 )
         if args.mode in ("causal", "both"):
             try:
-                run_case(args.b, seqlen, args.qhead, args.kvhead, args.headdim, True)
+                run_case(args.b, seqlen, args.qhead, args.kvhead, args.headdim, True, args.manual_block_count)
             except torch.OutOfMemoryError as exc:
                 torch.cuda.empty_cache()
                 print(

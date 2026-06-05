@@ -14,6 +14,7 @@
 #include "cutlass/kernel_launch.h"
 
 #include "cuda_check.h"
+#include "min_fa3_launch_override.h"
 #include "min_fa3_varlen_params.h"
 #include "min_fa3_varlen_traits.h"
 #include "min_fa3_varlen_scheduler.h"
@@ -26,7 +27,10 @@ namespace min_fa3_varlen_demo {
 using namespace cute;
 
 template <bool IsCausal>
-void run_min_fa3_varlen_sm90(Flash_fwd_params& params, cudaStream_t stream) {
+void run_min_fa3_varlen_sm90(
+    Flash_fwd_params& params,
+    cudaStream_t stream,
+    std::optional<int> manual_block_count) {
     using Config = FwdConfig<IsCausal>;
     using ArchTag = cutlass::arch::Sm90;
     using TileShape_MNK = Shape<Int<Config::kBlockM>, Int<Config::kBlockN>, Int<kHeadDim>>;
@@ -174,7 +178,9 @@ void run_min_fa3_varlen_sm90(Flash_fwd_params& params, cudaStream_t stream) {
         {device, params.num_sm},
         scheduler_args});
 
-    dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
+    dim3 grid_dims = min_fa3_detail::resolve_launch_grid_shape(
+        AttnKernel::get_grid_shape(kernel_params),
+        manual_block_count);
     dim3 block_dims = AttnKernel::get_block_shape();
     int smem_size = AttnKernel::SharedStorageSize;
     auto kernel = cutlass::device_kernel<AttnKernel>;
