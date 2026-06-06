@@ -117,21 +117,18 @@ These strides are then fed into the copied Hopper launch path to build the inter
 ## Build
 
 ```bash
-cd hopper/min_fa3_demo
 make
 ```
 
 ## Test
 
 ```bash
-cd hopper/min_fa3_demo
 python test_min_fa3.py
 ```
 
 Varlen test:
 
 ```bash
-cd hopper/min_fa3_demo
 python test_min_fa3_varlen.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --mode both
 python test_min_fa3_varlen.py --b 2 --seqlen 256 --qhead 16 --kvhead 8 --headdim 128 --mode causal
 ```
@@ -139,7 +136,6 @@ python test_min_fa3_varlen.py --b 2 --seqlen 256 --qhead 16 --kvhead 8 --headdim
 Parameterized test examples:
 
 ```bash
-cd hopper/min_fa3_demo
 python test_min_fa3.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --mode both
 python test_min_fa3.py --b 2 --seqlen 256 --qhead 16 --kvhead 8 --headdim 128 --mode causal
 python test_min_fa3.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --mode causal --manual-block-count 132
@@ -148,14 +144,12 @@ python test_min_fa3.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --m
 ## Benchmark
 
 ```bash
-cd hopper/min_fa3_demo
 python benchmark.py
 ```
 
 Varlen benchmark:
 
 ```bash
-cd hopper/min_fa3_demo
 python benchmark_varlen.py
 python benchmark_varlen.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both
 python benchmark_varlen.py --b 4 --seqlen 256 --qhead 16 --kvhead 8 --headdim 128 --mode causal
@@ -164,7 +158,6 @@ python benchmark_varlen.py --b 4 --seqlen 256 --qhead 16 --kvhead 8 --headdim 12
 Parameterized benchmark examples:
 
 ```bash
-cd hopper/min_fa3_demo
 python benchmark.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 32 --headdim 128 --mode both
 python benchmark.py --b 4 --seqlen 256 --qhead 16 --kvhead 8 --headdim 128 --mode causal
 python benchmark.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 32 --headdim 128 --mode noncausal
@@ -176,7 +169,6 @@ python benchmark.py --b 4 --seqlen 1024 --qhead 32 --kvhead 32 --headdim 128 --m
 Default test submission:
 
 ```bash
-cd hopper/min_fa3_demo
 sbatch run.slurm
 ```
 
