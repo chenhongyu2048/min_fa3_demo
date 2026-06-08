@@ -22,22 +22,31 @@ export CPLUS_INCLUDE_PATH=$CUDNN_HOME/include:$CPLUS_INCLUDE_PATH
 export https_proxy=http://u-MS9MdQ:Qixfk8ku@10.248.0.7:3128
 export http_proxy=http://u-MS9MdQ:Qixfk8ku@10.248.0.7:3128
 
-cd /data/home/scyb683/run/flash-attention/hopper/min_fa3_demo/
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 # make clean && make
 echo "Running tests and benchmarks for BSHD style FA3"
 echo "========================================================="
 python test_min_fa3.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 8 --d 128 --mode both
 python benchmark.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 8 --d 128 --mode both
+python test_min_fa3.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 8 --d 128 --mode both --manual-block-count 128
+python benchmark.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 8 --d 128 --mode both --manual-block-count 128
 # echo "========================================================="
-python test_min_fa3.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 32 --d 128 --mode both
-python benchmark.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 32 --d 128 --mode both
-echo "========================================================="
+# python test_min_fa3.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 32 --d 128 --mode both
+# python benchmark.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 32 --d 128 --mode both
+# echo "========================================================="
 
-echo "Running tests and benchmarks for variable-length FA3"
-echo "========================================================="
-python test_min_fa3_varlen.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --mode both
-python benchmark_varlen.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --mode both
+# echo "Running tests and benchmarks for variable-length FA3"
 # echo "========================================================="
-python test_min_fa3_varlen.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 32 --headdim 128 --mode both
-python benchmark_varlen.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 32 --headdim 128 --mode both
-echo "========================================================="
+# python test_min_fa3_varlen.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --mode both
+# python benchmark_varlen.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --mode both
+# # echo "========================================================="
+# python test_min_fa3_varlen.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 32 --headdim 128 --mode both
+# python benchmark_varlen.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 32 --headdim 128 --mode both
+# echo "========================================================="
+
+# Remote-load benchmark note:
+# This script requests 1 GPU, so it cannot run benchmark_parallel_remote_load.py as-is.
+# Use a 2+ GPU job and launch, for example:
+# torchrun --nproc_per_node=2 benchmark_parallel_remote_load.py --shape 4096x4096 --src-rank 0

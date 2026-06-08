@@ -13,11 +13,14 @@
 #include "min_fa3_params.h"
 #include "min_fa3_varlen_params.h"
 
+namespace py = pybind11;
+
+void bind_parallel_remote_load(py::module_& m);
+
 namespace {
 
 using BshdParams = ::Flash_fwd_params;
 using VarlenParams = min_fa3_varlen_demo::Flash_fwd_params;
-namespace py = pybind11;
 
 int round_multiple(int x, int m) {
     return (x + m - 1) / m * m;
@@ -388,4 +391,5 @@ PYBIND11_MODULE(_min_fa3_op, m) {
         py::kw_only(),
         py::arg("manual_block_count") = py::none(),
         "Internal CPU-side helper for testing launch-grid override resolution.");
+    bind_parallel_remote_load(m);
 }

@@ -55,9 +55,9 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
-    static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
+    static constexpr bool Transpose_V = Is_FP8 && !V_colmajor; // FALSE
     static constexpr bool Use_TMA_Q = !PackGQA;
-    static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
+    static constexpr bool Use_TMA_KV = !PagedKVNonTMA; // TRUE
     static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
     static constexpr bool SameHeadDim = get<2>(TileShape_MNK{}) == kHeadDimV;
@@ -677,7 +677,7 @@ struct CollectiveMainloopFwdSm90 {
         Tensor tVgVt_TMA = group_modes<0, 3>(block_tma_V.partition_S(gVt_TMA));  // (TMA, k, batch)
         Tensor tVsVt_TMA = group_modes<0, 3>(block_tma_V.partition_D(sVt));  // (TMA, PIPE)
         auto [tQvgQv, tQvsQv] = [&] {
-            if constexpr (HasQv) {
+            if constexpr (HasQv) { // FALSE
                 auto shape_Qv = make_shape(get<0>(params.shape_Q), params.headdim_v, get<2>(params.shape_Q), get<3>(params.shape_Q));
                 Tensor mQv = params.tma_load_Qv.get_tma_tensor(shape_Qv)(_, _, bidh, !is_varlen_q ? bidb : 0);
                 Tensor gQv = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQv), select<0, 2>(TileShape_MNK_QV{}), make_coord(m_block, _0{}));  // (M, Kv)
@@ -722,7 +722,7 @@ struct CollectiveMainloopFwdSm90 {
         Tensor tTranssVt = logical_divide(group_modes<1, rank(tTranssVt_) - 1>(tTranssVt_), Shape<Underscore, Int<Transpose_ILP>>{});  // ((16, 1), (2, kHeadDim / 64 * kBlockN / 32 / 2), kStages)
         Tensor tTranssV = logical_divide(group_modes<1, rank(tTranssV_) - 1>(tTranssV_), Shape<Underscore, Int<Transpose_ILP>>{});  // ((16, 1), (2, kHeadDim / 64 * kBlockN / 32 / 2), kStages)
         auto transpose_V = [&](int stage) {
-            if constexpr (Transpose_V) {
+            if constexpr (Transpose_V) { // FALSE
                 #pragma unroll
                 for (int i = 0; i < size<1, 1>(tTranssVt); ++i) {
                     Tensor tTransrV = make_fragment_like(tTranssV(_, make_coord(_, _0{}), _0{}));
@@ -751,7 +751,7 @@ struct CollectiveMainloopFwdSm90 {
 
         auto load_K = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
             pipeline_k.producer_acquire(smem_pipe_write);
-            if constexpr (!PagedKVNonTMA) {
+            if constexpr (!PagedKVNonTMA) { // TRUE
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_K_TMA();
                 copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
                     tKgK_TMA(_, n_block_idx, bidb_kv_idx), tKsK_TMA(_, smem_pipe_write.index()));
@@ -765,7 +765,7 @@ struct CollectiveMainloopFwdSm90 {
         auto load_V = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
             auto pipeline_v_load = cute::conditional_return<!Transpose_V>(pipeline_v, pipeline_vt);
             pipeline_v_load.producer_acquire(smem_pipe_write);
-            if constexpr (!PagedKVNonTMA) {
+            if constexpr (!PagedKVNonTMA) { // TRUE
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_V_TMA();
                 copy(params.tma_load_V.with(*pipeline_v_load.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
                     tVgVt_TMA(_, n_block_idx, bidb_kv_idx), tVsVt_TMA(_, smem_pipe_write.index()));
@@ -798,10 +798,10 @@ struct CollectiveMainloopFwdSm90 {
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         // If this is true, we're guaranteed that only the first warp will execute this function
         static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
-        bool should_load_KV = !Use_TMA_KV || ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync());
+        bool should_load_KV = !Use_TMA_KV || ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync()); // True for the elected thread
 
         if (should_load_KV) {
-            if constexpr (PagedKVNonTMA) {
+            if constexpr (PagedKVNonTMA) { // FALSE
                 paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
             } else {
                 paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block);
@@ -812,7 +812,7 @@ struct CollectiveMainloopFwdSm90 {
             // if (thread_idx == 0) { printf("Producer: main load, after load K, index = %d\n", smem_pipe_write.index());}
         }
 
-        if constexpr (Use_TMA_Q) {
+        if constexpr (Use_TMA_Q) { // TRUE
             // Wait for the MMA warpgroups to signal that smem_q is ready
             if (SingleProducerWarp || warp_idx_in_warpgroup == 0) {
                 cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
@@ -855,7 +855,7 @@ struct CollectiveMainloopFwdSm90 {
         shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
         // if (thread_idx == 0) { printf("Producer: main load, after barrier_O\n");}
 
-        if constexpr (!Transpose_V && !IntraWGOverlap) {
+        if constexpr (!Transpose_V && !IntraWGOverlap) { // FALSE
             if (should_load_KV) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
         }
         int n_block_prev = n_block;
@@ -865,7 +865,7 @@ struct CollectiveMainloopFwdSm90 {
             PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
             ++smem_pipe_write;
             if (should_load_KV) {
-                if constexpr (PagedKVNonTMA) {
+                if constexpr (PagedKVNonTMA) { // FALSE
                     paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
                 } else {
                     paged_kv_manager.load_page_table_TMA(n_block);

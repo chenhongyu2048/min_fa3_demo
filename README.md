@@ -133,6 +133,14 @@ python test_min_fa3_varlen.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 
 python test_min_fa3_varlen.py --b 2 --seqlen 256 --qhead 16 --kvhead 8 --headdim 128 --mode causal
 ```
 
+Remote load test:
+
+```bash
+torchrun --nproc_per_node=2 test_parallel_remote_load.py --shape 256x384 --src-rank 0
+torchrun --nproc_per_node=4 test_parallel_remote_load.py --shape 256x384,512x512 --src-rank 1
+torchrun --nproc_per_node=2 test_parallel_remote_load.py --shape 512x512 --src-rank 0 --num-blocks 64
+```
+
 Parameterized test examples:
 
 ```bash
@@ -153,6 +161,14 @@ Varlen benchmark:
 python benchmark_varlen.py
 python benchmark_varlen.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both
 python benchmark_varlen.py --b 4 --seqlen 256 --qhead 16 --kvhead 8 --headdim 128 --mode causal
+```
+
+Remote load benchmark:
+
+```bash
+torchrun --nproc_per_node=2 benchmark_parallel_remote_load.py
+torchrun --nproc_per_node=2 benchmark_parallel_remote_load.py --shape 4096x4096,8192x4096 --src-rank 0
+torchrun --nproc_per_node=4 benchmark_parallel_remote_load.py --shape 4096x4096 --src-rank 1 --num-blocks 64
 ```
 
 Parameterized benchmark examples:
