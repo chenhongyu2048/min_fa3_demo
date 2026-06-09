@@ -22,8 +22,7 @@ export CPLUS_INCLUDE_PATH=$CUDNN_HOME/include:$CPLUS_INCLUDE_PATH
 export https_proxy=http://u-MS9MdQ:Qixfk8ku@10.248.0.7:3128
 export http_proxy=http://u-MS9MdQ:Qixfk8ku@10.248.0.7:3128
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+cd /data/home/scyb683/run/min_fa3_demo
 
 # make clean && make
 echo "Running tests and benchmarks for BSHD style FA3"
