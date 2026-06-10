@@ -25,12 +25,14 @@ export http_proxy=http://u-MS9MdQ:Qixfk8ku@10.248.0.7:3128
 cd /data/home/scyb683/run/min_fa3_demo
 
 # make clean && make
-echo "Running tests and benchmarks for BSHD style FA3"
-echo "========================================================="
-python test_min_fa3.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 8 --d 128 --mode both
-python benchmark.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 8 --d 128 --mode both
-python test_min_fa3.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 8 --d 128 --mode both --manual-block-count 128
-python benchmark.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 8 --d 128 --mode both --manual-block-count 128
+
+# Flash Attention 3 (FA3) benchmark:
+# echo "Running tests and benchmarks for BSHD style FA3"
+# echo "========================================================="
+# python test_min_fa3.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 8 --d 128 --mode both
+# python benchmark.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 8 --d 128 --mode both
+# python test_min_fa3.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 8 --d 128 --mode both --manual-block-count 128
+# python benchmark.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 8 --d 128 --mode both --manual-block-count 128
 # echo "========================================================="
 # python test_min_fa3.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 32 --d 128 --mode both
 # python benchmark.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-head 32 --d 128 --mode both
@@ -49,3 +51,10 @@ python benchmark.py --b 16 --seqlen 512,1024,2048,4096,8192 --qo-head 32 --kv-he
 # This script requests 1 GPU, so it cannot run benchmark_parallel_remote_load.py as-is.
 # Use a 2+ GPU job and launch, for example:
 # torchrun --nproc_per_node=2 benchmark_parallel_remote_load.py --shape 4096x4096 --src-rank 0
+
+# Ring-FlashAttention benchmark:
+# echo "Running tests and benchmarks for Ring-FlashAttention"
+# echo "========================================================="
+python test_min_fa3_varlen_ring_local.py --b 16 --seqlen 1024,4096 --qhead 32 --kvhead 8 --num-comp-sm 132 --num-comm-sm 0 --mode both
+python test_min_fa3_varlen_ring_local.py --b 16 --seqlen 1024,4096 --qhead 32 --kvhead 8 --num-comp-sm 128 --num-comm-sm 4 --mode both
+# python test_min_fa3_varlen_ring_local.py --b 16 --seqlen 1024,4096 --qhead 32 --kvhead 8 --num-comp-sm 128 --num-comm-sm 4 --mode both

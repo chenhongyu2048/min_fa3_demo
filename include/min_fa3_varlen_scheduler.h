@@ -27,6 +27,9 @@ struct TileSchedulerArguments {
     int const* const num_m_blocks_ptr = nullptr;
     int const* const varlen_batch_idx_ptr = nullptr;
     int const* const num_nheads_in_l2_ptr = nullptr;
+    int const virtual_grid_blocks = 0;
+    int const compute_block_offset = 0;
+    bool const use_virtual_grid = false;
 };
 
 template<int kBlockM, int kBlockN, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
@@ -60,6 +63,9 @@ public:
         int const* const varlen_batch_idx_ptr;
         // int const* const num_n_blocks_ptr;
         int const* const num_nheads_in_l2_ptr;
+        int const virtual_grid_blocks;
+        int const compute_block_offset;
+        bool const use_virtual_grid;
     };
 
     static Params
@@ -82,7 +88,10 @@ public:
                 args.num_m_blocks_ptr,
                 args.varlen_batch_idx_ptr,
                 // aras.num_n_blocks_ptr,
-                args.num_nheads_in_l2_ptr};
+                args.num_nheads_in_l2_ptr,
+                args.virtual_grid_blocks,
+                args.compute_block_offset,
+                args.use_virtual_grid};
     }
 
     static dim3
@@ -132,6 +141,18 @@ public:
 
     CUTLASS_DEVICE
     VarlenDynamicPersistentTileScheduler(SharedStorage* const smem_scheduler) : work_info_smem(smem_scheduler) {};
+
+    CUTLASS_DEVICE
+    static int
+    virtual_block_idx(Params const& params) {
+        return params.use_virtual_grid ? int(blockIdx.x) - params.compute_block_offset : int(blockIdx.x);
+    }
+
+    CUTLASS_DEVICE
+    static int
+    virtual_grid_dim_x(Params const& params) {
+        return params.use_virtual_grid ? params.virtual_grid_blocks : int(gridDim.x);
+    }
 
     CUTLASS_DEVICE
     WorkTileInfo
@@ -303,7 +324,7 @@ public:
     WorkTileInfo
     get_initial_work(Params const& params) const {
         if constexpr (IsProducerWarp) {
-            WorkTileInfo work_info = tile_idx_to_work_tile(params, int(blockIdx.x), {0, 0, 0, 0});
+            WorkTileInfo work_info = tile_idx_to_work_tile(params, virtual_block_idx(params), {0, 0, 0, 0});
             if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
                 *work_info_smem = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
             }
@@ -324,7 +345,7 @@ public:
     void
     prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {
         if (threadIdx.x % NumProducerThreads == 0) {
-            current_work.tile_idx = atomicAdd(params.tile_count_semaphore, 1) + int(gridDim.x);
+            current_work.tile_idx = atomicAdd(params.tile_count_semaphore, 1) + virtual_grid_dim_x(params);
         }
     }
 

@@ -96,6 +96,19 @@ struct Flash_fwd_params : public Qkv_params {
     int num_sm;
 };
 
+struct Ring_fwd_params : public Flash_fwd_params {
+    int num_comp_sm = 0;
+    int num_comm_sm = 0;
+    int src_dev = 0;
+    int ring_rank = 0;
+    int ring_world_size = 1;
+    int ring_step = 0;
+    // Communication CTAs prefetch remote K/V into these buffers while compute CTAs
+    // continue reading the current K/V from k_ptr / v_ptr.
+    void* __restrict__ local_k_staging_ptr = nullptr;
+    void* __restrict__ local_v_staging_ptr = nullptr;
+};
+
 void prepare_varlen_num_blocks(Flash_fwd_params& params,
                                cudaStream_t stream,
                                bool packgqa,

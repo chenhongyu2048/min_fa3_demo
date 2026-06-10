@@ -93,6 +93,8 @@ ext_modules = [
             str(this_dir / "csrc" / "min_fa3_varlen_prepare_scheduler.cu"),
             str(this_dir / "csrc" / "min_fa3_varlen_launch.cu"),
             str(this_dir / "csrc" / "min_fa3_varlen_kernel.cu"),
+            str(this_dir / "csrc" / "min_fa3_varlen_ring_launch.cu"),
+            str(this_dir / "csrc" / "min_fa3_varlen_ring_bindings.cu"),
             str(this_dir / "csrc" / "parallel" / "remote_load.cu"),
             str(this_dir / "csrc" / "parallel" / "remote_load_bindings.cu"),
         ],

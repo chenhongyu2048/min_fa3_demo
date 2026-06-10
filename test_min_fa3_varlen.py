@@ -15,8 +15,6 @@ def parse_seqlen_spec(spec: str) -> list[int]:
         token = token.strip().lower()
         if not token:
             continue
-        if "x" in token:
-            raise SystemExit("--seqlen only accepts one length per case; rectangular SqxSk input is no longer supported")
         cases.append(int(token))
     if not cases:
         raise SystemExit("--seqlen must provide at least one case")

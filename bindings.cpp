@@ -16,6 +16,7 @@
 namespace py = pybind11;
 
 void bind_parallel_remote_load(py::module_& m);
+void bind_varlen_ring(py::module_& m);
 
 namespace {
 
@@ -392,4 +393,5 @@ PYBIND11_MODULE(_min_fa3_op, m) {
         py::arg("manual_block_count") = py::none(),
         "Internal CPU-side helper for testing launch-grid override resolution.");
     bind_parallel_remote_load(m);
+    bind_varlen_ring(m);
 }

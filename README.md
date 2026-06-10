@@ -141,6 +141,14 @@ torchrun --nproc_per_node=4 test_parallel_remote_load.py --shape 256x384,512x512
 torchrun --nproc_per_node=2 test_parallel_remote_load.py --shape 512x512 --src-rank 0 --num-blocks 64
 ```
 
+Ring-attention varlen tests:
+
+```bash
+python test_min_fa3_varlen_ring_local.py --b 2 --seqlen 128 --qhead 16 --kvhead 8 --num-comp-sm 1 --num-comm-sm 1 --mode both
+python test_min_fa3_varlen_ring_local.py --b 3 --seqlen 128,256 --qhead 16 --kvhead 8 --num-comp-sm 2 --num-comm-sm 2 --mode both
+torchrun --nproc_per_node=2 test_min_fa3_varlen_ring_multi_rank.py --b 2 --seqlen 128,256 --qhead 16 --kvhead 8 --src-rank 0 --num-comp-sm 1 --num-comm-sm 1 --mode both
+```
+
 Parameterized test examples:
 
 ```bash
@@ -223,6 +231,45 @@ v = torch.randn(batch_size * seqlen, 8, 128, device="cuda", dtype=torch.bfloat16
 
 o = min_fa3_op.forward_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen, seqlen, False)
 print(o.shape)
+```
+
+Ring varlen usage:
+
+```python
+import torch
+import min_fa3_op
+
+cu_seqlens_q = torch.tensor([0, 128, 256], device="cuda", dtype=torch.int32)
+cu_seqlens_k = torch.tensor([0, 128, 256], device="cuda", dtype=torch.int32)
+
+q = torch.randn(256, 16, 128, device="cuda", dtype=torch.bfloat16)
+k = torch.randn(256, 8, 128, device="cuda", dtype=torch.bfloat16)
+v = torch.randn(256, 8, 128, device="cuda", dtype=torch.bfloat16)
+remote_k = min_fa3_op.create_parallel_tensor(k, local_rank=0, local_world_size=1)
+remote_v = min_fa3_op.create_parallel_tensor(v, local_rank=0, local_world_size=1)
+next_k = torch.empty_like(k)
+next_v = torch.empty_like(v)
+
+o = min_fa3_op.forward_varlen_ring(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    128,
+    128,
+    False,
+    remote_k=remote_k,
+    remote_v=remote_v,
+    src_rank=0,
+    num_comp_sm=1,
+    num_comm_sm=1,
+    ring_step=0,
+    prefetch_k=next_k,
+    prefetch_v=next_v,
+)
+print(o.shape)
+print(next_k.shape, next_v.shape)
 ```
 
 ## Manual launch override

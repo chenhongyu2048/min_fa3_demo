@@ -12,6 +12,7 @@ from _min_fa3_op import (
     parallel_remote_load_vec_out as _parallel_remote_load_vec_out_cuda,
     forward,
     forward_varlen,
+    forward_varlen_ring as _forward_varlen_ring_cuda,
     parallel_remote_load as _parallel_remote_load_cuda,
     parallel_remote_load_vec as _parallel_remote_load_vec_cuda,
 )
@@ -153,11 +154,54 @@ def parallel_remote_load_vec(
     return _parallel_remote_load_vec_cuda(parallel_input, int(src_rank), int(num_blocks))
 
 
+def forward_varlen_ring(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_causal: bool,
+    *,
+    remote_k: TKParallelTensor,
+    remote_v: TKParallelTensor,
+    src_rank: int,
+    num_comp_sm: int,
+    num_comm_sm: int,
+    ring_step: int,
+    prefetch_k: Union[torch.Tensor, TKParallelTensor],
+    prefetch_v: Union[torch.Tensor, TKParallelTensor],
+) -> torch.Tensor:
+    prefetch_k_tensor = prefetch_k.data_ if isinstance(prefetch_k, TKParallelTensor) else prefetch_k
+    prefetch_v_tensor = prefetch_v.data_ if isinstance(prefetch_v, TKParallelTensor) else prefetch_v
+
+    return _forward_varlen_ring_cuda(
+        q,
+        k,
+        v,
+        remote_k,
+        remote_v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        bool(is_causal),
+        int(src_rank),
+        int(num_comp_sm),
+        int(num_comm_sm),
+        int(ring_step),
+        prefetch_k_tensor,
+        prefetch_v_tensor,
+    )
+
+
 __all__ = [
     "TKParallelTensor",
     "create_parallel_tensor",
     "forward",
     "forward_varlen",
+    "forward_varlen_ring",
     "parallel_remote_load",
     "parallel_remote_load_vec",
 ]
