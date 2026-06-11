@@ -4,6 +4,10 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+
 #include <torch/extension.h>
 
 #include "kittens.cuh"
@@ -85,7 +89,12 @@ struct RingKernelConfig {
         true>;
     using AttnKernel = flash::enable_sm90<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
 
-    static constexpr int kVecLength = kHeadDim;
+    static constexpr int kVecLength = 1024;
+    static_assert(AttnKernel::MaxThreadsPerBlock % cutlass::NumThreadsPerWarp == 0);
+    static constexpr int kNumWarpsPerBlock = AttnKernel::MaxThreadsPerBlock / cutlass::NumThreadsPerWarp;
+    static constexpr int kNumCommChunks = kNumWarpsPerBlock / 2;
+    static_assert(kNumCommChunks > 0);
+    // static constexpr int kNumCommChunks = 3;
     using shared_vec = sv_bf<kVecLength>;
     using staging_gl = gl<bf16, 1, 1, -1, kVecLength, shared_vec>;
     using remote_pgl = pgl<staging_gl, NumDevices, false>;
@@ -107,46 +116,93 @@ struct RingKernelConfig {
 };
 
 template <typename RingConfig>
-__device__ inline void run_ring_remote_load(
+constexpr void check_ring_kernel_param_layout() {
+    static_assert(alignof(CUtensorMap) >= 64);
+    static_assert(alignof(typename RingConfig::AttnKernel::Params) >= 64);
+    static_assert(alignof(typename RingConfig::remote_pgl) >= 64);
+    static_assert(alignof(typename RingConfig::staging_gl) >= 64);
+    static_assert(alignof(typename RingConfig::KernelParams) >= 64);
+
+    static_assert(offsetof(typename RingConfig::KernelParams, compute) % 64 == 0);
+    static_assert(offsetof(typename RingConfig::KernelParams, remote_k) % 64 == 0);
+    static_assert(offsetof(typename RingConfig::KernelParams, remote_v) % 64 == 0);
+    static_assert(offsetof(typename RingConfig::KernelParams, local_k) % 64 == 0);
+    static_assert(offsetof(typename RingConfig::KernelParams, local_v) % 64 == 0);
+}
+
+template <typename RingConfig>
+struct alignas(128) RingRemoteLoadBarriers {
+    semaphore arrived[RingConfig::kNumCommChunks];
+    semaphore finished[RingConfig::kNumCommChunks];
+};
+
+template <typename RingConfig>
+CUTLASS_DEVICE
+void run_ring_remote_load(
     const typename RingConfig::KernelParams& params,
     int comm_bid,
     char* smem_buf) {
-    if (threadIdx.x != 0 || comm_bid >= params.num_comm_sm) {
+    if (comm_bid >= params.num_comm_sm) {
         return;
     }
 
     tma_swizzle_allocator allocator(reinterpret_cast<int*>(smem_buf));
-    typename RingConfig::shared_vec (&vec)[2] = allocator.allocate<typename RingConfig::shared_vec, 2>();
-    __shared__ semaphore arrived[2];
+    typename RingConfig::shared_vec (&vec)[RingConfig::kNumCommChunks] =
+        allocator.allocate<typename RingConfig::shared_vec, RingConfig::kNumCommChunks>();
+    __shared__ RingRemoteLoadBarriers<RingConfig> barriers;
 
-    const int total_tasks = params.rows * 2;
-    int stage = 0;
-    int iter = 0;
-    for (int task_id = comm_bid; task_id < total_tasks; task_id += params.num_comm_sm, stage ^= 1, ++iter) {
-        if (iter >= 2) {
-            tma::store_async_read_wait<1>();
-        }
+    static_assert(sizeof(RingRemoteLoadBarriers<RingConfig>) % 128 == 0);
 
-        const bool is_v = task_id >= params.rows;
-        const int row_idx = is_v ? task_id - params.rows : task_id;
-
-        init_semaphore(arrived[stage], 0, 1);
-        tma::expect_bytes(arrived[stage], sizeof(vec[stage]));
-        if (!is_v) {
-            tma::load_async(vec[stage], params.remote_k[params.src_dev], {row_idx, 0}, arrived[stage]);
-        } else {
-            tma::load_async(vec[stage], params.remote_v[params.src_dev], {row_idx, 0}, arrived[stage]);
-        }
-        wait(arrived[stage], 0);
-
-        if (!is_v) {
-            tma::store_async(params.local_k, vec[stage], {row_idx, 0});
-        } else {
-            tma::store_async(params.local_v, vec[stage], {row_idx, 0});
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int i = 0; i < RingConfig::kNumCommChunks; ++i) {
+            init_semaphore(barriers.arrived[i], 0, 1);
+            init_semaphore(barriers.finished[i], 0, 1);
         }
     }
-    if (iter > 0) {
-        tma::store_async_read_wait<0>();
+    __syncthreads();
+
+    const int total_tasks = params.rows * 2;
+    const int warp_id = warp::groupid();
+    uint32_t phasebits = 0xFFFF0000;
+
+    if (warp_id < RingConfig::kNumCommChunks && laneid() == 0) {
+        const int chunk_id = warp_id;
+        for (int task_id = RingConfig::kNumCommChunks * comm_bid + chunk_id;
+             task_id < total_tasks;
+             task_id += RingConfig::kNumCommChunks * params.num_comm_sm) {
+            const bool is_v = task_id >= params.rows;
+            const int row_idx = is_v ? task_id - params.rows : task_id;
+
+            wait(barriers.finished[chunk_id], get_phasebit<1>(phasebits, 0));
+            update_phasebit<1>(phasebits, 0);
+
+            tma::expect_bytes(barriers.arrived[chunk_id], sizeof(typename RingConfig::shared_vec));
+            if (!is_v) {
+                tma::load_async(vec[chunk_id], params.remote_k[params.src_dev], {row_idx, 0}, barriers.arrived[chunk_id]);
+            } else {
+                tma::load_async(vec[chunk_id], params.remote_v[params.src_dev], {row_idx, 0}, barriers.arrived[chunk_id]);
+            }
+        }
+    } else if (warp_id < 2 * RingConfig::kNumCommChunks && laneid() == 0) {
+        const int chunk_id = warp_id - RingConfig::kNumCommChunks;
+        for (int task_id = RingConfig::kNumCommChunks * comm_bid + chunk_id;
+             task_id < total_tasks;
+             task_id += RingConfig::kNumCommChunks * params.num_comm_sm) {
+            const bool is_v = task_id >= params.rows;
+            const int row_idx = is_v ? task_id - params.rows : task_id;
+
+            wait(barriers.arrived[chunk_id], get_phasebit<0>(phasebits, 0));
+            update_phasebit<0>(phasebits, 0);
+
+            if (!is_v) {
+                tma::store_async(params.local_k, vec[chunk_id], {row_idx, 0});
+            } else {
+                tma::store_async(params.local_v, vec[chunk_id], {row_idx, 0});
+            }
+            tma::store_async_read_wait();
+            arrive(barriers.finished[chunk_id]);
+        }
     }
 }
 
@@ -176,12 +232,17 @@ void run_min_fa3_varlen_ring_sm90(
     cudaStream_t stream) {
     using RingConfig = RingKernelConfig<IsCausal, NumDevices>;
     using AttnKernel = typename RingConfig::AttnKernel;
+    check_ring_kernel_param_layout<RingConfig>();
 
     int const seqlen_q = params.total_q;
     int const batch_q = 1;
     int const batch_k = 1;
-    int const remote_rows = params.total_k * params.h_k;
+    int const remote_rows = params.total_k;
     using Index = typename Flash_fwd_params::index_t;
+
+    TORCH_CHECK(params.h_k * params.d == RingConfig::kVecLength, 
+                "Ring varlen communication path currently requires kv_heads * head_dim == ", RingConfig::kVecLength, 
+                ". Got kv_heads=", params.h_k,", head_dim=", params.d);
 
     typename RingConfig::CollectiveMainloop::StrideV v_strides = make_stride(
         params.v_row_stride, _1{}, params.v_head_stride, Index{0});
@@ -290,6 +351,10 @@ void run_min_fa3_varlen_ring_sm90(
     dim3 grid_dims(uint32_t(params.num_comp_sm + params.num_comm_sm), 1, 1);
     dim3 block_dims = AttnKernel::get_block_shape();
     int smem_size = AttnKernel::SharedStorageSize;
+    printf("launch grid=(%u,%u,%u) block=(%u,%u,%u) smem=%d bytes\n",
+           grid_dims.x, grid_dims.y, grid_dims.z,
+           block_dims.x, block_dims.y, block_dims.z,
+           smem_size);
 
     if (smem_size >= 48 * 1024) {
         CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -299,6 +364,19 @@ void run_min_fa3_varlen_ring_sm90(
         params.local_k_staging_ptr != nullptr ? params.local_k_staging_ptr : params.k_ptr);
     uint64_t local_v_dst = reinterpret_cast<uint64_t>(
         params.local_v_staging_ptr != nullptr ? params.local_v_staging_ptr : params.v_ptr);
+
+    // pre-check mem address alignment
+    auto check_64b_alignment = [](uint64_t ptr, const char* name) {
+        TORCH_CHECK(ptr % 64 == 0, name, " must be 64-byte aligned for ring launch diagnostics");
+    };
+    check_64b_alignment(reinterpret_cast<uint64_t>(params.q_ptr), "q_ptr");
+    check_64b_alignment(reinterpret_cast<uint64_t>(params.k_ptr), "k_ptr");
+    check_64b_alignment(reinterpret_cast<uint64_t>(params.v_ptr), "v_ptr");
+    check_64b_alignment(reinterpret_cast<uint64_t>(params.o_ptr), "o_ptr");
+    check_64b_alignment(local_k_dst, "local_k_staging_ptr");
+    check_64b_alignment(local_v_dst, "local_v_staging_ptr");
+    check_64b_alignment(reinterpret_cast<uint64_t>(remote_k.data_.data_ptr()), "remote_k.data_ptr");
+    check_64b_alignment(reinterpret_cast<uint64_t>(remote_v.data_.data_ptr()), "remote_v.data_ptr");
 
     typename RingConfig::KernelParams kernel_params{
         compute_params,

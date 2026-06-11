@@ -87,16 +87,16 @@ ext_modules = [
     CUDAExtension(
         name="_min_fa3_op",
         sources=[
-            str(this_dir / "bindings.cpp"),
-            str(this_dir / "csrc" / "min_fa3_launch.cu"),
-            str(this_dir / "csrc" / "min_fa3_kernel.cu"),
-            str(this_dir / "csrc" / "min_fa3_varlen_prepare_scheduler.cu"),
-            str(this_dir / "csrc" / "min_fa3_varlen_launch.cu"),
-            str(this_dir / "csrc" / "min_fa3_varlen_kernel.cu"),
-            str(this_dir / "csrc" / "min_fa3_varlen_ring_launch.cu"),
-            str(this_dir / "csrc" / "min_fa3_varlen_ring_bindings.cu"),
-            str(this_dir / "csrc" / "parallel" / "remote_load.cu"),
-            str(this_dir / "csrc" / "parallel" / "remote_load_bindings.cu"),
+            "bindings.cpp",
+            "csrc/min_fa3_launch.cu",
+            "csrc/min_fa3_kernel.cu",
+            "csrc/min_fa3_varlen_prepare_scheduler.cu",
+            "csrc/min_fa3_varlen_launch.cu",
+            "csrc/min_fa3_varlen_kernel.cu",
+            "csrc/min_fa3_varlen_ring_launch.cu",
+            "csrc/min_fa3_varlen_ring_bindings.cu",
+            "csrc/parallel/remote_load.cu",
+            "csrc/parallel/remote_load_bindings.cu",
         ],
         include_dirs=[
             str(this_dir / "include"),
@@ -131,4 +131,6 @@ setup(
     name="min_fa3_demo",
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension.with_options(no_python_abi_suffix=True)},
+    packages=[],
+    py_modules=["min_fa3_op"],
 )
