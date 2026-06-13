@@ -146,7 +146,19 @@ def run_case(
     dist.barrier()
 
     local_ref = reference_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, is_causal)
+    base = min_fa3_op.forward_varlen(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqlen,
+        seqlen,
+        is_causal,
+        manual_block_count=num_comp_sm,
+    )
     torch.testing.assert_close(out.float(), local_ref.float(), atol=2e-1, rtol=2e-1)
+    torch.testing.assert_close(out.float(), base.float(), atol=2e-1, rtol=2e-1)
 
     if num_comm_sm > 0:
         torch.testing.assert_close(prefetch_k.float(), expected_k.float(), atol=0.0, rtol=0.0)

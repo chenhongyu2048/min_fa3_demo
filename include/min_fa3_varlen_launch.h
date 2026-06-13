@@ -65,6 +65,7 @@ void run_min_fa3_varlen_sm90(
         kVarlen,
         kPackGQA,
         kSplit,
+        false,
         false>;
     using Scheduler = flash::VarlenDynamicPersistentTileScheduler<
         Config::kBlockM,

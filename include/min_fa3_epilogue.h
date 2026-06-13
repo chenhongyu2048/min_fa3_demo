@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <cmath>
+
 #include <cutlass/cutlass.h>
 #include <cutlass/fast_math.h>  // For FastDivMod
 #include "cute/tensor.hpp"
@@ -24,7 +26,8 @@ namespace flash {
 using namespace cute;
 
 template <class TileShape_MNK_PV_, class ClusterShape_, class Element_, class ArchTag_,
-          int NumEpilogueThreads_, bool Varlen_, bool PackGQA_, bool Split_, bool FP8PermuteCol=false>
+          int NumEpilogueThreads_, bool Varlen_, bool PackGQA_, bool Split_, bool FP8PermuteCol=false,
+          bool EnableReduction=false>
 struct CollectiveEpilogueFwd {
 
     using TileShape_MNK_PV = TileShape_MNK_PV_;
@@ -42,6 +45,8 @@ struct CollectiveEpilogueFwd {
     static_assert(ArchTag::kMinComputeCapability >= 80);
     static_assert(ArchTag::kMinComputeCapability >= 90 || CUTE_STATIC_V(size(ClusterShape{})) == 1);
     static_assert(sizeof(Element) <= 2);
+    static_assert(!(EnableReduction && (Use_TMA_O || Split || PackGQA)),
+                  "EnableReduction only supports the non-TMA, non-split, non-PackGQA epilogue path");
 
     static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
     static constexpr int kHeadDimV = get<1>(TileShape_MNK_PV{});
@@ -136,6 +141,30 @@ struct CollectiveEpilogueFwd {
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
     };
+
+    CUTLASS_DEVICE static float merge_running_lse_(float prev_lse, float block_lse) {
+        if (prev_lse == -INFINITY && block_lse == -INFINITY) {
+            return -INFINITY;
+        }
+        float const max_lse = prev_lse > block_lse ? prev_lse : block_lse;
+        float const prev_term = prev_lse == -INFINITY ? 0.0f : expf(prev_lse - max_lse);
+        float const block_term = block_lse == -INFINITY ? 0.0f : expf(block_lse - max_lse);
+        return max_lse + __logf(prev_term + block_term);
+    }
+
+    CUTLASS_DEVICE static float merge_running_output_(
+        float prev_out,
+        float block_out,
+        float prev_lse,
+        float block_lse,
+        float merged_lse) {
+        if (merged_lse == -INFINITY) {
+            return 0.0f;
+        }
+        float const prev_scale = prev_lse == -INFINITY ? 0.0f : expf(prev_lse - merged_lse);
+        float const block_scale = block_lse == -INFINITY ? 0.0f : expf(block_lse - merged_lse);
+        return prev_scale * prev_out + block_scale * block_out;
+    }
 
     // Device side kernel params
     struct Params {
@@ -298,15 +327,17 @@ struct CollectiveEpilogueFwd {
                                   params.shape_LSE_packed,
                                   !is_split ? params.stride_LSE_packed : params.stride_LSE_partial_packed)(_, bidh, !is_varlen ? bidb : 0, !is_split ? 0 : split_idx);
         // if (thread_idx == 0) { printf("Before LSE write, m_block: %d, bidh: %d, bidb: %d, split_idx: %d, offset_o: %d, seqlen_o: %d\n", m_block, bidh, bidb, split_idx, offset_o, seqlen_o); print(mLSE); printf("\n"); }
-        if (!LargeHeadDimV || warp_group_idx == 0) {
-            if constexpr (!PackGQA) {
-                #pragma unroll
-                for (int mi = 0; mi < size(lse); ++mi) {
-                    int const row = m_block * kBlockM + get<0>(taccOcO_row(mi));
-                    if (get<1>(taccOcO_row(_0{})) == 0 && row < seqlen_o) { mLSE(row) = lse(mi); }
+        if constexpr (!EnableReduction) {
+            if (!LargeHeadDimV || warp_group_idx == 0) {
+                if constexpr (!PackGQA) {
+                    #pragma unroll
+                    for (int mi = 0; mi < size(lse); ++mi) {
+                        int const row = m_block * kBlockM + get<0>(taccOcO_row(mi));
+                        if (get<1>(taccOcO_row(_0{})) == 0 && row < seqlen_o) { mLSE(row) = lse(mi); }
+                    }
+                } else {
+                    PackGQA_t::store_LSE(mLSE, lse, tiled_mma, params.qhead_per_khead_divmod, thread_idx, seqlen_o, m_block);
                 }
-            } else {
-                PackGQA_t::store_LSE(mLSE, lse, tiled_mma, params.qhead_per_khead_divmod, thread_idx, seqlen_o, m_block);
             }
         }
 
@@ -350,16 +381,97 @@ struct CollectiveEpilogueFwd {
                     }
                 }
                 if constexpr (!PackGQA) {
-                    // (BLK_M,BLK_K) -> (blk_m,blk_k)
-                    Tensor tOcO = gmem_thr_copy_O.partition_D(cute::make_identity_tensor(select<0, 1>(TileShape_MNK_PV{})));
-                    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOsO)));
-                    #pragma unroll
-                    for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(params.shape_O); }
-                    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
-                    // Clear_OOB_K must be false since we don't want to write zeros to gmem
-                    flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-                        gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, seqlen_o - m_block * kBlockM
-                    );
+                    if constexpr (!EnableReduction) {
+                        // (BLK_M,BLK_K) -> (blk_m,blk_k)
+                        Tensor tOcO = gmem_thr_copy_O.partition_D(cute::make_identity_tensor(select<0, 1>(TileShape_MNK_PV{})));
+                        Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOsO)));
+                        #pragma unroll
+                        for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(params.shape_O); }
+                        Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+                        // Clear_OOB_K must be false since we don't want to write zeros to gmem
+                        flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                            gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, seqlen_o - m_block * kBlockM
+                        );
+                    } else {
+                        static constexpr int kGmemElemsPerStoreReduction = 2;
+                        cute::Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element> gmem_copy_direct;
+                        Tensor tOrO_prev_acc = make_fragment_like(tOrO_out);
+                        Tensor tOrO_out_rowcol = make_tensor(tOrO_out.data(), flash::convert_layout_acc_rowcol(tOrO_out.layout()));
+                        Tensor tOrO_out_copy = cute::tiled_divide(tOrO_out_rowcol, Shape<_1, Int<kGmemElemsPerStoreReduction>>{});
+                        Tensor tOrO_prev_rowcol = make_tensor(tOrO_prev_acc.data(), flash::convert_layout_acc_rowcol(tOrO_prev_acc.layout()));
+                        Tensor tOrO_prev_copy = cute::tiled_divide(tOrO_prev_rowcol, Shape<_1, Int<kGmemElemsPerStoreReduction>>{});
+                        Tensor tOgO = thread_mma.partition_C(gO);
+                        Tensor tOgO_rowcol = make_tensor(tOgO.data(), flash::convert_layout_acc_rowcol(tOgO.layout()));
+                        Tensor tOgO_copy = cute::tiled_divide(tOgO_rowcol, Shape<_1, Int<kGmemElemsPerStoreReduction>>{});
+                        Tensor taccOcO_col = taccOcO_rowcol(_0{}, _);
+                        constexpr int kLseFragSize = CUTE_STATIC_V(size(lse));
+                        float prev_lse_vals[kLseFragSize];
+                        float merged_lse_vals[kLseFragSize];
+                        bool row_valid[kLseFragSize];
+                        #pragma unroll
+                        for (int m = 0; m < kLseFragSize; ++m) {
+                            int const row = m_block * kBlockM + get<0>(taccOcO_row(m));
+                            row_valid[m] = row < seqlen_o;
+                            if (row_valid[m]) {
+                                float const prev_lse = mLSE(row);
+                                float const block_lse = lse(m);
+                                prev_lse_vals[m] = prev_lse;
+                                merged_lse_vals[m] = merge_running_lse_(prev_lse, block_lse);
+                            } else {
+                                prev_lse_vals[m] = -INFINITY;
+                                merged_lse_vals[m] = -INFINITY;
+                            }
+                        }
+                        #pragma unroll
+                        for (int m = 0; m < kLseFragSize; ++m) {
+                            if (row_valid[m]) {
+                                #pragma unroll
+                                for (int k = 0; k < size(taccOcO_col) / kGmemElemsPerStoreReduction; ++k) {
+                                    if (get<1>(taccOcO_col(k * kGmemElemsPerStoreReduction)) < get<1>(params.shape_O)) {
+                                        cute::copy(gmem_copy_direct, tOgO_copy(_, m, k), tOrO_prev_copy(_, m, k));
+                                    }
+                                }
+                            }
+                        }
+                        // All threads must finish reading the previous running LSE before
+                        // any thread writes the merged value back for this CTA tile.
+                        flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                        #pragma unroll
+                        for (int m = 0; m < kLseFragSize; ++m) {
+                            int const row = m_block * kBlockM + get<0>(taccOcO_row(m));
+                            if (row_valid[m]) {
+                                float const block_lse = lse(m);
+                                float const prev_lse = prev_lse_vals[m];
+                                float const merged_lse = merged_lse_vals[m];
+                                #pragma unroll
+                                for (int k = 0; k < size(taccOcO_col) / kGmemElemsPerStoreReduction; ++k) {
+                                    if (get<1>(taccOcO_col(k * kGmemElemsPerStoreReduction)) < get<1>(params.shape_O)) {
+                                        #pragma unroll
+                                        for (int i = 0; i < kGmemElemsPerStoreReduction; ++i) {
+                                            tOrO_prev_copy(i, m, k) = Element(merge_running_output_(
+                                                static_cast<float>(tOrO_prev_copy(i, m, k)),
+                                                static_cast<float>(tOrO_out_copy(i, m, k)),
+                                                prev_lse,
+                                                block_lse,
+                                                merged_lse));
+                                        }
+                                    }
+                                }
+                                if (get<1>(taccOcO_row(_0{})) == 0) { mLSE(row) = merged_lse; }
+                            }
+                        }
+                        #pragma unroll
+                        for (int m = 0; m < kLseFragSize; ++m) {
+                            if (row_valid[m]) {
+                                #pragma unroll
+                                for (int k = 0; k < size(taccOcO_col) / kGmemElemsPerStoreReduction; ++k) {
+                                    if (get<1>(taccOcO_col(k * kGmemElemsPerStoreReduction)) < get<1>(params.shape_O)) {
+                                        cute::copy(gmem_copy_direct, tOrO_prev_copy(_, m, k), tOgO_copy(_, m, k));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 } else {
                     // If PackGQA, we split the work of compute O_ptr among threads in the same row
                     PackGQA_t::store_O(mO, tOrO, params.qhead_per_khead_divmod, thread_idx, seqlen_o, m_block);

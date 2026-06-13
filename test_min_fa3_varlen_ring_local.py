@@ -120,6 +120,9 @@ def run_case(
         manual_block_count=num_comp_sm,
     )
 
+    # Ring mode now always runs the epilogue merge against neutral-initialized out/lse,
+    # so a single local block should still match both the direct FA3 varlen path and
+    # the PyTorch reference.
     torch.testing.assert_close(out_ring.float(), ref.float(), atol=2e-1, rtol=2e-1)
     torch.testing.assert_close(out_ring.float(), base.float(), atol=2e-1, rtol=2e-1)
     if num_comm_sm > 0:

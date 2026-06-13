@@ -64,6 +64,7 @@ void run_min_fa3_sm90(
         kVarlen,
         kPackGQA,
         kSplit,
+        false,
         false>;
     using Scheduler = std::conditional_t<
         IsCausal,

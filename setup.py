@@ -122,6 +122,7 @@ ext_modules = [
                 "-DNDEBUG",
                 "-gencode",
                 "arch=compute_90a,code=sm_90a",
+                "-Xptxas=-v",
             ],
         },
     )

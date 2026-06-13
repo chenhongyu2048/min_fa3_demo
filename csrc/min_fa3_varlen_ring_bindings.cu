@@ -272,8 +272,8 @@ torch::Tensor forward_varlen_ring(torch::Tensor q,
                 "cu_seqlens_k[-1] must equal k.size(0). Got ", cu_seqlens_k[batch_size].item<int>(),
                 " vs ", k.size(0));
 
-    auto out = torch::empty_like(q);
-    auto lse = torch::empty({q.size(1), q.size(0)}, q.options().dtype(torch::kFloat));
+    auto out = torch::zeros_like(q);
+    auto lse = torch::full({q.size(1), q.size(0)}, -std::numeric_limits<float>::infinity(), q.options().dtype(torch::kFloat));
 
     int b_rounded = round_multiple(batch_size, 4);
     bool varlen_sort_batches = true;

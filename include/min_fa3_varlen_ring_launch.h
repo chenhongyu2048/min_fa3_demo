@@ -75,7 +75,8 @@ struct RingKernelConfig {
         kVarlen,
         kPackGQA,
         kSplit,
-        false>;
+        false,
+        true>;
     using Scheduler = flash::VarlenDynamicPersistentTileScheduler<
         Config::kBlockM,
         Config::kBlockN,
@@ -351,10 +352,10 @@ void run_min_fa3_varlen_ring_sm90(
     dim3 grid_dims(uint32_t(params.num_comp_sm + params.num_comm_sm), 1, 1);
     dim3 block_dims = AttnKernel::get_block_shape();
     int smem_size = AttnKernel::SharedStorageSize;
-    printf("launch grid=(%u,%u,%u) block=(%u,%u,%u) smem=%d bytes\n",
-           grid_dims.x, grid_dims.y, grid_dims.z,
-           block_dims.x, block_dims.y, block_dims.z,
-           smem_size);
+    // printf("launch grid=(%u,%u,%u) block=(%u,%u,%u) smem=%d bytes\n",
+    //        grid_dims.x, grid_dims.y, grid_dims.z,
+    //        block_dims.x, block_dims.y, block_dims.z,
+    //        smem_size);
 
     if (smem_size >= 48 * 1024) {
         CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));

@@ -171,6 +171,14 @@ python benchmark_varlen.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --
 python benchmark_varlen.py --b 4 --seqlen 256 --qhead 16 --kvhead 8 --headdim 128 --mode causal
 ```
 
+Ring-local varlen benchmark:
+
+```bash
+python benchmark_varlen_ring_local.py
+python benchmark_varlen_ring_local.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 0 --mode both
+python benchmark_varlen_ring_local.py --b 4 --seqlen 1024 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 4 --mode causal
+```
+
 Remote load benchmark:
 
 ```bash
