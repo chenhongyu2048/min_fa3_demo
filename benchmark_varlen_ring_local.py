@@ -1,5 +1,9 @@
 """
-Benchmark: min_fa3 varlen ring-local demo vs PyTorch vs FA2 vs FA3 vs base min_fa3 varlen
+Benchmark: min_fa3 varlen ring-local demo vs PyTorch vs FA2 vs FA3 vs base min_fa3 varlen vs min_fa3 varlen ring with reduction
+We add reduction to monitor the time spent in the attention kernel and the time spent in the output/LSE merging logic, as in the ring-attention pattern.
+
+if --num-comm-sm 0, there will not launch SMs for communication (TMA loading from local/remote).
+and if num_comm_sm (>0) is too small, the communication may not fully overlap with the computation, so the timing may be higher than expected. The optimal number of comm SMs may depend on the case and is a subject of future investigation.
 
 Examples:
     python benchmark_varlen_ring_local.py
@@ -14,9 +18,10 @@ import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 THIS_DIR = Path(__file__).resolve().parent
 HOPPER_DIR = THIS_DIR.parent
@@ -62,9 +67,55 @@ class Case:
 class Result:
     time_ms: float
     tflops: float
+    attn_ms: float | None = None
+    reduction_ms: float | None = None
 
 
-Method = Callable[..., float | None]
+@dataclass(frozen=True)
+class TimingBreakdown:
+    total_ms: float
+    attn_ms: float | None = None
+    reduction_ms: float | None = None
+
+
+Method = Callable[..., TimingBreakdown | None]
+
+
+@torch.jit.script
+def _update_out_and_lse(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    block_out: torch.Tensor,
+    block_lse: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    block_out = block_out.to(torch.float32)
+    block_lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
+
+    out = out - F.sigmoid(block_lse - lse) * (out - block_out)
+    lse = lse - F.logsigmoid(lse - block_lse)
+
+    return out, lse
+
+
+def update_out_and_lse(
+    out: Optional[torch.Tensor],
+    lse: Optional[torch.Tensor],
+    block_out: torch.Tensor,
+    block_lse: torch.Tensor,
+    slice_=None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if out is None:
+        if slice_ is not None:
+            raise RuntimeError("first update_out_and_lse should not pass slice_ args")
+        out = block_out.to(torch.float32)
+        lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
+    elif slice_ is not None:
+        slice_out, slice_lse = out[slice_], lse[slice_]
+        slice_out, slice_lse = _update_out_and_lse(slice_out, slice_lse, block_out, block_lse)
+        out[slice_], lse[slice_] = slice_out, slice_lse
+    else:
+        out, lse = _update_out_and_lse(out, lse, block_out, block_lse)
+    return out, lse
 
 
 def format_oom(exc: torch.OutOfMemoryError) -> str:
@@ -115,7 +166,7 @@ def parse_args() -> argparse.Namespace:
         help="Number of communication CTAs for min_fa3_varlen_ring",
     )
     parser.add_argument("--num-iters", type=int, default=50, help="Timing iterations")
-    parser.add_argument("--warmup-iters", type=int, default=10, help="Warmup iterations")
+    parser.add_argument("--warmup-iters", type=int, default=50, help="Warmup iterations")
     return parser.parse_args()
 
 
@@ -180,8 +231,60 @@ def median_time_ms(fn: Callable[[], None], warmup_iters: int, num_iters: int) ->
     return statistics.median(s.elapsed_time(e) for s, e in zip(start_events, end_events))
 
 
-def take_output(result):
-    return result[0] if isinstance(result, tuple) else result
+def median_split_time_ms(
+    attn_fn: Callable[[], tuple[torch.Tensor, torch.Tensor]],
+    reduction_fn: Callable[[torch.Tensor, torch.Tensor], None],
+    warmup_iters: int,
+    num_iters: int,
+) -> TimingBreakdown:
+    for _ in range(warmup_iters):
+        block_out, block_lse = attn_fn()
+        reduction_fn(block_out, block_lse)
+    torch.cuda.synchronize()
+
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    attn_end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    for i in range(num_iters):
+        start_events[i].record()
+        block_out, block_lse = attn_fn()
+        attn_end_events[i].record()
+        reduction_fn(block_out, block_lse)
+        end_events[i].record()
+    torch.cuda.synchronize()
+    total_ms = statistics.median(s.elapsed_time(e) for s, e in zip(start_events, end_events))
+    attn_ms = statistics.median(s.elapsed_time(e) for s, e in zip(start_events, attn_end_events))
+    reduction_ms = statistics.median(s.elapsed_time(e) for s, e in zip(attn_end_events, end_events))
+    return TimingBreakdown(total_ms=total_ms, attn_ms=attn_ms, reduction_ms=reduction_ms)
+
+
+def make_batch_reduction_buffers(
+    batch_size: int,
+    seqlen: int,
+    num_heads: int,
+    head_dim: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.randn(batch_size, seqlen, num_heads, head_dim, dtype=torch.float32, device=device)
+    lse = torch.randn(batch_size, seqlen, num_heads, 1, dtype=torch.float32, device=device)
+    return out, lse
+
+
+def make_varlen_reduction_buffers(
+    total_q: int,
+    num_heads: int,
+    head_dim: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.randn(total_q, num_heads, head_dim, dtype=torch.float32, device=device)
+    lse = torch.randn(total_q, num_heads, 1, dtype=torch.float32, device=device)
+    return out, lse
+
+
+def take_output_and_lse(result) -> tuple[torch.Tensor, torch.Tensor]:
+    if not isinstance(result, tuple) or len(result) < 2:
+        raise RuntimeError("expected attention backend to return at least (out, softmax_lse)")
+    return result[0], result[1]
 
 
 def bench_pytorch(
@@ -194,24 +297,36 @@ def bench_pytorch(
     is_causal: bool,
     warmup_iters: int,
     num_iters: int,
-) -> float | None:
+) -> TimingBreakdown | None:
     seqlen_q = (cu_seqlens_q[1] - cu_seqlens_q[0]).item()
     seqlen_k = (cu_seqlens_k[1] - cu_seqlens_k[0]).item()
     q_bshd = q.view(batch_size, seqlen_q, q.size(1), q.size(2))
     k_bshd = k.view(batch_size, seqlen_k, k.size(1), k.size(2))
     v_bshd = v.view(batch_size, seqlen_k, v.size(1), v.size(2))
-    qt = q_bshd.transpose(1, 2)
-    kt = k_bshd.transpose(1, 2)
-    vt = v_bshd.transpose(1, 2)
+    qt = q_bshd.transpose(1, 2).contiguous()
+    kt = k_bshd.transpose(1, 2).contiguous()
+    vt = v_bshd.transpose(1, 2).contiguous()
     enable_gqa = qt.size(1) != kt.size(1)
+    old_out, old_lse = make_batch_reduction_buffers(batch_size, seqlen_q, q.size(1), q.size(2), q.device)
 
-    def run() -> None:
-        if enable_gqa:
-            torch.nn.functional.scaled_dot_product_attention(qt, kt, vt, is_causal=is_causal, enable_gqa=True)
-        else:
-            torch.nn.functional.scaled_dot_product_attention(qt, kt, vt, is_causal=is_causal)
+    def attn_fn() -> tuple[torch.Tensor, torch.Tensor]:
+        block_k = kt.repeat_interleave(qt.size(1) // kt.size(1), dim=1) if enable_gqa else kt
+        block_v = vt.repeat_interleave(qt.size(1) // vt.size(1), dim=1) if enable_gqa else vt
+        block_out, block_lse, *_ = torch.ops.aten._scaled_dot_product_flash_attention.default(
+            qt,
+            block_k,
+            block_v,
+            0.0,
+            is_causal,
+            False,
+        )
+        return block_out.transpose(1, 2), block_lse
 
-    return median_time_ms(run, warmup_iters, num_iters)
+    def reduction_fn(block_out: torch.Tensor, block_lse: torch.Tensor) -> None:
+        merged_out, merged_lse = update_out_and_lse(old_out, old_lse, block_out, block_lse)
+        del merged_out, merged_lse
+
+    return median_split_time_ms(attn_fn, reduction_fn, warmup_iters, num_iters)
 
 
 def bench_fa2(
@@ -224,18 +339,33 @@ def bench_fa2(
     is_causal: bool,
     warmup_iters: int,
     num_iters: int,
-) -> float | None:
+) -> TimingBreakdown | None:
     if flash_attn_varlen_func2 is None:
         return None
     max_seqlen_q = (cu_seqlens_q[1] - cu_seqlens_q[0]).item()
     max_seqlen_k = (cu_seqlens_k[1] - cu_seqlens_k[0]).item()
-    return median_time_ms(
-        lambda: take_output(
-            flash_attn_varlen_func2(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=is_causal)
-        ),
-        warmup_iters,
-        num_iters,
-    )
+    old_out, old_lse = make_varlen_reduction_buffers(q.size(0), q.size(1), q.size(2), q.device)
+
+    def attn_fn() -> tuple[torch.Tensor, torch.Tensor]:
+        return take_output_and_lse(
+            flash_attn_varlen_func2(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                causal=is_causal,
+                return_attn_probs=True,
+            )
+        )
+
+    def reduction_fn(block_out: torch.Tensor, block_lse: torch.Tensor) -> None:
+        merged_out, merged_lse = update_out_and_lse(old_out, old_lse, block_out, block_lse)
+        del merged_out, merged_lse
+
+    return median_split_time_ms(attn_fn, reduction_fn, warmup_iters, num_iters)
 
 
 def bench_fa3(
@@ -248,18 +378,33 @@ def bench_fa3(
     is_causal: bool,
     warmup_iters: int,
     num_iters: int,
-) -> float | None:
+) -> TimingBreakdown | None:
     if flash_attn_varlen_func3 is None:
         return None
     max_seqlen_q = (cu_seqlens_q[1] - cu_seqlens_q[0]).item()
     max_seqlen_k = (cu_seqlens_k[1] - cu_seqlens_k[0]).item()
-    return median_time_ms(
-        lambda: take_output(
-            flash_attn_varlen_func3(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=is_causal)
-        ),
-        warmup_iters,
-        num_iters,
-    )
+    old_out, old_lse = make_varlen_reduction_buffers(q.size(0), q.size(1), q.size(2), q.device)
+
+    def attn_fn() -> tuple[torch.Tensor, torch.Tensor]:
+        return take_output_and_lse(
+            flash_attn_varlen_func3(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                causal=is_causal,
+                return_attn_probs=True,
+            )
+        )
+
+    def reduction_fn(block_out: torch.Tensor, block_lse: torch.Tensor) -> None:
+        merged_out, merged_lse = update_out_and_lse(old_out, old_lse, block_out, block_lse)
+        del merged_out, merged_lse
+
+    return median_split_time_ms(attn_fn, reduction_fn, warmup_iters, num_iters)
 
 
 def bench_min_fa3_varlen(
@@ -273,7 +418,7 @@ def bench_min_fa3_varlen(
     warmup_iters: int,
     num_iters: int,
     manual_block_count: int,
-) -> float | None:
+) -> TimingBreakdown | None:
     if k.size(1) != v.size(1):
         return None
     if q.size(1) % k.size(1) != 0:
@@ -282,20 +427,22 @@ def bench_min_fa3_varlen(
         return None
     max_seqlen_q = (cu_seqlens_q[1] - cu_seqlens_q[0]).item()
     max_seqlen_k = (cu_seqlens_k[1] - cu_seqlens_k[0]).item()
-    return median_time_ms(
-        lambda: min_fa3_op.forward_varlen(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            is_causal,
-            manual_block_count=manual_block_count,
-        ),
-        warmup_iters,
-        num_iters,
+    return TimingBreakdown(
+        total_ms=median_time_ms(
+            lambda: min_fa3_op.forward_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                is_causal,
+                manual_block_count=manual_block_count,
+            ),
+            warmup_iters,
+            num_iters,
+        )
     )
 
 
@@ -315,7 +462,7 @@ def bench_min_fa3_varlen_ring(
     remote_v: min_fa3_op.TKParallelTensor,
     prefetch_k: torch.Tensor,
     prefetch_v: torch.Tensor,
-) -> float | None:
+) -> TimingBreakdown | None:
     if k.size(1) != v.size(1):
         return None
     if q.size(1) % k.size(1) != 0:
@@ -324,27 +471,29 @@ def bench_min_fa3_varlen_ring(
         return None
     max_seqlen_q = (cu_seqlens_q[1] - cu_seqlens_q[0]).item()
     max_seqlen_k = (cu_seqlens_k[1] - cu_seqlens_k[0]).item()
-    return median_time_ms(
-        lambda: min_fa3_op.forward_varlen_ring(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            is_causal,
-            remote_k=remote_k,
-            remote_v=remote_v,
-            src_rank=0,
-            num_comp_sm=num_comp_sm,
-            num_comm_sm=num_comm_sm,
-            ring_step=0,
-            prefetch_k=prefetch_k,
-            prefetch_v=prefetch_v,
-        ),
-        warmup_iters,
-        num_iters,
+    return TimingBreakdown(
+        total_ms=median_time_ms(
+            lambda: min_fa3_op.forward_varlen_ring(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                is_causal,
+                remote_k=remote_k,
+                remote_v=remote_v,
+                src_rank=0,
+                num_comp_sm=num_comp_sm,
+                num_comm_sm=num_comm_sm,
+                ring_step=0,
+                prefetch_k=prefetch_k,
+                prefetch_v=prefetch_v,
+            ),
+            warmup_iters,
+            num_iters,
+        )
     )
 
 
@@ -376,7 +525,7 @@ def bench_case(
     for name, fn in methods:
         try:
             if name == "min_fa3_varlen":
-                time_ms = bench_min_fa3_varlen(
+                timing = bench_min_fa3_varlen(
                     q,
                     k,
                     v,
@@ -389,7 +538,7 @@ def bench_case(
                     num_comp_sm,
                 )
             elif name == "min_fa3_varlen_ring":
-                time_ms = bench_min_fa3_varlen_ring(
+                timing = bench_min_fa3_varlen_ring(
                     q,
                     k,
                     v,
@@ -407,7 +556,7 @@ def bench_case(
                     prefetch_v,
                 )
             else:
-                time_ms = fn(
+                timing = fn(
                     q,
                     k,
                     v,
@@ -418,11 +567,16 @@ def bench_case(
                     warmup_iters,
                     num_iters,
                 )
-            if time_ms is None:
+            if timing is None:
                 results[name] = None
                 continue
-            tflops = get_flops(case) / (time_ms * 1e-3) / 1e12
-            results[name] = Result(time_ms=time_ms, tflops=tflops)
+            tflops = get_flops(case) / (timing.total_ms * 1e-3) / 1e12
+            results[name] = Result(
+                time_ms=timing.total_ms,
+                tflops=tflops,
+                attn_ms=timing.attn_ms,
+                reduction_ms=timing.reduction_ms,
+            )
         except torch.OutOfMemoryError as exc:
             torch.cuda.empty_cache()
             print(f"[{name} OOM: {format_case_key(case)}] [{format_oom(exc)}]")
@@ -449,13 +603,17 @@ def print_table(results_by_case: dict[Case, dict[str, Result | None]]) -> None:
     print("=" * 100)
     for case, results in results_by_case.items():
         print(format_case_key(case))
-        print(f"{'Method':<24} {'Time (ms)':>12} {'TFLOPS':>12}")
+        print(f"{'Method':<24} {'Attn (ms)':>12} {'Reduce (ms)':>12} {'Time (ms)':>12} {'TFLOPS':>12}")
         for method in methods:
             result = results.get(method)
             if result is None:
-                print(f"{method:<24} {'N/A':>12} {'N/A':>12}")
+                print(f"{method:<24} {'N/A':>12} {'N/A':>12} {'N/A':>12} {'N/A':>12}")
             else:
-                print(f"{method:<24} {result.time_ms:>12.3f} {result.tflops:>12.1f}")
+                attn_ms = f"{result.attn_ms:>12.3f}" if result.attn_ms is not None else f"{'N/A':>12}"
+                reduction_ms = (
+                    f"{result.reduction_ms:>12.3f}" if result.reduction_ms is not None else f"{'N/A':>12}"
+                )
+                print(f"{method:<24} {attn_ms} {reduction_ms} {result.time_ms:>12.3f} {result.tflops:>12.1f}")
         print("-" * 100)
 
 
