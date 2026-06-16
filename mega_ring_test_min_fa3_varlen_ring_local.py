@@ -70,40 +70,37 @@ def run_case(
     kv_heads: int,
     head_dim: int,
     is_causal: bool,
-    src_rank: int,
     num_comp_sm: int,
     num_comm_sm: int,
-    ring_step: int,
     local_rank: int,
     local_world_size: int,
 ) -> None:
     device = torch.device("cuda")
     total_tokens = batch_size * seqlen
     q = torch.randn(total_tokens, q_heads, head_dim, device=device, dtype=torch.bfloat16)
-    k = torch.randn(total_tokens, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
-    v = torch.randn(total_tokens, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
     cu_seqlens_q = make_cu_seqlens(batch_size, seqlen, device)
     cu_seqlens_k = make_cu_seqlens(batch_size, seqlen, device)
     remote_k = min_fa3_op.TKParallelTensor(
-        list(k.shape),
+        [total_tokens, kv_heads, head_dim],
         torch.bfloat16,
         local_rank,
         local_world_size,
         False,
     )
     remote_v = min_fa3_op.TKParallelTensor(
-        list(v.shape),
+        [total_tokens, kv_heads, head_dim],
         torch.bfloat16,
         local_rank,
         local_world_size,
         False,
     )
-    remote_k.data_.copy_(k)
-    remote_v.data_.copy_(v)
-    prefetch_k = torch.empty_like(k)
-    prefetch_v = torch.empty_like(v)
+    # Use the VMM-backed TK storage as the ordinary K/V tensors too.
+    k = remote_k.data_
+    v = remote_v.data_
+    k.normal_()
+    v.normal_()
 
-    out_ring = min_fa3_op.forward_varlen_ring(
+    out_mega_ring = min_fa3_op.forward_varlen_mega_ring(
         q,
         k,
         v,
@@ -114,12 +111,8 @@ def run_case(
         is_causal,
         remote_k=remote_k,
         remote_v=remote_v,
-        src_rank=src_rank,
         num_comp_sm=num_comp_sm,
         num_comm_sm=num_comm_sm,
-        ring_step=ring_step,
-        prefetch_k=prefetch_k,
-        prefetch_v=prefetch_v,
     )
     ref = reference_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, is_causal)
     base = min_fa3_op.forward_varlen(
@@ -134,24 +127,17 @@ def run_case(
         manual_block_count=num_comp_sm,
     )
 
-    # Ring mode now always runs the epilogue merge against neutral-initialized out/lse,
-    # so a single local block should still match both the direct FA3 varlen path and
-    # the PyTorch reference.
-    torch.testing.assert_close(out_ring.float(), ref.float(), atol=2e-1, rtol=2e-1)
-    torch.testing.assert_close(out_ring.float(), base.float(), atol=2e-1, rtol=2e-1)
-    if num_comm_sm > 0:
-        torch.cuda.synchronize()
-        torch.testing.assert_close(prefetch_k.float(), k.float(), atol=0.0, rtol=0.0)
-        torch.testing.assert_close(prefetch_v.float(), v.float(), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(out_mega_ring.float(), ref.float(), atol=2e-1, rtol=2e-1)
+    torch.testing.assert_close(out_mega_ring.float(), base.float(), atol=2e-1, rtol=2e-1)
     print(
-        f"ring varlen case causal={is_causal}: ok "
+        f"mega ring varlen local case causal={is_causal}: ok "
         f"(B={batch_size}, S={seqlen}, QH={q_heads}, KVH={kv_heads}, D={head_dim}, "
         f"num_comp_sm={num_comp_sm}, num_comm_sm={num_comm_sm})"
     )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the minimal Hopper FA3 varlen ring-attention demo test.")
+    parser = argparse.ArgumentParser(description="Run the minimal Hopper FA3 varlen mega-ring demo local test.")
     parser.add_argument("--b", type=int, default=2, help="Batch size B.")
     parser.add_argument(
         "--seqlen",
@@ -165,7 +151,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kvhead", type=int, default=8, help="Number of key/value heads")
     parser.add_argument("--headdim", type=int, default=128, help="Head dimension D")
     parser.add_argument("--num-comp-sm", type=int, default=1, help="Number of compute CTAs")
-    parser.add_argument("--num-comm-sm", type=int, default=1, help="Number of communication CTAs")
+    parser.add_argument("--num-comm-sm", type=int, default=0, help="Number of communication CTAs")
     parser.add_argument(
         "--mode",
         choices=("noncausal", "causal", "both"),
@@ -190,9 +176,13 @@ if __name__ == "__main__":
         raise SystemExit(
             f"This demo requires qhead % kvhead == 0 for GQA/MQA, got qhead={args.qhead}, kvhead={args.kvhead}"
         )
+    if args.kvhead * args.headdim != 1024:
+        raise SystemExit(
+            "Mega ring communication path requires kvhead * headdim == 1024, "
+            f"got kvhead={args.kvhead}, headdim={args.headdim}"
+        )
 
-    # cases = [(args.num_comp_sm, 0), (args.num_comp_sm, args.num_comm_sm)]
-    cases = [(args.num_comp_sm, args.num_comm_sm), ]
+    cases = [(args.num_comp_sm, 0), (args.num_comp_sm, args.num_comm_sm)]
 
     for seqlen in seqlen_cases:
         seen: set[tuple[int, int]] = set()
@@ -210,17 +200,15 @@ if __name__ == "__main__":
                         args.kvhead,
                         args.headdim,
                         False,
-                        0,
                         num_comp_sm,
                         num_comm_sm,
-                        0,
                         torch.cuda.current_device(),
                         1,
                     )
                 except torch.OutOfMemoryError as exc:
                     torch.cuda.empty_cache()
                     print(
-                        f"ring varlen case causal=False: skipped due to OOM "
+                        f"mega ring varlen local case causal=False: skipped due to OOM "
                         f"(B={args.b}, S={seqlen}, num_comp_sm={num_comp_sm}, num_comm_sm={num_comm_sm}) "
                         f"[{format_oom(exc)}]"
                     )
@@ -233,17 +221,15 @@ if __name__ == "__main__":
                         args.kvhead,
                         args.headdim,
                         True,
-                        0,
                         num_comp_sm,
                         num_comm_sm,
-                        0,
                         torch.cuda.current_device(),
                         1,
                     )
                 except torch.OutOfMemoryError as exc:
                     torch.cuda.empty_cache()
                     print(
-                        f"ring varlen case causal=True: skipped due to OOM "
+                        f"mega ring varlen local case causal=True: skipped due to OOM "
                         f"(B={args.b}, S={seqlen}, num_comp_sm={num_comp_sm}, num_comm_sm={num_comm_sm}) "
                         f"[{format_oom(exc)}]"
                     )

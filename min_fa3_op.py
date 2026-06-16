@@ -12,6 +12,7 @@ from _min_fa3_op import (
     parallel_remote_load_vec_out as _parallel_remote_load_vec_out_cuda,
     forward,
     forward_varlen,
+    forward_varlen_mega_ring as _forward_varlen_mega_ring_cuda,
     forward_varlen_ring as _forward_varlen_ring_cuda,
     parallel_remote_load as _parallel_remote_load_cuda,
     parallel_remote_load_vec as _parallel_remote_load_vec_cuda,
@@ -196,11 +197,46 @@ def forward_varlen_ring(
     )
 
 
+def forward_varlen_mega_ring(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_causal: bool,
+    *,
+    remote_k: TKParallelTensor,
+    remote_v: TKParallelTensor,
+    num_comp_sm: int,
+    num_comm_sm: int,
+) -> torch.Tensor:
+    # MEGA_RING: explicit opt-in path. K/V are the local concatenated
+    # [world_size * local_total_k, kv_heads, 128] buffers used by the fused
+    # persistent kernel; default forward_varlen_ring remains single-step.
+    return _forward_varlen_mega_ring_cuda(
+        q,
+        k,
+        v,
+        remote_k,
+        remote_v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        bool(is_causal),
+        int(num_comp_sm),
+        int(num_comm_sm),
+    )
+
+
 __all__ = [
     "TKParallelTensor",
     "create_parallel_tensor",
     "forward",
     "forward_varlen",
+    "forward_varlen_mega_ring",
     "forward_varlen_ring",
     "parallel_remote_load",
     "parallel_remote_load_vec",

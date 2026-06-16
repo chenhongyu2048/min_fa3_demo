@@ -149,6 +149,13 @@ python test_min_fa3_varlen_ring_local.py --b 3 --seqlen 128,256 --qhead 16 --kvh
 torchrun --nproc_per_node=2 test_min_fa3_varlen_ring_multi_rank.py --b 2 --seqlen 128,256 --qhead 16 --kvhead 8 --src-rank 0 --num-comp-sm 1 --num-comm-sm 1 --mode both
 ```
 
+Mega-ring varlen tests:
+
+```bash
+python mega_ring_test_min_fa3_varlen_ring_local.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 1 --num-comm-sm 1 --mode both
+torchrun --standalone --nproc_per_node=2 mega_ring_test_min_fa3_varlen_ring_multi_rank.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 1 --num-comm-sm 1 --mode both
+```
+
 Parameterized test examples:
 
 ```bash
@@ -177,6 +184,14 @@ Ring-local varlen benchmark:
 python benchmark_varlen_ring_local.py
 python benchmark_varlen_ring_local.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 0 --mode both
 python benchmark_varlen_ring_local.py --b 4 --seqlen 1024 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 4 --mode causal
+```
+
+Mega-ring local varlen benchmark:
+
+```bash
+python benchmark_varlen_mega_ring_local.py
+python benchmark_varlen_mega_ring_local.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 0 --mode both
+python benchmark_varlen_mega_ring_local.py --b 4 --seqlen 1024 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 4 --mode causal
 ```
 
 Remote load benchmark:

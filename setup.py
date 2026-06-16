@@ -95,6 +95,9 @@ ext_modules = [
             "csrc/min_fa3_varlen_kernel.cu",
             "csrc/min_fa3_varlen_ring_launch.cu",
             "csrc/min_fa3_varlen_ring_bindings.cu",
+            # MEGA_RING: explicit default-off multi-step fused ring path.
+            "csrc/mega_ring_min_fa3_varlen_ring_launch.cu",
+            "csrc/mega_ring_min_fa3_varlen_ring_bindings.cu",
             "csrc/parallel/remote_load.cu",
             "csrc/parallel/remote_load_bindings.cu",
         ],

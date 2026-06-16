@@ -26,6 +26,7 @@
 #include "rotary.h"
 #include "utils.h"
 #include "sm90_pipeline_no_cluster.hpp"
+#include "mega_ring_semaphore.cuh"
 
 namespace flash {
 
@@ -399,6 +400,12 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        // MEGA_RING: optional default-off metadata. When the mega-ring scheduler is not selected these stay null/zero and are never read.
+        int const* const mega_ring_kv_ready_counts = nullptr; // whether the kv block for this step is ready
+        int* const mega_ring_step_ready = nullptr; // whether the last step's output has been merged and it's safe to do reduction for current step
+        int const mega_ring_rank = 0;
+        int const mega_ring_world_size = 1;
+        int const mega_ring_total_k_per_rank = 0;
     };
 
     // Device side kernel params
@@ -456,6 +463,12 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const *const seqlens_rotary = nullptr;
+        // MEGA_RING: optional default-off metadata used only by MegaRingVarlenDynamicPersistentTileScheduler.
+        int const* const mega_ring_kv_ready_counts = nullptr;
+        int* const mega_ring_step_ready = nullptr;
+        int const mega_ring_rank = 0;
+        int const mega_ring_world_size = 1;
+        int const mega_ring_total_k_per_rank = 0;
     };
 
     static Params
@@ -567,7 +580,9 @@ struct CollectiveMainloopFwdSm90 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.mega_ring_kv_ready_counts, args.mega_ring_step_ready,
+                args.mega_ring_rank, args.mega_ring_world_size, args.mega_ring_total_k_per_rank};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -589,7 +604,7 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
-    template <typename SchedulerPrefetch, typename SharedStorage>
+    template <bool EnableMegaRing=false, typename SchedulerPrefetch, typename SharedStorage>
     CUTLASS_DEVICE void
     load(Params const& params,
          MainloopPipelineK pipeline_k,
@@ -600,7 +615,8 @@ struct CollectiveMainloopFwdSm90 {
          SchedulerPrefetch const& scheduler_prefetch,
          SeqlenInfo_t const& seqlen_info,
          cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
-         int &work_idx
+         int &work_idx,
+         int mega_ring_step = 0
          ) {
 
         // some of these are captured in lambda so can't use structured binding
@@ -612,6 +628,29 @@ struct CollectiveMainloopFwdSm90 {
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
             params.qhead_per_khead_divmod);
+        // MEGA_RING: decode the ring step into the KV rank used by this tile.
+        // Causal ring attention treats lower-numbered rank blocks as past context, the local rank block
+        // as normally causal, and wrapped higher-numbered rank blocks as future context.
+        int mega_ring_kv_rank = 0;
+        int mega_ring_rank_delta = 0;
+        if constexpr (EnableMegaRing) {
+            mega_ring_kv_rank = (params.mega_ring_rank - mega_ring_step + params.mega_ring_world_size) % params.mega_ring_world_size;
+            mega_ring_rank_delta = params.mega_ring_rank - mega_ring_kv_rank;
+            if constexpr (Is_causal) {
+                if (mega_ring_rank_delta < 0) {
+                    // the entire KV tile is in the future, so we can skip loading it
+                    n_block_min = 0;
+                    n_block_max = 0;
+                } else if (mega_ring_rank_delta > 0) {
+                    // the entire KV tile is in the past, so we can load it all
+                    n_block_min = 0;
+                    // MEGA_RING: keep this as a local value so device code
+                    // does not ODR-use the class-level constexpr kBlockN.
+                    int const block_n = get<1>(TileShape_MNK{});
+                    n_block_max = cute::ceil_div(seqlen_info.seqlen_k, block_n);
+                }
+            }
+        }
         // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) {
@@ -659,11 +698,18 @@ struct CollectiveMainloopFwdSm90 {
         Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, _);
         auto shape_V = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
         Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(shape_V)(_, _, bidh_kv, _);
+        int const mega_ring_kv_offset = [&] {
+            if constexpr (EnableMegaRing) {
+                return mega_ring_kv_rank * params.mega_ring_total_k_per_rank;
+            } else {
+                return 0;
+            }
+        }();
 
         Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
         // if (cute::thread0()) { printf("Varlen = %d, params.leftpad_k = %p, leftpad_k = %d\n", Varlen, params.leftpad_k, leftpad_k); }
-        Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)
-        Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k, _0{}), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));  // (K, N, _, _)
+        Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k + mega_ring_kv_offset, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)
+        Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k + mega_ring_kv_offset, _0{}), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));  // (K, N, _, _)
 
         auto block_tma_Q = params.tma_load_Q.get_slice(_0{});
         Tensor tQgQ = group_modes<0, 3>(block_tma_Q.partition_S(gQ));  // (TMA)
@@ -799,6 +845,19 @@ struct CollectiveMainloopFwdSm90 {
         // If this is true, we're guaranteed that only the first warp will execute this function
         static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
         bool should_load_KV = !Use_TMA_KV || ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync()); // True for the elected thread
+
+        if constexpr (EnableMegaRing) {
+            // MEGA_RING: communication CTAs increment this counter after each
+            // K/V row is resident in the local concatenated KV buffer. One
+            // producer thread polls; the barrier releases the rest of the
+            // producer threads before they touch Q/K/V pipeline state.
+            if (thread_idx == 0) {
+                min_fa3_varlen_demo::mega_ring::wait_until_at_least(
+                    params.mega_ring_kv_ready_counts + mega_ring_kv_rank,
+                    params.mega_ring_total_k_per_rank * 2);
+            }
+            flash::named_barrier_sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::MegaRingKVReady));
+        }
 
         if (should_load_KV) {
             if constexpr (PagedKVNonTMA) { // FALSE
@@ -953,7 +1012,7 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
-    template <typename SharedStorage, typename FrgTensorO, typename Softmax>
+    template <bool EnableMegaRing=false, typename SharedStorage, typename FrgTensorO, typename Softmax>
     CUTLASS_DEVICE bool
     mma(Params const& params,
         MainloopPipelineK pipeline_k,
@@ -965,7 +1024,8 @@ struct CollectiveMainloopFwdSm90 {
         int &work_idx,
         SeqlenInfo_t const& seqlen_info,
         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
-        SharedStorage& shared_storage
+        SharedStorage& shared_storage,
+        int mega_ring_step = 0
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -981,6 +1041,28 @@ struct CollectiveMainloopFwdSm90 {
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
             params.qhead_per_khead_divmod);
+        // MEGA_RING: mirror the producer-side KV rank visibility rule before
+        // waiting on any producer pipeline state. Past rank blocks are fully
+        // visible for causal attention; wrapped future rank blocks are empty.
+        int mega_ring_kv_rank = 0;
+        int mega_ring_rank_delta = 0;
+        bool mega_ring_use_causal_mask = true;
+        if constexpr (EnableMegaRing) {
+            mega_ring_kv_rank = (params.mega_ring_rank - mega_ring_step + params.mega_ring_world_size) % params.mega_ring_world_size;
+            mega_ring_rank_delta = params.mega_ring_rank - mega_ring_kv_rank;
+            if constexpr (Is_causal) {
+                if (mega_ring_rank_delta < 0) {
+                    // the entire KV tile is in the future, so we can skip loading it
+                    n_block_min = 0;
+                    n_block_max = 0;
+                } else if (mega_ring_rank_delta > 0) {
+                    // the entire KV tile is in the past, so we can load it all
+                    n_block_min = 0;
+                    n_block_max = cute::ceil_div(seqlen_info.seqlen_k, kBlockN);
+                    mega_ring_use_causal_mask = false;
+                }
+            }
+        }
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
@@ -1150,7 +1232,16 @@ struct CollectiveMainloopFwdSm90 {
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
             }
             scoremod_premask_fn(tSrS);
-            mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+            if constexpr (EnableMegaRing && Is_causal) {
+                // MEGA_RING: past rank blocks need to run with full-mask.
+                if (mega_ring_use_causal_mask) {
+                    mask.template apply<true /*Seqlenk_mask*/, true /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
+                } else {
+                    mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
+                }
+            } else {
+                mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+            }
 
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
             // Don't need to store scales to send to WG1 (in the case of LargeHeadDimV) since it's 1.f
@@ -1210,7 +1301,19 @@ struct CollectiveMainloopFwdSm90 {
             };
 
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
-                auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+                auto mask_fn = [&](auto& tSrS, int n_block) {
+                    if constexpr (EnableMegaRing && Is_causal) {
+                        // MEGA_RING: no causal mask for rank blocks strictly
+                        // before the local rank in the global sequence.
+                        if (mega_ring_use_causal_mask) {
+                            mask.template apply<false /*Seqlenk_mask*/, true /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
+                        }else {
+                            mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
+                        }
+                    } else {
+                        mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+                    }
+                };
                 int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
                     seqlen_info, m_block, n_block_min, params.window_size_right,
                     params.attention_chunk_divmod, params.qhead_per_khead_divmod);
@@ -1307,11 +1410,34 @@ struct CollectiveMainloopFwdSm90 {
                 pipeline_v.consumer_release(smem_pipe_read);  // release V
             };
 
-            auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+            auto first_iter_mask_fn = [&](auto& tSrS, int n_block) {
+                if constexpr (EnableMegaRing && Is_causal) {
+                    // MEGA_RING: past rank blocks need only the seqlen-k mask.
+                    if (mega_ring_use_causal_mask) {
+                        mask.template apply<true /*Seqlenk_mask*/, true /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
+                    } else {
+                        mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
+                    }
+                } else {
+                    mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+                }
+            };
             fwd_step(n_block, first_iter_mask_fn, cute::true_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
             --n_block;
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
-                auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+                auto mask_fn = [&](auto& tSrS, int n_block) {
+                    if constexpr (EnableMegaRing && Is_causal) {
+                        // MEGA_RING: no causal mask for rank blocks strictly
+                        // before the local rank in the global sequence.
+                        if (mega_ring_use_causal_mask) {
+                            mask.template apply<false /*Seqlenk_mask*/, true /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
+                        } else {
+                            mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
+                        }
+                    } else {
+                        mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+                    }
+                };
                 int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
                     seqlen_info, m_block, n_block_min, params.window_size_right,
                     params.attention_chunk_divmod, params.qhead_per_khead_divmod);

@@ -30,6 +30,10 @@ struct TileSchedulerArguments {
     int const virtual_grid_blocks = 0;
     int const compute_block_offset = 0;
     bool const use_virtual_grid = false;
+    // MEGA_RING: optional scheduler bounds for the explicit mega-ring path.
+    // Default values keep existing varlen and single-step ring paths unchanged.
+    int const mega_ring_world_size = 1;
+    int const mega_ring_tiles_per_step = 0;
 };
 
 template<int kBlockM, int kBlockN, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
@@ -46,6 +50,11 @@ protected:
     SharedStorage* const work_info_smem;
 
 public:
+    // MEGA_RING: default scheduler does not expose ring-step metadata.
+    static constexpr bool EnableMegaRing = false;
+    // MEGA_RING: expose the existing scheduler barrier participant count to
+    // the copied mega-ring scheduler variant.
+    static constexpr int kNumThreads = NumThreads;
 
     // Device side kernel params
     struct Params {
@@ -66,6 +75,10 @@ public:
         int const virtual_grid_blocks;
         int const compute_block_offset;
         bool const use_virtual_grid;
+        // MEGA_RING: default-off scheduler extension used only by
+        // MegaRingVarlenDynamicPersistentTileScheduler.
+        int const mega_ring_world_size;
+        int const mega_ring_tiles_per_step;
     };
 
     static Params
@@ -91,7 +104,9 @@ public:
                 args.num_nheads_in_l2_ptr,
                 args.virtual_grid_blocks,
                 args.compute_block_offset,
-                args.use_virtual_grid};
+                args.use_virtual_grid,
+                args.mega_ring_world_size,
+                args.mega_ring_tiles_per_step};
     }
 
     static dim3

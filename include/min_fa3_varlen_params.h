@@ -103,6 +103,13 @@ struct Ring_fwd_params : public Flash_fwd_params {
     int ring_rank = 0;
     int ring_world_size = 1;
     int ring_step = 0;
+    // MEGA_RING: explicit multi-step fused path metadata. The default
+    // single-step ring path leaves these null/zero and does not read them.
+    int mega_ring_tiles_per_step = 0;
+    int mega_ring_total_k_per_rank = 0;
+    int* __restrict__ mega_ring_kv_ready_counts = nullptr;
+    // MEGA_RING: per-Q-tile completed-step counters for in-place O/LSE reduction ordering.
+    int* __restrict__ mega_ring_step_ready = nullptr;
     // Communication CTAs prefetch remote K/V into these buffers while compute CTAs
     // continue reading the current K/V from k_ptr / v_ptr.
     void* __restrict__ local_k_staging_ptr = nullptr;

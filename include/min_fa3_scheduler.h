@@ -33,6 +33,8 @@ template<bool Split=false>
 class StaticPersistentTileScheduler {
 public:
     using SharedStorage = int;
+    // MEGA_RING: default fixed-layout scheduler does not expose ring-step metadata.
+    static constexpr bool EnableMegaRing = false;
 
     struct Params {
         int total_blocks;
@@ -93,6 +95,8 @@ class DynamicPersistentTileScheduler {
 
 public:
     using SharedStorage = int;
+    // MEGA_RING: default fixed-layout scheduler does not expose ring-step metadata.
+    static constexpr bool EnableMegaRing = false;
 
 protected:
     SharedStorage* const tile_count_smem;

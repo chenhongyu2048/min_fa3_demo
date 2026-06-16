@@ -52,15 +52,28 @@ cd /data/home/scyb683/run/min_fa3_demo
 # Use a 2+ GPU job and launch, for example:
 # torchrun --nproc_per_node=2 benchmark_parallel_remote_load.py --shape 4096x4096 --src-rank 0
 
-# Ring-FlashAttention benchmark:
-echo "Running tests and benchmarks for Ring-FlashAttention"
-echo "========================================================="
+# Single-Step Ring-FlashAttention benchmark:
+# echo "Running tests and benchmarks for Ring-FlashAttention"
+# echo "========================================================="
 # python test_min_fa3_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --num-comp-sm 128 --num-comm-sm 0 --mode both
-python benchmark_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 0 --mode both
+# python benchmark_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 0 --mode both
 # python test_min_fa3_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --num-comp-sm 128 --num-comm-sm 4 --mode both
-python benchmark_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 4 --mode both
-python benchmark_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 124 --num-comm-sm 8 --mode both
-python benchmark_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 116 --num-comm-sm 16 --mode both
-python benchmark_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 108 --num-comm-sm 24 --mode both
+# python benchmark_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 4 --mode both
+# python benchmark_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 124 --num-comm-sm 8 --mode both
+# python benchmark_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 116 --num-comm-sm 16 --mode both
+# python benchmark_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 108 --num-comm-sm 24 --mode both
+
+# Multi-Step Mega-Ring-FlashAttention varlen benchmark:
+echo "Running tests and benchmarks for Mega-Ring-FlashAttention"
+echo "========================================================="
+python mega_ring_test_min_fa3_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --num-comp-sm 128 --num-comm-sm 0 --mode both
+python benchmark_varlen_mega_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 0 --mode both
+python mega_ring_test_min_fa3_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --num-comp-sm 128 --num-comm-sm 4 --mode both
+python benchmark_varlen_mega_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 4 --mode both
+python benchmark_varlen_mega_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 124 --num-comm-sm 8 --mode both
+python benchmark_varlen_mega_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 116 --num-comm-sm 16 --mode both
+python benchmark_varlen_mega_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 108 --num-comm-sm 24 --mode both
+
+# Memory sanitizer runs:
 # compute-sanitizer --tool memcheck python test_min_fa3_varlen_ring_local.py --b 16 --seqlen 1024,4096 --qhead 32 --kvhead 8 --num-comp-sm 128 --num-comm-sm 0 --mode both > memcheck-128-0.log 2>&1
 # compute-sanitizer --tool memcheck python test_min_fa3_varlen_ring_local.py --b 16 --seqlen 1024,4096 --qhead 32 --kvhead 8 --num-comp-sm 128 --num-comm-sm 4 --mode both > memcheck-128-4.log 2>&1

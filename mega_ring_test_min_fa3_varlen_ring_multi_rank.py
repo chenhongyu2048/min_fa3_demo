@@ -31,7 +31,7 @@ def init_distributed() -> tuple[int, int]:
 
     if dist.get_world_size() != local_world_size:
         raise SystemExit(
-            "ThunderKittens ring-attention demo is single-node only: "
+            "ThunderKittens mega-ring attention demo is single-node only: "
             f"world_size={dist.get_world_size()}, local_world_size={local_world_size}"
         )
 
@@ -52,39 +52,55 @@ def raise_if_any_rank_failed(local_error: str | None, local_rank: int) -> None:
     raise AssertionError(f"another rank failed this case; rank {local_rank} had no local assertion failure")
 
 
-def reference_flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool) -> torch.Tensor:
-    q_bhsd = q.permute(0, 2, 1, 3).float()
-    k_bhsd = k.permute(0, 2, 1, 3).float()
-    v_bhsd = v.permute(0, 2, 1, 3).float()
-    enable_gqa = q_bhsd.size(1) != k_bhsd.size(1)
-    if enable_gqa:
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q_bhsd, k_bhsd, v_bhsd, is_causal=is_causal, enable_gqa=True
-        )
-    else:
-        out = torch.nn.functional.scaled_dot_product_attention(q_bhsd, k_bhsd, v_bhsd, is_causal=is_causal)
-    return out.permute(0, 2, 1, 3).to(dtype=q.dtype)
-
-
-def reference_varlen(
+def reference_mega_ring_varlen(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     is_causal: bool,
+    local_rank: int,
+    local_world_size: int,
 ) -> torch.Tensor:
     outputs: list[torch.Tensor] = []
     batch_size = cu_seqlens_q.numel() - 1
+    local_total_k = cu_seqlens_k[-1].item()
+    scale = q.size(-1) ** -0.5
+    qhead_per_kvhead = q.size(1) // k.size(1)
+
     for batch_idx in range(batch_size):
         q_start = cu_seqlens_q[batch_idx].item()
         q_end = cu_seqlens_q[batch_idx + 1].item()
         k_start = cu_seqlens_k[batch_idx].item()
         k_end = cu_seqlens_k[batch_idx + 1].item()
-        q_i = q[q_start:q_end].unsqueeze(0)
-        k_i = k[k_start:k_end].unsqueeze(0)
-        v_i = v[k_start:k_end].unsqueeze(0)
-        outputs.append(reference_flash(q_i, k_i, v_i, is_causal).squeeze(0))
+
+        q_i = q[q_start:q_end].float()
+        k_blocks = []
+        v_blocks = []
+        key_positions = []
+        for rank_idx in range(local_world_size):
+            block_start = rank_idx * local_total_k + k_start
+            block_end = rank_idx * local_total_k + k_end
+            k_blocks.append(k[block_start:block_end])
+            v_blocks.append(v[block_start:block_end])
+            key_positions.append(torch.arange(k_start, k_end, device=q.device, dtype=torch.int64) + rank_idx * local_total_k)
+
+        k_i = torch.cat(k_blocks, dim=0).float()
+        v_i = torch.cat(v_blocks, dim=0).float()
+        key_pos = torch.cat(key_positions, dim=0)
+        if qhead_per_kvhead != 1:
+            k_i = k_i.repeat_interleave(qhead_per_kvhead, dim=1)
+            v_i = v_i.repeat_interleave(qhead_per_kvhead, dim=1)
+
+        scores = torch.einsum("qhd,khd->hqk", q_i, k_i) * scale
+        if is_causal:
+            query_pos = torch.arange(q_start, q_end, device=q.device, dtype=torch.int64) + local_rank * local_total_k
+            causal_mask = key_pos.unsqueeze(0) <= query_pos.unsqueeze(1)
+            scores = scores.masked_fill(~causal_mask.unsqueeze(0), float("-inf"))
+
+        probs = torch.softmax(scores, dim=-1)
+        outputs.append(torch.einsum("hqk,khd->qhd", probs, v_i).to(dtype=q.dtype))
+
     return torch.cat(outputs, dim=0)
 
 
@@ -99,9 +115,16 @@ def make_rank_local_qkv(
     q = torch.randn(total_q, q_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     base_k = torch.arange(total_k * kv_heads * head_dim, device="cuda", dtype=torch.float32)
     base_v = torch.arange(total_k * kv_heads * head_dim, device="cuda", dtype=torch.float32)
-    k = (base_k.reshape(total_k, kv_heads, head_dim) + local_rank * 1000.0).to(torch.bfloat16).contiguous()
-    v = (base_v.reshape(total_k, kv_heads, head_dim) + local_rank * 2000.0 + 7.0).to(torch.bfloat16).contiguous()
+    k = ((base_k % 16).reshape(total_k, kv_heads, head_dim) + local_rank * 16.0).to(torch.bfloat16).contiguous()
+    v = ((base_v % 16).reshape(total_k, kv_heads, head_dim) + local_rank * 16.0 + 7.0).to(torch.bfloat16).contiguous()
     return q, k, v
+
+
+def gather_rank_blocks(local_tensor: torch.Tensor, local_rank: int, local_world_size: int) -> torch.Tensor:
+    blocks = [torch.empty_like(local_tensor) for _ in range(local_world_size)]
+    dist.all_gather(blocks, local_tensor)
+    blocks[local_rank] = local_tensor
+    return torch.cat(blocks, dim=0).contiguous()
 
 
 def run_case(
@@ -111,10 +134,8 @@ def run_case(
     kv_heads: int,
     head_dim: int,
     is_causal: bool,
-    src_rank: int,
     num_comp_sm: int,
     num_comm_sm: int,
-    ring_step: int,
     local_rank: int,
     local_world_size: int,
 ) -> None:
@@ -122,34 +143,43 @@ def run_case(
     cu_seqlens_q = make_cu_seqlens(batch_size, seqlen, torch.device("cuda"))
     cu_seqlens_k = make_cu_seqlens(batch_size, seqlen, torch.device("cuda"))
 
-    q, k, v = make_rank_local_qkv(total_tokens, total_tokens, q_heads, kv_heads, head_dim, local_rank)
+    q, local_k, local_v = make_rank_local_qkv(
+        total_tokens,
+        total_tokens,
+        q_heads,
+        kv_heads,
+        head_dim,
+        local_rank,
+    )
+    expected_k = gather_rank_blocks(local_k, local_rank, local_world_size)
+    expected_v = gather_rank_blocks(local_v, local_rank, local_world_size)
+    local_block_start = local_rank * total_tokens
+    local_block_end = local_block_start + total_tokens
     remote_k = min_fa3_op.TKParallelTensor(
-        list(k.shape),
+        list(expected_k.shape),
         torch.bfloat16,
         local_rank,
         local_world_size,
         False,
     )
     remote_v = min_fa3_op.TKParallelTensor(
-        list(v.shape),
+        list(expected_v.shape),
         torch.bfloat16,
         local_rank,
         local_world_size,
         False,
     )
-    remote_k.data_.copy_(k)
-    remote_v.data_.copy_(v)
-    prefetch_k = torch.empty_like(k)
-    prefetch_v = torch.empty_like(v)
-
-    expected_k = k.clone()
-    expected_v = v.clone()
-    dist.broadcast(expected_k, src=src_rank)
-    dist.broadcast(expected_v, src=src_rank)
+    # Use the VMM-backed TK storage as the ordinary K/V tensors too.
+    k = remote_k.data_
+    v = remote_v.data_
+    k.zero_()
+    v.zero_()
+    k[local_block_start:local_block_end].copy_(local_k)
+    v[local_block_start:local_block_end].copy_(local_v)
 
     torch.cuda.synchronize()
     dist.barrier()
-    out = min_fa3_op.forward_varlen_ring(
+    out = min_fa3_op.forward_varlen_mega_ring(
         q,
         k,
         v,
@@ -160,35 +190,28 @@ def run_case(
         is_causal,
         remote_k=remote_k,
         remote_v=remote_v,
-        src_rank=src_rank,
         num_comp_sm=num_comp_sm,
         num_comm_sm=num_comm_sm,
-        ring_step=ring_step,
-        prefetch_k=prefetch_k,
-        prefetch_v=prefetch_v,
     )
     torch.cuda.synchronize()
     dist.barrier()
 
-    local_ref = reference_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, is_causal)
-    base = min_fa3_op.forward_varlen(
+    ref = reference_mega_ring_varlen(
         q,
-        k,
-        v,
+        expected_k,
+        expected_v,
         cu_seqlens_q,
         cu_seqlens_k,
-        seqlen,
-        seqlen,
         is_causal,
-        manual_block_count=num_comp_sm,
+        local_rank,
+        local_world_size,
     )
     local_error: str | None = None
     try:
-        torch.testing.assert_close(out.float(), local_ref.float(), atol=2e-1, rtol=2e-1)
-        torch.testing.assert_close(out.float(), base.float(), atol=2e-1, rtol=2e-1)
+        torch.testing.assert_close(out.float(), ref.float(), atol=2e-1, rtol=2e-1)
         if num_comm_sm > 0:
-            torch.testing.assert_close(prefetch_k.float(), expected_k.float(), atol=0.0, rtol=0.0)
-            torch.testing.assert_close(prefetch_v.float(), expected_v.float(), atol=0.0, rtol=0.0)
+            torch.testing.assert_close(k.float(), expected_k.float(), atol=0.0, rtol=0.0)
+            torch.testing.assert_close(v.float(), expected_v.float(), atol=0.0, rtol=0.0)
     except AssertionError as exc:
         local_error = str(exc)
 
@@ -196,14 +219,15 @@ def run_case(
 
     if local_rank == 0:
         print(
-            f"distributed ring varlen case causal={is_causal}: ok "
-            f"(world_size={local_world_size}, src_rank={src_rank}, B={batch_size}, S={seqlen}, "
-            f"QH={q_heads}, KVH={kv_heads}, D={head_dim}, num_comp_sm={num_comp_sm}, num_comm_sm={num_comm_sm})"
+            f"distributed mega ring varlen case causal={is_causal}: ok "
+            f"(world_size={local_world_size}, B={batch_size}, S={seqlen}, "
+            f"QH={q_heads}, KVH={kv_heads}, D={head_dim}, "
+            f"num_comp_sm={num_comp_sm}, num_comm_sm={num_comm_sm})"
         )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the distributed minimal Hopper FA3 varlen ring-attention demo test.")
+    parser = argparse.ArgumentParser(description="Run the distributed minimal Hopper FA3 varlen mega-ring demo test.")
     parser.add_argument("--b", type=int, default=2, help="Batch size B.")
     parser.add_argument(
         "--seqlen",
@@ -211,12 +235,11 @@ def parse_args() -> argparse.Namespace:
         dest="seqlen",
         type=str,
         default="128",
-        help="Comma-separated sequence lengths S. Q, K, and V all use the same S.",
+        help="Comma-separated sequence lengths S. Q and each rank-local K/V block all use the same S.",
     )
     parser.add_argument("--qhead", type=int, default=16, help="Number of query/output heads")
     parser.add_argument("--kvhead", type=int, default=8, help="Number of key/value heads")
     parser.add_argument("--headdim", type=int, default=128, help="Head dimension D")
-    parser.add_argument("--src-rank", type=int, default=0, help="Source rank to read K/V from.")
     parser.add_argument("--num-comp-sm", type=int, default=1, help="Number of compute CTAs")
     parser.add_argument("--num-comm-sm", type=int, default=1, help="Number of communication CTAs")
     parser.add_argument(
@@ -243,11 +266,13 @@ if __name__ == "__main__":
         raise SystemExit(
             f"This demo requires qhead % kvhead == 0 for GQA/MQA, got qhead={args.qhead}, kvhead={args.kvhead}"
         )
+    if args.kvhead * args.headdim != 1024:
+        raise SystemExit(
+            "Mega ring communication path requires kvhead * headdim == 1024, "
+            f"got kvhead={args.kvhead}, headdim={args.headdim}"
+        )
 
     local_rank, local_world_size = init_distributed()
-    if args.src_rank < 0 or args.src_rank >= local_world_size:
-        raise SystemExit(f"--src-rank must be in [0, {local_world_size}), got src_rank={args.src_rank}")
-
     cases = [(args.num_comp_sm, 0), (args.num_comp_sm, args.num_comm_sm)]
 
     try:
@@ -258,6 +283,8 @@ if __name__ == "__main__":
                 if key in seen:
                     continue
                 seen.add(key)
+                if local_world_size > 1 and num_comm_sm == 0:
+                    continue
                 if args.mode in ("noncausal", "both"):
                     run_case(
                         args.b,
@@ -266,10 +293,8 @@ if __name__ == "__main__":
                         args.kvhead,
                         args.headdim,
                         False,
-                        args.src_rank,
                         num_comp_sm,
                         num_comm_sm,
-                        0,
                         local_rank,
                         local_world_size,
                     )
@@ -281,10 +306,8 @@ if __name__ == "__main__":
                         args.kvhead,
                         args.headdim,
                         True,
-                        args.src_rank,
                         num_comp_sm,
                         num_comm_sm,
-                        0,
                         local_rank,
                         local_world_size,
                     )

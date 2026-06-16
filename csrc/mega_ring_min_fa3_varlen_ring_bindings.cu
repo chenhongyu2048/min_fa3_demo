@@ -1,3 +1,6 @@
+// Mega ring variant copied and trimmed from csrc/min_fa3_varlen_ring_bindings.cu.
+// Changes are marked with MEGA_RING comments.
+
 #include <torch/extension.h>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -6,9 +9,13 @@
 
 #include <cmath>
 #include <limits>
+// MEGA_RING: host-side readiness counter initialization uses std::vector.
+#include <vector>
 
+// MEGA_RING: use the fused multi-step mega-ring launch instead of the
+// single-step ring launch.
+#include "mega_ring_min_fa3_varlen_ring_launch.h"
 #include "min_fa3_varlen_params.h"
-#include "min_fa3_varlen_ring_launch.h"
 
 namespace py = pybind11;
 
@@ -29,20 +36,11 @@ void check_varlen_qkv(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous [total_tokens, H, D]");
 }
 
-void check_parallel_varlen_base(const kittens::py::TKParallelTensor& t, const char* name) {
-    TORCH_CHECK(t.data_.is_cuda(), name, " must wrap a CUDA tensor");
-    TORCH_CHECK(t.data_.scalar_type() == torch::kBFloat16, name, " must wrap dtype torch.bfloat16");
-    TORCH_CHECK(t.data_.dim() == 3, name, " must wrap a [rows, H, D] tensor");
-    TORCH_CHECK(t.data_.size(2) == 128, name, " must wrap head_dim D=128");
-    TORCH_CHECK(t.data_.is_contiguous(), name, " must wrap a contiguous tensor");
-}
-
-void check_prefetch_buffer(const torch::Tensor& t,
-                           const torch::Tensor& ref,
-                           const char* name) {
-    check_varlen_qkv(t, name);
-    TORCH_CHECK(t.device() == ref.device(), name, " must be on the same CUDA device as its reference tensor");
-    TORCH_CHECK(t.sizes().vec() == ref.sizes().vec(), name, " must have the same shape as its reference tensor");
+void check_parallel_varlen_qkv(const kittens::py::TKParallelTensor& t, const char* name) {
+    // MEGA_RING: remote K/V are VMM-backed TKParallelTensor buffers, but the
+    // attention path still consumes their local tensor view as regular varlen
+    // [total_tokens, H, D] storage.
+    check_varlen_qkv(t.data_, name);
 }
 
 void check_cu_seqlens(const torch::Tensor& t, const char* name) {
@@ -97,6 +95,8 @@ VarlenParams make_varlen_params(const torch::Tensor& q,
     params.d = q.size(2);
     params.d_rounded = params.d;
     params.total_q = q.size(0);
+    // MEGA_RING: shape_K describes the full local [world_size * local_total_k]
+    // buffer, while cu_seqlens_k still describes one per-rank KV block.
     params.total_k = k.size(0);
     params.b_k = params.b;
     params.dv = v.size(2);
@@ -146,23 +146,27 @@ VarlenParams make_varlen_params(const torch::Tensor& q,
     return params;
 }
 
-RingVarlenParams make_ring_varlen_params(const torch::Tensor& q,
-                                         const torch::Tensor& k,
-                                         const torch::Tensor& v,
-                                         const torch::Tensor& cu_seqlens_q,
-                                         const torch::Tensor& cu_seqlens_k,
-                                         int max_seqlen_q,
-                                         int max_seqlen_k,
-                                         torch::Tensor& out,
-                                         torch::Tensor& softmax_lse,
-                                         torch::Tensor& scheduler_metadata,
-                                         bool is_causal,
-                                         int num_comp_sm,
-                                         int num_comm_sm,
-                                         int src_dev,
-                                         int ring_rank,
-                                         int ring_world_size,
-                                         int ring_step) {
+// MEGA_RING: keep the original ring params type and populate the extra
+// multi-step scheduler/readiness fields required by the fused launch.
+RingVarlenParams make_mega_ring_varlen_params(const torch::Tensor& q,
+                                              const torch::Tensor& k,
+                                              const torch::Tensor& v,
+                                              const torch::Tensor& cu_seqlens_q,
+                                              const torch::Tensor& cu_seqlens_k,
+                                              int max_seqlen_q,
+                                              int max_seqlen_k,
+                                              int local_total_k,
+                                              torch::Tensor& out,
+                                              torch::Tensor& softmax_lse,
+                                              torch::Tensor& scheduler_metadata,
+                                              bool is_causal,
+                                              int num_comp_sm,
+                                              int num_comm_sm,
+                                              int ring_rank,
+                                              int ring_world_size,
+                                              int tiles_per_step,
+                                              torch::Tensor& kv_ready_counts,
+                                              torch::Tensor& step_ready) {
     RingVarlenParams params{};
     static_cast<VarlenParams&>(params) = make_varlen_params(
         q,
@@ -178,34 +182,52 @@ RingVarlenParams make_ring_varlen_params(const torch::Tensor& q,
         is_causal);
     params.num_comp_sm = num_comp_sm;
     params.num_comm_sm = num_comm_sm;
-    params.src_dev = src_dev;
+    // MEGA_RING: the launch covers all ring steps. Source rank selection is
+    // derived in-kernel from ring_rank, ring_world_size, and ring_step.
+    params.src_dev = 0;
     params.ring_rank = ring_rank;
     params.ring_world_size = ring_world_size;
-    params.ring_step = ring_step;
+    params.ring_step = 0;
+    params.mega_ring_tiles_per_step = tiles_per_step;
+    params.mega_ring_total_k_per_rank = local_total_k;
+    params.mega_ring_kv_ready_counts = kv_ready_counts.data_ptr<int>();
+    params.mega_ring_step_ready = step_ready.data_ptr<int>();
     return params;
 }
 
-torch::Tensor forward_varlen_ring(torch::Tensor q,
-                                  torch::Tensor k,
-                                  torch::Tensor v,
-                                  kittens::py::TKParallelTensor& remote_k,
-                                  kittens::py::TKParallelTensor& remote_v,
-                                  torch::Tensor cu_seqlens_q,
-                                  torch::Tensor cu_seqlens_k,
-                                  int64_t max_seqlen_q,
-                                  int64_t max_seqlen_k,
-                                  bool is_causal,
-                                  int64_t src_rank,
-                                  int64_t num_comp_sm,
-                                  int64_t num_comm_sm,
-                                  int64_t ring_step,
-                                  torch::Tensor prefetch_k,
-                                  torch::Tensor prefetch_v) {
+// MEGA_RING: step counters are indexed by the original per-step varlen Q tile
+// id. Each counter tracks how many ring steps have completed for that Q tile.
+int compute_tiles_per_step(const torch::Tensor& cu_seqlens_q, int batch_size, int q_heads) {
+    int tiles = 0;
+    for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        int const start = cu_seqlens_q[batch_idx].item<int>();
+        int const end = cu_seqlens_q[batch_idx + 1].item<int>();
+        TORCH_CHECK(end >= start, "cu_seqlens_q must be nondecreasing");
+        tiles += round_multiple(end - start, 128) / 128 * q_heads;
+    }
+    return tiles;
+}
+
+// MEGA_RING: public binding launches all ring steps in one CUDA kernel. The
+// caller provides full [world_size * local_total_k, KVH, D] K/V buffers instead
+// of src_rank/ring_step plus temporary prefetch buffers.
+torch::Tensor forward_varlen_mega_ring(torch::Tensor q,
+                                       torch::Tensor k,
+                                       torch::Tensor v,
+                                       kittens::py::TKParallelTensor& remote_k,
+                                       kittens::py::TKParallelTensor& remote_v,
+                                       torch::Tensor cu_seqlens_q,
+                                       torch::Tensor cu_seqlens_k,
+                                       int64_t max_seqlen_q,
+                                       int64_t max_seqlen_k,
+                                       bool is_causal,
+                                       int64_t num_comp_sm,
+                                       int64_t num_comm_sm) {
     check_varlen_qkv(q, "q");
     check_varlen_qkv(k, "k");
     check_varlen_qkv(v, "v");
-    check_parallel_varlen_base(remote_k, "remote_k");
-    check_parallel_varlen_base(remote_v, "remote_v");
+    check_parallel_varlen_qkv(remote_k, "remote_k");
+    check_parallel_varlen_qkv(remote_v, "remote_v");
     check_cu_seqlens(cu_seqlens_q, "cu_seqlens_q");
     check_cu_seqlens(cu_seqlens_k, "cu_seqlens_k");
 
@@ -218,10 +240,14 @@ torch::Tensor forward_varlen_ring(torch::Tensor q,
     TORCH_CHECK(remote_v.data_.sizes().vec() == v.sizes().vec(), "remote_v must have the same shape as local v");
     TORCH_CHECK(remote_k.data_.data_ptr() != remote_v.data_.data_ptr(),
                 "remote_k and remote_v must be separate TKParallelTensor allocations");
+    // MEGA_RING: K and V are separate VMM-backed tensors, but they must describe
+    // the same local rank in the same local ring.
     TORCH_CHECK(remote_k.local_rank_ == q.get_device(), "remote_k local_rank must match q.device.index");
     TORCH_CHECK(remote_v.local_rank_ == q.get_device(), "remote_v local_rank must match q.device.index");
     TORCH_CHECK(remote_k.local_world_size_ == remote_v.local_world_size_,
                 "remote_k and remote_v must have the same local_world_size");
+    TORCH_CHECK(remote_k.local_rank_ == remote_v.local_rank_,
+                "remote_k and remote_v must have the same local_rank");
     TORCH_CHECK(k.size(1) == v.size(1), "k and v must have the same KV head count");
     TORCH_CHECK(q.size(1) % k.size(1) == 0,
                 "This demo requires qhead % kvhead == 0 for GQA/MQA. Got qhead=",
@@ -233,33 +259,8 @@ torch::Tensor forward_varlen_ring(torch::Tensor q,
                 "max seqlens must fit in int32");
     TORCH_CHECK(num_comp_sm > 0, "num_comp_sm must be positive. Got ", num_comp_sm);
     TORCH_CHECK(num_comm_sm >= 0, "num_comm_sm must be non-negative. Got ", num_comm_sm);
-    TORCH_CHECK(src_rank >= 0 && src_rank < remote_k.local_world_size_,
-                "src_rank must be in [0, local_world_size). Got src_rank=",
-                src_rank,
-                ", local_world_size=",
-                remote_k.local_world_size_);
-    TORCH_CHECK(ring_step >= 0, "ring_step must be non-negative. Got ", ring_step);
     TORCH_CHECK(num_comp_sm <= std::numeric_limits<int>::max() && num_comm_sm <= std::numeric_limits<int>::max(),
                 "num_comp_sm and num_comm_sm must fit in int32");
-    TORCH_CHECK(
-        q.size(0) <= std::numeric_limits<int>::max() &&
-            k.size(0) <= std::numeric_limits<int>::max() &&
-            q.size(1) <= std::numeric_limits<int>::max() &&
-            k.size(1) <= std::numeric_limits<int>::max(),
-        "Ring varlen path requires q/k token and head counts to fit in int32");
-    TORCH_CHECK(
-        k.size(0) * k.size(1) <= std::numeric_limits<int>::max(),
-        "Ring varlen path requires total_k * kv_heads to fit in int32. Got total_k=",
-        k.size(0),
-        ", kv_heads=",
-        k.size(1));
-    TORCH_CHECK(
-        prefetch_k.defined() == prefetch_v.defined(),
-        "prefetch_k and prefetch_v must either both be provided or both be omitted");
-    if (prefetch_k.defined()) {
-        check_prefetch_buffer(prefetch_k, k, "prefetch_k");
-        check_prefetch_buffer(prefetch_v, v, "prefetch_v");
-    }
 
     c10::cuda::CUDAGuard device_guard(q.device());
     auto* props = at::cuda::getCurrentDeviceProperties();
@@ -267,16 +268,39 @@ torch::Tensor forward_varlen_ring(torch::Tensor q,
                 "min_fa3_demo only supports Hopper SM90. Current device capability is ",
                 props->major, ".", props->minor);
 
-    int batch_size = cu_seqlens_q.size(0) - 1;
+    int const batch_size = cu_seqlens_q.size(0) - 1;
+    // MEGA_RING: ring identity is taken from the TKParallelTensor allocation.
+    int const world_size = remote_k.local_world_size_;
+    int const ring_rank = remote_k.local_rank_;
     TORCH_CHECK(batch_size >= 1, "varlen demo requires batch size B >= 1");
     TORCH_CHECK(cu_seqlens_q[0].item<int>() == 0, "cu_seqlens_q must start with 0");
     TORCH_CHECK(cu_seqlens_k[0].item<int>() == 0, "cu_seqlens_k must start with 0");
     TORCH_CHECK(cu_seqlens_q[batch_size].item<int>() == q.size(0),
                 "cu_seqlens_q[-1] must equal q.size(0). Got ", cu_seqlens_q[batch_size].item<int>(),
                 " vs ", q.size(0));
-    TORCH_CHECK(cu_seqlens_k[batch_size].item<int>() == k.size(0),
-                "cu_seqlens_k[-1] must equal k.size(0). Got ", cu_seqlens_k[batch_size].item<int>(),
-                " vs ", k.size(0));
+    // MEGA_RING: cu_seqlens_k describes one rank-local KV block, while K/V
+    // storage contains one such block for every rank in local rank order.
+    int const local_total_k = cu_seqlens_k[batch_size].item<int>();
+    TORCH_CHECK(local_total_k > 0, "cu_seqlens_k[-1] must be positive");
+    TORCH_CHECK(k.size(0) == int64_t(world_size) * local_total_k,
+                "mega ring k must have shape [world_size * local_total_k, KVH, D]. Got k.size(0)=",
+                k.size(0), ", world_size=", world_size, ", local_total_k=", local_total_k);
+    TORCH_CHECK(v.size(0) == int64_t(world_size) * local_total_k,
+                "mega ring v must have shape [world_size * local_total_k, KVH, D]. Got v.size(0)=",
+                v.size(0), ", world_size=", world_size, ", local_total_k=", local_total_k);
+    TORCH_CHECK(
+        k.size(0) * k.size(1) <= std::numeric_limits<int>::max(),
+        "Mega ring varlen path requires total_k * kv_heads to fit in int32. Got total_k=",
+        k.size(0),
+        ", kv_heads=",
+        k.size(1));
+    // MEGA_RING: the current remote-load vector path copies a full KV row whose
+    // flattened KVH * D width is fixed to 1024 bf16 values.
+    TORCH_CHECK(k.size(1) * k.size(2) == 1024,
+                "Mega ring communication path currently requires kv_heads * head_dim == 1024. Got kv_heads=",
+                k.size(1), ", head_dim=", k.size(2));
+    TORCH_CHECK(world_size == 1 || num_comm_sm > 0,
+                "mega ring requires num_comm_sm > 0 when world_size > 1");
 
     auto out = torch::zeros_like(q);
     auto lse = torch::full({q.size(1), q.size(0)}, -std::numeric_limits<float>::infinity(), q.options().dtype(torch::kFloat));
@@ -288,14 +312,27 @@ torch::Tensor forward_varlen_ring(torch::Tensor q,
     int metadata_size = 1 + b_rounded * num_prepare_batch_vectors;
     auto scheduler_metadata = torch::empty({metadata_size}, q.options().dtype(torch::kInt32));
 
-    auto k_staging = torch::Tensor();
-    auto v_staging = torch::Tensor();
-    if (num_comm_sm > 0) {
-        k_staging = prefetch_k.defined() ? prefetch_k : torch::empty_like(k);
-        v_staging = prefetch_v.defined() ? prefetch_v : torch::empty_like(v);
-    }
+    // MEGA_RING: device counters coordinate remote K/V availability and
+    // per-Q-tile reduction ordering across ring steps.
+    int const tiles_per_step = compute_tiles_per_step(cu_seqlens_q, batch_size, q.size(1));
+    TORCH_CHECK(tiles_per_step > 0, "mega ring requires at least one Q tile per step");
+    auto kv_ready_counts = torch::zeros({world_size}, q.options().dtype(torch::kInt32));
+    auto step_ready = torch::zeros({tiles_per_step}, q.options().dtype(torch::kInt32));
 
-    auto params = make_ring_varlen_params(
+    // MEGA_RING: initial local rank block is already resident in the local
+    // concatenated K/V buffer. Host-side initialization is outside the fused
+    // attention/communication kernel and does not change default paths.
+    std::vector<int> kv_ready_counts_host(world_size, 0);
+    kv_ready_counts_host[ring_rank] = local_total_k * 2;
+    auto stream = at::cuda::getDefaultCUDAStream(q.get_device());
+    C10_CUDA_CHECK(cudaMemcpyAsync(
+        kv_ready_counts.data_ptr<int>(),
+        kv_ready_counts_host.data(),
+        sizeof(int) * world_size,
+        cudaMemcpyHostToDevice,
+        stream));
+
+    auto params = make_mega_ring_varlen_params(
         q,
         k,
         v,
@@ -303,37 +340,31 @@ torch::Tensor forward_varlen_ring(torch::Tensor q,
         cu_seqlens_k,
         static_cast<int>(max_seqlen_q),
         static_cast<int>(max_seqlen_k),
+        local_total_k,
         out,
         lse,
         scheduler_metadata,
         is_causal,
         static_cast<int>(num_comp_sm),
         static_cast<int>(num_comm_sm),
-        static_cast<int>(src_rank),
-        remote_k.local_rank_,
-        remote_k.local_world_size_,
-        static_cast<int>(ring_step));
-    if (num_comm_sm > 0) {
-        params.local_k_staging_ptr = k_staging.data_ptr();
-        params.local_v_staging_ptr = v_staging.data_ptr();
-    }
+        ring_rank,
+        world_size,
+        tiles_per_step,
+        kv_ready_counts,
+        step_ready);
 
-    auto stream = at::cuda::getDefaultCUDAStream(q.get_device());
-    if (num_comm_sm > 0) {
-        k_staging.record_stream(stream);
-        v_staging.record_stream(stream);
-    }
-    min_fa3_varlen_demo::run_min_fa3_varlen_ring_fwd(params, remote_k, remote_v, stream);
+    // MEGA_RING: one fused launch runs communication CTAs and compute CTAs.
+    min_fa3_varlen_demo::run_mega_ring_min_fa3_varlen_ring_fwd(params, remote_k, remote_v, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
 }  // namespace
 
-void bind_varlen_ring(py::module_& m) {
+void bind_varlen_mega_ring(py::module_& m) {
     m.def(
-        "forward_varlen_ring",
-        &forward_varlen_ring,
+        "forward_varlen_mega_ring",
+        &forward_varlen_mega_ring,
         py::arg("q"),
         py::arg("k"),
         py::arg("v"),
@@ -344,13 +375,9 @@ void bind_varlen_ring(py::module_& m) {
         py::arg("max_seqlen_q"),
         py::arg("max_seqlen_k"),
         py::arg("is_causal"),
-        py::arg("src_rank"),
         py::arg("num_comp_sm"),
         py::arg("num_comm_sm"),
-        py::arg("ring_step"),
-        py::arg("prefetch_k"),
-        py::arg("prefetch_v"),
-        "Minimal Hopper varlen ring-attention demo.\n\n"
-        "Compute CTAs read the current local K/V buffer while communication CTAs optionally prefetch the next K/V "
-        "buffer from src_rank into prefetch_k/prefetch_v.");
+        "MEGA_RING: explicit multi-step fused Hopper varlen ring-attention demo.\n\n"
+        "K/V must be contiguous [world_size * local_total_k, kv_heads, 128] buffers. "
+        "The kernel performs persistent compute and remote K/V TMA loads in one launch.");
 }

@@ -43,6 +43,7 @@ enum class FwdNamedBarriers {
     WarpSchedulerWG2 = 2,
     WarpSchedulerWG3 = 3,
     AppendKV = 4,
+    MegaRingKVReady = AppendKV, // Reuse the same barrier for mega ring K/V ready synchronization, cause AppendKV is forbidden currently
     QueryRotated = 5,
     PFull = 6,
     PEmpty = 7,
