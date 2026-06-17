@@ -38,8 +38,9 @@ def init_distributed() -> tuple[int, int]:
     return local_rank, local_world_size
 
 
-def make_cu_seqlens(batch_size: int, seqlen: int, device: torch.device) -> torch.Tensor:
-    return torch.arange(0, (batch_size + 1) * seqlen, seqlen, device=device, dtype=torch.int32)
+def make_cu_seqlens(batch_size: int, seqlen: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    host = torch.arange(0, (batch_size + 1) * seqlen, seqlen, dtype=torch.int32)
+    return host.to(device=device), host
 
 
 def raise_if_any_rank_failed(local_error: str | None, local_rank: int) -> None:
@@ -119,8 +120,8 @@ def run_case(
     local_world_size: int,
 ) -> None:
     total_tokens = batch_size * seqlen
-    cu_seqlens_q = make_cu_seqlens(batch_size, seqlen, torch.device("cuda"))
-    cu_seqlens_k = make_cu_seqlens(batch_size, seqlen, torch.device("cuda"))
+    cu_seqlens_q, cu_seqlens_q_host = make_cu_seqlens(batch_size, seqlen, torch.device("cuda"))
+    cu_seqlens_k, cu_seqlens_k_host = make_cu_seqlens(batch_size, seqlen, torch.device("cuda"))
 
     q, k, v = make_rank_local_qkv(total_tokens, total_tokens, q_heads, kv_heads, head_dim, local_rank)
     remote_k = min_fa3_op.TKParallelTensor(
@@ -158,6 +159,8 @@ def run_case(
         seqlen,
         seqlen,
         is_causal,
+        cu_seqlens_q_host=cu_seqlens_q_host,
+        cu_seqlens_k_host=cu_seqlens_k_host,
         remote_k=remote_k,
         remote_v=remote_v,
         src_rank=src_rank,
@@ -170,7 +173,7 @@ def run_case(
     torch.cuda.synchronize()
     dist.barrier()
 
-    local_ref = reference_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, is_causal)
+    local_ref = reference_varlen(q, k, v, cu_seqlens_q_host, cu_seqlens_k_host, is_causal)
     base = min_fa3_op.forward_varlen(
         q,
         k,
@@ -180,6 +183,8 @@ def run_case(
         seqlen,
         seqlen,
         is_causal,
+        cu_seqlens_q_host=cu_seqlens_q_host,
+        cu_seqlens_k_host=cu_seqlens_k_host,
         manual_block_count=num_comp_sm,
     )
     local_error: str | None = None

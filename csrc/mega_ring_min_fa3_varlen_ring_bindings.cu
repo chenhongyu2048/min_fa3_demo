@@ -9,8 +9,6 @@
 
 #include <cmath>
 #include <limits>
-// MEGA_RING: host-side readiness counter initialization uses std::vector.
-#include <vector>
 
 // MEGA_RING: use the fused multi-step mega-ring launch instead of the
 // single-step ring launch.
@@ -23,6 +21,10 @@ namespace {
 
 using RingVarlenParams = min_fa3_varlen_demo::Ring_fwd_params;
 using VarlenParams = min_fa3_varlen_demo::Flash_fwd_params;
+
+__global__ void set_mega_ring_local_kv_ready_count(int* counts, int rank, int value) {
+    counts[rank] = value;
+}
 
 int round_multiple(int x, int m) {
     return (x + m - 1) / m * m;
@@ -49,6 +51,15 @@ void check_cu_seqlens(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.dim() == 1, name, " must be 1D");
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
     TORCH_CHECK(t.numel() >= 2, name, " must have shape [B + 1] with B >= 1");
+}
+
+void check_cu_seqlens_host(const torch::Tensor& t, const torch::Tensor& device_t, const char* name) {
+    TORCH_CHECK(!t.is_cuda(), name, " must be a CPU tensor");
+    TORCH_CHECK(t.scalar_type() == torch::kInt32, name, " must have dtype torch.int32");
+    TORCH_CHECK(t.dim() == 1, name, " must be 1D");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(t.numel() == device_t.numel(),
+                name, " must have the same length as its CUDA cu_seqlens tensor");
 }
 
 VarlenParams make_varlen_params(const torch::Tensor& q,
@@ -197,12 +208,12 @@ RingVarlenParams make_mega_ring_varlen_params(const torch::Tensor& q,
 
 // MEGA_RING: step counters are indexed by the original per-step varlen Q tile
 // id. Each counter tracks how many ring steps have completed for that Q tile.
-int compute_tiles_per_step(const torch::Tensor& cu_seqlens_q, int batch_size, int q_heads) {
+int compute_tiles_per_step(const int* cu_seqlens_q_host, int batch_size, int q_heads) {
     int tiles = 0;
     for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-        int const start = cu_seqlens_q[batch_idx].item<int>();
-        int const end = cu_seqlens_q[batch_idx + 1].item<int>();
-        TORCH_CHECK(end >= start, "cu_seqlens_q must be nondecreasing");
+        int const start = cu_seqlens_q_host[batch_idx];
+        int const end = cu_seqlens_q_host[batch_idx + 1];
+        TORCH_CHECK(end >= start, "cu_seqlens_q_host must be nondecreasing");
         tiles += round_multiple(end - start, 128) / 128 * q_heads;
     }
     return tiles;
@@ -218,6 +229,8 @@ torch::Tensor forward_varlen_mega_ring(torch::Tensor q,
                                        kittens::py::TKParallelTensor& remote_v,
                                        torch::Tensor cu_seqlens_q,
                                        torch::Tensor cu_seqlens_k,
+                                       torch::Tensor cu_seqlens_q_host,
+                                       torch::Tensor cu_seqlens_k_host,
                                        int64_t max_seqlen_q,
                                        int64_t max_seqlen_k,
                                        bool is_causal,
@@ -230,6 +243,8 @@ torch::Tensor forward_varlen_mega_ring(torch::Tensor q,
     check_parallel_varlen_qkv(remote_v, "remote_v");
     check_cu_seqlens(cu_seqlens_q, "cu_seqlens_q");
     check_cu_seqlens(cu_seqlens_k, "cu_seqlens_k");
+    check_cu_seqlens_host(cu_seqlens_q_host, cu_seqlens_q, "cu_seqlens_q_host");
+    check_cu_seqlens_host(cu_seqlens_k_host, cu_seqlens_k, "cu_seqlens_k_host");
 
     TORCH_CHECK(q.device() == k.device() && q.device() == v.device(), "q, k, v must be on the same CUDA device");
     TORCH_CHECK(q.device() == cu_seqlens_q.device() && q.device() == cu_seqlens_k.device(),
@@ -268,20 +283,22 @@ torch::Tensor forward_varlen_mega_ring(torch::Tensor q,
                 "min_fa3_demo only supports Hopper SM90. Current device capability is ",
                 props->major, ".", props->minor);
 
-    int const batch_size = cu_seqlens_q.size(0) - 1;
+    int const batch_size = cu_seqlens_q_host.size(0) - 1;
+    int const* cu_seqlens_q_host_ptr = cu_seqlens_q_host.data_ptr<int>();
+    int const* cu_seqlens_k_host_ptr = cu_seqlens_k_host.data_ptr<int>();
     // MEGA_RING: ring identity is taken from the TKParallelTensor allocation.
     int const world_size = remote_k.local_world_size_;
     int const ring_rank = remote_k.local_rank_;
     TORCH_CHECK(batch_size >= 1, "varlen demo requires batch size B >= 1");
-    TORCH_CHECK(cu_seqlens_q[0].item<int>() == 0, "cu_seqlens_q must start with 0");
-    TORCH_CHECK(cu_seqlens_k[0].item<int>() == 0, "cu_seqlens_k must start with 0");
-    TORCH_CHECK(cu_seqlens_q[batch_size].item<int>() == q.size(0),
-                "cu_seqlens_q[-1] must equal q.size(0). Got ", cu_seqlens_q[batch_size].item<int>(),
+    TORCH_CHECK(cu_seqlens_q_host_ptr[0] == 0, "cu_seqlens_q_host must start with 0");
+    TORCH_CHECK(cu_seqlens_k_host_ptr[0] == 0, "cu_seqlens_k_host must start with 0");
+    TORCH_CHECK(cu_seqlens_q_host_ptr[batch_size] == q.size(0),
+                "cu_seqlens_q_host[-1] must equal q.size(0). Got ", cu_seqlens_q_host_ptr[batch_size],
                 " vs ", q.size(0));
     // MEGA_RING: cu_seqlens_k describes one rank-local KV block, while K/V
     // storage contains one such block for every rank in local rank order.
-    int const local_total_k = cu_seqlens_k[batch_size].item<int>();
-    TORCH_CHECK(local_total_k > 0, "cu_seqlens_k[-1] must be positive");
+    int const local_total_k = cu_seqlens_k_host_ptr[batch_size];
+    TORCH_CHECK(local_total_k > 0, "cu_seqlens_k_host[-1] must be positive");
     TORCH_CHECK(k.size(0) == int64_t(world_size) * local_total_k,
                 "mega ring k must have shape [world_size * local_total_k, KVH, D]. Got k.size(0)=",
                 k.size(0), ", world_size=", world_size, ", local_total_k=", local_total_k);
@@ -314,23 +331,17 @@ torch::Tensor forward_varlen_mega_ring(torch::Tensor q,
 
     // MEGA_RING: device counters coordinate remote K/V availability and
     // per-Q-tile reduction ordering across ring steps.
-    int const tiles_per_step = compute_tiles_per_step(cu_seqlens_q, batch_size, q.size(1));
+    int const tiles_per_step = compute_tiles_per_step(cu_seqlens_q_host_ptr, batch_size, q.size(1));
     TORCH_CHECK(tiles_per_step > 0, "mega ring requires at least one Q tile per step");
     auto kv_ready_counts = torch::zeros({world_size}, q.options().dtype(torch::kInt32));
     auto step_ready = torch::zeros({tiles_per_step}, q.options().dtype(torch::kInt32));
 
     // MEGA_RING: initial local rank block is already resident in the local
-    // concatenated K/V buffer. Host-side initialization is outside the fused
-    // attention/communication kernel and does not change default paths.
-    std::vector<int> kv_ready_counts_host(world_size, 0);
-    kv_ready_counts_host[ring_rank] = local_total_k * 2;
+    // concatenated K/V buffer.
     auto stream = at::cuda::getDefaultCUDAStream(q.get_device());
-    C10_CUDA_CHECK(cudaMemcpyAsync(
-        kv_ready_counts.data_ptr<int>(),
-        kv_ready_counts_host.data(),
-        sizeof(int) * world_size,
-        cudaMemcpyHostToDevice,
-        stream));
+    set_mega_ring_local_kv_ready_count<<<1, 1, 0, stream>>>(
+        kv_ready_counts.data_ptr<int>(), ring_rank, local_total_k * 2);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     auto params = make_mega_ring_varlen_params(
         q,
@@ -372,6 +383,8 @@ void bind_varlen_mega_ring(py::module_& m) {
         py::arg("remote_v"),
         py::arg("cu_seqlens_q"),
         py::arg("cu_seqlens_k"),
+        py::arg("cu_seqlens_q_host"),
+        py::arg("cu_seqlens_k_host"),
         py::arg("max_seqlen_q"),
         py::arg("max_seqlen_k"),
         py::arg("is_causal"),

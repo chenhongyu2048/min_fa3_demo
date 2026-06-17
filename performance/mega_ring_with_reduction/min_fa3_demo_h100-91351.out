@@ -1,0 +1,872 @@
+Running tests and benchmarks for Mega-Ring-FlashAttention
+=========================================================
+mega ring varlen local case causal=False: ok (B=16, S=512, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=True: ok (B=16, S=512, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=False: ok (B=16, S=1024, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=True: ok (B=16, S=1024, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=False: ok (B=16, S=2048, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=True: ok (B=16, S=2048, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=False: ok (B=16, S=4096, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=True: ok (B=16, S=4096, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=False: ok (B=16, S=8192, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=True: ok (B=16, S=8192, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+Loaded min_fa3_op (minimal Hopper demo)
+Loaded flash_attn varlen (FA2)
+Loaded flash_attn_interface varlen (FA3)
+Config: B=16, qhead=32, kvhead=8, D=128, mode=both, num_iters=50, warmup_iters=50, num_comp_sm=128, num_comm_sm=0, profile=False
+Seqlen: 512,1024,2048,4096,8192
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+
+==============================================================================================================
+Varlen Mega-Ring Local Benchmark Results
+==============================================================================================================
+B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.379        0.151        0.530        129.5
+FA2_varlen                          0.210        0.146        0.356        193.2
+FA3_varlen                          0.171        0.145        0.316        217.7
+min_fa3_varlen                        N/A          N/A        0.152        452.2
+min_fa3_varlen_ring                   N/A          N/A        0.211        325.1
+min_fa3_varlen_mega_ring              N/A          N/A        0.237        290.2
+--------------------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        1.102        0.606        1.709        160.9
+FA2_varlen                          0.743        0.422        1.165        236.0
+FA3_varlen                          0.501        0.422        0.923        297.8
+min_fa3_varlen                        N/A          N/A        0.464        592.0
+min_fa3_varlen_ring                   N/A          N/A        0.638        431.1
+min_fa3_varlen_mega_ring              N/A          N/A        0.646        425.7
+--------------------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        3.640        1.200        4.840        227.2
+FA2_varlen                          2.848        0.841        3.689        298.0
+FA3_varlen                          1.909        0.924        2.834        388.0
+min_fa3_varlen                        N/A          N/A        1.969        558.3
+min_fa3_varlen_ring                   N/A          N/A        2.079        528.9
+min_fa3_varlen_mega_ring              N/A          N/A        2.102        523.0
+--------------------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       13.489        2.446       15.928        276.1
+FA2_varlen                         11.524        1.729       13.246        332.0
+FA3_varlen                          7.190        1.878        9.070        484.9
+min_fa3_varlen                        N/A          N/A        7.206        610.4
+min_fa3_varlen_ring                   N/A          N/A        7.812        563.0
+min_fa3_varlen_mega_ring              N/A          N/A        7.815        562.7
+--------------------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       51.986        5.000       56.997        308.7
+FA2_varlen                         45.980        3.485       49.478        355.6
+FA3_varlen                         27.774        3.873       31.661        555.6
+min_fa3_varlen                        N/A          N/A       28.123        625.5
+min_fa3_varlen_ring                   N/A          N/A       29.086        604.8
+min_fa3_varlen_mega_ring              N/A          N/A       29.271        601.0
+--------------------------------------------------------------------------------------------------------------
+B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.350        0.152        0.502         68.5
+FA2_varlen                          0.193        0.147        0.340        101.0
+FA3_varlen                          0.124        0.146        0.270        127.3
+min_fa3_varlen                        N/A          N/A        0.111        310.0
+min_fa3_varlen_ring                   N/A          N/A        0.169        203.6
+min_fa3_varlen_mega_ring              N/A          N/A        0.188        182.6
+--------------------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.806        0.611        1.417         97.0
+FA2_varlen                          0.501        0.423        0.924        148.7
+FA3_varlen                          0.317        0.422        0.739        186.0
+min_fa3_varlen                        N/A          N/A        0.293        468.6
+min_fa3_varlen_ring                   N/A          N/A        0.423        325.3
+min_fa3_varlen_mega_ring              N/A          N/A        0.454        302.5
+--------------------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        2.299        1.200        3.499        157.1
+FA2_varlen                          1.647        0.838        2.484        221.3
+FA3_varlen                          0.982        0.855        1.839        299.0
+min_fa3_varlen                        N/A          N/A        1.103        498.6
+min_fa3_varlen_ring                   N/A          N/A        1.339        410.5
+min_fa3_varlen_mega_ring              N/A          N/A        1.335        411.8
+--------------------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        7.799        2.486       10.282        213.9
+FA2_varlen                          6.294        1.745        8.040        273.5
+FA3_varlen                          3.568        1.849        5.417        405.9
+min_fa3_varlen                        N/A          N/A        3.974        553.3
+min_fa3_varlen_ring                   N/A          N/A        4.226        520.3
+min_fa3_varlen_mega_ring              N/A          N/A        4.279        513.9
+--------------------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       27.852        4.963       32.816        268.0
+FA2_varlen                         24.173        3.505       27.679        317.8
+FA3_varlen                         13.639        3.842       17.497        502.7
+min_fa3_varlen                        N/A          N/A       14.713        597.8
+min_fa3_varlen_ring                   N/A          N/A       15.230        577.5
+min_fa3_varlen_mega_ring              N/A          N/A       15.329        573.8
+--------------------------------------------------------------------------------------------------------------
+mega ring varlen local case causal=False: ok (B=16, S=512, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=True: ok (B=16, S=512, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=False: ok (B=16, S=512, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=4)
+mega ring varlen local case causal=True: ok (B=16, S=512, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=4)
+mega ring varlen local case causal=False: ok (B=16, S=1024, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=True: ok (B=16, S=1024, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=False: ok (B=16, S=1024, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=4)
+mega ring varlen local case causal=True: ok (B=16, S=1024, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=4)
+mega ring varlen local case causal=False: ok (B=16, S=2048, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=True: ok (B=16, S=2048, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=False: ok (B=16, S=2048, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=4)
+mega ring varlen local case causal=True: ok (B=16, S=2048, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=4)
+mega ring varlen local case causal=False: ok (B=16, S=4096, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=True: ok (B=16, S=4096, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=False: ok (B=16, S=4096, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=4)
+mega ring varlen local case causal=True: ok (B=16, S=4096, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=4)
+mega ring varlen local case causal=False: ok (B=16, S=8192, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=True: ok (B=16, S=8192, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=0)
+mega ring varlen local case causal=False: ok (B=16, S=8192, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=4)
+mega ring varlen local case causal=True: ok (B=16, S=8192, QH=32, KVH=8, D=128, num_comp_sm=128, num_comm_sm=4)
+Loaded min_fa3_op (minimal Hopper demo)
+Loaded flash_attn varlen (FA2)
+Loaded flash_attn_interface varlen (FA3)
+Config: B=16, qhead=32, kvhead=8, D=128, mode=both, num_iters=50, warmup_iters=50, num_comp_sm=128, num_comm_sm=4, profile=False
+Seqlen: 512,1024,2048,4096,8192
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+
+==============================================================================================================
+Varlen Mega-Ring Local Benchmark Results
+==============================================================================================================
+B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.379        0.151        0.531        129.5
+FA2_varlen                          0.209        0.146        0.355        193.5
+FA3_varlen                          0.171        0.146        0.317        216.8
+min_fa3_varlen                        N/A          N/A        0.152        451.8
+min_fa3_varlen_ring                   N/A          N/A        0.483        142.2
+min_fa3_varlen_mega_ring              N/A          N/A        0.237        289.9
+--------------------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        1.097        0.607        1.704        161.3
+FA2_varlen                          0.739        0.423        1.162        236.6
+FA3_varlen                          0.508        0.428        0.935        293.9
+min_fa3_varlen                        N/A          N/A        0.467        588.7
+min_fa3_varlen_ring                   N/A          N/A        1.094        251.3
+min_fa3_varlen_mega_ring              N/A          N/A        0.633        434.2
+--------------------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        3.641        1.207        4.848        226.8
+FA2_varlen                          3.000        0.880        3.881        283.3
+FA3_varlen                          1.861        0.907        2.767        397.4
+min_fa3_varlen                        N/A          N/A        1.938        567.2
+min_fa3_varlen_ring                   N/A          N/A        2.413        455.6
+min_fa3_varlen_mega_ring              N/A          N/A        2.181        504.0
+--------------------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       13.525        2.471       15.989        275.1
+FA2_varlen                         11.671        1.735       13.406        328.1
+FA3_varlen                          7.199        1.881        9.079        484.4
+min_fa3_varlen                        N/A          N/A        7.337        599.4
+min_fa3_varlen_ring                   N/A          N/A        7.899        556.8
+min_fa3_varlen_mega_ring              N/A          N/A        7.887        557.6
+--------------------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       52.127        5.038       57.149        307.8
+FA2_varlen                         46.486        3.503       49.970        352.1
+FA3_varlen                         27.844        3.871       31.715        554.7
+min_fa3_varlen                        N/A          N/A       28.034        627.5
+min_fa3_varlen_ring                   N/A          N/A       29.641        593.5
+min_fa3_varlen_mega_ring              N/A          N/A       29.391        598.6
+--------------------------------------------------------------------------------------------------------------
+B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.364        0.155        0.520         66.1
+FA2_varlen                          0.197        0.148        0.345         99.7
+FA3_varlen                          0.125        0.146        0.272        126.4
+min_fa3_varlen                        N/A          N/A        0.112        308.0
+min_fa3_varlen_ring                   N/A          N/A        0.509         67.5
+min_fa3_varlen_mega_ring              N/A          N/A        0.189        181.9
+--------------------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.804        0.609        1.414         97.2
+FA2_varlen                          0.502        0.424        0.926        148.5
+FA3_varlen                          0.316        0.422        0.739        186.0
+min_fa3_varlen                        N/A          N/A        0.293        468.7
+min_fa3_varlen_ring                   N/A          N/A        1.043        131.8
+min_fa3_varlen_mega_ring              N/A          N/A        0.451        304.7
+--------------------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        2.297        1.200        3.497        157.2
+FA2_varlen                          1.640        0.837        2.476        222.0
+FA3_varlen                          0.985        0.858        1.842        298.4
+min_fa3_varlen                        N/A          N/A        1.197        459.4
+min_fa3_varlen_ring                   N/A          N/A        2.155        255.1
+min_fa3_varlen_mega_ring              N/A          N/A        1.291        425.8
+--------------------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        7.869        2.487       10.356        212.3
+FA2_varlen                          6.379        1.754        8.133        270.4
+FA3_varlen                          3.544        1.836        5.379        408.8
+min_fa3_varlen                        N/A          N/A        4.003        549.4
+min_fa3_varlen_ring                   N/A          N/A        4.969        442.5
+min_fa3_varlen_mega_ring              N/A          N/A        4.392        500.7
+--------------------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       27.937        4.964       32.889        267.4
+FA2_varlen                         24.183        3.485       27.672        317.9
+FA3_varlen                         13.645        3.842       17.507        502.4
+min_fa3_varlen                        N/A          N/A       14.804        594.2
+min_fa3_varlen_ring                   N/A          N/A       15.310        574.6
+min_fa3_varlen_mega_ring              N/A          N/A       15.501        567.5
+--------------------------------------------------------------------------------------------------------------
+Loaded min_fa3_op (minimal Hopper demo)
+Loaded flash_attn varlen (FA2)
+Loaded flash_attn_interface varlen (FA3)
+Config: B=16, qhead=32, kvhead=8, D=128, mode=both, num_iters=50, warmup_iters=50, num_comp_sm=124, num_comm_sm=8, profile=False
+Seqlen: 512,1024,2048,4096,8192
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+
+==============================================================================================================
+Varlen Mega-Ring Local Benchmark Results
+==============================================================================================================
+B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.379        0.152        0.531        129.4
+FA2_varlen                          0.209        0.146        0.355        193.3
+FA3_varlen                          0.170        0.146        0.317        216.9
+min_fa3_varlen                        N/A          N/A        0.158        435.2
+min_fa3_varlen_ring                   N/A          N/A        0.317        216.5
+min_fa3_varlen_mega_ring              N/A          N/A        0.244        281.6
+--------------------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        1.097        0.608        1.705        161.2
+FA2_varlen                          0.738        0.424        1.162        236.6
+FA3_varlen                          0.503        0.426        0.929        295.9
+min_fa3_varlen                        N/A          N/A        0.534        514.5
+min_fa3_varlen_ring                   N/A          N/A        0.678        405.2
+min_fa3_varlen_mega_ring              N/A          N/A        0.667        411.9
+--------------------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        3.641        1.207        4.849        226.8
+FA2_varlen                          2.907        0.862        3.769        291.7
+FA3_varlen                          1.876        0.911        2.787        394.5
+min_fa3_varlen                        N/A          N/A        1.962        560.4
+min_fa3_varlen_ring                   N/A          N/A        2.251        488.4
+min_fa3_varlen_mega_ring              N/A          N/A        2.184        503.5
+--------------------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       13.513        2.472       15.987        275.1
+FA2_varlen                         11.742        1.744       13.477        326.3
+FA3_varlen                          7.262        1.885        9.151        480.6
+min_fa3_varlen                        N/A          N/A        7.446        590.6
+min_fa3_varlen_ring                   N/A          N/A        7.972        551.7
+min_fa3_varlen_mega_ring              N/A          N/A        7.972        551.7
+--------------------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       52.073        5.003       57.101        308.1
+FA2_varlen                         46.486        3.505       49.972        352.0
+FA3_varlen                         27.959        3.872       31.804        553.2
+min_fa3_varlen                        N/A          N/A       28.611        614.9
+min_fa3_varlen_ring                   N/A          N/A       29.817        590.0
+min_fa3_varlen_mega_ring              N/A          N/A       29.842        589.5
+--------------------------------------------------------------------------------------------------------------
+B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.349        0.152        0.502         68.4
+FA2_varlen                          0.195        0.148        0.343        100.3
+FA3_varlen                          0.124        0.146        0.270        127.2
+min_fa3_varlen                        N/A          N/A        0.114        301.4
+min_fa3_varlen_ring                   N/A          N/A        0.289        119.0
+min_fa3_varlen_mega_ring              N/A          N/A        0.196        175.4
+--------------------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.808        0.612        1.420         96.8
+FA2_varlen                          0.503        0.424        0.927        148.3
+FA3_varlen                          0.318        0.424        0.741        185.4
+min_fa3_varlen                        N/A          N/A        0.302        455.0
+min_fa3_varlen_ring                   N/A          N/A        0.639        215.1
+min_fa3_varlen_mega_ring              N/A          N/A        0.465        295.7
+--------------------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        2.302        1.201        3.502        157.0
+FA2_varlen                          1.663        0.848        2.509        219.1
+FA3_varlen                          1.008        0.875        1.884        291.8
+min_fa3_varlen                        N/A          N/A        1.189        462.4
+min_fa3_varlen_ring                   N/A          N/A        1.387        396.3
+min_fa3_varlen_mega_ring              N/A          N/A        1.357        405.0
+--------------------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        7.689        2.456       10.134        217.0
+FA2_varlen                          6.351        1.738        8.087        271.9
+FA3_varlen                          3.549        1.837        5.384        408.4
+min_fa3_varlen                        N/A          N/A        4.072        540.0
+min_fa3_varlen_ring                   N/A          N/A        4.286        513.1
+min_fa3_varlen_mega_ring              N/A          N/A        4.402        499.5
+--------------------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       27.918        4.964       32.857        267.7
+FA2_varlen                         24.190        3.495       27.677        317.8
+FA3_varlen                         13.659        3.843       17.504        502.5
+min_fa3_varlen                        N/A          N/A       14.947        588.5
+min_fa3_varlen_ring                   N/A          N/A       15.584        564.4
+min_fa3_varlen_mega_ring              N/A          N/A       15.689        560.7
+--------------------------------------------------------------------------------------------------------------
+Loaded min_fa3_op (minimal Hopper demo)
+Loaded flash_attn varlen (FA2)
+Loaded flash_attn_interface varlen (FA3)
+Config: B=16, qhead=32, kvhead=8, D=128, mode=both, num_iters=50, warmup_iters=50, num_comp_sm=116, num_comm_sm=16, profile=False
+Seqlen: 512,1024,2048,4096,8192
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+
+==============================================================================================================
+Varlen Mega-Ring Local Benchmark Results
+==============================================================================================================
+B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.379        0.150        0.530        129.6
+FA2_varlen                          0.208        0.145        0.354        194.2
+FA3_varlen                          0.170        0.145        0.316        217.7
+min_fa3_varlen                        N/A          N/A        0.166        414.2
+min_fa3_varlen_ring                   N/A          N/A        0.232        296.6
+min_fa3_varlen_mega_ring              N/A          N/A        0.254        270.5
+--------------------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        1.096        0.607        1.704        161.3
+FA2_varlen                          0.739        0.424        1.163        236.3
+FA3_varlen                          0.498        0.423        0.920        298.6
+min_fa3_varlen                        N/A          N/A        0.546        503.9
+min_fa3_varlen_ring                   N/A          N/A        0.681        403.6
+min_fa3_varlen_mega_ring              N/A          N/A        0.697        394.2
+--------------------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        3.616        1.200        4.816        228.3
+FA2_varlen                          2.946        0.863        3.809        288.7
+FA3_varlen                          1.865        0.906        2.772        396.6
+min_fa3_varlen                        N/A          N/A        2.034        540.6
+min_fa3_varlen_ring                   N/A          N/A        2.333        471.3
+min_fa3_varlen_mega_ring              N/A          N/A        2.270        484.3
+--------------------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       13.436        2.453       15.886        276.9
+FA2_varlen                         11.773        1.745       13.518        325.4
+FA3_varlen                          7.256        1.893        9.146        480.9
+min_fa3_varlen                        N/A          N/A        7.713        570.2
+min_fa3_varlen_ring                   N/A          N/A        8.287        530.7
+min_fa3_varlen_mega_ring              N/A          N/A        8.342        527.2
+--------------------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       51.950        5.036       56.983        308.7
+FA2_varlen                         46.318        3.504       49.800        353.3
+FA3_varlen                         27.870        3.871       31.739        554.3
+min_fa3_varlen                        N/A          N/A       29.341        599.6
+min_fa3_varlen_ring                   N/A          N/A       31.043        566.7
+min_fa3_varlen_mega_ring              N/A          N/A       31.123        565.2
+--------------------------------------------------------------------------------------------------------------
+B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.360        0.154        0.514         66.8
+FA2_varlen                          0.195        0.147        0.342        100.4
+FA3_varlen                          0.124        0.146        0.270        127.3
+min_fa3_varlen                        N/A          N/A        0.121        283.6
+min_fa3_varlen_ring                   N/A          N/A        0.192        178.7
+min_fa3_varlen_mega_ring              N/A          N/A        0.205        167.9
+--------------------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.808        0.611        1.419         96.8
+FA2_varlen                          0.500        0.422        0.923        148.9
+FA3_varlen                          0.316        0.422        0.738        186.2
+min_fa3_varlen                        N/A          N/A        0.329        418.2
+min_fa3_varlen_ring                   N/A          N/A        0.455        301.9
+min_fa3_varlen_mega_ring              N/A          N/A        0.495        277.6
+--------------------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        2.308        1.202        3.510        156.6
+FA2_varlen                          1.665        0.847        2.511        219.0
+FA3_varlen                          1.002        0.870        1.872        293.8
+min_fa3_varlen                        N/A          N/A        1.191        461.7
+min_fa3_varlen_ring                   N/A          N/A        1.405        391.3
+min_fa3_varlen_mega_ring              N/A          N/A        1.406        391.1
+--------------------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        7.770        2.474       10.234        214.9
+FA2_varlen                          6.346        1.736        8.083        272.1
+FA3_varlen                          3.537        1.835        5.374        409.2
+min_fa3_varlen                        N/A          N/A        4.187        525.2
+min_fa3_varlen_ring                   N/A          N/A        4.492        489.5
+min_fa3_varlen_mega_ring              N/A          N/A        4.593        478.7
+--------------------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       27.861        4.946       32.830        267.9
+FA2_varlen                         24.204        3.485       27.687        317.7
+FA3_varlen                         13.659        3.840       17.497        502.7
+min_fa3_varlen                        N/A          N/A       15.504        567.4
+min_fa3_varlen_ring                   N/A          N/A       16.059        547.7
+min_fa3_varlen_mega_ring              N/A          N/A       16.296        539.8
+--------------------------------------------------------------------------------------------------------------
+Loaded min_fa3_op (minimal Hopper demo)
+Loaded flash_attn varlen (FA2)
+Loaded flash_attn_interface varlen (FA3)
+Config: B=16, qhead=32, kvhead=8, D=128, mode=both, num_iters=50, warmup_iters=50, num_comp_sm=108, num_comm_sm=24, profile=False
+Seqlen: 512,1024,2048,4096,8192
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+
+==============================================================================================================
+Varlen Mega-Ring Local Benchmark Results
+==============================================================================================================
+B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.379        0.150        0.530        129.8
+FA2_varlen                          0.209        0.146        0.354        194.0
+FA3_varlen                          0.170        0.145        0.315        218.0
+min_fa3_varlen                        N/A          N/A        0.175        392.8
+min_fa3_varlen_ring                   N/A          N/A        0.244        281.3
+min_fa3_varlen_mega_ring              N/A          N/A        0.266        258.0
+--------------------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        1.096        0.607        1.703        161.4
+FA2_varlen                          0.739        0.423        1.162        236.6
+FA3_varlen                          0.499        0.423        0.922        298.3
+min_fa3_varlen                        N/A          N/A        0.564        487.7
+min_fa3_varlen_ring                   N/A          N/A        0.714        385.0
+min_fa3_varlen_mega_ring              N/A          N/A        0.735        374.2
+--------------------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        3.643        1.208        4.850        226.7
+FA2_varlen                          2.921        0.862        3.784        290.6
+FA3_varlen                          1.870        0.906        2.776        396.1
+min_fa3_varlen                        N/A          N/A        2.138        514.2
+min_fa3_varlen_ring                   N/A          N/A        2.451        448.7
+min_fa3_varlen_mega_ring              N/A          N/A        2.383        461.4
+--------------------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       13.536        2.469       15.994        275.0
+FA2_varlen                         11.671        1.745       13.416        327.8
+FA3_varlen                          7.266        1.881        9.149        480.7
+min_fa3_varlen                        N/A          N/A        8.096        543.2
+min_fa3_varlen_ring                   N/A          N/A        8.717        504.5
+min_fa3_varlen_mega_ring              N/A          N/A        8.757        502.2
+--------------------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       51.955        5.007       56.960        308.9
+FA2_varlen                         46.485        3.483       49.968        352.1
+FA3_varlen                         27.892        3.872       31.738        554.3
+min_fa3_varlen                        N/A          N/A       30.836        570.5
+min_fa3_varlen_ring                   N/A          N/A       32.382        543.3
+min_fa3_varlen_mega_ring              N/A          N/A       32.484        541.6
+--------------------------------------------------------------------------------------------------------------
+B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.344        0.151        0.496         69.3
+FA2_varlen                          0.194        0.147        0.340        101.0
+FA3_varlen                          0.124        0.146        0.270        127.2
+min_fa3_varlen                        N/A          N/A        0.128        267.5
+min_fa3_varlen_ring                   N/A          N/A        0.196        175.5
+min_fa3_varlen_mega_ring              N/A          N/A        0.216        158.7
+--------------------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.807        0.610        1.417         97.0
+FA2_varlen                          0.502        0.423        0.926        148.5
+FA3_varlen                          0.317        0.422        0.740        185.8
+min_fa3_varlen                        N/A          N/A        0.342        401.6
+min_fa3_varlen_ring                   N/A          N/A        0.488        281.6
+min_fa3_varlen_mega_ring              N/A          N/A        0.514        267.3
+--------------------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        2.303        1.201        3.503        156.9
+FA2_varlen                          1.697        0.860        2.558        214.9
+FA3_varlen                          1.001        0.870        1.870        294.0
+min_fa3_varlen                        N/A          N/A        1.278        430.2
+min_fa3_varlen_ring                   N/A          N/A        1.428        385.0
+min_fa3_varlen_mega_ring              N/A          N/A        1.451        378.8
+--------------------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        7.674        2.451       10.125        217.2
+FA2_varlen                          6.324        1.737        8.063        272.7
+FA3_varlen                          3.546        1.835        5.382        408.6
+min_fa3_varlen                        N/A          N/A        4.349        505.6
+min_fa3_varlen_ring                   N/A          N/A        4.617        476.3
+min_fa3_varlen_mega_ring              N/A          N/A        4.786        459.5
+--------------------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       27.943        4.964       32.977        266.7
+FA2_varlen                         24.135        3.499       27.629        318.4
+FA3_varlen                         13.653        3.845       17.505        502.5
+min_fa3_varlen                        N/A          N/A       16.139        545.0
+min_fa3_varlen_ring                   N/A          N/A       16.699        526.7
+min_fa3_varlen_mega_ring              N/A          N/A       17.064        515.5
+--------------------------------------------------------------------------------------------------------------
+=========================================================
+Loaded min_fa3_op (minimal Hopper demo)
+Loaded flash_attn varlen (FA2)
+Loaded flash_attn_interface varlen (FA3)
+Config: B=16, qhead=32, kvhead=8, D=128, mode=both, num_iters=50, warmup_iters=50, num_comp_sm=116, num_comm_sm=16, profile=True
+Seqlen: 512,1024,2048,4096,8192
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Running B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Running B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+
+==============================================================================================================
+Varlen Mega-Ring Local Benchmark Results
+==============================================================================================================
+B=16,S=512,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.388        0.162        0.550        124.9
+FA2_varlen                          0.212        0.157        0.369        186.1
+FA3_varlen                          0.173        0.157        0.330        208.0
+min_fa3_varlen                        N/A          N/A        0.170        405.0
+min_fa3_varlen_ring                   N/A          N/A        0.234        293.1
+min_fa3_varlen_mega_ring              N/A          N/A        0.256        268.8
+--------------------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        1.110        0.628        1.738        158.1
+FA2_varlen                          0.742        0.443        1.186        231.8
+FA3_varlen                          0.505        0.446        0.951        289.1
+min_fa3_varlen                        N/A          N/A        0.513        535.7
+min_fa3_varlen_ring                   N/A          N/A        0.680        404.3
+min_fa3_varlen_mega_ring              N/A          N/A        0.692        397.0
+--------------------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        3.643        1.238        4.881        225.2
+FA2_varlen                          2.862        0.885        3.745        293.6
+FA3_varlen                          1.867        0.953        2.820        389.9
+min_fa3_varlen                        N/A          N/A        2.052        535.9
+min_fa3_varlen_ring                   N/A          N/A        2.235        492.0
+min_fa3_varlen_mega_ring              N/A          N/A        2.261        486.4
+--------------------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       13.561        2.547       16.108        273.0
+FA2_varlen                         11.648        1.799       13.444        327.1
+FA3_varlen                          7.145        1.945        9.089        483.9
+min_fa3_varlen                        N/A          N/A        7.662        574.0
+min_fa3_varlen_ring                   N/A          N/A        8.366        525.7
+min_fa3_varlen_mega_ring              N/A          N/A        8.345        527.1
+--------------------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=False
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       52.008        5.156       57.187        307.6
+FA2_varlen                         46.193        3.633       49.828        353.1
+FA3_varlen                         27.858        4.031       31.860        552.2
+min_fa3_varlen                        N/A          N/A       29.385        598.7
+min_fa3_varlen_ring                   N/A          N/A       30.989        567.7
+min_fa3_varlen_mega_ring              N/A          N/A       31.115        565.4
+--------------------------------------------------------------------------------------------------------------
+B=16,S=512,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.365        0.166        0.532         64.6
+FA2_varlen                          0.197        0.159        0.355         96.7
+FA3_varlen                          0.127        0.157        0.284        120.9
+min_fa3_varlen                        N/A          N/A        0.124        277.2
+min_fa3_varlen_ring                   N/A          N/A        0.195        176.0
+min_fa3_varlen_mega_ring              N/A          N/A        0.208        165.4
+--------------------------------------------------------------------------------------------------------------
+B=16,S=1024,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        0.822        0.632        1.454         94.5
+FA2_varlen                          0.509        0.444        0.953        144.2
+FA3_varlen                          0.320        0.443        0.764        180.0
+min_fa3_varlen                        N/A          N/A        0.325        423.2
+min_fa3_varlen_ring                   N/A          N/A        0.470        292.5
+min_fa3_varlen_mega_ring              N/A          N/A        0.497        276.5
+--------------------------------------------------------------------------------------------------------------
+B=16,S=2048,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        2.333        1.240        3.576        153.7
+FA2_varlen                          1.649        0.878        2.529        217.4
+FA3_varlen                          1.014        0.925        1.940        283.4
+min_fa3_varlen                        N/A          N/A        1.207        455.6
+min_fa3_varlen_ring                   N/A          N/A        1.397        393.5
+min_fa3_varlen_mega_ring              N/A          N/A        1.409        390.0
+--------------------------------------------------------------------------------------------------------------
+B=16,S=4096,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                        7.512        2.460        9.972        220.5
+FA2_varlen                          6.223        1.787        8.008        274.6
+FA3_varlen                          3.563        1.929        5.483        401.1
+min_fa3_varlen                        N/A          N/A        4.065        540.9
+min_fa3_varlen_ring                   N/A          N/A        4.495        489.2
+min_fa3_varlen_mega_ring              N/A          N/A        4.538        484.5
+--------------------------------------------------------------------------------------------------------------
+B=16,S=8192,QH=32,KVH=8,D=128,causal=True
+Method                          Attn (ms)  Reduce (ms)    Time (ms)       TFLOPS
+PyTorch_SDPA                       28.008        5.105       33.054        266.1
+FA2_varlen                         24.060        3.634       27.705        317.5
+FA3_varlen                         13.579        3.982       17.554        501.1
+min_fa3_varlen                        N/A          N/A       15.506        567.3
+min_fa3_varlen_ring                   N/A          N/A       16.096        546.5
+min_fa3_varlen_mega_ring              N/A          N/A       16.273        540.5
+--------------------------------------------------------------------------------------------------------------
+Collecting data...
+Generating '/tmp/nsys-report-898a.qdstrm'
+[1/8] [0%                          ] my_report.nsys-rep[1/8] [0%                          ] my_report.nsys-rep[1/8] [0%                          ] my_report.nsys-rep[1/8] [5%                          ] my_report.nsys-rep[1/8] [13%                         ] my_report.nsys-rep[1/8] [===22%                      ] my_report.nsys-rep[1/8] [=====30%                    ] my_report.nsys-rep[1/8] [=======39%                  ] my_report.nsys-rep[1/8] [==========47%               ] my_report.nsys-rep[1/8] [============55%             ] my_report.nsys-rep[1/8] [==============64%           ] my_report.nsys-rep[1/8] [=================72%        ] my_report.nsys-rep[1/8] [===================80%      ] my_report.nsys-rep[1/8] [====================85%     ] my_report.nsys-rep[1/8] [========================100%] my_report.nsys-rep[1/8] [========================100%] my_report.nsys-rep
+[2/8] [0%                          ] my_report.sqlite[2/8] [1%                          ] my_report.sqlite[2/8] [2%                          ] my_report.sqlite[2/8] [3%                          ] my_report.sqlite[2/8] [4%                          ] my_report.sqlite[2/8] [5%                          ] my_report.sqlite[2/8] [6%                          ] my_report.sqlite[2/8] [7%                          ] my_report.sqlite[2/8] [8%                          ] my_report.sqlite[2/8] [9%                          ] my_report.sqlite[2/8] [10%                         ] my_report.sqlite[2/8] [11%                         ] my_report.sqlite[2/8] [12%                         ] my_report.sqlite[2/8] [13%                         ] my_report.sqlite[2/8] [14%                         ] my_report.sqlite[2/8] [=15%                        ] my_report.sqlite[2/8] [=16%                        ] my_report.sqlite[2/8] [=17%                        ] my_report.sqlite[2/8] [==18%                       ] my_report.sqlite[2/8] [==19%                       ] my_report.sqlite[2/8] [==20%                       ] my_report.sqlite[2/8] [==21%                       ] my_report.sqlite[2/8] [===22%                      ] my_report.sqlite[2/8] [===23%                      ] my_report.sqlite[2/8] [===24%                      ] my_report.sqlite[2/8] [====25%                     ] my_report.sqlite[2/8] [====26%                     ] my_report.sqlite[2/8] [====27%                     ] my_report.sqlite[2/8] [====28%                     ] my_report.sqlite[2/8] [=====29%                    ] my_report.sqlite[2/8] [=====30%                    ] my_report.sqlite[2/8] [=====31%                    ] my_report.sqlite[2/8] [=====32%                    ] my_report.sqlite[2/8] [======33%                   ] my_report.sqlite[2/8] [======34%                   ] my_report.sqlite[2/8] [======35%                   ] my_report.sqlite[2/8] [=======36%                  ] my_report.sqlite[2/8] [=======37%                  ] my_report.sqlite[2/8] [=======38%                  ] my_report.sqlite[2/8] [=======39%                  ] my_report.sqlite[2/8] [========40%                 ] my_report.sqlite[2/8] [========41%                 ] my_report.sqlite[2/8] [========42%                 ] my_report.sqlite[2/8] [=========43%                ] my_report.sqlite[2/8] [=========44%                ] my_report.sqlite[2/8] [=========45%                ] my_report.sqlite[2/8] [=========46%                ] my_report.sqlite[2/8] [==========47%               ] my_report.sqlite[2/8] [==========48%               ] my_report.sqlite[2/8] [==========49%               ] my_report.sqlite[2/8] [===========50%              ] my_report.sqlite[2/8] [===========51%              ] my_report.sqlite[2/8] [===========52%              ] my_report.sqlite[2/8] [===========53%              ] my_report.sqlite[2/8] [============54%             ] my_report.sqlite[2/8] [============55%             ] my_report.sqlite[2/8] [============56%             ] my_report.sqlite[2/8] [============57%             ] my_report.sqlite[2/8] [=============58%            ] my_report.sqlite[2/8] [=============59%            ] my_report.sqlite[2/8] [=============60%            ] my_report.sqlite[2/8] [==============61%           ] my_report.sqlite[2/8] [==============62%           ] my_report.sqlite[2/8] [==============63%           ] my_report.sqlite[2/8] [==============64%           ] my_report.sqlite[2/8] [===============65%          ] my_report.sqlite[2/8] [===============66%          ] my_report.sqlite[2/8] [===============67%          ] my_report.sqlite[2/8] [================68%         ] my_report.sqlite[2/8] [================69%         ] my_report.sqlite[2/8] [================70%         ] my_report.sqlite[2/8] [================71%         ] my_report.sqlite[2/8] [=================72%        ] my_report.sqlite[2/8] [=================73%        ] my_report.sqlite[2/8] [=================74%        ] my_report.sqlite[2/8] [==================75%       ] my_report.sqlite[2/8] [==================76%       ] my_report.sqlite[2/8] [==================77%       ] my_report.sqlite[2/8] [==================78%       ] my_report.sqlite[2/8] [===================79%      ] my_report.sqlite[2/8] [===================80%      ] my_report.sqlite[2/8] [===================81%      ] my_report.sqlite[2/8] [===================82%      ] my_report.sqlite[2/8] [====================83%     ] my_report.sqlite[2/8] [====================84%     ] my_report.sqlite[2/8] [====================85%     ] my_report.sqlite[2/8] [=====================86%    ] my_report.sqlite[2/8] [=====================87%    ] my_report.sqlite[2/8] [=====================88%    ] my_report.sqlite[2/8] [=====================89%    ] my_report.sqlite[2/8] [======================90%   ] my_report.sqlite[2/8] [======================91%   ] my_report.sqlite[2/8] [======================92%   ] my_report.sqlite[2/8] [=======================93%  ] my_report.sqlite[2/8] [=======================94%  ] my_report.sqlite[2/8] [=======================95%  ] my_report.sqlite[2/8] [=======================96%  ] my_report.sqlite[2/8] [========================97% ] my_report.sqlite[2/8] [========================98% ] my_report.sqlite[2/8] [========================99% ] my_report.sqlite[2/8] [========================100%] my_report.sqlite[2/8] [========================100%] my_report.sqlite
+[3/8] Executing 'nvtx_sum' stats report
+
+ Time (%)  Total Time (ns)  Instances     Avg (ns)         Med (ns)        Min (ns)       Max (ns)     StdDev (ns)   Style                                                  Range                                               
+ --------  ---------------  ---------  ---------------  ---------------  -------------  -------------  -----------  -------  ---------------------------------------------------------------------------------------------------
+     11.4    2,861,741,841          1  2,861,741,841.0  2,861,741,841.0  2,861,741,841  2,861,741,841          0.0  PushPop  :PyTorch_SDPA B=16,S=8192,QH=32,KVH=8,D=128,causal=False                                           
+     10.0    2,493,150,623          1  2,493,150,623.0  2,493,150,623.0  2,493,150,623  2,493,150,623          0.0  PushPop  :FA2_varlen B=16,S=8192,QH=32,KVH=8,D=128,causal=False                                             
+      6.6    1,655,352,520          1  1,655,352,520.0  1,655,352,520.0  1,655,352,520  1,655,352,520          0.0  PushPop  :PyTorch_SDPA B=16,S=8192,QH=32,KVH=8,D=128,causal=True                                            
+      6.4    1,594,482,098          1  1,594,482,098.0  1,594,482,098.0  1,594,482,098  1,594,482,098          0.0  PushPop  :FA3_varlen B=16,S=8192,QH=32,KVH=8,D=128,causal=False                                             
+      6.2    1,555,738,201          1  1,555,738,201.0  1,555,738,201.0  1,555,738,201  1,555,738,201          0.0  PushPop  :min_fa3_varlen_mega_ring B=16,S=8192,QH=32,KVH=8,D=128,causal=False,num_comp_sm=116,num_comm_sm=16
+      6.2    1,548,388,518          1  1,548,388,518.0  1,548,388,518.0  1,548,388,518  1,548,388,518          0.0  PushPop  :min_fa3_varlen_ring B=16,S=8192,QH=32,KVH=8,D=128,causal=False,num_comp_sm=116,num_comm_sm=16     
+      5.9    1,469,858,512          1  1,469,858,512.0  1,469,858,512.0  1,469,858,512  1,469,858,512          0.0  PushPop  :min_fa3_varlen B=16,S=8192,QH=32,KVH=8,D=128,causal=False,manual_block_count=116                  
+      5.5    1,388,937,100          1  1,388,937,100.0  1,388,937,100.0  1,388,937,100  1,388,937,100          0.0  PushPop  :FA2_varlen B=16,S=8192,QH=32,KVH=8,D=128,causal=True                                              
+      3.5      881,890,137          1    881,890,137.0    881,890,137.0    881,890,137    881,890,137          0.0  PushPop  :FA3_varlen B=16,S=8192,QH=32,KVH=8,D=128,causal=True                                              
+      3.3      815,041,635          1    815,041,635.0    815,041,635.0    815,041,635    815,041,635          0.0  PushPop  :min_fa3_varlen_mega_ring B=16,S=8192,QH=32,KVH=8,D=128,causal=True,num_comp_sm=116,num_comm_sm=16 
+      3.2      807,422,586          1    807,422,586.0    807,422,586.0    807,422,586    807,422,586          0.0  PushPop  :PyTorch_SDPA B=16,S=4096,QH=32,KVH=8,D=128,causal=False                                           
+      3.2      803,368,149          1    803,368,149.0    803,368,149.0    803,368,149    803,368,149          0.0  PushPop  :min_fa3_varlen_ring B=16,S=8192,QH=32,KVH=8,D=128,causal=True,num_comp_sm=116,num_comm_sm=16      
+      3.1      774,762,112          1    774,762,112.0    774,762,112.0    774,762,112    774,762,112          0.0  PushPop  :min_fa3_varlen B=16,S=8192,QH=32,KVH=8,D=128,causal=True,manual_block_count=116                   
+      2.7      671,128,920          1    671,128,920.0    671,128,920.0    671,128,920    671,128,920          0.0  PushPop  :FA2_varlen B=16,S=4096,QH=32,KVH=8,D=128,causal=False                                             
+      2.0      507,785,509          1    507,785,509.0    507,785,509.0    507,785,509    507,785,509          0.0  PushPop  :PyTorch_SDPA B=16,S=4096,QH=32,KVH=8,D=128,causal=True                                            
+      1.8      455,938,489          1    455,938,489.0    455,938,489.0    455,938,489    455,938,489          0.0  PushPop  :FA3_varlen B=16,S=4096,QH=32,KVH=8,D=128,causal=False                                             
+      1.7      417,947,365          1    417,947,365.0    417,947,365.0    417,947,365    417,947,365          0.0  PushPop  :min_fa3_varlen_mega_ring B=16,S=4096,QH=32,KVH=8,D=128,causal=False,num_comp_sm=116,num_comm_sm=16
+      1.7      416,995,051          1    416,995,051.0    416,995,051.0    416,995,051    416,995,051          0.0  PushPop  :min_fa3_varlen_ring B=16,S=4096,QH=32,KVH=8,D=128,causal=False,num_comp_sm=116,num_comm_sm=16     
+      1.6      400,970,573          1    400,970,573.0    400,970,573.0    400,970,573    400,970,573          0.0  PushPop  :FA2_varlen B=16,S=4096,QH=32,KVH=8,D=128,causal=True                                              
+      1.5      384,968,579          1    384,968,579.0    384,968,579.0    384,968,579    384,968,579          0.0  PushPop  :min_fa3_varlen B=16,S=4096,QH=32,KVH=8,D=128,causal=False,manual_block_count=116                  
+      1.1      274,981,857          1    274,981,857.0    274,981,857.0    274,981,857    274,981,857          0.0  PushPop  :FA3_varlen B=16,S=4096,QH=32,KVH=8,D=128,causal=True                                              
+      1.0      244,465,841          1    244,465,841.0    244,465,841.0    244,465,841    244,465,841          0.0  PushPop  :PyTorch_SDPA B=16,S=2048,QH=32,KVH=8,D=128,causal=False                                           
+      0.9      227,267,168          1    227,267,168.0    227,267,168.0    227,267,168    227,267,168          0.0  PushPop  :min_fa3_varlen_mega_ring B=16,S=4096,QH=32,KVH=8,D=128,causal=True,num_comp_sm=116,num_comm_sm=16 
+      0.9      225,744,586          1    225,744,586.0    225,744,586.0    225,744,586    225,744,586          0.0  PushPop  :min_fa3_varlen_ring B=16,S=4096,QH=32,KVH=8,D=128,causal=True,num_comp_sm=116,num_comm_sm=16      
+      0.8      204,623,175          1    204,623,175.0    204,623,175.0    204,623,175    204,623,175          0.0  PushPop  :min_fa3_varlen B=16,S=4096,QH=32,KVH=8,D=128,causal=True,manual_block_count=116                   
+      0.8      188,612,768          1    188,612,768.0    188,612,768.0    188,612,768    188,612,768          0.0  PushPop  :FA2_varlen B=16,S=2048,QH=32,KVH=8,D=128,causal=False                                             
+      0.7      179,113,730          1    179,113,730.0    179,113,730.0    179,113,730    179,113,730          0.0  PushPop  :PyTorch_SDPA B=16,S=2048,QH=32,KVH=8,D=128,causal=True                                            
+      0.6      142,830,720          1    142,830,720.0    142,830,720.0    142,830,720    142,830,720          0.0  PushPop  :FA3_varlen B=16,S=2048,QH=32,KVH=8,D=128,causal=False                                             
+      0.5      126,746,949          1    126,746,949.0    126,746,949.0    126,746,949    126,746,949          0.0  PushPop  :FA2_varlen B=16,S=2048,QH=32,KVH=8,D=128,causal=True                                              
+      0.5      114,440,641          1    114,440,641.0    114,440,641.0    114,440,641    114,440,641          0.0  PushPop  :min_fa3_varlen_mega_ring B=16,S=2048,QH=32,KVH=8,D=128,causal=False,num_comp_sm=116,num_comm_sm=16
+      0.4      112,092,530          1    112,092,530.0    112,092,530.0    112,092,530    112,092,530          0.0  PushPop  :min_fa3_varlen_ring B=16,S=2048,QH=32,KVH=8,D=128,causal=False,num_comp_sm=116,num_comm_sm=16     
+      0.4      102,964,848          1    102,964,848.0    102,964,848.0    102,964,848    102,964,848          0.0  PushPop  :min_fa3_varlen B=16,S=2048,QH=32,KVH=8,D=128,causal=False,manual_block_count=116                  
+      0.4       97,206,320          1     97,206,320.0     97,206,320.0     97,206,320     97,206,320          0.0  PushPop  :FA3_varlen B=16,S=2048,QH=32,KVH=8,D=128,causal=True                                              
+      0.3       87,260,442          1     87,260,442.0     87,260,442.0     87,260,442     87,260,442          0.0  PushPop  :PyTorch_SDPA B=16,S=1024,QH=32,KVH=8,D=128,causal=False                                           
+      0.3       73,018,371          1     73,018,371.0     73,018,371.0     73,018,371     73,018,371          0.0  PushPop  :PyTorch_SDPA B=16,S=1024,QH=32,KVH=8,D=128,causal=True                                            
+      0.3       70,795,458          1     70,795,458.0     70,795,458.0     70,795,458     70,795,458          0.0  PushPop  :min_fa3_varlen_mega_ring B=16,S=2048,QH=32,KVH=8,D=128,causal=True,num_comp_sm=116,num_comm_sm=16 
+      0.3       70,138,015          1     70,138,015.0     70,138,015.0     70,138,015     70,138,015          0.0  PushPop  :min_fa3_varlen_ring B=16,S=2048,QH=32,KVH=8,D=128,causal=True,num_comp_sm=116,num_comm_sm=16      
+      0.2       60,574,865          1     60,574,865.0     60,574,865.0     60,574,865     60,574,865          0.0  PushPop  :min_fa3_varlen B=16,S=2048,QH=32,KVH=8,D=128,causal=True,manual_block_count=116                   
+      0.2       59,667,274          1     59,667,274.0     59,667,274.0     59,667,274     59,667,274          0.0  PushPop  :FA2_varlen B=16,S=1024,QH=32,KVH=8,D=128,causal=False                                             
+      0.2       48,095,284          1     48,095,284.0     48,095,284.0     48,095,284     48,095,284          0.0  PushPop  :FA3_varlen B=16,S=1024,QH=32,KVH=8,D=128,causal=False                                             
+      0.2       47,994,347          1     47,994,347.0     47,994,347.0     47,994,347     47,994,347          0.0  PushPop  :FA2_varlen B=16,S=1024,QH=32,KVH=8,D=128,causal=True                                              
+      0.2       38,591,344          1     38,591,344.0     38,591,344.0     38,591,344     38,591,344          0.0  PushPop  :FA3_varlen B=16,S=1024,QH=32,KVH=8,D=128,causal=True                                              
+      0.1       34,948,676          1     34,948,676.0     34,948,676.0     34,948,676     34,948,676          0.0  PushPop  :min_fa3_varlen_mega_ring B=16,S=1024,QH=32,KVH=8,D=128,causal=False,num_comp_sm=116,num_comm_sm=16
+      0.1       34,328,360          1     34,328,360.0     34,328,360.0     34,328,360     34,328,360          0.0  PushPop  :min_fa3_varlen_ring B=16,S=1024,QH=32,KVH=8,D=128,causal=False,num_comp_sm=116,num_comm_sm=16     
+      0.1       27,867,904          1     27,867,904.0     27,867,904.0     27,867,904     27,867,904          0.0  PushPop  :PyTorch_SDPA B=16,S=512,QH=32,KVH=8,D=128,causal=False                                            
+      0.1       26,835,753          1     26,835,753.0     26,835,753.0     26,835,753     26,835,753          0.0  PushPop  :PyTorch_SDPA B=16,S=512,QH=32,KVH=8,D=128,causal=True                                             
+      0.1       25,958,447          1     25,958,447.0     25,958,447.0     25,958,447     25,958,447          0.0  PushPop  :min_fa3_varlen B=16,S=1024,QH=32,KVH=8,D=128,causal=False,manual_block_count=116                  
+      0.1       25,144,921          1     25,144,921.0     25,144,921.0     25,144,921     25,144,921          0.0  PushPop  :min_fa3_varlen_mega_ring B=16,S=1024,QH=32,KVH=8,D=128,causal=True,num_comp_sm=116,num_comm_sm=16 
+      0.1       23,668,728          1     23,668,728.0     23,668,728.0     23,668,728     23,668,728          0.0  PushPop  :min_fa3_varlen_ring B=16,S=1024,QH=32,KVH=8,D=128,causal=True,num_comp_sm=116,num_comm_sm=16      
+      0.1       18,850,761          1     18,850,761.0     18,850,761.0     18,850,761     18,850,761          0.0  PushPop  :FA2_varlen B=16,S=512,QH=32,KVH=8,D=128,causal=False                                              
+      0.1       18,155,610          1     18,155,610.0     18,155,610.0     18,155,610     18,155,610          0.0  PushPop  :FA2_varlen B=16,S=512,QH=32,KVH=8,D=128,causal=True                                               
+      0.1       16,913,315          1     16,913,315.0     16,913,315.0     16,913,315     16,913,315          0.0  PushPop  :FA3_varlen B=16,S=512,QH=32,KVH=8,D=128,causal=False                                              
+      0.1       16,582,542          1     16,582,542.0     16,582,542.0     16,582,542     16,582,542          0.0  PushPop  :min_fa3_varlen B=16,S=1024,QH=32,KVH=8,D=128,causal=True,manual_block_count=116                   
+      0.1       14,591,038          1     14,591,038.0     14,591,038.0     14,591,038     14,591,038          0.0  PushPop  :FA3_varlen B=16,S=512,QH=32,KVH=8,D=128,causal=True                                               
+      0.1       13,113,328          1     13,113,328.0     13,113,328.0     13,113,328     13,113,328          0.0  PushPop  :min_fa3_varlen_mega_ring B=16,S=512,QH=32,KVH=8,D=128,causal=False,num_comp_sm=116,num_comm_sm=16 
+      0.0       12,028,850          1     12,028,850.0     12,028,850.0     12,028,850     12,028,850          0.0  PushPop  :min_fa3_varlen_ring B=16,S=512,QH=32,KVH=8,D=128,causal=False,num_comp_sm=116,num_comm_sm=16      
+      0.0       10,701,445          1     10,701,445.0     10,701,445.0     10,701,445     10,701,445          0.0  PushPop  :min_fa3_varlen_mega_ring B=16,S=512,QH=32,KVH=8,D=128,causal=True,num_comp_sm=116,num_comm_sm=16  
+      0.0       10,038,452          1     10,038,452.0     10,038,452.0     10,038,452     10,038,452          0.0  PushPop  :min_fa3_varlen_ring B=16,S=512,QH=32,KVH=8,D=128,causal=True,num_comp_sm=116,num_comm_sm=16       
+      0.0        8,803,145          1      8,803,145.0      8,803,145.0      8,803,145      8,803,145          0.0  PushPop  :min_fa3_varlen B=16,S=512,QH=32,KVH=8,D=128,causal=False,manual_block_count=116                   
+      0.0        6,501,079          1      6,501,079.0      6,501,079.0      6,501,079      6,501,079          0.0  PushPop  :min_fa3_varlen B=16,S=512,QH=32,KVH=8,D=128,causal=True,manual_block_count=116                    
+
+[4/8] Executing 'osrt_sum' stats report
+
+ Time (%)  Total Time (ns)  Num Calls    Avg (ns)      Med (ns)     Min (ns)    Max (ns)    StdDev (ns)            Name         
+ --------  ---------------  ---------  ------------  -------------  ---------  -----------  ------------  ----------------------
+     97.6   53,042,409,142        538  98,591,838.6  100,111,440.5      1,218  482,287,439  21,768,049.0  poll                  
+      2.1    1,122,426,800      1,829     613,683.3       19,699.0      1,040   71,349,245   4,977,902.2  ioctl                 
+      0.1       59,308,256      2,391      24,804.8        5,130.0      1,003    1,144,212      45,943.8  open64                
+      0.1       53,666,432         73     735,156.6        2,134.0      1,195   19,445,031   3,569,232.8  fopen                 
+      0.0       19,040,321      2,214       8,600.0        3,531.5      1,021      224,771      15,157.5  read                  
+      0.0       18,451,953         14   1,317,996.6        2,964.0      1,253   18,410,377   4,919,525.8  open                  
+      0.0        5,056,769          1   5,056,769.0    5,056,769.0  5,056,769    5,056,769           0.0  nanosleep             
+      0.0        4,157,774      2,692       1,544.5        1,147.0      1,000       19,661       1,249.8  munmap                
+      0.0        3,140,744        327       9,604.7        2,549.0      1,001    1,804,733     100,253.7  mmap64                
+      0.0        2,041,243        198      10,309.3        9,773.5      1,891       41,722       3,560.1  fgets                 
+      0.0          285,996          5      57,199.2       57,309.0     55,545       58,581       1,222.5  sleep                 
+      0.0          269,857         11      24,532.5       25,601.0     17,327       30,228       4,253.5  sem_timedwait         
+      0.0          259,635         78       3,328.7        2,252.0      1,024       49,170       5,617.0  mmap                  
+      0.0          150,328         25       6,013.1        5,357.0      1,449       16,368       3,501.9  write                 
+      0.0          119,968          2      59,984.0       59,984.0     59,528       60,440         644.9  pthread_create        
+      0.0           71,804          1      71,804.0       71,804.0     71,804       71,804           0.0  pthread_cond_wait     
+      0.0           49,242         30       1,641.4        1,164.5      1,001        6,457       1,322.0  fclose                
+      0.0           38,238          7       5,462.6        3,590.0      2,696       13,614       3,867.2  fopen64               
+      0.0           26,373          8       3,296.6        2,311.0      1,079       10,155       2,999.5  pthread_cond_signal   
+      0.0           23,825          3       7,941.7        5,514.0      2,858       15,453       6,639.2  fread                 
+      0.0           20,183          2      10,091.5       10,091.5      1,604       18,579      12,003.1  bind                  
+      0.0           17,749          3       5,916.3        5,919.0      5,277        6,553         638.0  socket                
+      0.0           10,026          3       3,342.0        3,768.0      1,909        4,349       1,274.6  pipe2                 
+      0.0            7,527          1       7,527.0        7,527.0      7,527        7,527           0.0  connect               
+      0.0            5,979          2       2,989.5        2,989.5      1,670        4,309       1,866.1  fwrite                
+      0.0            5,351          2       2,675.5        2,675.5      1,867        3,484       1,143.4  pthread_cond_broadcast
+      0.0            4,312          1       4,312.0        4,312.0      4,312        4,312           0.0  ftruncate             
+      0.0            4,178          2       2,089.0        2,089.0      1,682        2,496         575.6  signal                
+      0.0            2,612          2       1,306.0        1,306.0      1,127        1,485         253.1  pthread_mutex_trylock 
+      0.0            2,565          2       1,282.5        1,282.5      1,038        1,527         345.8  sigaction             
+
+[5/8] Executing 'cuda_api_sum' stats report
+
+ Time (%)  Total Time (ns)  Num Calls    Avg (ns)       Med (ns)     Min (ns)     Max (ns)      StdDev (ns)                 Name               
+ --------  ---------------  ---------  -------------  -------------  ---------  -------------  -------------  ---------------------------------
+     98.3   49,363,627,943        120  411,363,566.2  110,160,110.5  3,545,937  2,852,235,662  627,815,962.0  cudaDeviceSynchronize            
+      1.1      557,018,972         92    6,054,554.0      282,729.5     82,452    188,469,515   25,371,721.2  cudaFree                         
+      0.3      136,417,403     24,144        5,650.2        3,150.0      2,520     13,651,209      142,041.0  cudaLaunchKernel                 
+      0.1       27,576,915         96      287,259.5      173,431.0     81,564      5,238,273      553,450.0  cudaMalloc                       
+      0.1       25,787,856      7,500        3,438.4        3,198.0      2,412        626,351        7,350.1  cudaEventRecordWithFlags_v11010  
+      0.0       20,473,992         20    1,023,699.6    1,051,219.5    766,442      1,273,480      166,188.7  cuMemExportToShareableHandle     
+      0.0       19,183,934     12,000        1,598.7        1,516.0      1,418         11,686          329.8  cudaEventQuery                   
+      0.0       13,757,464      4,000        3,439.4        3,189.0      2,600         18,731          913.3  cudaLaunchKernelExC_v11060       
+      0.0       11,211,376      2,996        3,742.1        3,611.5      2,802         18,229          998.8  cuLaunchKernel                   
+      0.0        8,965,381         20      448,269.0      268,610.5     58,319      1,108,371      404,348.0  cuMemSetAccess                   
+      0.0        7,498,830         20      374,941.5       78,503.0     16,605      3,817,154      916,850.6  cuMemCreate                      
+      0.0        7,369,542          3    2,456,514.0    2,779,483.0  1,372,532      3,217,527      963,967.5  cudaGetDeviceProperties_v2_v12000
+      0.0        6,754,416      7,500          900.6          768.0        456        102,830        1,581.6  cudaEventCreateWithFlags         
+      0.0        4,232,903      7,500          564.4          364.0        306        740,886        9,212.1  cudaEventDestroy                 
+      0.0        4,160,256     20,000          208.0          194.0        176          2,427           62.2  cudaGetDriverEntryPoint_v11030   
+      0.0        3,575,870     28,000          127.7          118.0        100          4,234           55.5  cuTensorMapEncodeTiled           
+      0.0        2,702,951      7,796          346.7          322.0        247          7,802          190.8  cudaStreamIsCapturing_v10000     
+      0.0        2,147,808         20      107,390.4       94,902.0     66,664        305,567       52,949.9  cuMemUnmap                       
+      0.0        2,054,942         40       51,373.6        5,766.0      2,287        569,094      133,959.9  cudaStreamSynchronize            
+      0.0          211,918          4       52,979.5       54,318.0     46,978         56,304        4,275.3  cuModuleLoadData                 
+      0.0          199,228         20        9,961.4        8,164.5      3,982         24,727        6,909.0  cudaMemcpyAsync                  
+      0.0          111,404         20        5,570.2        4,757.0      1,685         19,213        4,037.5  cuMemAddressReserve              
+      0.0           69,163         20        3,458.2        2,223.0      1,194          8,020        2,390.7  cuMemAddressFree                 
+      0.0           59,158         20        2,957.9        2,482.0      1,752          7,858        1,407.8  cuMemMap                         
+      0.0            8,837         20          441.9          425.0        314            803          113.1  cuMemRetainAllocationHandle      
+      0.0            8,220         40          205.5          178.5        104            456           86.4  cuMemRelease                     
+      0.0            5,593         20          279.6          242.5        133            534          115.2  cuMemGetAllocationGranularity    
+      0.0            1,127          1        1,127.0        1,127.0      1,127          1,127            0.0  cuModuleGetLoadingMode           
+
+[6/8] Executing 'cuda_gpu_kern_sum' stats report
+
+ Time (%)  Total Time (ns)  Instances    Avg (ns)     Med (ns)    Min (ns)   Max (ns)   StdDev (ns)                                                   Name                                                
+ --------  ---------------  ---------  ------------  -----------  --------  ----------  ------------  ----------------------------------------------------------------------------------------------------
+     13.2    6,610,554,039        500  13,221,108.1  3,043,232.0   221,537  52,268,208  18,744,128.1  void pytorch_flash::flash_fwd_kernel<Flash_fwd_kernel_traits<(int)128, (int)128, (int)64, (int)4, (…
+     12.3    6,158,994,463        500  12,317,988.9  2,869,103.0   203,457  46,751,572  17,442,597.7  void flash::flash_fwd_kernel<Flash_fwd_kernel_traits<(int)128, (int)128, (int)64, (int)4, (bool)0, …
+      9.5    4,730,040,813      2,996   1,578,785.3    913,893.0   139,329   5,420,669   1,498,934.3  fused_to_sub_sigmoid_sub_mul_sub                                                                    
+      8.4    4,194,752,250        500   8,389,504.5  2,160,283.0   214,049  31,244,356  11,556,934.1  void min_fa3_varlen_demo::mega_ring_detail::mega_ring_flash_attn_varlen_kernel<min_fa3_varlen_demo:…
+      8.3    4,174,294,310        500   8,348,588.6  2,147,691.0   200,961  31,698,086  11,511,788.6  void min_fa3_varlen_demo::ring_detail::ring_flash_attn_varlen_kernel<min_fa3_varlen_demo::ring_deta…
+      8.0    3,980,089,966        500   7,960,179.9  2,045,275.0   160,480  29,617,116  11,064,517.0  void cutlass::device_kernel<flash::enable_sm90<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwd…
+      7.5    3,766,648,673        500   7,533,297.3  1,958,106.0   164,640  29,076,152  10,480,062.8  void cutlass::device_kernel<flash::enable_sm90<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwd…
+      6.9    3,437,461,176        500   6,874,922.4  1,738,825.5   182,913  27,821,298   9,584,475.3  void pytorch_flash::flash_fwd_kernel<Flash_fwd_kernel_traits<(int)128, (int)128, (int)64, (int)4, (…
+      6.5    3,264,971,065        500   6,529,942.1  1,642,456.5   184,833  24,734,306   9,045,429.4  void flash::flash_fwd_kernel<Flash_fwd_kernel_traits<(int)128, (int)128, (int)64, (int)4, (bool)0, …
+      4.5    2,227,887,242        500   4,455,774.5  1,319,943.0   169,537  16,412,887   5,949,183.4  void min_fa3_varlen_demo::mega_ring_detail::mega_ring_flash_attn_varlen_kernel<min_fa3_varlen_demo:…
+      4.4    2,198,089,188        500   4,396,178.4  1,310,246.5   158,177  15,891,987   5,860,448.8  void min_fa3_varlen_demo::ring_detail::ring_flash_attn_varlen_kernel<min_fa3_varlen_demo::ring_deta…
+      4.2    2,114,319,226        500   4,228,638.5  1,188,214.5   115,553  15,979,764   5,805,410.0  void cutlass::device_kernel<flash::enable_sm90<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwd…
+      3.7    1,865,016,570        500   3,730,033.1  1,003,909.5   117,985  14,205,002   5,106,606.0  void cutlass::device_kernel<flash::enable_sm90<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwd…
+      1.8      924,957,302      2,030     455,644.0    295,041.0    25,793   1,656,009     402,286.2  void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::n…
+      0.5      246,324,139      2,000     123,162.1     79,936.0    20,256     316,865     107,383.6  void at::native::vectorized_elementwise_kernel<(int)8, at::native::FillFunctor<c10::BFloat16>, std:…
+      0.1       39,467,154      3,010      13,112.0      8,896.0     3,808     254,850      12,500.4  void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::n…
+      0.0       14,941,137         60     249,019.0     46,880.0     4,832   1,372,551     394,089.4  void at::native::<unnamed>::distribution_elementwise_grid_stride_kernel<float, (int)4, void at::nat…
+      0.0       12,723,052      3,002       4,238.2      2,432.0     1,376     184,961       5,062.1  void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctor_add<float>, std::arr…
+      0.0       11,588,023      3,000       3,862.7      2,912.0     1,664       9,344       2,302.6  void at::native::vectorized_elementwise_kernel<(int)4, at::native::launch_log_sigmoid_forward_kerne…
+      0.0       10,318,943      3,000       3,439.6      3,424.0     2,528       4,640         301.2  void min_fa3_varlen_detail::prepare_varlen_num_blocks_kernel<(int)1, (bool)1>(int, int, int, const …
+      0.0        7,628,010         30     254,267.0    157,377.0    22,144   1,397,608     332,939.1  void at::native::<unnamed>::distribution_elementwise_grid_stride_kernel<float, (int)4, void at::nat…
+      0.0        4,735,194      2,000       2,367.6      1,824.0       992       6,016       1,321.4  void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<float>, std::array<c…
+      0.0        3,583,371      1,000       3,583.4      3,584.0     2,816       4,672         281.4  void flash::prepare_varlen_num_blocks_kernel<(int)1, (bool)1>(int, int, int, const int *, const int…
+      0.0        1,584,899      2,000         792.4        768.0       640       1,696          88.4  void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<int>, std::array<cha…
+      0.0          673,732          4     168,433.0    166,993.0   110,145     229,601      64,059.7  void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::n…
+      0.0          671,555      1,000         671.6        672.0       544       1,408          68.4  <unnamed>::set_mega_ring_local_kv_ready_count(int *, int, int)                                      
+      0.0          588,740          4     147,185.0    147,169.0    98,497     195,905      56,201.6  void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIterator…
+      0.0            7,616          4       1,904.0      1,936.0     1,760       1,984          99.5  void at::native::vectorized_elementwise_kernel<(int)4, at::native::sigmoid_kernel_cuda(at::TensorIt…
+
+[7/8] Executing 'cuda_gpu_mem_time_sum' stats report
+
+ Time (%)  Total Time (ns)  Count  Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)           Operation          
+ --------  ---------------  -----  --------  --------  --------  --------  -----------  ----------------------------
+    100.0           18,432     20     921.6     768.0       736     1,344        209.3  [CUDA memcpy Host-to-Device]
+
+[8/8] Executing 'cuda_gpu_mem_size_sum' stats report
+
+ Total (MB)  Count  Avg (MB)  Med (MB)  Min (MB)  Max (MB)  StdDev (MB)           Operation          
+ ----------  -----  --------  --------  --------  --------  -----------  ----------------------------
+      0.001     20     0.000     0.000     0.000     0.000        0.000  [CUDA memcpy Host-to-Device]
+
+Generated:
+    /data/run01/scyb683/min_fa3_demo/my_report.nsys-rep
+    /data/run01/scyb683/min_fa3_demo/my_report.sqlite

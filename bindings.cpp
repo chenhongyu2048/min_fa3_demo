@@ -52,6 +52,15 @@ void check_cu_seqlens(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.numel() >= 2, name, " must have shape [B + 1] with B >= 1");
 }
 
+void check_cu_seqlens_host(const torch::Tensor& t, const torch::Tensor& device_t, const char* name) {
+    TORCH_CHECK(!t.is_cuda(), name, " must be a CPU tensor");
+    TORCH_CHECK(t.scalar_type() == torch::kInt32, name, " must have dtype torch.int32");
+    TORCH_CHECK(t.dim() == 1, name, " must be 1D");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(t.numel() == device_t.numel(),
+                name, " must have the same length as its CUDA cu_seqlens tensor");
+}
+
 std::optional<int> parse_manual_block_count(py::object manual_block_count_obj) {
     if (manual_block_count_obj.is_none()) {
         return std::nullopt;
@@ -268,6 +277,8 @@ torch::Tensor forward_varlen(torch::Tensor q,
                              torch::Tensor v,
                              torch::Tensor cu_seqlens_q,
                              torch::Tensor cu_seqlens_k,
+                             torch::Tensor cu_seqlens_q_host,
+                             torch::Tensor cu_seqlens_k_host,
                              int64_t max_seqlen_q,
                              int64_t max_seqlen_k,
                              bool is_causal,
@@ -278,6 +289,8 @@ torch::Tensor forward_varlen(torch::Tensor q,
     check_varlen_qkv(v, "v");
     check_cu_seqlens(cu_seqlens_q, "cu_seqlens_q");
     check_cu_seqlens(cu_seqlens_k, "cu_seqlens_k");
+    check_cu_seqlens_host(cu_seqlens_q_host, cu_seqlens_q, "cu_seqlens_q_host");
+    check_cu_seqlens_host(cu_seqlens_k_host, cu_seqlens_k, "cu_seqlens_k_host");
 
     TORCH_CHECK(q.device() == k.device() && q.device() == v.device(), "q, k, v must be on the same CUDA device");
     TORCH_CHECK(q.device() == cu_seqlens_q.device() && q.device() == cu_seqlens_k.device(),
@@ -298,15 +311,17 @@ torch::Tensor forward_varlen(torch::Tensor q,
                 "min_fa3_demo only supports Hopper SM90. Current device capability is ",
                 props->major, ".", props->minor);
 
-    int batch_size = cu_seqlens_q.size(0) - 1;
+    int batch_size = cu_seqlens_q_host.size(0) - 1;
+    int const* cu_seqlens_q_host_ptr = cu_seqlens_q_host.data_ptr<int>();
+    int const* cu_seqlens_k_host_ptr = cu_seqlens_k_host.data_ptr<int>();
     TORCH_CHECK(batch_size >= 1, "varlen demo requires batch size B >= 1");
-    TORCH_CHECK(cu_seqlens_q[0].item<int>() == 0, "cu_seqlens_q must start with 0");
-    TORCH_CHECK(cu_seqlens_k[0].item<int>() == 0, "cu_seqlens_k must start with 0");
-    TORCH_CHECK(cu_seqlens_q[batch_size].item<int>() == q.size(0),
-                "cu_seqlens_q[-1] must equal q.size(0). Got ", cu_seqlens_q[batch_size].item<int>(),
+    TORCH_CHECK(cu_seqlens_q_host_ptr[0] == 0, "cu_seqlens_q_host must start with 0");
+    TORCH_CHECK(cu_seqlens_k_host_ptr[0] == 0, "cu_seqlens_k_host must start with 0");
+    TORCH_CHECK(cu_seqlens_q_host_ptr[batch_size] == q.size(0),
+                "cu_seqlens_q_host[-1] must equal q.size(0). Got ", cu_seqlens_q_host_ptr[batch_size],
                 " vs ", q.size(0));
-    TORCH_CHECK(cu_seqlens_k[batch_size].item<int>() == k.size(0),
-                "cu_seqlens_k[-1] must equal k.size(0). Got ", cu_seqlens_k[batch_size].item<int>(),
+    TORCH_CHECK(cu_seqlens_k_host_ptr[batch_size] == k.size(0),
+                "cu_seqlens_k_host[-1] must equal k.size(0). Got ", cu_seqlens_k_host_ptr[batch_size],
                 " vs ", k.size(0));
 
     auto out = torch::empty_like(q);
@@ -376,6 +391,8 @@ PYBIND11_MODULE(_min_fa3_op, m) {
         py::arg("v"),
         py::arg("cu_seqlens_q"),
         py::arg("cu_seqlens_k"),
+        py::arg("cu_seqlens_q_host"),
+        py::arg("cu_seqlens_k_host"),
         py::arg("max_seqlen_q"),
         py::arg("max_seqlen_k"),
         py::arg("is_causal"),

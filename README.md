@@ -192,6 +192,7 @@ Mega-ring local varlen benchmark:
 python benchmark_varlen_mega_ring_local.py
 python benchmark_varlen_mega_ring_local.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 0 --mode both
 python benchmark_varlen_mega_ring_local.py --b 4 --seqlen 1024 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 4 --mode causal
+nsys profile -t cuda,nvtx,osrt -o my_report --stats=true python benchmark_varlen_mega_ring_local.py --profile --b 16 --seqlen 1024 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 116 --num-comm-sm 16 --mode noncausal
 ```
 
 Remote load benchmark:
@@ -245,14 +246,27 @@ import min_fa3_op
 
 batch_size = 2
 seqlen = 128
-cu_seqlens_q = torch.tensor([0, 128, 256], device="cuda", dtype=torch.int32)
-cu_seqlens_k = torch.tensor([0, 128, 256], device="cuda", dtype=torch.int32)
+cu_seqlens_q_host = torch.tensor([0, 128, 256], dtype=torch.int32)
+cu_seqlens_k_host = torch.tensor([0, 128, 256], dtype=torch.int32)
+cu_seqlens_q = cu_seqlens_q_host.to(device="cuda")
+cu_seqlens_k = cu_seqlens_k_host.to(device="cuda")
 
 q = torch.randn(batch_size * seqlen, 16, 128, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(batch_size * seqlen, 8, 128, device="cuda", dtype=torch.bfloat16)
 v = torch.randn(batch_size * seqlen, 8, 128, device="cuda", dtype=torch.bfloat16)
 
-o = min_fa3_op.forward_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen, seqlen, False)
+o = min_fa3_op.forward_varlen(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    seqlen,
+    seqlen,
+    False,
+    cu_seqlens_q_host=cu_seqlens_q_host,
+    cu_seqlens_k_host=cu_seqlens_k_host,
+)
 print(o.shape)
 ```
 
@@ -282,6 +296,8 @@ o = min_fa3_op.forward_varlen_ring(
     128,
     128,
     False,
+    cu_seqlens_q_host=cu_seqlens_q_host,
+    cu_seqlens_k_host=cu_seqlens_k_host,
     remote_k=remote_k,
     remote_v=remote_v,
     src_rank=0,
@@ -311,6 +327,6 @@ Behavior:
 ## Current limitations
 
 - The demo currently requires contiguous BSHD tensors.
-- The varlen demo currently requires contiguous flattened `[total_tokens, H, D]` tensors and CUDA `int32` `cu_seqlens`.
+- The varlen demo currently requires contiguous flattened `[total_tokens, H, D]` tensors, CUDA `int32` `cu_seqlens`, and matching CPU `int32` host copies of `cu_seqlens`.
 - The output LSE is allocated internally and not exposed.
 - The demo fixes cluster size to `1` to keep the standalone launch path small while preserving the original SM90 forward mainloop and kernel structure.

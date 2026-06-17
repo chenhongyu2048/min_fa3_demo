@@ -11,7 +11,7 @@ from _min_fa3_op import (
     parallel_remote_load_out as _parallel_remote_load_out_cuda,
     parallel_remote_load_vec_out as _parallel_remote_load_vec_out_cuda,
     forward,
-    forward_varlen,
+    forward_varlen as _forward_varlen_cuda,
     forward_varlen_mega_ring as _forward_varlen_mega_ring_cuda,
     forward_varlen_ring as _forward_varlen_ring_cuda,
     parallel_remote_load as _parallel_remote_load_cuda,
@@ -155,6 +155,35 @@ def parallel_remote_load_vec(
     return _parallel_remote_load_vec_cuda(parallel_input, int(src_rank), int(num_blocks))
 
 
+def forward_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_causal: bool,
+    *,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
+    manual_block_count: Optional[int] = None,
+) -> torch.Tensor:
+    return _forward_varlen_cuda(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_q_host,
+        cu_seqlens_k_host,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        bool(is_causal),
+        manual_block_count=manual_block_count,
+    )
+
+
 def forward_varlen_ring(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -165,6 +194,8 @@ def forward_varlen_ring(
     max_seqlen_k: int,
     is_causal: bool,
     *,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
     remote_k: TKParallelTensor,
     remote_v: TKParallelTensor,
     src_rank: int,
@@ -185,6 +216,8 @@ def forward_varlen_ring(
         remote_v,
         cu_seqlens_q,
         cu_seqlens_k,
+        cu_seqlens_q_host,
+        cu_seqlens_k_host,
         int(max_seqlen_q),
         int(max_seqlen_k),
         bool(is_causal),
@@ -207,6 +240,8 @@ def forward_varlen_mega_ring(
     max_seqlen_k: int,
     is_causal: bool,
     *,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
     remote_k: TKParallelTensor,
     remote_v: TKParallelTensor,
     num_comp_sm: int,
@@ -223,6 +258,8 @@ def forward_varlen_mega_ring(
         remote_v,
         cu_seqlens_q,
         cu_seqlens_k,
+        cu_seqlens_q_host,
+        cu_seqlens_k_host,
         int(max_seqlen_q),
         int(max_seqlen_k),
         bool(is_causal),

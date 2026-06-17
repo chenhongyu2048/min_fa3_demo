@@ -136,8 +136,9 @@ def parse_cases(args: argparse.Namespace) -> list[Case]:
     ]
 
 
-def make_cu_seqlens(batch_size: int, seqlen: int, device: torch.device) -> torch.Tensor:
-    return torch.arange(0, (batch_size + 1) * seqlen, seqlen, device=device, dtype=torch.int32)
+def make_cu_seqlens(batch_size: int, seqlen: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    host = torch.arange(0, (batch_size + 1) * seqlen, seqlen, dtype=torch.int32)
+    return host.to(device=device), host
 
 
 def make_inputs(case: Case, dtype: torch.dtype = torch.bfloat16) -> tuple[torch.Tensor, ...]:
@@ -145,9 +146,9 @@ def make_inputs(case: Case, dtype: torch.dtype = torch.bfloat16) -> tuple[torch.
     q = torch.randn(total_tokens, case.qo_heads, case.head_dim, dtype=dtype, device="cuda")
     k = torch.randn(total_tokens, case.kv_heads, case.head_dim, dtype=dtype, device="cuda")
     v = torch.randn(total_tokens, case.kv_heads, case.head_dim, dtype=dtype, device="cuda")
-    cu_seqlens_q = make_cu_seqlens(case.batch_size, case.seqlen, q.device)
-    cu_seqlens_k = make_cu_seqlens(case.batch_size, case.seqlen, q.device)
-    return q, k, v, cu_seqlens_q, cu_seqlens_k
+    cu_seqlens_q, cu_seqlens_q_host = make_cu_seqlens(case.batch_size, case.seqlen, q.device)
+    cu_seqlens_k, cu_seqlens_k_host = make_cu_seqlens(case.batch_size, case.seqlen, q.device)
+    return q, k, v, cu_seqlens_q, cu_seqlens_k, cu_seqlens_q_host, cu_seqlens_k_host
 
 
 def median_time_ms(fn: Callable[[], None], warmup_iters: int, num_iters: int) -> float:
@@ -175,13 +176,15 @@ def bench_pytorch(
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
     batch_size: int,
     is_causal: bool,
     warmup_iters: int,
     num_iters: int,
 ) -> float | None:
-    seqlen_q = (cu_seqlens_q[1] - cu_seqlens_q[0]).item()
-    seqlen_k = (cu_seqlens_k[1] - cu_seqlens_k[0]).item()
+    seqlen_q = int(cu_seqlens_q_host[1] - cu_seqlens_q_host[0])
+    seqlen_k = int(cu_seqlens_k_host[1] - cu_seqlens_k_host[0])
     q_bshd = q.view(batch_size, seqlen_q, q.size(1), q.size(2))
     k_bshd = k.view(batch_size, seqlen_k, k.size(1), k.size(2))
     v_bshd = v.view(batch_size, seqlen_k, v.size(1), v.size(2))
@@ -205,6 +208,8 @@ def bench_fa2(
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
     batch_size: int,
     is_causal: bool,
     warmup_iters: int,
@@ -212,8 +217,8 @@ def bench_fa2(
 ) -> float | None:
     if flash_attn_varlen_func2 is None:
         return None
-    max_seqlen_q = (cu_seqlens_q[1] - cu_seqlens_q[0]).item()
-    max_seqlen_k = (cu_seqlens_k[1] - cu_seqlens_k[0]).item()
+    max_seqlen_q = int(cu_seqlens_q_host[1] - cu_seqlens_q_host[0])
+    max_seqlen_k = int(cu_seqlens_k_host[1] - cu_seqlens_k_host[0])
     return median_time_ms(
         lambda: take_output(
             flash_attn_varlen_func2(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=is_causal)
@@ -229,6 +234,8 @@ def bench_fa3(
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
     batch_size: int,
     is_causal: bool,
     warmup_iters: int,
@@ -236,8 +243,8 @@ def bench_fa3(
 ) -> float | None:
     if flash_attn_varlen_func3 is None:
         return None
-    max_seqlen_q = (cu_seqlens_q[1] - cu_seqlens_q[0]).item()
-    max_seqlen_k = (cu_seqlens_k[1] - cu_seqlens_k[0]).item()
+    max_seqlen_q = int(cu_seqlens_q_host[1] - cu_seqlens_q_host[0])
+    max_seqlen_k = int(cu_seqlens_k_host[1] - cu_seqlens_k_host[0])
     return median_time_ms(
         lambda: take_output(
             flash_attn_varlen_func3(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=is_causal)
@@ -253,6 +260,8 @@ def bench_min_fa3_varlen(
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
     batch_size: int,
     is_causal: bool,
     warmup_iters: int,
@@ -265,8 +274,8 @@ def bench_min_fa3_varlen(
         return None
     if q.size(2) != 128 or k.size(2) != 128 or v.size(2) != 128:
         return None
-    max_seqlen_q = (cu_seqlens_q[1] - cu_seqlens_q[0]).item()
-    max_seqlen_k = (cu_seqlens_k[1] - cu_seqlens_k[0]).item()
+    max_seqlen_q = int(cu_seqlens_q_host[1] - cu_seqlens_q_host[0])
+    max_seqlen_k = int(cu_seqlens_k_host[1] - cu_seqlens_k_host[0])
     return median_time_ms(
         lambda: min_fa3_op.forward_varlen(
             q,
@@ -277,6 +286,8 @@ def bench_min_fa3_varlen(
             max_seqlen_q,
             max_seqlen_k,
             is_causal,
+            cu_seqlens_q_host=cu_seqlens_q_host,
+            cu_seqlens_k_host=cu_seqlens_k_host,
             manual_block_count=manual_block_count,
         ),
         warmup_iters,
@@ -293,7 +304,7 @@ def bench_case(case: Case, warmup_iters: int, num_iters: int, manual_block_count
     ]
     results: dict[str, Result | None] = {}
     try:
-        q, k, v, cu_seqlens_q, cu_seqlens_k = make_inputs(case)
+        q, k, v, cu_seqlens_q, cu_seqlens_k, cu_seqlens_q_host, cu_seqlens_k_host = make_inputs(case)
     except torch.OutOfMemoryError as exc:
         torch.cuda.empty_cache()
         print(f"[case OOM while allocating inputs: {format_case_key(case)}] [{format_oom(exc)}]")
@@ -310,6 +321,8 @@ def bench_case(case: Case, warmup_iters: int, num_iters: int, manual_block_count
                     v,
                     cu_seqlens_q,
                     cu_seqlens_k,
+                    cu_seqlens_q_host,
+                    cu_seqlens_k_host,
                     case.batch_size,
                     case.is_causal,
                     warmup_iters,
@@ -323,6 +336,8 @@ def bench_case(case: Case, warmup_iters: int, num_iters: int, manual_block_count
                     v,
                     cu_seqlens_q,
                     cu_seqlens_k,
+                    cu_seqlens_q_host,
+                    cu_seqlens_k_host,
                     case.batch_size,
                     case.is_causal,
                     warmup_iters,
