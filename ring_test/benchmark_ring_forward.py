@@ -1,0 +1,862 @@
+"""Torchrun entry point for multi-rank forward ring-attention benchmarks.
+
+The script compares Python-side ring attention using PyTorch/FA2/FA3 block
+kernels with the local min_fa3 varlen, min_fa3 single-step ring, and fused
+min_fa3 mega-ring paths. Timing is end-to-end per method call and reports the
+maximum elapsed time across ranks.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import statistics
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Optional
+
+import torch
+import torch.distributed as dist
+
+THIS_DIR = Path(__file__).resolve().parent
+DEMO_DIR = THIS_DIR.parent
+if str(DEMO_DIR) not in sys.path:
+    sys.path.insert(0, str(DEMO_DIR))
+
+import min_fa3_op
+
+from ring_common import (
+    flash_varlen_block_attention,
+    gather_rank_tensor,
+    pytorch_varlen_block_attention,
+    raise_if_any_rank_failed,
+    reference_block_lse,
+    reference_ring_varlen,
+    ring_varlen_forward,
+    update_out_and_lse,
+)
+
+try:
+    from flash_attn import flash_attn_varlen_func as flash_attn_varlen_func2
+except ImportError:
+    flash_attn_varlen_func2 = None
+
+try:
+    from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func3
+except ImportError:
+    flash_attn_varlen_func3 = None
+
+
+METHOD_ORDER = [
+    "pytorch",
+    "fa2",
+    "fa3",
+    "min_varlen",
+    "min_varlen_ring",
+    "min_varlen_mega_ring",
+]
+
+
+@dataclass(frozen=True)
+class Case:
+    """One benchmark problem shape and attention mode."""
+
+    batch_size: int
+    seqlen: int
+    q_heads: int
+    kv_heads: int
+    head_dim: int
+    is_causal: bool
+
+
+@dataclass
+class MethodRun:
+    """Callable bundle for a benchmark method.
+
+    `timing_fn` is what is measured. `check_fn` may differ from `timing_fn` for
+    paths such as min_varlen_ring, where correctness can require a Python-side
+    reference-LSE merge that should not be included in timing.
+    """
+
+    name: str
+    timing_fn: Callable[[], torch.Tensor]
+    check_fn: Optional[Callable[[], torch.Tensor]]
+    note: str = ""
+
+
+@dataclass
+class Result:
+    """Printable benchmark result for one method."""
+
+    time_ms: Optional[float]
+    tflops: Optional[float]
+    check: str
+    note: str = ""
+
+
+def parse_seqlen_spec(spec: str) -> list[int]:
+    """Parse the unified comma-separated local sequence length CLI format."""
+    cases: list[int] = []
+    for token in spec.split(","):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if "x" in token:
+            raise SystemExit("--seqlen only accepts one length per case; rectangular SqxSk input is not supported")
+        cases.append(int(token))
+    if not cases:
+        raise SystemExit("--seqlen must provide at least one case")
+    return cases
+
+
+def parse_methods(spec: str) -> list[str]:
+    """Parse the method list while preserving user order and removing duplicates."""
+    methods: list[str] = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token == "all":
+            methods.extend(METHOD_ORDER)
+        elif token in METHOD_ORDER:
+            methods.append(token)
+        else:
+            raise SystemExit(f"unknown method '{token}', expected one of {METHOD_ORDER} or all")
+
+    deduped: list[str] = []
+    for method in methods:
+        if method not in deduped:
+            deduped.append(method)
+    return deduped
+
+
+def parse_args() -> argparse.Namespace:
+    """Define the ring_test command-line interface."""
+    parser = argparse.ArgumentParser(
+        description="Distributed forward-only ring-attention test/benchmark for varlen backends."
+    )
+    parser.add_argument("--b", type=int, default=1, help="Batch size B per rank.")
+    parser.add_argument(
+        "--seqlen",
+        "--seqlens",
+        dest="seqlen",
+        type=str,
+        default="128",
+        help="Comma-separated local sequence lengths S per rank.",
+    )
+    parser.add_argument("--qhead", type=int, default=8, help="Number of query/output heads.")
+    parser.add_argument("--kvhead", type=int, default=8, help="Number of key/value heads.")
+    parser.add_argument("--headdim", type=int, default=128, help="Head dimension D.")
+    parser.add_argument(
+        "--mode",
+        choices=("noncausal", "causal", "both"),
+        default="both",
+        help="Run noncausal, causal, or both.",
+    )
+    parser.add_argument(
+        "--methods",
+        type=str,
+        default="all",
+        help=f"Comma-separated methods from {METHOD_ORDER}, or all.",
+    )
+    parser.add_argument("--num-comp-sm", type=int, default=1, help="Compute CTAs for min_fa3 ring kernels.")
+    parser.add_argument("--num-comm-sm", type=int, default=1, help="Communication CTAs for min_fa3 ring kernels.")
+    parser.add_argument("--warmup-iters", type=int, default=5, help="Warmup iterations.")
+    parser.add_argument("--num-iters", type=int, default=20, help="Measured iterations.")
+    parser.add_argument("--seed", type=int, default=1234, help="Base RNG seed.")
+    parser.add_argument("--check", dest="check", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--atol", type=float, default=2e-1, help="Correctness absolute tolerance.")
+    parser.add_argument("--rtol", type=float, default=2e-1, help="Correctness relative tolerance.")
+    parser.add_argument(
+        "--check-min-ring-reference-lse",
+        action="store_true",
+        help=(
+            "Also check min_varlen_ring by merging its per-step outputs with a PyTorch reference LSE. "
+            "The timed min_varlen_ring path still measures only the requested kernel launch pattern."
+        ),
+    )
+    return parser.parse_args()
+
+
+def init_distributed() -> tuple[int, int]:
+    """Initialize single-node NCCL distributed execution.
+
+    TKParallelTensor remote-load paths are local IPC paths, so this script
+    intentionally rejects multi-node world sizes where WORLD_SIZE differs from
+    LOCAL_WORLD_SIZE.
+    """
+    if "LOCAL_RANK" not in os.environ or "LOCAL_WORLD_SIZE" not in os.environ:
+        raise SystemExit("Run with torchrun so LOCAL_RANK and LOCAL_WORLD_SIZE are set")
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    try:
+        dist.init_process_group(backend="nccl", device_id=device)
+    except TypeError:
+        dist.init_process_group(backend="nccl")
+
+    if dist.get_world_size() != local_world_size:
+        raise SystemExit(
+            "This ring_test path is single-node only because TKParallelTensor uses local IPC: "
+            f"world_size={dist.get_world_size()}, local_world_size={local_world_size}"
+        )
+    return local_rank, local_world_size
+
+
+def available_on_all_ranks(local_available: bool) -> bool:
+    """Return True only if the optional backend is importable on every rank."""
+    available = torch.tensor([1 if local_available else 0], device="cuda", dtype=torch.int32)
+    dist.all_reduce(available, op=dist.ReduceOp.MIN)
+    return bool(available.item())
+
+
+def cuda_barrier() -> None:
+    """Barrier with an explicit CUDA device to avoid NCCL device-selection warnings."""
+    try:
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+    except TypeError:
+        dist.barrier()
+
+
+def make_cu_seqlens(batch_size: int, seqlen: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create matching device and host cumulative sequence length tensors."""
+    host = torch.arange(0, (batch_size + 1) * seqlen, seqlen, dtype=torch.int32)
+    return host.to(device=device), host
+
+
+def make_inputs(case: Case, local_rank: int, seed: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate deterministic rank-local Q/K/V inputs for one case."""
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(seed + local_rank * 1009 + (1 if case.is_causal else 0))
+    total_tokens = case.batch_size * case.seqlen
+    q = torch.randn(
+        total_tokens,
+        case.q_heads,
+        case.head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    k = torch.randn(
+        total_tokens,
+        case.kv_heads,
+        case.head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    v = torch.randn(
+        total_tokens,
+        case.kv_heads,
+        case.head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    return q.contiguous(), k.contiguous(), v.contiguous()
+
+
+def make_ring_parallel_tensors(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    local_rank: int,
+    local_world_size: int,
+) -> tuple[min_fa3_op.TKParallelTensor, min_fa3_op.TKParallelTensor]:
+    """Create same-shape TKParallelTensor wrappers for the single-step ring path."""
+    remote_k = min_fa3_op.TKParallelTensor(list(k.shape), torch.bfloat16, local_rank, local_world_size, False)
+    remote_v = min_fa3_op.TKParallelTensor(list(v.shape), torch.bfloat16, local_rank, local_world_size, False)
+    remote_k.data_.copy_(k)
+    remote_v.data_.copy_(v)
+    return remote_k, remote_v
+
+
+def make_mega_parallel_tensors(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    local_rank: int,
+    local_world_size: int,
+) -> tuple[min_fa3_op.TKParallelTensor, min_fa3_op.TKParallelTensor]:
+    """Create full [world_size * local_tokens, KVH, D] TK buffers for mega-ring.
+
+    Each rank initializes only its own block. The mega-ring kernel's communication
+    CTAs remotely load the other rank blocks into the same full local buffer.
+    """
+    full_shape = [local_world_size * k.size(0), k.size(1), k.size(2)]
+    remote_k = min_fa3_op.TKParallelTensor(full_shape, torch.bfloat16, local_rank, local_world_size, False)
+    remote_v = min_fa3_op.TKParallelTensor(full_shape, torch.bfloat16, local_rank, local_world_size, False)
+    remote_k.data_.zero_()
+    remote_v.data_.zero_()
+    start = local_rank * k.size(0)
+    end = start + k.size(0)
+    remote_k.data_[start:end].copy_(k)
+    remote_v.data_[start:end].copy_(v)
+    return remote_k, remote_v
+
+
+def min_varlen_local_steps_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_causal: bool,
+    rank: int,
+    world_size: int,
+    num_comp_sm: int,
+) -> torch.Tensor:
+    """Launch the base min_fa3 varlen kernel once per visible ring step.
+
+    This path intentionally performs no inter-rank communication and no Python
+    output/LSE reduction. It exists to compare the cost of repeatedly launching
+    the local base varlen kernel under the same step count.
+    """
+    out = None
+    for step in range(world_size):
+        if not is_causal or step <= rank:
+            out = min_fa3_op.forward_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                is_causal and step == 0,
+                cu_seqlens_q_host=cu_seqlens_q_host,
+                cu_seqlens_k_host=cu_seqlens_k_host,
+                manual_block_count=num_comp_sm,
+            )
+    if out is None:
+        raise RuntimeError("min_varlen local step loop produced no output")
+    return out
+
+
+def min_varlen_ring_steps_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_causal: bool,
+    rank: int,
+    world_size: int,
+    remote_k: min_fa3_op.TKParallelTensor,
+    remote_v: min_fa3_op.TKParallelTensor,
+    num_comp_sm: int,
+    num_comm_sm: int,
+    merge_with_reference_lse: bool,
+) -> torch.Tensor:
+    """Launch the min_fa3 single-step ring kernel across ring steps.
+
+    The timed mode returns the last visible step output and is labeled
+    timing-only, because the current binding does not expose the kernel LSE
+    required for a true Python-side merge. When `merge_with_reference_lse` is
+    true, the function uses PyTorch reference LSE to check whether the per-step
+    min_varlen_ring outputs can be merged into the full ring result.
+    """
+    if world_size > 1 and num_comm_sm <= 0:
+        raise RuntimeError("min_varlen_ring multi-rank path requires num_comm_sm > 0")
+
+    prefetch_k = [torch.empty_like(k), torch.empty_like(k)]
+    prefetch_v = [torch.empty_like(v), torch.empty_like(v)]
+    cur_k = k
+    cur_v = v
+    out = None
+    lse = None
+    last_out = None
+
+    for step in range(world_size):
+        if not is_causal or step <= rank:
+            # At step s, rank r consumes the K/V block from rank (r - s).
+            # The communication CTAs prefetch rank (r - s - 1) for the next step.
+            next_src_rank = (rank - step - 1 + world_size) % world_size
+            buffer_idx = step % 2
+            launch_comm_sm = num_comm_sm if step + 1 < world_size else 0
+            block_out = min_fa3_op.forward_varlen_ring(
+                q,
+                cur_k,
+                cur_v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                is_causal and step == 0,
+                cu_seqlens_q_host=cu_seqlens_q_host,
+                cu_seqlens_k_host=cu_seqlens_k_host,
+                remote_k=remote_k,
+                remote_v=remote_v,
+                src_rank=next_src_rank,
+                num_comp_sm=num_comp_sm,
+                num_comm_sm=launch_comm_sm,
+                ring_step=step,
+                prefetch_k=prefetch_k[buffer_idx],
+                prefetch_v=prefetch_v[buffer_idx],
+            )
+            last_out = block_out
+            if merge_with_reference_lse:
+                # The binding returns block_out but not block_lse. This optional
+                # check path computes only the missing LSE with a simple reference.
+                block_lse = reference_block_lse(
+                    q,
+                    cur_k,
+                    batch_size=cu_seqlens_q_host.numel() - 1,
+                    seqlen_q=max_seqlen_q,
+                    seqlen_k=max_seqlen_k,
+                    is_causal=is_causal and step == 0,
+                )
+                out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+            if step + 1 < world_size:
+                # The prefetch buffer written by this kernel launch is consumed
+                # as the local K/V input for the next visible step.
+                cur_k = prefetch_k[buffer_idx]
+                cur_v = prefetch_v[buffer_idx]
+
+    if merge_with_reference_lse:
+        if out is None:
+            raise RuntimeError("min_varlen_ring reference-LSE merge produced no output")
+        return out.to(q.dtype)
+    if last_out is None:
+        raise RuntimeError("min_varlen_ring step loop produced no output")
+    return last_out
+
+
+def build_method_runs(
+    methods: list[str],
+    case: Case,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
+    local_rank: int,
+    local_world_size: int,
+    args: argparse.Namespace,
+) -> list[MethodRun]:
+    """Create per-method timing/check callables for one input allocation.
+
+    Capturing `remote_k`/`remote_v` as default arguments is intentional. Python
+    closures capture variables by reference, and later methods allocate
+    different TKParallelTensor shapes.
+    """
+    runs: list[MethodRun] = []
+    max_seqlen_q = case.seqlen
+    max_seqlen_k = case.seqlen
+
+    for method in methods:
+        if method == "pytorch":
+            def fn(method=method):
+                # Full Python-side ring: P2P K/V exchange, one PyTorch block
+                # attention call per visible step, and online LSE merge.
+                return ring_varlen_forward(
+                    dist.group.WORLD,
+                    q,
+                    k,
+                    v,
+                    case.is_causal,
+                    lambda q_, k_, v_, causal_: pytorch_varlen_block_attention(
+                        q_, k_, v_, case.batch_size, max_seqlen_q, max_seqlen_k, causal_
+                    ),
+                )
+
+            runs.append(MethodRun(method, fn, fn))
+        elif method == "fa2":
+            if flash_attn_varlen_func2 is None:
+                runs.append(MethodRun(method, lambda: q, None, "not available"))
+                continue
+
+            def fn(method=method):
+                # FA2 uses the same Python ring structure; only the per-step
+                # varlen attention backend changes.
+                return ring_varlen_forward(
+                    dist.group.WORLD,
+                    q,
+                    k,
+                    v,
+                    case.is_causal,
+                    lambda q_, k_, v_, causal_: flash_varlen_block_attention(
+                        flash_attn_varlen_func2,
+                        q_,
+                        k_,
+                        v_,
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        causal_,
+                    ),
+                )
+
+            runs.append(MethodRun(method, fn, fn))
+        elif method == "fa3":
+            if flash_attn_varlen_func3 is None:
+                runs.append(MethodRun(method, lambda: q, None, "not available"))
+                continue
+
+            def fn(method=method):
+                # FA3 uses the same Python ring structure; only the per-step
+                # varlen attention backend changes.
+                return ring_varlen_forward(
+                    dist.group.WORLD,
+                    q,
+                    k,
+                    v,
+                    case.is_causal,
+                    lambda q_, k_, v_, causal_: flash_varlen_block_attention(
+                        flash_attn_varlen_func3,
+                        q_,
+                        k_,
+                        v_,
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        causal_,
+                    ),
+                )
+
+            runs.append(MethodRun(method, fn, fn))
+        elif method == "min_varlen":
+            def fn(method=method):
+                # Timing-only local step loop. This is not a complete ring
+                # implementation because it never exchanges K/V across ranks.
+                return min_varlen_local_steps_forward(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    cu_seqlens_q_host,
+                    cu_seqlens_k_host,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    case.is_causal,
+                    local_rank,
+                    local_world_size,
+                    args.num_comp_sm,
+                )
+
+            runs.append(MethodRun(method, fn, None, "timing-only local step loop"))
+        elif method == "min_varlen_ring":
+            remote_k, remote_v = make_ring_parallel_tensors(k, v, local_rank, local_world_size)
+
+            def timing_fn(method=method, remote_k=remote_k, remote_v=remote_v):
+                # Timing path launches the kernel's remote-load step sequence
+                # without adding Python-side output reduction.
+                return min_varlen_ring_steps_forward(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    cu_seqlens_q_host,
+                    cu_seqlens_k_host,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    case.is_causal,
+                    local_rank,
+                    local_world_size,
+                    remote_k,
+                    remote_v,
+                    args.num_comp_sm,
+                    args.num_comm_sm,
+                    False,
+                )
+
+            check_fn = None
+            note = "timing-only multi-step remote-load launches"
+            if args.check_min_ring_reference_lse:
+                def check_fn(method=method, remote_k=remote_k, remote_v=remote_v):
+                    # Optional check path adds a reference-LSE merge around the
+                    # single-step kernel outputs. This is excluded from timing.
+                    return min_varlen_ring_steps_forward(
+                        q,
+                        k,
+                        v,
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        cu_seqlens_q_host,
+                        cu_seqlens_k_host,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        case.is_causal,
+                        local_rank,
+                        local_world_size,
+                        remote_k,
+                        remote_v,
+                        args.num_comp_sm,
+                        args.num_comm_sm,
+                        True,
+                    )
+
+                note = "timed without Python merge; checked with reference LSE"
+            runs.append(MethodRun(method, timing_fn, check_fn, note))
+        elif method == "min_varlen_mega_ring":
+            remote_k, remote_v = make_mega_parallel_tensors(k, v, local_rank, local_world_size)
+
+            def fn(method=method, remote_k=remote_k, remote_v=remote_v):
+                # Fused mega-ring path: one kernel launch covers all ring steps,
+                # remote K/V loads, and output/LSE reduction.
+                return min_fa3_op.forward_varlen_mega_ring(
+                    q,
+                    remote_k.data_,
+                    remote_v.data_,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    case.is_causal,
+                    cu_seqlens_q_host=cu_seqlens_q_host,
+                    cu_seqlens_k_host=cu_seqlens_k_host,
+                    remote_k=remote_k,
+                    remote_v=remote_v,
+                    num_comp_sm=args.num_comp_sm,
+                    num_comm_sm=args.num_comm_sm,
+                )
+
+            runs.append(MethodRun(method, fn, fn))
+        else:
+            raise RuntimeError(f"unhandled method {method}")
+
+    return runs
+
+
+def measure_distributed_ms(fn: Callable[[], torch.Tensor], warmup_iters: int, num_iters: int) -> float:
+    """Measure median end-to-end method latency, using max rank time per sample."""
+    for _ in range(warmup_iters):
+        fn()
+    torch.cuda.synchronize()
+    cuda_barrier()
+
+    samples: list[float] = []
+    for _ in range(num_iters):
+        cuda_barrier()
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        fn()
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+        elapsed_tensor = torch.tensor([elapsed], device="cuda", dtype=torch.float64)
+        # Report the completion time of the slowest rank, which is the relevant
+        # end-to-end latency for a distributed forward call.
+        dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
+        samples.append(elapsed_tensor.item() * 1000.0)
+    cuda_barrier()
+    return statistics.median(samples)
+
+
+def aggregate_tflops(case: Case, local_rank: int, local_world_size: int, time_ms: float) -> float:
+    """Compute aggregate TFLOPS for the visible attention work across ranks."""
+    if case.is_causal:
+        visible_scores = case.seqlen * (local_rank * case.seqlen) + case.seqlen * (case.seqlen + 1) // 2
+    else:
+        visible_scores = case.seqlen * (local_world_size * case.seqlen)
+    local_flops = 4 * case.batch_size * visible_scores * case.q_heads * case.head_dim
+    flops_tensor = torch.tensor([float(local_flops)], device="cuda", dtype=torch.float64)
+    dist.all_reduce(flops_tensor, op=dist.ReduceOp.SUM)
+    return flops_tensor.item() / (time_ms * 1e-3) / 1e12
+
+
+def check_output(
+    method: str,
+    fn: Callable[[], torch.Tensor],
+    ref: torch.Tensor,
+    atol: float,
+    rtol: float,
+) -> str:
+    """Run a method check and synchronize assertion failures across ranks."""
+    local_error = None
+    try:
+        out = fn()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
+    except Exception as exc:
+        local_error = f"{method}: {exc}"
+    raise_if_any_rank_failed(local_error, dist.group.WORLD)
+    return "ok"
+
+
+def run_case(
+    case: Case,
+    methods: list[str],
+    local_rank: int,
+    local_world_size: int,
+    args: argparse.Namespace,
+) -> dict[str, Result]:
+    """Run all requested methods for one shape/mode case."""
+    q, k, v = make_inputs(case, local_rank, args.seed)
+    cu_seqlens_q, cu_seqlens_q_host = make_cu_seqlens(case.batch_size, case.seqlen, q.device)
+    cu_seqlens_k, cu_seqlens_k_host = make_cu_seqlens(case.batch_size, case.seqlen, q.device)
+    runs = build_method_runs(
+        methods,
+        case,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_q_host,
+        cu_seqlens_k_host,
+        local_rank,
+        local_world_size,
+        args,
+    )
+
+    ref = None
+    if args.check:
+        # The reference gathers all rank-local K/V blocks and computes the local
+        # rank's expected output against the full global sequence.
+        k_by_rank = gather_rank_tensor(k, dist.group.WORLD)
+        v_by_rank = gather_rank_tensor(v, dist.group.WORLD)
+        ref = reference_ring_varlen(
+            q,
+            k_by_rank,
+            v_by_rank,
+            case.batch_size,
+            case.seqlen,
+            local_rank,
+            case.is_causal,
+        )
+
+    results: dict[str, Result] = {}
+    for run in runs:
+        if run.note == "not available":
+            results[run.name] = Result(None, None, "skip", run.note)
+            continue
+        try:
+            time_ms = measure_distributed_ms(run.timing_fn, args.warmup_iters, args.num_iters)
+            tflops = aggregate_tflops(case, local_rank, local_world_size, time_ms)
+            check = "skip"
+            # Most full-ring methods use their timing function for checks.
+            # Timing-only methods either have no check_fn or a separate check_fn.
+            if args.check and run.check_fn is not None and ref is not None:
+                check = check_output(run.name, run.check_fn, ref, args.atol, args.rtol)
+            elif args.check and run.check_fn is None:
+                check = "timing-only"
+            results[run.name] = Result(time_ms, tflops, check, run.note)
+        except torch.OutOfMemoryError as exc:
+            torch.cuda.empty_cache()
+            msg = str(exc).splitlines()[0]
+            results[run.name] = Result(None, None, "oom", msg)
+        except Exception as exc:
+            results[run.name] = Result(None, None, "error", str(exc))
+        cuda_barrier()
+    return results
+
+
+def make_cases(args: argparse.Namespace) -> list[Case]:
+    """Expand CLI arguments into concrete benchmark cases."""
+    causal_values = {
+        "noncausal": [False],
+        "causal": [True],
+        "both": [False, True],
+    }[args.mode]
+    return [
+        Case(args.b, seqlen, args.qhead, args.kvhead, args.headdim, is_causal)
+        for is_causal in causal_values
+        for seqlen in parse_seqlen_spec(args.seqlen)
+    ]
+
+
+def validate_args(args: argparse.Namespace, methods: list[str], local_world_size: int) -> None:
+    """Validate arguments against the minimal demo's supported configuration."""
+    if args.headdim != 128:
+        raise SystemExit(f"This demo requires D=128, got D={args.headdim}")
+    if args.qhead % args.kvhead != 0:
+        raise SystemExit(f"qhead must be divisible by kvhead, got qhead={args.qhead}, kvhead={args.kvhead}")
+    if args.num_comp_sm <= 0:
+        raise SystemExit(f"--num-comp-sm must be positive, got {args.num_comp_sm}")
+    if args.num_comm_sm < 0:
+        raise SystemExit(f"--num-comm-sm must be non-negative, got {args.num_comm_sm}")
+    if args.num_iters <= 0:
+        raise SystemExit(f"--num-iters must be positive, got {args.num_iters}")
+    if args.warmup_iters < 0:
+        raise SystemExit(f"--warmup-iters must be non-negative, got {args.warmup_iters}")
+    if any(method in methods for method in ("min_varlen_ring", "min_varlen_mega_ring")):
+        if args.kvhead * args.headdim != 1024:
+            raise SystemExit(
+                "min_fa3 ring communication path requires kvhead * headdim == 1024, "
+                f"got kvhead={args.kvhead}, headdim={args.headdim}"
+            )
+        if local_world_size > 1 and args.num_comm_sm <= 0:
+            raise SystemExit("multi-rank min_fa3 ring paths require --num-comm-sm > 0")
+
+
+def print_results(case: Case, results: dict[str, Result], methods: list[str]) -> None:
+    """Print one result table on rank 0."""
+    mode = "causal" if case.is_causal else "noncausal"
+    print(
+        f"\nB={case.batch_size}, local_S={case.seqlen}, QH={case.q_heads}, "
+        f"KVH={case.kv_heads}, D={case.head_dim}, mode={mode}"
+    )
+    print(f"{'Method':<24} {'Time ms':>12} {'TFLOPS':>12} {'Check':>14}  Note")
+    for method in methods:
+        result = results.get(method)
+        if result is None:
+            continue
+        time_s = "N/A" if result.time_ms is None else f"{result.time_ms:.3f}"
+        tflops_s = "N/A" if result.tflops is None else f"{result.tflops:.1f}"
+        print(f"{method:<24} {time_s:>12} {tflops_s:>12} {result.check:>14}  {result.note}")
+
+
+def main() -> None:
+    """Program entry point."""
+    global flash_attn_varlen_func2, flash_attn_varlen_func3
+
+    args = parse_args()
+    methods = parse_methods(args.methods)
+
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is required")
+    local_rank, local_world_size = init_distributed()
+    try:
+        major, minor = torch.cuda.get_device_capability()
+        if (major, minor) != (9, 0):
+            raise SystemExit(f"This demo requires SM90 Hopper, got {(major, minor)}")
+        if not available_on_all_ranks(flash_attn_varlen_func2 is not None):
+            # A distributed benchmark cannot safely run an optional backend if
+            # only some ranks imported it successfully.
+            flash_attn_varlen_func2 = None
+        if not available_on_all_ranks(flash_attn_varlen_func3 is not None):
+            flash_attn_varlen_func3 = None
+        validate_args(args, methods, local_world_size)
+        cases = make_cases(args)
+
+        if local_rank == 0:
+            print(
+                f"Config: world_size={local_world_size}, methods={methods}, B={args.b}, "
+                f"seqlen={args.seqlen}, qhead={args.qhead}, kvhead={args.kvhead}, "
+                f"D={args.headdim}, mode={args.mode}, num_comp_sm={args.num_comp_sm}, "
+                f"num_comm_sm={args.num_comm_sm}, warmup={args.warmup_iters}, iters={args.num_iters}, "
+                f"check={args.check}"
+            )
+            if args.check:
+                print("Checks compare each rank output against a full-rank PyTorch reference.")
+
+        for case in cases:
+            if local_rank == 0:
+                print(f"\nRunning local_S={case.seqlen}, causal={case.is_causal}", flush=True)
+            results = run_case(case, methods, local_rank, local_world_size, args)
+            if local_rank == 0:
+                print_results(case, results, methods)
+            cuda_barrier()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

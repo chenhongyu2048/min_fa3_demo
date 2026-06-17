@@ -63,19 +63,35 @@ cd /data/home/scyb683/run/min_fa3_demo
 # python benchmark_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 116 --num-comm-sm 16 --mode both
 # python benchmark_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 108 --num-comm-sm 24 --mode both
 
-# Multi-Step Mega-Ring-FlashAttention varlen benchmark:
-echo "Running tests and benchmarks for Mega-Ring-FlashAttention"
-echo "========================================================="
-python mega_ring_test_min_fa3_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --num-comp-sm 128 --num-comm-sm 0 --mode both
-python benchmark_varlen_mega_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 0 --mode both
-python mega_ring_test_min_fa3_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --num-comp-sm 128 --num-comm-sm 4 --mode both
-python benchmark_varlen_mega_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 4 --mode both
-python benchmark_varlen_mega_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 124 --num-comm-sm 8 --mode both
-python benchmark_varlen_mega_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 116 --num-comm-sm 16 --mode both
-python benchmark_varlen_mega_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 108 --num-comm-sm 24 --mode both
+# Single-Step Mega-Ring-FlashAttention varlen benchmark:
+# echo "Running tests and benchmarks for Mega-Ring-FlashAttention"
+# echo "========================================================="
+# python mega_ring_test_min_fa3_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --num-comp-sm 128 --num-comm-sm 0 --mode both
+# python benchmark_varlen_mega_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 0 --mode both
+# python mega_ring_test_min_fa3_varlen_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --num-comp-sm 128 --num-comm-sm 4 --mode both
+# python benchmark_varlen_mega_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 4 --mode both
+# python benchmark_varlen_mega_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 124 --num-comm-sm 8 --mode both
+# python benchmark_varlen_mega_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 116 --num-comm-sm 16 --mode both
+# python benchmark_varlen_mega_ring_local.py --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 108 --num-comm-sm 24 --mode both
 
+# echo "========================================================="
+# nsys profile -t cuda,nvtx,osrt -o my_report --stats=true python benchmark_varlen_mega_ring_local.py --profile --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 116 --num-comm-sm 16 --mode both
+
+# Multi-Step Multi-rank full Ring-FlashAttention forward benchmark:
+# These examples require a 2-GPU allocation, e.g. change the header to #SBATCH --gres=gpu:2
+echo "Running multi-rank ring_test benchmark with correctness checks"
 echo "========================================================="
-nsys profile -t cuda,nvtx,osrt -o my_report --stats=true python benchmark_varlen_mega_ring_local.py --profile --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 116 --num-comm-sm 16 --mode both
+torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
+    --b 16 --seqlen 4096 --qhead 32 --kvhead 8 --headdim 128 \
+    --mode both --methods all --num-comp-sm 74 --num-comm-sm 4 \
+    --warmup-iters 20 --num-iters 30 --check --check-min-ring-reference-lse
+
+echo "Running multi-rank ring_test benchmark without correctness checks"
+echo "========================================================="
+torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
+    --b 16 --seqlen 4096 --qhead 32 --kvhead 8 --headdim 128 \
+    --mode both --methods all --num-comp-sm 74 --num-comm-sm 4 \
+    --warmup-iters 20 --num-iters 30 --no-check
 
 # Memory sanitizer runs:
 # compute-sanitizer --tool memcheck python test_min_fa3_varlen_ring_local.py --b 16 --seqlen 1024,4096 --qhead 32 --kvhead 8 --num-comp-sm 128 --num-comm-sm 0 --mode both > memcheck-128-0.log 2>&1
