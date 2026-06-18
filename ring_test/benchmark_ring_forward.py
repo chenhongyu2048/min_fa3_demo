@@ -10,9 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import statistics
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -41,11 +39,13 @@ from ring_common import (
 try:
     from flash_attn import flash_attn_varlen_func as flash_attn_varlen_func2
 except ImportError:
+    print("FA2 flash_attn_varlen_func is not available, skipping FA2 benchmarks", flush=True)
     flash_attn_varlen_func2 = None
 
 try:
     from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func3
 except ImportError:
+    print("FA3 flash_attn_varlen_func is not available, skipping FA3 benchmarks", flush=True)
     flash_attn_varlen_func3 = None
 
 
@@ -94,6 +94,16 @@ class Result:
     tflops: Optional[float]
     check: str
     note: str = ""
+    rank_times_ms: Optional[list[float]] = None
+
+
+@dataclass
+class TimingResult:
+    """CUDA-event timing summary for one measured method."""
+
+    local_time_ms: float
+    max_time_ms: float
+    rank_times_ms: Optional[list[float]]
 
 
 def parse_seqlen_spec(spec: str) -> list[int]:
@@ -381,6 +391,7 @@ def min_varlen_ring_steps_forward(
         if not is_causal or step <= rank:
             # At step s, rank r consumes the K/V block from rank (r - s).
             # The communication CTAs prefetch rank (r - s - 1) for the next step.
+            # Obviously the prefetching doesn't depend on the prefetch buffer of the `next_src_rank`.
             next_src_rank = (rank - step - 1 + world_size) % world_size
             buffer_idx = step % 2
             launch_comm_sm = num_comm_sm if step + 1 < world_size else 0
@@ -488,6 +499,7 @@ def build_method_runs(
                     v,
                     case.is_causal,
                     lambda q_, k_, v_, causal_: flash_varlen_block_attention(
+                        method,
                         flash_attn_varlen_func2,
                         q_,
                         k_,
@@ -516,6 +528,7 @@ def build_method_runs(
                     v,
                     case.is_causal,
                     lambda q_, k_, v_, causal_: flash_varlen_block_attention(
+                        method,
                         flash_attn_varlen_func3,
                         q_,
                         k_,
@@ -634,28 +647,42 @@ def build_method_runs(
     return runs
 
 
-def measure_distributed_ms(fn: Callable[[], torch.Tensor], warmup_iters: int, num_iters: int) -> float:
-    """Measure median end-to-end method latency, using max rank time per sample."""
+def measure_distributed_ms(fn: Callable[[], torch.Tensor], warmup_iters: int, num_iters: int) -> TimingResult:
+    """Measure average CUDA-event latency for local rank time and max rank time."""
     for _ in range(warmup_iters):
         fn()
     torch.cuda.synchronize()
     cuda_barrier()
 
-    samples: list[float] = []
+    local_samples_ms: list[float] = []
+    max_samples_ms: list[float] = []
     for _ in range(num_iters):
         cuda_barrier()
         torch.cuda.synchronize()
-        start = time.perf_counter()
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
         fn()
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start
-        elapsed_tensor = torch.tensor([elapsed], device="cuda", dtype=torch.float64)
+        end_event.record()
+        end_event.synchronize()
+
+        elapsed_ms = start_event.elapsed_time(end_event)
+        elapsed_tensor = torch.tensor([elapsed_ms], device="cuda", dtype=torch.float64)
         # Report the completion time of the slowest rank, which is the relevant
         # end-to-end latency for a distributed forward call.
         dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
-        samples.append(elapsed_tensor.item() * 1000.0)
+        local_samples_ms.append(elapsed_ms)
+        max_samples_ms.append(elapsed_tensor.item())
     cuda_barrier()
-    return statistics.median(samples)
+
+    local_avg_ms = sum(local_samples_ms) / len(local_samples_ms)
+    max_avg_ms = sum(max_samples_ms) / len(max_samples_ms)
+    local_avg_tensor = torch.tensor([local_avg_ms], device="cuda", dtype=torch.float64)
+    rank_time_tensors = [torch.empty_like(local_avg_tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(rank_time_tensors, local_avg_tensor)
+    rank_times_ms = [tensor.item() for tensor in rank_time_tensors] if dist.get_rank() == 0 else None
+    return TimingResult(local_avg_ms, max_avg_ms, rank_times_ms)
 
 
 def aggregate_tflops(case: Case, local_rank: int, local_world_size: int, time_ms: float) -> float:
@@ -737,7 +764,8 @@ def run_case(
             results[run.name] = Result(None, None, "skip", run.note)
             continue
         try:
-            time_ms = measure_distributed_ms(run.timing_fn, args.warmup_iters, args.num_iters)
+            timing = measure_distributed_ms(run.timing_fn, args.warmup_iters, args.num_iters)
+            time_ms = timing.max_time_ms
             tflops = aggregate_tflops(case, local_rank, local_world_size, time_ms)
             check = "skip"
             # Most full-ring methods use their timing function for checks.
@@ -746,7 +774,7 @@ def run_case(
                 check = check_output(run.name, run.check_fn, ref, args.atol, args.rtol)
             elif args.check and run.check_fn is None:
                 check = "timing-only"
-            results[run.name] = Result(time_ms, tflops, check, run.note)
+            results[run.name] = Result(time_ms, tflops, check, run.note, timing.rank_times_ms)
         except torch.OutOfMemoryError as exc:
             torch.cuda.empty_cache()
             msg = str(exc).splitlines()[0]
@@ -802,14 +830,25 @@ def print_results(case: Case, results: dict[str, Result], methods: list[str]) ->
         f"\nB={case.batch_size}, local_S={case.seqlen}, QH={case.q_heads}, "
         f"KVH={case.kv_heads}, D={case.head_dim}, mode={mode}"
     )
-    print(f"{'Method':<24} {'Time ms':>12} {'TFLOPS':>12} {'Check':>14}  Note")
+    rows: list[tuple[str, str, str, str, str]] = []
     for method in methods:
         result = results.get(method)
         if result is None:
             continue
-        time_s = "N/A" if result.time_ms is None else f"{result.time_ms:.3f}"
+        if result.time_ms is None:
+            time_s = "N/A"
+        elif result.rank_times_ms is None:
+            time_s = f"max_across_ranks={result.time_ms:.3f}"
+        else:
+            rank_times_s = ", ".join(f"t{rank}={time_ms:.3f}" for rank, time_ms in enumerate(result.rank_times_ms))
+            time_s = f"{rank_times_s} | max_across_ranks={result.time_ms:.3f}"
         tflops_s = "N/A" if result.tflops is None else f"{result.tflops:.1f}"
-        print(f"{method:<24} {time_s:>12} {tflops_s:>12} {result.check:>14}  {result.note}")
+        rows.append((method, time_s, tflops_s, result.check, result.note))
+
+    time_width = max((64, *(len(row[1]) for row in rows)))
+    print(f"{'Method':<24} {'Time ms':<{time_width}} {'TFLOPS':>12} {'Check':>14}  Note")
+    for method, time_s, tflops_s, check, note in rows:
+        print(f"{method:<24} {time_s:<{time_width}} {tflops_s:>12} {check:>14}  {note}")
 
 
 def main() -> None:

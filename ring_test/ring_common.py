@@ -252,6 +252,7 @@ def pytorch_varlen_block_attention(
 
 
 def flash_varlen_block_attention(
+    method: str,
     flash_varlen_func,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -264,11 +265,10 @@ def flash_varlen_block_attention(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run one FA2/FA3 varlen block and return output plus normalized LSE.
 
-    The two FlashAttention Python packages expose slightly different keyword
-    names across versions, so this adapter accepts both `return_attn_probs` and
-    `return_softmax` styles.
+    The two FlashAttention Python packages expose different keyword names for
+    returning LSE, so the benchmark method name selects the matching call.
     """
-    try:
+    if method == "fa2":
         result = flash_varlen_func(
             q,
             k,
@@ -280,7 +280,7 @@ def flash_varlen_block_attention(
             causal=is_causal,
             return_attn_probs=True,
         )
-    except TypeError:
+    elif method == "fa3":
         result = flash_varlen_func(
             q,
             k,
@@ -292,6 +292,8 @@ def flash_varlen_block_attention(
             causal=is_causal,
             return_softmax=True,
         )
+    else:
+        raise ValueError(f"unsupported FlashAttention method '{method}'")
     return take_output_and_lse(result, q.size(0), q.size(1))
 
 
