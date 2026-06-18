@@ -356,46 +356,6 @@ def reference_ring_varlen(
     return torch.cat(outputs, dim=0).contiguous()
 
 
-def reference_block_lse(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    batch_size: int,
-    seqlen_q: int,
-    seqlen_k: int,
-    is_causal: bool,
-) -> torch.Tensor:
-    """Compute reference LSE for one block attention call.
-
-    This is used only by the optional `min_varlen_ring` correctness path because
-    the current min_fa3 single-step ring binding returns output but not LSE.
-    """
-    q_heads = q.size(1)
-    kv_heads = k.size(1)
-    head_dim = q.size(2)
-    qhead_per_kvhead = q_heads // kv_heads
-    scale = head_dim ** -0.5
-    lse_blocks: list[torch.Tensor] = []
-    q_b = q.view(batch_size, seqlen_q, q_heads, head_dim).float()
-    k_b = k.view(batch_size, seqlen_k, kv_heads, head_dim).float()
-
-    for batch_idx in range(batch_size):
-        q_i = q_b[batch_idx]
-        k_i = k_b[batch_idx]
-        if qhead_per_kvhead != 1:
-            k_i = k_i.repeat_interleave(qhead_per_kvhead, dim=1)
-        scores = torch.einsum("qhd,khd->hqk", q_i, k_i) * scale
-        if is_causal:
-            q_pos = torch.arange(seqlen_q, device=q.device, dtype=torch.int64)
-            k_pos = torch.arange(seqlen_k, device=q.device, dtype=torch.int64)
-            if seqlen_k >= seqlen_q:
-                q_pos = q_pos + (seqlen_k - seqlen_q)
-            causal_mask = k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
-            scores = scores.masked_fill(~causal_mask.unsqueeze(0), float("-inf"))
-        lse_blocks.append(torch.logsumexp(scores, dim=-1))
-
-    return torch.stack(lse_blocks, dim=1).reshape(q_heads, batch_size * seqlen_q).contiguous()
-
-
 def raise_if_any_rank_failed(local_error: Optional[str], process_group: Optional[dist.ProcessGroup]) -> None:
     """Turn per-rank check failures into one synchronized exception path."""
     failed = torch.tensor([1 if local_error is not None else 0], device="cuda", dtype=torch.int32)

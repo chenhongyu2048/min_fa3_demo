@@ -45,6 +45,40 @@ void check_prefetch_buffer(const torch::Tensor& t,
     TORCH_CHECK(t.sizes().vec() == ref.sizes().vec(), name, " must have the same shape as its reference tensor");
 }
 
+void check_out(const torch::Tensor& t, const torch::Tensor& q, const char* name) {
+    check_varlen_qkv(t, name);
+    TORCH_CHECK(t.device() == q.device(), name, " must be on the same CUDA device as q");
+    TORCH_CHECK(t.sizes().vec() == q.sizes().vec(), name, " must have the same shape as q");
+}
+
+void check_lse(const torch::Tensor& t, const torch::Tensor& q, const char* name) {
+    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
+    TORCH_CHECK(t.scalar_type() == torch::kFloat, name, " must have dtype torch.float32");
+    TORCH_CHECK(t.dim() == 2, name, " must have shape [qhead, total_q]");
+    TORCH_CHECK(t.size(0) == q.size(1) && t.size(1) == q.size(0),
+                name, " must have shape [qhead, total_q]");
+    TORCH_CHECK(t.device() == q.device(), name, " must be on the same CUDA device as q");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+}
+
+torch::Tensor resolve_out(py::object out_obj, const torch::Tensor& q) {
+    if (out_obj.is_none()) {
+        return torch::zeros_like(q);
+    }
+    auto out = out_obj.cast<torch::Tensor>();
+    check_out(out, q, "out");
+    return out;
+}
+
+torch::Tensor resolve_lse(py::object lse_obj, const torch::Tensor& q) {
+    if (lse_obj.is_none()) {
+        return torch::full({q.size(1), q.size(0)}, -std::numeric_limits<float>::infinity(), q.options().dtype(torch::kFloat));
+    }
+    auto lse = lse_obj.cast<torch::Tensor>();
+    check_lse(lse, q, "lse");
+    return lse;
+}
+
 void check_cu_seqlens(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
     TORCH_CHECK(t.scalar_type() == torch::kInt32, name, " must have dtype torch.int32");
@@ -194,24 +228,27 @@ RingVarlenParams make_ring_varlen_params(const torch::Tensor& q,
     return params;
 }
 
-torch::Tensor forward_varlen_ring(torch::Tensor q,
-                                  torch::Tensor k,
-                                  torch::Tensor v,
-                                  kittens::py::TKParallelTensor& remote_k,
-                                  kittens::py::TKParallelTensor& remote_v,
-                                  torch::Tensor cu_seqlens_q,
-                                  torch::Tensor cu_seqlens_k,
-                                  torch::Tensor cu_seqlens_q_host,
-                                  torch::Tensor cu_seqlens_k_host,
-                                  int64_t max_seqlen_q,
-                                  int64_t max_seqlen_k,
-                                  bool is_causal,
-                                  int64_t src_rank,
-                                  int64_t num_comp_sm,
-                                  int64_t num_comm_sm,
-                                  int64_t ring_step,
-                                  torch::Tensor prefetch_k,
-                                  torch::Tensor prefetch_v) {
+py::object forward_varlen_ring(torch::Tensor q,
+                               torch::Tensor k,
+                               torch::Tensor v,
+                               kittens::py::TKParallelTensor& remote_k,
+                               kittens::py::TKParallelTensor& remote_v,
+                               torch::Tensor cu_seqlens_q,
+                               torch::Tensor cu_seqlens_k,
+                               torch::Tensor cu_seqlens_q_host,
+                               torch::Tensor cu_seqlens_k_host,
+                               int64_t max_seqlen_q,
+                               int64_t max_seqlen_k,
+                               bool is_causal,
+                               int64_t src_rank,
+                               int64_t num_comp_sm,
+                               int64_t num_comm_sm,
+                               int64_t ring_step,
+                               torch::Tensor prefetch_k,
+                               torch::Tensor prefetch_v,
+                               py::object out_obj,
+                               py::object lse_obj,
+                               bool return_lse) {
     check_varlen_qkv(q, "q");
     check_varlen_qkv(k, "k");
     check_varlen_qkv(v, "v");
@@ -293,8 +330,8 @@ torch::Tensor forward_varlen_ring(torch::Tensor q,
                 "cu_seqlens_k_host[-1] must equal k.size(0). Got ", cu_seqlens_k_host_ptr[batch_size],
                 " vs ", k.size(0));
 
-    auto out = torch::zeros_like(q);
-    auto lse = torch::full({q.size(1), q.size(0)}, -std::numeric_limits<float>::infinity(), q.options().dtype(torch::kFloat));
+    auto out = resolve_out(out_obj, q);
+    auto lse = resolve_lse(lse_obj, q);
 
     int b_rounded = round_multiple(batch_size, 4);
     bool varlen_sort_batches = true;
@@ -340,7 +377,10 @@ torch::Tensor forward_varlen_ring(torch::Tensor q,
     }
     min_fa3_varlen_demo::run_min_fa3_varlen_ring_fwd(params, remote_k, remote_v, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return out;
+    if (return_lse) {
+        return py::make_tuple(out, lse);
+    }
+    return py::cast(out);
 }
 
 }  // namespace
@@ -367,6 +407,9 @@ void bind_varlen_ring(py::module_& m) {
         py::arg("ring_step"),
         py::arg("prefetch_k"),
         py::arg("prefetch_v"),
+        py::arg("out") = py::none(),
+        py::arg("lse") = py::none(),
+        py::arg("return_lse") = false,
         "Minimal Hopper varlen ring-attention demo.\n\n"
         "Compute CTAs read the current local K/V buffer while communication CTAs optionally prefetch the next K/V "
         "buffer from src_rank into prefetch_k/prefetch_v.");

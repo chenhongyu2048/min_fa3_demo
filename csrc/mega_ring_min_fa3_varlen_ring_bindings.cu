@@ -45,6 +45,40 @@ void check_parallel_varlen_qkv(const kittens::py::TKParallelTensor& t, const cha
     check_varlen_qkv(t.data_, name);
 }
 
+void check_out(const torch::Tensor& t, const torch::Tensor& q, const char* name) {
+    check_varlen_qkv(t, name);
+    TORCH_CHECK(t.device() == q.device(), name, " must be on the same CUDA device as q");
+    TORCH_CHECK(t.sizes().vec() == q.sizes().vec(), name, " must have the same shape as q");
+}
+
+void check_lse(const torch::Tensor& t, const torch::Tensor& q, const char* name) {
+    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
+    TORCH_CHECK(t.scalar_type() == torch::kFloat, name, " must have dtype torch.float32");
+    TORCH_CHECK(t.dim() == 2, name, " must have shape [qhead, total_q]");
+    TORCH_CHECK(t.size(0) == q.size(1) && t.size(1) == q.size(0),
+                name, " must have shape [qhead, total_q]");
+    TORCH_CHECK(t.device() == q.device(), name, " must be on the same CUDA device as q");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+}
+
+torch::Tensor resolve_out(py::object out_obj, const torch::Tensor& q) {
+    if (out_obj.is_none()) {
+        return torch::zeros_like(q);
+    }
+    auto out = out_obj.cast<torch::Tensor>();
+    check_out(out, q, "out");
+    return out;
+}
+
+torch::Tensor resolve_lse(py::object lse_obj, const torch::Tensor& q) {
+    if (lse_obj.is_none()) {
+        return torch::full({q.size(1), q.size(0)}, -std::numeric_limits<float>::infinity(), q.options().dtype(torch::kFloat));
+    }
+    auto lse = lse_obj.cast<torch::Tensor>();
+    check_lse(lse, q, "lse");
+    return lse;
+}
+
 void check_cu_seqlens(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
     TORCH_CHECK(t.scalar_type() == torch::kInt32, name, " must have dtype torch.int32");
@@ -222,20 +256,23 @@ int compute_tiles_per_step(const int* cu_seqlens_q_host, int batch_size, int q_h
 // MEGA_RING: public binding launches all ring steps in one CUDA kernel. The
 // caller provides full [world_size * local_total_k, KVH, D] K/V buffers instead
 // of src_rank/ring_step plus temporary prefetch buffers.
-torch::Tensor forward_varlen_mega_ring(torch::Tensor q,
-                                       torch::Tensor k,
-                                       torch::Tensor v,
-                                       kittens::py::TKParallelTensor& remote_k,
-                                       kittens::py::TKParallelTensor& remote_v,
-                                       torch::Tensor cu_seqlens_q,
-                                       torch::Tensor cu_seqlens_k,
-                                       torch::Tensor cu_seqlens_q_host,
-                                       torch::Tensor cu_seqlens_k_host,
-                                       int64_t max_seqlen_q,
-                                       int64_t max_seqlen_k,
-                                       bool is_causal,
-                                       int64_t num_comp_sm,
-                                       int64_t num_comm_sm) {
+py::object forward_varlen_mega_ring(torch::Tensor q,
+                                    torch::Tensor k,
+                                    torch::Tensor v,
+                                    kittens::py::TKParallelTensor& remote_k,
+                                    kittens::py::TKParallelTensor& remote_v,
+                                    torch::Tensor cu_seqlens_q,
+                                    torch::Tensor cu_seqlens_k,
+                                    torch::Tensor cu_seqlens_q_host,
+                                    torch::Tensor cu_seqlens_k_host,
+                                    int64_t max_seqlen_q,
+                                    int64_t max_seqlen_k,
+                                    bool is_causal,
+                                    int64_t num_comp_sm,
+                                    int64_t num_comm_sm,
+                                    py::object out_obj,
+                                    py::object lse_obj,
+                                    bool return_lse) {
     check_varlen_qkv(q, "q");
     check_varlen_qkv(k, "k");
     check_varlen_qkv(v, "v");
@@ -319,8 +356,8 @@ torch::Tensor forward_varlen_mega_ring(torch::Tensor q,
     TORCH_CHECK(world_size == 1 || num_comm_sm > 0,
                 "mega ring requires num_comm_sm > 0 when world_size > 1");
 
-    auto out = torch::zeros_like(q);
-    auto lse = torch::full({q.size(1), q.size(0)}, -std::numeric_limits<float>::infinity(), q.options().dtype(torch::kFloat));
+    auto out = resolve_out(out_obj, q);
+    auto lse = resolve_lse(lse_obj, q);
 
     int b_rounded = round_multiple(batch_size, 4);
     bool varlen_sort_batches = true;
@@ -367,7 +404,10 @@ torch::Tensor forward_varlen_mega_ring(torch::Tensor q,
     // MEGA_RING: one fused launch runs communication CTAs and compute CTAs.
     min_fa3_varlen_demo::run_mega_ring_min_fa3_varlen_ring_fwd(params, remote_k, remote_v, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return out;
+    if (return_lse) {
+        return py::make_tuple(out, lse);
+    }
+    return py::cast(out);
 }
 
 }  // namespace
@@ -390,6 +430,9 @@ void bind_varlen_mega_ring(py::module_& m) {
         py::arg("is_causal"),
         py::arg("num_comp_sm"),
         py::arg("num_comm_sm"),
+        py::arg("out") = py::none(),
+        py::arg("lse") = py::none(),
+        py::arg("return_lse") = false,
         "MEGA_RING: explicit multi-step fused Hopper varlen ring-attention demo.\n\n"
         "K/V must be contiguous [world_size * local_total_k, kv_heads, 128] buffers. "
         "The kernel performs persistent compute and remote K/V TMA loads in one launch.");

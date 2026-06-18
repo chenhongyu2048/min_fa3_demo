@@ -3,11 +3,11 @@
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=8
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
-#SBATCH --time=00:10:00
+#SBATCH --time=00:30:00
 
 source /etc/profile.d/modules.sh
 source /data/apps/miniforge3/25.11.0-1/etc/profile.d/conda.sh
@@ -48,8 +48,7 @@ cd /data/home/scyb683/run/min_fa3_demo
 # echo "========================================================="
 
 # Remote-load benchmark note:
-# This script requests 1 GPU, so it cannot run benchmark_parallel_remote_load.py as-is.
-# Use a 2+ GPU job and launch, for example:
+# This script requests 2 GPUs, so benchmark_parallel_remote_load.py can be run with:
 # torchrun --nproc_per_node=2 benchmark_parallel_remote_load.py --shape 4096x4096 --src-rank 0
 
 # Single-Step Ring-FlashAttention benchmark:
@@ -78,19 +77,27 @@ cd /data/home/scyb683/run/min_fa3_demo
 # nsys profile -t cuda,nvtx,osrt -o my_report --stats=true python benchmark_varlen_mega_ring_local.py --profile --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 116 --num-comm-sm 16 --mode both
 
 # Multi-Step Multi-rank full Ring-FlashAttention forward benchmark:
-# These examples require a 2-GPU allocation, e.g. change the header to #SBATCH --gres=gpu:2
+# This script requests a 2-GPU allocation for these examples.
 echo "Running multi-rank ring_test benchmark with correctness checks"
 echo "========================================================="
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
-    --b 16 --seqlen 4096 --qhead 32 --kvhead 8 --headdim 128 \
-    --mode both --methods all --num-comp-sm 74 --num-comm-sm 4 \
-    --warmup-iters 20 --num-iters 30 --check --check-min-ring-reference-lse
+    --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 \
+    --mode both --methods all --num-comp-sm 128 --num-comm-sm 4 \
+    --warmup-iters 20 --num-iters 30 --check
 
 echo "Running multi-rank ring_test benchmark without correctness checks"
 echo "========================================================="
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
-    --b 16 --seqlen 4096 --qhead 32 --kvhead 8 --headdim 128 \
-    --mode both --methods all --num-comp-sm 74 --num-comm-sm 4 \
+    --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 \
+    --mode both --methods all --num-comp-sm 128 --num-comm-sm 4 \
+    --warmup-iters 20 --num-iters 30 --no-check
+torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
+    --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 \
+    --mode both --methods all --num-comp-sm 124 --num-comm-sm 8 \
+    --warmup-iters 20 --num-iters 30 --no-check
+torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
+    --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 \
+    --mode both --methods all --num-comp-sm 116 --num-comm-sm 16 \
     --warmup-iters 20 --num-iters 30 --no-check
 
 # Memory sanitizer runs:

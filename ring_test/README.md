@@ -17,9 +17,9 @@ The minimal FA3 methods follow the current local demo APIs:
   cross-step ring merge.
 - `min_varlen_ring` launches the existing single-step ring kernel for multiple
   steps. The kernel does its own remote load and per-launch reduction. The timed
-  path does not add Python communication or Python reduction. Add
-  `--check-min-ring-reference-lse` if you want a correctness check that merges
-  those per-step outputs with a PyTorch reference LSE.
+  path passes running `out` and `lse` buffers through each launch, so correctness
+  checks use the kernel-produced reduction state directly without Python
+  communication or Python reduction.
 - `min_varlen_mega_ring` launches the fused mega-ring kernel once. This is the
   complete multi-step ring kernel path and is checked by default.
 
@@ -43,13 +43,13 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
   --warmup-iters 1 --num-iters 3
 ```
 
-To include the optional single-step min ring correctness check:
+To run only the single-step min ring path with correctness checks:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
   --b 1 --seqlen 128 --qhead 8 --kvhead 8 --mode both \
   --methods min_varlen_ring --num-comp-sm 1 --num-comm-sm 1 \
-  --check-min-ring-reference-lse --warmup-iters 1 --num-iters 3
+  --warmup-iters 1 --num-iters 3
 ```
 
 # Result Example
@@ -66,7 +66,7 @@ pytorch                       114.027        154.3             ok
 fa2                           100.139        175.7             ok  
 fa3                            69.020        254.9             ok  
 min_varlen                     68.260        257.7    timing-only  timing-only local step loop
-min_varlen_ring                69.536        253.0             ok  timed without Python merge; checked with reference LSE
+min_varlen_ring                69.536        253.0             ok
 min_varlen_mega_ring           69.726        252.3             ok  
 
 Running local_S=4096, causal=True
@@ -77,6 +77,6 @@ pytorch                        89.154         98.7             ok
 fa2                            77.318        113.8             ok  
 fa3                            52.941        166.2             ok  
 min_varlen                     51.464        170.9    timing-only  timing-only local step loop
-min_varlen_ring                52.665        167.0             ok  timed without Python merge; checked with reference LSE
+min_varlen_ring                52.665        167.0             ok
 min_varlen_mega_ring           51.806        169.8             ok
 ```

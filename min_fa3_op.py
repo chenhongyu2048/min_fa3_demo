@@ -204,7 +204,10 @@ def forward_varlen_ring(
     ring_step: int,
     prefetch_k: Union[torch.Tensor, TKParallelTensor],
     prefetch_v: Union[torch.Tensor, TKParallelTensor],
-) -> torch.Tensor:
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     prefetch_k_tensor = prefetch_k.data_ if isinstance(prefetch_k, TKParallelTensor) else prefetch_k
     prefetch_v_tensor = prefetch_v.data_ if isinstance(prefetch_v, TKParallelTensor) else prefetch_v
 
@@ -227,6 +230,9 @@ def forward_varlen_ring(
         int(ring_step),
         prefetch_k_tensor,
         prefetch_v_tensor,
+        out,
+        lse,
+        bool(return_lse),
     )
 
 
@@ -246,7 +252,10 @@ def forward_varlen_mega_ring(
     remote_v: TKParallelTensor,
     num_comp_sm: int,
     num_comm_sm: int,
-) -> torch.Tensor:
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     # MEGA_RING: explicit opt-in path. K/V are the local concatenated
     # [world_size * local_total_k, kv_heads, 128] buffers used by the fused
     # persistent kernel; default forward_varlen_ring remains single-step.
@@ -265,6 +274,9 @@ def forward_varlen_mega_ring(
         bool(is_causal),
         int(num_comp_sm),
         int(num_comm_sm),
+        out,
+        lse,
+        bool(return_lse),
     )
 
 

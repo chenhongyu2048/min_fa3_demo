@@ -30,10 +30,8 @@ from ring_common import (
     gather_rank_tensor,
     pytorch_varlen_block_attention,
     raise_if_any_rank_failed,
-    reference_block_lse,
     reference_ring_varlen,
     ring_varlen_forward,
-    update_out_and_lse,
 )
 
 try:
@@ -75,15 +73,14 @@ class Case:
 class MethodRun:
     """Callable bundle for a benchmark method.
 
-    `timing_fn` is what is measured. `check_fn` may differ from `timing_fn` for
-    paths such as min_varlen_ring, where correctness can require a Python-side
-    reference-LSE merge that should not be included in timing.
+    `timing_fn` is what is measured and, for complete methods, what is checked.
+    `checkable=False` marks timing-only paths.
     """
 
     name: str
     timing_fn: Callable[[], torch.Tensor]
-    check_fn: Optional[Callable[[], torch.Tensor]]
     note: str = ""
+    checkable: bool = True
 
 
 @dataclass
@@ -179,14 +176,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--check", dest="check", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--atol", type=float, default=2e-1, help="Correctness absolute tolerance.")
     parser.add_argument("--rtol", type=float, default=2e-1, help="Correctness relative tolerance.")
-    parser.add_argument(
-        "--check-min-ring-reference-lse",
-        action="store_true",
-        help=(
-            "Also check min_varlen_ring by merging its per-step outputs with a PyTorch reference LSE. "
-            "The timed min_varlen_ring path still measures only the requested kernel launch pattern."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -366,15 +355,11 @@ def min_varlen_ring_steps_forward(
     remote_v: min_fa3_op.TKParallelTensor,
     num_comp_sm: int,
     num_comm_sm: int,
-    merge_with_reference_lse: bool,
 ) -> torch.Tensor:
     """Launch the min_fa3 single-step ring kernel across ring steps.
 
-    The timed mode returns the last visible step output and is labeled
-    timing-only, because the current binding does not expose the kernel LSE
-    required for a true Python-side merge. When `merge_with_reference_lse` is
-    true, the function uses PyTorch reference LSE to check whether the per-step
-    min_varlen_ring outputs can be merged into the full ring result.
+    The same output and LSE buffers are passed through every visible ring step,
+    so the kernel's device-side online reduction produces the full-ring result.
     """
     if world_size > 1 and num_comm_sm <= 0:
         raise RuntimeError("min_varlen_ring multi-rank path requires num_comm_sm > 0")
@@ -383,9 +368,9 @@ def min_varlen_ring_steps_forward(
     prefetch_v = [torch.empty_like(v), torch.empty_like(v)]
     cur_k = k
     cur_v = v
-    out = None
-    lse = None
-    last_out = None
+    out = torch.zeros_like(q)
+    lse = torch.full((q.size(1), q.size(0)), float("-inf"), device=q.device, dtype=torch.float32)
+    produced_output = False
 
     for step in range(world_size):
         if not is_causal or step <= rank:
@@ -395,7 +380,7 @@ def min_varlen_ring_steps_forward(
             next_src_rank = (rank - step - 1 + world_size) % world_size
             buffer_idx = step % 2
             launch_comm_sm = num_comm_sm if step + 1 < world_size else 0
-            block_out = min_fa3_op.forward_varlen_ring(
+            out, lse = min_fa3_op.forward_varlen_ring(
                 q,
                 cur_k,
                 cur_v,
@@ -414,33 +399,20 @@ def min_varlen_ring_steps_forward(
                 ring_step=step,
                 prefetch_k=prefetch_k[buffer_idx],
                 prefetch_v=prefetch_v[buffer_idx],
+                out=out,
+                lse=lse,
+                return_lse=True,
             )
-            last_out = block_out
-            if merge_with_reference_lse:
-                # The binding returns block_out but not block_lse. This optional
-                # check path computes only the missing LSE with a simple reference.
-                block_lse = reference_block_lse(
-                    q,
-                    cur_k,
-                    batch_size=cu_seqlens_q_host.numel() - 1,
-                    seqlen_q=max_seqlen_q,
-                    seqlen_k=max_seqlen_k,
-                    is_causal=is_causal and step == 0,
-                )
-                out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+            produced_output = True
             if step + 1 < world_size:
                 # The prefetch buffer written by this kernel launch is consumed
                 # as the local K/V input for the next visible step.
                 cur_k = prefetch_k[buffer_idx]
                 cur_v = prefetch_v[buffer_idx]
 
-    if merge_with_reference_lse:
-        if out is None:
-            raise RuntimeError("min_varlen_ring reference-LSE merge produced no output")
-        return out.to(q.dtype)
-    if last_out is None:
+    if not produced_output:
         raise RuntimeError("min_varlen_ring step loop produced no output")
-    return last_out
+    return out
 
 
 def build_method_runs(
@@ -483,10 +455,10 @@ def build_method_runs(
                     ),
                 )
 
-            runs.append(MethodRun(method, fn, fn))
+            runs.append(MethodRun(method, fn))
         elif method == "fa2":
             if flash_attn_varlen_func2 is None:
-                runs.append(MethodRun(method, lambda: q, None, "not available"))
+                runs.append(MethodRun(method, lambda: q, "not available", checkable=False))
                 continue
 
             def fn(method=method):
@@ -512,10 +484,10 @@ def build_method_runs(
                     ),
                 )
 
-            runs.append(MethodRun(method, fn, fn))
+            runs.append(MethodRun(method, fn))
         elif method == "fa3":
             if flash_attn_varlen_func3 is None:
-                runs.append(MethodRun(method, lambda: q, None, "not available"))
+                runs.append(MethodRun(method, lambda: q, "not available", checkable=False))
                 continue
 
             def fn(method=method):
@@ -541,7 +513,7 @@ def build_method_runs(
                     ),
                 )
 
-            runs.append(MethodRun(method, fn, fn))
+            runs.append(MethodRun(method, fn))
         elif method == "min_varlen":
             def fn(method=method):
                 # Timing-only local step loop. This is not a complete ring
@@ -562,13 +534,13 @@ def build_method_runs(
                     args.num_comp_sm,
                 )
 
-            runs.append(MethodRun(method, fn, None, "timing-only local step loop"))
+            runs.append(MethodRun(method, fn, "timing-only local step loop", checkable=False))
         elif method == "min_varlen_ring":
             remote_k, remote_v = make_ring_parallel_tensors(k, v, local_rank, local_world_size)
 
-            def timing_fn(method=method, remote_k=remote_k, remote_v=remote_v):
-                # Timing path launches the kernel's remote-load step sequence
-                # without adding Python-side output reduction.
+            def fn(method=method, remote_k=remote_k, remote_v=remote_v):
+                # Single-step ring path: each launch consumes one ring block and
+                # updates the running O/LSE buffers in the kernel epilogue.
                 return min_varlen_ring_steps_forward(
                     q,
                     k,
@@ -586,37 +558,9 @@ def build_method_runs(
                     remote_v,
                     args.num_comp_sm,
                     args.num_comm_sm,
-                    False,
                 )
 
-            check_fn = None
-            note = "timing-only multi-step remote-load launches"
-            if args.check_min_ring_reference_lse:
-                def check_fn(method=method, remote_k=remote_k, remote_v=remote_v):
-                    # Optional check path adds a reference-LSE merge around the
-                    # single-step kernel outputs. This is excluded from timing.
-                    return min_varlen_ring_steps_forward(
-                        q,
-                        k,
-                        v,
-                        cu_seqlens_q,
-                        cu_seqlens_k,
-                        cu_seqlens_q_host,
-                        cu_seqlens_k_host,
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        case.is_causal,
-                        local_rank,
-                        local_world_size,
-                        remote_k,
-                        remote_v,
-                        args.num_comp_sm,
-                        args.num_comm_sm,
-                        True,
-                    )
-
-                note = "timed without Python merge; checked with reference LSE"
-            runs.append(MethodRun(method, timing_fn, check_fn, note))
+            runs.append(MethodRun(method, fn))
         elif method == "min_varlen_mega_ring":
             remote_k, remote_v = make_mega_parallel_tensors(k, v, local_rank, local_world_size)
 
@@ -640,7 +584,7 @@ def build_method_runs(
                     num_comm_sm=args.num_comm_sm,
                 )
 
-            runs.append(MethodRun(method, fn, fn))
+            runs.append(MethodRun(method, fn))
         else:
             raise RuntimeError(f"unhandled method {method}")
 
@@ -768,11 +712,9 @@ def run_case(
             time_ms = timing.max_time_ms
             tflops = aggregate_tflops(case, local_rank, local_world_size, time_ms)
             check = "skip"
-            # Most full-ring methods use their timing function for checks.
-            # Timing-only methods either have no check_fn or a separate check_fn.
-            if args.check and run.check_fn is not None and ref is not None:
-                check = check_output(run.name, run.check_fn, ref, args.atol, args.rtol)
-            elif args.check and run.check_fn is None:
+            if args.check and run.checkable and ref is not None:
+                check = check_output(run.name, run.timing_fn, ref, args.atol, args.rtol)
+            elif args.check and not run.checkable:
                 check = "timing-only"
             results[run.name] = Result(time_ms, tflops, check, run.note, timing.rank_times_ms)
         except torch.OutOfMemoryError as exc:
