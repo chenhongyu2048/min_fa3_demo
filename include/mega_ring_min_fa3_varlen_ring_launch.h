@@ -325,6 +325,7 @@ void run_mega_ring_min_fa3_varlen_ring_sm90(
         nullptr,
         params.mega_ring_kv_ready_counts,
         params.mega_ring_step_ready,
+        params.mega_ring_half_cu_seqlens,
         params.ring_rank,
         params.ring_world_size,
         local_total_k};
@@ -368,7 +369,9 @@ void run_mega_ring_min_fa3_varlen_ring_sm90(
         0,
         true,
         params.ring_world_size,
-        params.mega_ring_tiles_per_step};
+        params.ring_rank,
+        params.mega_ring_tiles_per_step,
+        params.mega_ring_tiles_per_half_step};
 
     if (!params.skip_scheduler_metadata_computation) {
         // MEGA_RING: still uses the copied varlen scheduler metadata prep; the

@@ -210,6 +210,8 @@ RingVarlenParams make_mega_ring_varlen_params(const torch::Tensor& q,
                                               int ring_rank,
                                               int ring_world_size,
                                               int tiles_per_step,
+                                              int tiles_per_half_step,
+                                              int* half_cu_seqlens,
                                               torch::Tensor& kv_ready_counts,
                                               torch::Tensor& step_ready) {
     RingVarlenParams params{};
@@ -234,7 +236,9 @@ RingVarlenParams make_mega_ring_varlen_params(const torch::Tensor& q,
     params.ring_world_size = ring_world_size;
     params.ring_step = 0;
     params.mega_ring_tiles_per_step = tiles_per_step;
+    params.mega_ring_tiles_per_half_step = tiles_per_half_step;
     params.mega_ring_total_k_per_rank = local_total_k;
+    params.mega_ring_half_cu_seqlens = half_cu_seqlens;
     params.mega_ring_kv_ready_counts = kv_ready_counts.data_ptr<int>();
     params.mega_ring_step_ready = step_ready.data_ptr<int>();
     return params;
@@ -270,6 +274,8 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
                                     bool is_causal,
                                     int64_t num_comp_sm,
                                     int64_t num_comm_sm,
+                                    py::object half_cu_seqlens_obj,
+                                    py::object half_cu_seqlens_host_obj,
                                     py::object out_obj,
                                     py::object lse_obj,
                                     bool return_lse) {
@@ -282,10 +288,23 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     check_cu_seqlens(cu_seqlens_k, "cu_seqlens_k");
     check_cu_seqlens_host(cu_seqlens_q_host, cu_seqlens_q, "cu_seqlens_q_host");
     check_cu_seqlens_host(cu_seqlens_k_host, cu_seqlens_k, "cu_seqlens_k_host");
+    torch::Tensor half_cu_seqlens;
+    torch::Tensor half_cu_seqlens_host;
+    if (is_causal) {
+        TORCH_CHECK(!half_cu_seqlens_obj.is_none(), "causal mega ring zigzag requires half_cu_seqlens");
+        TORCH_CHECK(!half_cu_seqlens_host_obj.is_none(), "causal mega ring zigzag requires half_cu_seqlens_host");
+        half_cu_seqlens = half_cu_seqlens_obj.cast<torch::Tensor>();
+        half_cu_seqlens_host = half_cu_seqlens_host_obj.cast<torch::Tensor>();
+        check_cu_seqlens(half_cu_seqlens, "half_cu_seqlens");
+        check_cu_seqlens_host(half_cu_seqlens_host, half_cu_seqlens, "half_cu_seqlens_host");
+    }
 
     TORCH_CHECK(q.device() == k.device() && q.device() == v.device(), "q, k, v must be on the same CUDA device");
     TORCH_CHECK(q.device() == cu_seqlens_q.device() && q.device() == cu_seqlens_k.device(),
                 "q, k, v, cu_seqlens_q, and cu_seqlens_k must be on the same CUDA device");
+    if (is_causal) {
+        TORCH_CHECK(half_cu_seqlens.device() == q.device(), "half_cu_seqlens must be on the same CUDA device as q");
+    }
     TORCH_CHECK(remote_k.data_.device() == q.device(), "remote_k must be created on the same local CUDA device as q");
     TORCH_CHECK(remote_v.data_.device() == q.device(), "remote_v must be created on the same local CUDA device as q");
     TORCH_CHECK(remote_k.data_.sizes().vec() == k.sizes().vec(), "remote_k must have the same shape as local k");
@@ -323,12 +342,18 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     int const batch_size = cu_seqlens_q_host.size(0) - 1;
     int const* cu_seqlens_q_host_ptr = cu_seqlens_q_host.data_ptr<int>();
     int const* cu_seqlens_k_host_ptr = cu_seqlens_k_host.data_ptr<int>();
+    int const* half_cu_seqlens_host_ptr = is_causal ? half_cu_seqlens_host.data_ptr<int>() : nullptr;
     // MEGA_RING: ring identity is taken from the TKParallelTensor allocation.
     int const world_size = remote_k.local_world_size_;
     int const ring_rank = remote_k.local_rank_;
     TORCH_CHECK(batch_size >= 1, "varlen demo requires batch size B >= 1");
     TORCH_CHECK(cu_seqlens_q_host_ptr[0] == 0, "cu_seqlens_q_host must start with 0");
     TORCH_CHECK(cu_seqlens_k_host_ptr[0] == 0, "cu_seqlens_k_host must start with 0");
+    if (is_causal) {
+        TORCH_CHECK(half_cu_seqlens_host.size(0) == cu_seqlens_q_host.size(0),
+                    "half_cu_seqlens_host must have the same length as cu_seqlens_q_host");
+        TORCH_CHECK(half_cu_seqlens_host_ptr[0] == 0, "half_cu_seqlens_host must start with 0");
+    }
     TORCH_CHECK(cu_seqlens_q_host_ptr[batch_size] == q.size(0),
                 "cu_seqlens_q_host[-1] must equal q.size(0). Got ", cu_seqlens_q_host_ptr[batch_size],
                 " vs ", q.size(0));
@@ -336,6 +361,26 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     // storage contains one such block for every rank in local rank order.
     int const local_total_k = cu_seqlens_k_host_ptr[batch_size];
     TORCH_CHECK(local_total_k > 0, "cu_seqlens_k_host[-1] must be positive");
+    int tiles_per_half_step = 0;
+    if (is_causal) {
+        for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+            int const q_len = cu_seqlens_q_host_ptr[batch_idx + 1] - cu_seqlens_q_host_ptr[batch_idx];
+            int const k_len = cu_seqlens_k_host_ptr[batch_idx + 1] - cu_seqlens_k_host_ptr[batch_idx];
+            int const half_len = half_cu_seqlens_host_ptr[batch_idx + 1] - half_cu_seqlens_host_ptr[batch_idx];
+            TORCH_CHECK(half_len > 0, "causal mega ring zigzag requires positive half_len for every batch");
+            TORCH_CHECK(q_len == 2 * half_len,
+                        "causal mega ring zigzag requires q seqlen == 2 * half_len. batch=", batch_idx,
+                        ", q_len=", q_len, ", half_len=", half_len);
+            TORCH_CHECK(k_len == 2 * half_len,
+                        "causal mega ring zigzag requires k seqlen == 2 * half_len. batch=", batch_idx,
+                        ", k_len=", k_len, ", half_len=", half_len);
+            TORCH_CHECK(half_len % 128 == 0,
+                        "causal mega ring zigzag requires half_len to be 128-aligned. batch=", batch_idx,
+                        ", half_len=", half_len);
+        }
+        tiles_per_half_step = compute_tiles_per_step(half_cu_seqlens_host_ptr, batch_size, q.size(1));
+        TORCH_CHECK(tiles_per_half_step > 0, "causal mega ring zigzag requires at least one half-Q tile per step");
+    }
     TORCH_CHECK(k.size(0) == int64_t(world_size) * local_total_k,
                 "mega ring k must have shape [world_size * local_total_k, KVH, D]. Got k.size(0)=",
                 k.size(0), ", world_size=", world_size, ", local_total_k=", local_total_k);
@@ -370,6 +415,11 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     // per-Q-tile reduction ordering across ring steps.
     int const tiles_per_step = compute_tiles_per_step(cu_seqlens_q_host_ptr, batch_size, q.size(1));
     TORCH_CHECK(tiles_per_step > 0, "mega ring requires at least one Q tile per step");
+    if (is_causal) {
+        TORCH_CHECK(tiles_per_step == 2 * tiles_per_half_step,
+                    "causal mega ring zigzag requires T_full == 2 * T_half. Got T_full=",
+                    tiles_per_step, ", T_half=", tiles_per_half_step);
+    }
     auto kv_ready_counts = torch::zeros({world_size}, q.options().dtype(torch::kInt32));
     auto step_ready = torch::zeros({tiles_per_step}, q.options().dtype(torch::kInt32));
 
@@ -398,6 +448,8 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
         ring_rank,
         world_size,
         tiles_per_step,
+        tiles_per_half_step,
+        is_causal ? static_cast<int*>(half_cu_seqlens.data_ptr()) : nullptr,
         kv_ready_counts,
         step_ready);
 
@@ -430,6 +482,8 @@ void bind_varlen_mega_ring(py::module_& m) {
         py::arg("is_causal"),
         py::arg("num_comp_sm"),
         py::arg("num_comm_sm"),
+        py::arg("half_cu_seqlens") = py::none(),
+        py::arg("half_cu_seqlens_host") = py::none(),
         py::arg("out") = py::none(),
         py::arg("lse") = py::none(),
         py::arg("return_lse") = false,

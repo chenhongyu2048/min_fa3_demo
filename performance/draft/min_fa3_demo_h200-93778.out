@@ -1,0 +1,454 @@
+Running multi-rank ring_test benchmark with correctness checks
+=========================================================
+Config: world_size=2, methods=['pytorch', 'fa2', 'fa3', 'min_varlen', 'min_varlen_ring', 'min_varlen_mega_ring'], B=16, seqlen=512,1024,2048,4096,8192, qhead=32, kvhead=8, D=128, mode=both, num_comp_sm=128, num_comm_sm=4, warmup=20, iters=30, check=True
+Checks compare each rank output against a full-rank PyTorch reference.
+Causal checks use the zigzag [front | back] reference by default.
+Agg TFLOPS sums visible attention work across ranks; Avg/GPU is that value divided by world_size.
+
+Running local_S=512, causal=False
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=1.786, t1=1.798 | max_across_ranks=1.800                             152.7       76.4             ok  
+fa2                      t0=0.916, t1=0.967 | max_across_ranks=0.967                             284.1      142.1             ok  
+fa3                      t0=0.855, t1=1.009 | max_across_ranks=1.018                             270.0      135.0             ok  
+min_varlen               t0=0.320, t1=0.320 | max_across_ranks=0.321                             857.1      428.5    timing-only  timing-only local step loop
+min_varlen_ring          t0=1.216, t1=1.226 | max_across_ranks=1.232                             223.2      111.6             ok  
+min_varlen_mega_ring     t0=1.420, t1=1.414 | max_across_ranks=1.421                             193.4       96.7             ok  
+
+Running local_S=1024, causal=False
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=3.946, t1=3.947 | max_across_ranks=3.952                             278.2      139.1             ok  
+fa2                      t0=2.377, t1=2.373 | max_across_ranks=2.377                             462.5      231.3             ok  
+fa3                      t0=1.941, t1=1.934 | max_across_ranks=1.941                             566.5      283.3             ok  
+min_varlen               t0=1.031, t1=0.983 | max_across_ranks=1.032                            1065.8      532.9    timing-only  timing-only local step loop
+min_varlen_ring          t0=2.615, t1=2.610 | max_across_ranks=2.637                             417.0      208.5             ok  
+min_varlen_mega_ring     t0=3.061, t1=3.059 | max_across_ranks=3.077                             357.4      178.7             ok  
+
+Running local_S=2048, causal=False
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=10.668, t1=10.651 | max_across_ranks=10.672                          412.1      206.1             ok  
+fa2                      t0=7.717, t1=7.623 | max_across_ranks=7.734                             568.7      284.3             ok  
+fa3                      t0=5.491, t1=5.520 | max_across_ranks=5.570                             789.5      394.8             ok  
+min_varlen               t0=3.774, t1=3.890 | max_across_ranks=3.890                            1130.5      565.2    timing-only  timing-only local step loop
+min_varlen_ring          t0=5.975, t1=5.962 | max_across_ranks=5.975                             736.0      368.0             ok  
+min_varlen_mega_ring     t0=6.874, t1=6.844 | max_across_ranks=6.878                             639.4      319.7             ok  
+
+Running local_S=4096, causal=False
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=34.093, t1=34.189 | max_across_ranks=34.370                          511.8      255.9             ok  
+fa2                      t0=26.891, t1=26.857 | max_across_ranks=27.007                          651.4      325.7             ok  
+fa3                      t0=18.346, t1=18.185 | max_across_ranks=18.494                          951.3      475.6             ok  
+min_varlen               t0=14.659, t1=14.839 | max_across_ranks=14.894                         1181.1      590.6    timing-only  timing-only local step loop
+min_varlen_ring          t0=16.406, t1=16.498 | max_across_ranks=16.589                         1060.5      530.2             ok  
+min_varlen_mega_ring     t0=17.838, t1=18.012 | max_across_ranks=18.219                          965.6      482.8             ok  
+
+Running local_S=8192, causal=False
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=117.370, t1=118.261 | max_across_ranks=118.451                       594.1      297.0             ok  
+fa2                      t0=99.619, t1=99.566 | max_across_ranks=99.801                          705.1      352.5             ok  
+fa3                      t0=63.744, t1=64.098 | max_across_ranks=64.311                         1094.2      547.1             ok  
+min_varlen               t0=56.146, t1=55.878 | max_across_ranks=56.379                         1248.1      624.1    timing-only  timing-only local step loop
+min_varlen_ring          t0=59.599, t1=59.540 | max_across_ranks=60.276                         1167.4      583.7             ok  
+min_varlen_mega_ring     t0=60.468, t1=59.717 | max_across_ranks=60.592                         1161.4      580.7             ok  
+
+Running local_S=512, causal=True
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=2.881, t1=2.659 | max_across_ranks=2.881                              47.8       23.9             ok  zigzag causal
+fa2                      t0=2.264, t1=2.093 | max_across_ranks=2.264                              60.8       30.4             ok  zigzag causal
+fa3                      t0=2.195, t1=2.079 | max_across_ranks=2.195                              62.7       31.3             ok  zigzag causal
+min_varlen               t0=0.128, t1=0.279 | max_across_ranks=0.279                             493.9      247.0    timing-only  timing-only local step loop
+min_varlen_ring          t0=1.027, t1=1.212 | max_across_ranks=1.212                             113.5       56.7    timing-only  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=1.327, t1=1.356 | max_across_ranks=1.357                             101.4       50.7             ok  zigzag causal
+
+Running local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=4.501, t1=4.196 | max_across_ranks=4.501                             122.2       61.1             ok  zigzag causal
+fa2                      t0=3.217, t1=2.965 | max_across_ranks=3.217                             171.0       85.5             ok  zigzag causal
+fa3                      t0=2.959, t1=2.751 | max_across_ranks=2.959                             185.9       93.0             ok  zigzag causal
+min_varlen               t0=0.317, t1=0.794 | max_across_ranks=0.794                             692.7      346.3    timing-only  timing-only local step loop
+min_varlen_ring          t0=2.063, t1=2.605 | max_across_ranks=2.605                             211.2      105.6    timing-only  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=2.777, t1=2.863 | max_across_ranks=2.863                             192.1       96.0             ok  zigzag causal
+
+Running local_S=2048, causal=True
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=8.852, t1=8.637 | max_across_ranks=8.852                             248.5      124.2             ok  zigzag causal
+fa2                      t0=6.114, t1=5.975 | max_across_ranks=6.116                             359.6      179.8             ok  zigzag causal
+fa3                      t0=4.953, t1=4.910 | max_across_ranks=4.955                             443.9      221.9             ok  zigzag causal
+min_varlen               t0=0.961, t1=2.956 | max_across_ranks=2.956                             744.0      372.0    timing-only  timing-only local step loop
+min_varlen_ring          t0=4.113, t1=5.938 | max_across_ranks=5.938                             370.4      185.2    timing-only  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=5.961, t1=6.088 | max_across_ranks=6.088                             361.3      180.6             ok  zigzag causal
+
+Running local_S=4096, causal=True
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=22.407, t1=22.224 | max_across_ranks=22.475                          391.4      195.7             ok  zigzag causal
+fa2                      t0=16.755, t1=16.637 | max_across_ranks=16.831                          522.7      261.3             ok  zigzag causal
+fa3                      t0=11.589, t1=11.704 | max_across_ranks=11.733                          749.7      374.9             ok  zigzag causal
+min_varlen               t0=3.355, t1=11.383 | max_across_ranks=11.383                           772.9      386.4    timing-only  timing-only local step loop
+min_varlen_ring          t0=8.289, t1=15.276 | max_across_ranks=15.276                           575.9      287.9    timing-only  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=13.574, t1=13.774 | max_across_ranks=13.774                          638.7      319.3             ok  zigzag causal
+
+Running local_S=8192, causal=True
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=68.955, t1=68.707 | max_across_ranks=69.315                          507.6      253.8             ok  zigzag causal
+fa2                      t0=56.033, t1=56.300 | max_across_ranks=57.007                          617.2      308.6             ok  zigzag causal
+fa3                      t0=35.511, t1=36.898 | max_across_ranks=37.008                          950.8      475.4             ok  zigzag causal
+min_varlen               t0=12.531, t1=42.948 | max_across_ranks=42.948                          819.3      409.6    timing-only  timing-only local step loop
+min_varlen_ring          t0=16.978, t1=47.113 | max_across_ranks=47.113                          746.9      373.4    timing-only  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=35.563, t1=36.376 | max_across_ranks=36.541                          962.9      481.5             ok  zigzag causal
+Running multi-rank ring_test benchmark without correctness checks
+=========================================================
+Config: world_size=2, methods=['pytorch', 'fa2', 'fa3', 'min_varlen', 'min_varlen_ring', 'min_varlen_mega_ring'], B=16, seqlen=512,1024,2048,4096,8192, qhead=32, kvhead=8, D=128, mode=both, num_comp_sm=128, num_comm_sm=4, warmup=20, iters=30, check=False
+Agg TFLOPS sums visible attention work across ranks; Avg/GPU is that value divided by world_size.
+
+Running local_S=512, causal=False
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=1.677, t1=1.671 | max_across_ranks=1.677                             163.9       81.9           skip  
+fa2                      t0=0.920, t1=0.920 | max_across_ranks=0.927                             296.6      148.3           skip  
+fa3                      t0=0.853, t1=0.878 | max_across_ranks=0.881                             312.0      156.0           skip  
+min_varlen               t0=0.323, t1=0.321 | max_across_ranks=0.323                             851.7      425.9           skip  timing-only local step loop
+min_varlen_ring          t0=1.218, t1=1.221 | max_across_ranks=1.230                             223.5      111.8           skip  
+min_varlen_mega_ring     t0=1.419, t1=1.418 | max_across_ranks=1.423                             193.1       96.6           skip  
+
+Running local_S=1024, causal=False
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=3.839, t1=3.831 | max_across_ranks=3.840                             286.3      143.2           skip  
+fa2                      t0=2.243, t1=2.262 | max_across_ranks=2.264                             485.7      242.8           skip  
+fa3                      t0=1.815, t1=1.828 | max_across_ranks=1.830                             600.9      300.5           skip  
+min_varlen               t0=1.044, t1=1.037 | max_across_ranks=1.058                            1039.4      519.7           skip  timing-only local step loop
+min_varlen_ring          t0=2.624, t1=2.616 | max_across_ranks=2.625                             418.9      209.4           skip  
+min_varlen_mega_ring     t0=3.060, t1=3.060 | max_across_ranks=3.067                             358.4      179.2           skip  
+
+Running local_S=2048, causal=False
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=10.654, t1=10.574 | max_across_ranks=10.654                          412.8      206.4           skip  
+fa2                      t0=7.677, t1=7.720 | max_across_ranks=7.743                             568.0      284.0           skip  
+fa3                      t0=5.578, t1=5.590 | max_across_ranks=5.630                             781.1      390.6           skip  
+min_varlen               t0=3.875, t1=3.877 | max_across_ranks=3.914                            1123.7      561.9           skip  timing-only local step loop
+min_varlen_ring          t0=5.995, t1=5.976 | max_across_ranks=5.995                             733.6      366.8           skip  
+min_varlen_mega_ring     t0=6.860, t1=6.862 | max_across_ranks=6.873                             639.9      320.0           skip  
+
+Running local_S=4096, causal=False
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=34.235, t1=34.275 | max_across_ranks=34.504                          509.9      254.9           skip  
+fa2                      t0=26.971, t1=26.917 | max_across_ranks=27.052                          650.3      325.2           skip  
+fa3                      t0=18.409, t1=18.253 | max_across_ranks=18.509                          950.5      475.2           skip  
+min_varlen               t0=14.493, t1=14.598 | max_across_ranks=14.621                         1203.2      601.6           skip  timing-only local step loop
+min_varlen_ring          t0=16.436, t1=16.415 | max_across_ranks=16.522                         1064.8      532.4           skip  
+min_varlen_mega_ring     t0=17.942, t1=18.001 | max_across_ranks=18.192                          967.0      483.5           skip  
+
+Running local_S=8192, causal=False
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=118.006, t1=118.260 | max_across_ranks=118.711                       592.8      296.4           skip  
+fa2                      t0=99.930, t1=100.048 | max_across_ranks=100.264                        701.8      350.9           skip  
+fa3                      t0=64.206, t1=64.180 | max_across_ranks=64.519                         1090.7      545.3           skip  
+min_varlen               t0=56.650, t1=56.073 | max_across_ranks=56.783                         1239.3      619.6           skip  timing-only local step loop
+min_varlen_ring          t0=60.716, t1=59.636 | max_across_ranks=60.759                         1158.2      579.1           skip  
+min_varlen_mega_ring     t0=60.882, t1=59.834 | max_across_ranks=60.960                         1154.3      577.2           skip  
+
+Running local_S=512, causal=True
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=2.890, t1=2.668 | max_across_ranks=2.890                              47.6       23.8           skip  zigzag causal
+fa2                      t0=2.273, t1=2.122 | max_across_ranks=2.275                              60.5       30.2           skip  zigzag causal
+fa3                      t0=2.220, t1=2.117 | max_across_ranks=2.227                              61.8       30.9           skip  zigzag causal
+min_varlen               t0=0.129, t1=0.280 | max_across_ranks=0.280                             491.3      245.7           skip  timing-only local step loop
+min_varlen_ring          t0=1.031, t1=1.214 | max_across_ranks=1.214                             113.3       56.7           skip  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=1.320, t1=1.359 | max_across_ranks=1.359                             101.2       50.6           skip  zigzag causal
+
+Running local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=4.548, t1=4.220 | max_across_ranks=4.548                             120.9       60.5           skip  zigzag causal
+fa2                      t0=3.226, t1=2.990 | max_across_ranks=3.226                             170.5       85.3           skip  zigzag causal
+fa3                      t0=2.947, t1=2.763 | max_across_ranks=2.947                             186.6       93.3           skip  zigzag causal
+min_varlen               t0=0.318, t1=0.787 | max_across_ranks=0.787                             699.2      349.6           skip  timing-only local step loop
+min_varlen_ring          t0=2.063, t1=2.604 | max_across_ranks=2.604                             211.2      105.6           skip  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=2.775, t1=2.865 | max_across_ranks=2.865                             192.0       96.0           skip  zigzag causal
+
+Running local_S=2048, causal=True
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=8.878, t1=8.652 | max_across_ranks=8.878                             247.8      123.9           skip  zigzag causal
+fa2                      t0=6.144, t1=5.986 | max_across_ranks=6.144                             358.0      179.0           skip  zigzag causal
+fa3                      t0=4.983, t1=4.938 | max_across_ranks=4.986                             441.2      220.6           skip  zigzag causal
+min_varlen               t0=0.966, t1=3.011 | max_across_ranks=3.011                             730.4      365.2           skip  timing-only local step loop
+min_varlen_ring          t0=4.117, t1=5.931 | max_across_ranks=5.931                             370.9      185.4           skip  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=5.953, t1=6.078 | max_across_ranks=6.078                             361.9      180.9           skip  zigzag causal
+
+Running local_S=4096, causal=True
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=22.510, t1=22.398 | max_across_ranks=22.586                          389.5      194.7           skip  zigzag causal
+fa2                      t0=16.725, t1=16.680 | max_across_ranks=16.834                          522.6      261.3           skip  zigzag causal
+fa3                      t0=11.667, t1=11.643 | max_across_ranks=11.721                          750.5      375.3           skip  zigzag causal
+min_varlen               t0=3.369, t1=11.608 | max_across_ranks=11.608                           757.8      378.9           skip  timing-only local step loop
+min_varlen_ring          t0=8.294, t1=15.263 | max_across_ranks=15.263                           576.4      288.2           skip  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=13.571, t1=13.783 | max_across_ranks=13.783                          638.2      319.1           skip  zigzag causal
+
+Running local_S=8192, causal=True
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=69.205, t1=68.178 | max_across_ranks=69.261                          508.0      254.0           skip  zigzag causal
+fa2                      t0=56.442, t1=55.960 | max_across_ranks=56.940                          618.0      309.0           skip  zigzag causal
+fa3                      t0=36.035, t1=36.457 | max_across_ranks=36.796                          956.3      478.1           skip  zigzag causal
+min_varlen               t0=12.553, t1=42.632 | max_across_ranks=42.632                          825.4      412.7           skip  timing-only local step loop
+min_varlen_ring          t0=16.989, t1=46.756 | max_across_ranks=46.756                          752.6      376.3           skip  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=35.801, t1=36.166 | max_across_ranks=36.492                          964.2      482.1           skip  zigzag causal
+Config: world_size=2, methods=['pytorch', 'fa2', 'fa3', 'min_varlen', 'min_varlen_ring', 'min_varlen_mega_ring'], B=16, seqlen=512,1024,2048,4096,8192, qhead=32, kvhead=8, D=128, mode=both, num_comp_sm=124, num_comm_sm=8, warmup=20, iters=30, check=False
+Agg TFLOPS sums visible attention work across ranks; Avg/GPU is that value divided by world_size.
+
+Running local_S=512, causal=False
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=1.676, t1=1.670 | max_across_ranks=1.678                             163.8       81.9           skip  
+fa2                      t0=0.924, t1=0.910 | max_across_ranks=0.926                             297.0      148.5           skip  
+fa3                      t0=0.862, t1=0.842 | max_across_ranks=0.863                             318.6      159.3           skip  
+min_varlen               t0=0.334, t1=0.332 | max_across_ranks=0.334                             822.3      411.1           skip  timing-only local step loop
+min_varlen_ring          t0=0.759, t1=0.762 | max_across_ranks=0.767                             358.5      179.2           skip  
+min_varlen_mega_ring     t0=0.848, t1=0.839 | max_across_ranks=0.849                             323.8      161.9           skip  
+
+Running local_S=1024, causal=False
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=3.861, t1=3.830 | max_across_ranks=3.863                             284.7      142.3           skip  
+fa2                      t0=2.297, t1=2.278 | max_across_ranks=2.309                             476.2      238.1           skip  
+fa3                      t0=1.818, t1=1.811 | max_across_ranks=1.824                             602.9      301.4           skip  
+min_varlen               t0=1.056, t1=1.082 | max_across_ranks=1.082                            1016.3      508.1           skip  timing-only local step loop
+min_varlen_ring          t0=1.683, t1=1.676 | max_across_ranks=1.684                             652.9      326.4           skip  
+min_varlen_mega_ring     t0=1.866, t1=1.864 | max_across_ranks=1.870                             588.0      294.0           skip  
+
+Running local_S=2048, causal=False
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=10.647, t1=10.650 | max_across_ranks=10.662                          412.5      206.2           skip  
+fa2                      t0=7.724, t1=7.837 | max_across_ranks=7.874                             558.6      279.3           skip  
+fa3                      t0=5.604, t1=5.535 | max_across_ranks=5.616                             783.2      391.6           skip  
+min_varlen               t0=3.900, t1=3.959 | max_across_ranks=3.961                            1110.2      555.1           skip  timing-only local step loop
+min_varlen_ring          t0=4.369, t1=4.369 | max_across_ranks=4.386                            1002.7      501.3           skip  
+min_varlen_mega_ring     t0=4.836, t1=4.875 | max_across_ranks=4.881                             901.0      450.5           skip  
+
+Running local_S=4096, causal=False
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=34.287, t1=34.344 | max_across_ranks=34.609                          508.3      254.2           skip  
+fa2                      t0=26.909, t1=27.005 | max_across_ranks=27.056                          650.2      325.1           skip  
+fa3                      t0=18.088, t1=18.361 | max_across_ranks=18.475                          952.2      476.1           skip  
+min_varlen               t0=14.687, t1=14.880 | max_across_ranks=14.888                         1181.7      590.8           skip  timing-only local step loop
+min_varlen_ring          t0=16.124, t1=16.022 | max_across_ranks=16.180                         1087.3      543.6           skip  
+min_varlen_mega_ring     t0=16.303, t1=16.433 | max_across_ranks=16.478                         1067.6      533.8           skip  
+
+Running local_S=8192, causal=False
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=118.357, t1=118.327 | max_across_ranks=118.863                       592.0      296.0           skip  
+fa2                      t0=99.866, t1=99.874 | max_across_ranks=100.088                         703.1      351.5           skip  
+fa3                      t0=64.108, t1=64.112 | max_across_ranks=64.435                         1092.1      546.0           skip  
+min_varlen               t0=57.076, t1=57.275 | max_across_ranks=57.378                         1226.4      613.2           skip  timing-only local step loop
+min_varlen_ring          t0=60.990, t1=60.848 | max_across_ranks=61.157                         1150.6      575.3           skip  
+min_varlen_mega_ring     t0=61.263, t1=61.194 | max_across_ranks=61.526                         1143.7      571.9           skip  
+
+Running local_S=512, causal=True
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=2.929, t1=2.636 | max_across_ranks=2.929                              47.0       23.5           skip  zigzag causal
+fa2                      t0=2.321, t1=2.081 | max_across_ranks=2.322                              59.3       29.6           skip  zigzag causal
+fa3                      t0=2.257, t1=2.067 | max_across_ranks=2.257                              61.0       30.5           skip  zigzag causal
+min_varlen               t0=0.133, t1=0.287 | max_across_ranks=0.287                             478.9      239.4           skip  timing-only local step loop
+min_varlen_ring          t0=0.557, t1=0.755 | max_across_ranks=0.755                             182.1       91.1           skip  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=0.761, t1=0.775 | max_across_ranks=0.777                             177.0       88.5           skip  zigzag causal
+
+Running local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=4.569, t1=4.195 | max_across_ranks=4.569                             120.4       60.2           skip  zigzag causal
+fa2                      t0=3.294, t1=2.950 | max_across_ranks=3.294                             167.0       83.5           skip  zigzag causal
+fa3                      t0=3.027, t1=2.774 | max_across_ranks=3.045                             180.6       90.3           skip  zigzag causal
+min_varlen               t0=0.328, t1=0.806 | max_across_ranks=0.806                             682.4      341.2           skip  timing-only local step loop
+min_varlen_ring          t0=1.100, t1=1.659 | max_across_ranks=1.659                             331.5      165.7           skip  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=1.589, t1=1.678 | max_across_ranks=1.679                             327.6      163.8           skip  zigzag causal
+
+Running local_S=2048, causal=True
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=8.925, t1=8.646 | max_across_ranks=8.925                             246.5      123.2           skip  zigzag causal
+fa2                      t0=6.228, t1=5.977 | max_across_ranks=6.228                             353.1      176.6           skip  zigzag causal
+fa3                      t0=5.047, t1=4.914 | max_across_ranks=5.048                             435.8      217.9           skip  zigzag causal
+min_varlen               t0=0.989, t1=3.029 | max_across_ranks=3.029                             726.3      363.1           skip  timing-only local step loop
+min_varlen_ring          t0=2.189, t1=4.079 | max_across_ranks=4.079                             539.2      269.6           skip  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=3.488, t1=3.641 | max_across_ranks=3.641                             604.2      302.1           skip  zigzag causal
+
+Running local_S=4096, causal=True
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=22.469, t1=22.167 | max_across_ranks=22.566                          389.8      194.9           skip  zigzag causal
+fa2                      t0=16.826, t1=16.581 | max_across_ranks=16.863                          521.7      260.8           skip  zigzag causal
+fa3                      t0=11.600, t1=11.718 | max_across_ranks=11.745                          749.0      374.5           skip  zigzag causal
+min_varlen               t0=3.430, t1=11.584 | max_across_ranks=11.584                           759.4      379.7           skip  timing-only local step loop
+min_varlen_ring          t0=4.433, t1=12.447 | max_across_ranks=12.447                           706.8      353.4           skip  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=9.165, t1=9.669 | max_across_ranks=9.669                             909.8      454.9           skip  zigzag causal
+
+Running local_S=8192, causal=True
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=68.852, t1=68.703 | max_across_ranks=69.376                          507.2      253.6           skip  zigzag causal
+fa2                      t0=56.546, t1=55.998 | max_across_ranks=56.916                          618.2      309.1           skip  zigzag causal
+fa3                      t0=35.617, t1=36.964 | max_across_ranks=37.085                          948.8      474.4           skip  zigzag causal
+min_varlen               t0=12.788, t1=43.649 | max_across_ranks=43.649                          806.1      403.1           skip  timing-only local step loop
+min_varlen_ring          t0=13.567, t1=46.343 | max_across_ranks=46.343                          759.3      379.6           skip  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=31.283, t1=32.076 | max_across_ranks=32.512                         1082.3      541.1           skip  zigzag causal
+Config: world_size=2, methods=['pytorch', 'fa2', 'fa3', 'min_varlen', 'min_varlen_ring', 'min_varlen_mega_ring'], B=16, seqlen=512,1024,2048,4096,8192, qhead=32, kvhead=8, D=128, mode=both, num_comp_sm=116, num_comm_sm=16, warmup=20, iters=30, check=False
+Agg TFLOPS sums visible attention work across ranks; Avg/GPU is that value divided by world_size.
+
+Running local_S=512, causal=False
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=1.671, t1=1.670 | max_across_ranks=1.673                             164.3       82.1           skip  
+fa2                      t0=0.915, t1=0.908 | max_across_ranks=0.920                             298.6      149.3           skip  
+fa3                      t0=0.849, t1=0.853 | max_across_ranks=0.858                             320.5      160.3           skip  
+min_varlen               t0=0.349, t1=0.349 | max_across_ranks=0.350                             786.1      393.1           skip  timing-only local step loop
+min_varlen_ring          t0=0.529, t1=0.527 | max_across_ranks=0.531                             518.0      259.0           skip  
+min_varlen_mega_ring     t0=0.604, t1=0.604 | max_across_ranks=0.607                             452.8      226.4           skip  
+
+Running local_S=1024, causal=False
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=3.831, t1=3.838 | max_across_ranks=3.845                             286.0      143.0           skip  
+fa2                      t0=2.267, t1=2.246 | max_across_ranks=2.268                             484.8      242.4           skip  
+fa3                      t0=1.828, t1=1.820 | max_across_ranks=1.832                             600.3      300.1           skip  
+min_varlen               t0=1.039, t1=1.127 | max_across_ranks=1.127                             976.0      488.0           skip  timing-only local step loop
+min_varlen_ring          t0=1.326, t1=1.318 | max_across_ranks=1.327                             828.8      414.4           skip  
+min_varlen_mega_ring     t0=1.430, t1=1.418 | max_across_ranks=1.435                             766.3      383.1           skip  
+
+Running local_S=2048, causal=False
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=10.639, t1=10.652 | max_across_ranks=10.658                          412.6      206.3           skip  
+fa2                      t0=7.549, t1=7.728 | max_across_ranks=7.760                             566.7      283.4           skip  
+fa3                      t0=5.592, t1=5.620 | max_across_ranks=5.653                             778.0      389.0           skip  
+min_varlen               t0=4.078, t1=3.997 | max_across_ranks=4.091                            1074.9      537.5           skip  timing-only local step loop
+min_varlen_ring          t0=4.475, t1=4.465 | max_across_ranks=4.480                             981.7      490.8           skip  
+min_varlen_mega_ring     t0=4.575, t1=4.676 | max_across_ranks=4.699                             936.0      468.0           skip  
+
+Running local_S=4096, causal=False
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=34.040, t1=34.284 | max_across_ranks=34.465                          510.4      255.2           skip  
+fa2                      t0=26.864, t1=26.893 | max_across_ranks=26.967                          652.4      326.2           skip  
+fa3                      t0=18.085, t1=18.238 | max_across_ranks=18.368                          957.8      478.9           skip  
+min_varlen               t0=15.449, t1=15.456 | max_across_ranks=15.532                         1132.6      566.3           skip  timing-only local step loop
+min_varlen_ring          t0=16.738, t1=16.784 | max_across_ranks=16.815                         1046.2      523.1           skip  
+min_varlen_mega_ring     t0=16.915, t1=17.020 | max_across_ranks=17.034                         1032.8      516.4           skip  
+
+Running local_S=8192, causal=False
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=118.236, t1=118.255 | max_across_ranks=118.691                       592.9      296.4           skip  
+fa2                      t0=99.771, t1=100.011 | max_across_ranks=100.226                        702.1      351.1           skip  
+fa3                      t0=63.969, t1=64.015 | max_across_ranks=64.343                         1093.7      546.8           skip  
+min_varlen               t0=59.192, t1=59.230 | max_across_ranks=59.443                         1183.8      591.9           skip  timing-only local step loop
+min_varlen_ring          t0=62.782, t1=62.877 | max_across_ranks=63.105                         1115.1      557.6           skip  
+min_varlen_mega_ring     t0=63.247, t1=63.214 | max_across_ranks=63.448                         1109.1      554.5           skip  
+
+Running local_S=512, causal=True
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=2.865, t1=2.653 | max_across_ranks=2.865                              48.0       24.0           skip  zigzag causal
+fa2                      t0=2.239, t1=2.093 | max_across_ranks=2.239                              61.4       30.7           skip  zigzag causal
+fa3                      t0=2.177, t1=2.092 | max_across_ranks=2.185                              63.0       31.5           skip  zigzag causal
+min_varlen               t0=0.138, t1=0.302 | max_across_ranks=0.302                             455.0      227.5           skip  timing-only local step loop
+min_varlen_ring          t0=0.319, t1=0.525 | max_across_ranks=0.525                             262.1      131.1           skip  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=0.482, t1=0.516 | max_across_ranks=0.516                             266.8      133.4           skip  zigzag causal
+
+Running local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=4.485, t1=4.198 | max_across_ranks=4.485                             122.6       61.3           skip  zigzag causal
+fa2                      t0=3.198, t1=2.968 | max_across_ranks=3.198                             172.0       86.0           skip  zigzag causal
+fa3                      t0=2.923, t1=2.745 | max_across_ranks=2.923                             188.2       94.1           skip  zigzag causal
+min_varlen               t0=0.344, t1=0.856 | max_across_ranks=0.856                             642.5      321.2           skip  timing-only local step loop
+min_varlen_ring          t0=0.615, t1=1.235 | max_across_ranks=1.235                             445.3      222.7           skip  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=1.070, t1=1.164 | max_across_ranks=1.164                             472.5      236.3           skip  zigzag causal
+
+Running local_S=2048, causal=True
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=8.855, t1=8.646 | max_across_ranks=8.855                             248.4      124.2           skip  zigzag causal
+fa2                      t0=6.101, t1=5.974 | max_across_ranks=6.101                             360.5      180.3           skip  zigzag causal
+fa3                      t0=4.943, t1=4.921 | max_across_ranks=4.945                             444.8      222.4           skip  zigzag causal
+min_varlen               t0=1.035, t1=3.161 | max_across_ranks=3.161                             695.9      348.0           skip  timing-only local step loop
+min_varlen_ring          t0=1.267, t1=3.540 | max_across_ranks=3.540                             621.3      310.6           skip  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=2.569, t1=2.781 | max_across_ranks=2.781                             790.8      395.4           skip  zigzag causal
+
+Running local_S=4096, causal=True
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=22.194, t1=22.263 | max_across_ranks=22.423                          392.3      196.2           skip  zigzag causal
+fa2                      t0=16.610, t1=16.547 | max_across_ranks=16.724                          526.0      263.0           skip  zigzag causal
+fa3                      t0=11.562, t1=11.664 | max_across_ranks=11.695                          752.2      376.1           skip  zigzag causal
+min_varlen               t0=3.588, t1=12.113 | max_across_ranks=12.113                           726.3      363.1           skip  timing-only local step loop
+min_varlen_ring          t0=4.006, t1=12.873 | max_across_ranks=12.873                           683.4      341.7           skip  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=8.500, t1=9.271 | max_across_ranks=9.271                             948.9      474.5           skip  zigzag causal
+
+Running local_S=8192, causal=True
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                            Agg TFLOPS    Avg/GPU          Check  Note
+pytorch                  t0=68.786, t1=68.699 | max_across_ranks=69.290                          507.8      253.9           skip  zigzag causal
+fa2                      t0=56.337, t1=56.136 | max_across_ranks=56.736                          620.2      310.1           skip  zigzag causal
+fa3                      t0=35.682, t1=36.793 | max_across_ranks=37.072                          949.1      474.6           skip  zigzag causal
+min_varlen               t0=13.353, t1=45.213 | max_across_ranks=45.213                          778.2      389.1           skip  timing-only local step loop
+min_varlen_ring          t0=14.143, t1=48.089 | max_across_ranks=48.089                          731.7      365.8           skip  ordinary causal ring timing-only
+min_varlen_mega_ring     t0=32.563, t1=33.335 | max_across_ranks=33.740                         1042.9      521.4           skip  zigzag causal

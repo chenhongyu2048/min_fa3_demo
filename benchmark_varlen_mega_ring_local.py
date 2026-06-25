@@ -605,6 +605,12 @@ def bench_min_fa3_varlen_mega_ring(
         return None
     max_seqlen_q = int(cu_seqlens_q_host[1] - cu_seqlens_q_host[0])
     max_seqlen_k = int(cu_seqlens_k_host[1] - cu_seqlens_k_host[0])
+    half_cu_seqlens = None
+    half_cu_seqlens_host = None
+    if is_causal:
+        if max_seqlen_q != max_seqlen_k or max_seqlen_q % 256 != 0:
+            return None
+        half_cu_seqlens, half_cu_seqlens_host = make_cu_seqlens(batch_size, max_seqlen_q // 2, q.device)
     return TimingBreakdown(
         total_ms=median_time_ms(
             lambda: min_fa3_op.forward_varlen_mega_ring(
@@ -618,6 +624,8 @@ def bench_min_fa3_varlen_mega_ring(
                 is_causal,
                 cu_seqlens_q_host=cu_seqlens_q_host,
                 cu_seqlens_k_host=cu_seqlens_k_host,
+                half_cu_seqlens=half_cu_seqlens,
+                half_cu_seqlens_host=half_cu_seqlens_host,
                 remote_k=remote_k,
                 remote_v=remote_v,
                 num_comp_sm=num_comp_sm,

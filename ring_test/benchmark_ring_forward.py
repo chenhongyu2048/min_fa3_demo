@@ -31,7 +31,9 @@ from ring_common import (
     pytorch_varlen_block_attention,
     raise_if_any_rank_failed,
     reference_ring_varlen,
+    reference_zigzag_ring_varlen,
     ring_varlen_forward,
+    zigzag_ring_varlen_forward,
 )
 
 try:
@@ -92,6 +94,7 @@ class Result:
     check: str
     note: str = ""
     rank_times_ms: Optional[list[float]] = None
+    avg_gpu_tflops: Optional[float] = None
 
 
 @dataclass
@@ -150,7 +153,7 @@ def parse_args() -> argparse.Namespace:
         "--seqlens",
         dest="seqlen",
         type=str,
-        default="128",
+        default="256",
         help="Comma-separated local sequence lengths S per rank.",
     )
     parser.add_argument("--qhead", type=int, default=8, help="Number of query/output heads.")
@@ -438,38 +441,73 @@ def build_method_runs(
     runs: list[MethodRun] = []
     max_seqlen_q = case.seqlen
     max_seqlen_k = case.seqlen
+    half_cu_seqlens = None
+    half_cu_seqlens_host = None
+    if case.is_causal and case.seqlen % 256 == 0:
+        half_cu_seqlens, half_cu_seqlens_host = make_cu_seqlens(case.batch_size, case.seqlen // 2, q.device)
 
     for method in methods:
         if method == "pytorch":
             def fn(method=method):
                 # Full Python-side ring: P2P K/V exchange, one PyTorch block
                 # attention call per visible step, and online LSE merge.
+                if case.is_causal:
+                    return zigzag_ring_varlen_forward(
+                        dist.group.WORLD,
+                        q,
+                        k,
+                        v,
+                        cu_seqlens_q,
+                        max_seqlen_q,
+                        lambda q_, k_, v_, _cu_q, _cu_k, max_q_, max_k_, causal_: pytorch_varlen_block_attention(
+                            q_, k_, v_, case.batch_size, max_q_, max_k_, causal_
+                        ),
+                    )
                 return ring_varlen_forward(
                     dist.group.WORLD,
                     q,
                     k,
                     v,
-                    case.is_causal,
+                    False,
                     lambda q_, k_, v_, causal_: pytorch_varlen_block_attention(
                         q_, k_, v_, case.batch_size, max_seqlen_q, max_seqlen_k, causal_
                     ),
                 )
 
-            runs.append(MethodRun(method, fn))
+            runs.append(MethodRun(method, fn, "zigzag causal" if case.is_causal else ""))
         elif method == "fa2":
             if flash_attn_varlen_func2 is None:
                 runs.append(MethodRun(method, lambda: q, "not available", checkable=False))
                 continue
 
             def fn(method=method):
-                # FA2 uses the same Python ring structure; only the per-step
-                # varlen attention backend changes.
+                if case.is_causal:
+                    return zigzag_ring_varlen_forward(
+                        dist.group.WORLD,
+                        q,
+                        k,
+                        v,
+                        cu_seqlens_q,
+                        max_seqlen_q,
+                        lambda q_, k_, v_, cu_q_, cu_k_, max_q_, max_k_, causal_: flash_varlen_block_attention(
+                            method,
+                            flash_attn_varlen_func2,
+                            q_,
+                            k_,
+                            v_,
+                            cu_q_,
+                            cu_k_,
+                            max_q_,
+                            max_k_,
+                            causal_,
+                        ),
+                    )
                 return ring_varlen_forward(
                     dist.group.WORLD,
                     q,
                     k,
                     v,
-                    case.is_causal,
+                    False,
                     lambda q_, k_, v_, causal_: flash_varlen_block_attention(
                         method,
                         flash_attn_varlen_func2,
@@ -484,21 +522,40 @@ def build_method_runs(
                     ),
                 )
 
-            runs.append(MethodRun(method, fn))
+            runs.append(MethodRun(method, fn, "zigzag causal" if case.is_causal else ""))
         elif method == "fa3":
             if flash_attn_varlen_func3 is None:
                 runs.append(MethodRun(method, lambda: q, "not available", checkable=False))
                 continue
 
             def fn(method=method):
-                # FA3 uses the same Python ring structure; only the per-step
-                # varlen attention backend changes.
+                if case.is_causal:
+                    return zigzag_ring_varlen_forward(
+                        dist.group.WORLD,
+                        q,
+                        k,
+                        v,
+                        cu_seqlens_q,
+                        max_seqlen_q,
+                        lambda q_, k_, v_, cu_q_, cu_k_, max_q_, max_k_, causal_: flash_varlen_block_attention(
+                            method,
+                            flash_attn_varlen_func3,
+                            q_,
+                            k_,
+                            v_,
+                            cu_q_,
+                            cu_k_,
+                            max_q_,
+                            max_k_,
+                            causal_,
+                        ),
+                    )
                 return ring_varlen_forward(
                     dist.group.WORLD,
                     q,
                     k,
                     v,
-                    case.is_causal,
+                    False,
                     lambda q_, k_, v_, causal_: flash_varlen_block_attention(
                         method,
                         flash_attn_varlen_func3,
@@ -513,7 +570,7 @@ def build_method_runs(
                     ),
                 )
 
-            runs.append(MethodRun(method, fn))
+            runs.append(MethodRun(method, fn, "zigzag causal" if case.is_causal else ""))
         elif method == "min_varlen":
             def fn(method=method):
                 # Timing-only local step loop. This is not a complete ring
@@ -560,8 +617,18 @@ def build_method_runs(
                     args.num_comm_sm,
                 )
 
-            runs.append(MethodRun(method, fn))
+            runs.append(
+                MethodRun(
+                    method,
+                    fn,
+                    "ordinary causal ring timing-only" if case.is_causal else "",
+                    checkable=not case.is_causal,
+                )
+            )
         elif method == "min_varlen_mega_ring":
+            if case.is_causal and half_cu_seqlens is None:
+                runs.append(MethodRun(method, lambda: q, "not available", checkable=False))
+                continue
             remote_k, remote_v = make_mega_parallel_tensors(k, v, local_rank, local_world_size)
 
             def fn(method=method, remote_k=remote_k, remote_v=remote_v):
@@ -578,13 +645,21 @@ def build_method_runs(
                     case.is_causal,
                     cu_seqlens_q_host=cu_seqlens_q_host,
                     cu_seqlens_k_host=cu_seqlens_k_host,
+                    half_cu_seqlens=half_cu_seqlens,
+                    half_cu_seqlens_host=half_cu_seqlens_host,
                     remote_k=remote_k,
                     remote_v=remote_v,
                     num_comp_sm=args.num_comp_sm,
                     num_comm_sm=args.num_comm_sm,
                 )
 
-            runs.append(MethodRun(method, fn))
+            runs.append(
+                MethodRun(
+                    method,
+                    fn,
+                    "zigzag causal" if case.is_causal else "",
+                )
+            )
         else:
             raise RuntimeError(f"unhandled method {method}")
 
@@ -688,19 +763,30 @@ def run_case(
 
     ref = None
     if args.check:
-        # The reference gathers all rank-local K/V blocks and computes the local
-        # rank's expected output against the full global sequence.
+        # The reference gathers all rank-local K/V blocks. Noncausal uses the
+        # ordinary full-rank sequence; causal uses the default zigzag layout.
         k_by_rank = gather_rank_tensor(k, dist.group.WORLD)
         v_by_rank = gather_rank_tensor(v, dist.group.WORLD)
-        ref = reference_ring_varlen(
-            q,
-            k_by_rank,
-            v_by_rank,
-            case.batch_size,
-            case.seqlen,
-            local_rank,
-            case.is_causal,
-        )
+        if case.is_causal:
+            ref = reference_zigzag_ring_varlen(
+                q,
+                
+                k_by_rank,
+                v_by_rank,
+                case.batch_size,
+                case.seqlen,
+                local_rank,
+            )
+        else:
+            ref = reference_ring_varlen(
+                q,
+                k_by_rank,
+                v_by_rank,
+                case.batch_size,
+                case.seqlen,
+                local_rank,
+                False,
+            )
 
     results: dict[str, Result] = {}
     for run in runs:
@@ -711,12 +797,13 @@ def run_case(
             timing = measure_distributed_ms(run.timing_fn, args.warmup_iters, args.num_iters)
             time_ms = timing.max_time_ms
             tflops = aggregate_tflops(case, local_rank, local_world_size, time_ms)
+            avg_gpu_tflops = tflops / local_world_size
             check = "skip"
             if args.check and run.checkable and ref is not None:
                 check = check_output(run.name, run.timing_fn, ref, args.atol, args.rtol)
             elif args.check and not run.checkable:
                 check = "timing-only"
-            results[run.name] = Result(time_ms, tflops, check, run.note, timing.rank_times_ms)
+            results[run.name] = Result(time_ms, tflops, check, run.note, timing.rank_times_ms, avg_gpu_tflops)
         except torch.OutOfMemoryError as exc:
             torch.cuda.empty_cache()
             msg = str(exc).splitlines()[0]
@@ -772,7 +859,7 @@ def print_results(case: Case, results: dict[str, Result], methods: list[str]) ->
         f"\nB={case.batch_size}, local_S={case.seqlen}, QH={case.q_heads}, "
         f"KVH={case.kv_heads}, D={case.head_dim}, mode={mode}"
     )
-    rows: list[tuple[str, str, str, str, str]] = []
+    rows: list[tuple[str, str, str, str, str, str]] = []
     for method in methods:
         result = results.get(method)
         if result is None:
@@ -785,12 +872,19 @@ def print_results(case: Case, results: dict[str, Result], methods: list[str]) ->
             rank_times_s = ", ".join(f"t{rank}={time_ms:.3f}" for rank, time_ms in enumerate(result.rank_times_ms))
             time_s = f"{rank_times_s} | max_across_ranks={result.time_ms:.3f}"
         tflops_s = "N/A" if result.tflops is None else f"{result.tflops:.1f}"
-        rows.append((method, time_s, tflops_s, result.check, result.note))
+        avg_gpu_tflops_s = "N/A" if result.avg_gpu_tflops is None else f"{result.avg_gpu_tflops:.1f}"
+        rows.append((method, time_s, tflops_s, avg_gpu_tflops_s, result.check, result.note))
 
     time_width = max((64, *(len(row[1]) for row in rows)))
-    print(f"{'Method':<24} {'Time ms':<{time_width}} {'TFLOPS':>12} {'Check':>14}  Note")
-    for method, time_s, tflops_s, check, note in rows:
-        print(f"{method:<24} {time_s:<{time_width}} {tflops_s:>12} {check:>14}  {note}")
+    print(
+        f"{'Method':<24} {'Time ms':<{time_width}} {'Agg TFLOPS':>12} "
+        f"{'Avg/GPU':>10} {'Check':>14}  Note"
+    )
+    for method, time_s, tflops_s, avg_gpu_tflops_s, check, note in rows:
+        print(
+            f"{method:<24} {time_s:<{time_width}} {tflops_s:>12} "
+            f"{avg_gpu_tflops_s:>10} {check:>14}  {note}"
+        )
 
 
 def main() -> None:
@@ -826,6 +920,8 @@ def main() -> None:
             )
             if args.check:
                 print("Checks compare each rank output against a full-rank PyTorch reference.")
+                print("Causal checks use the zigzag [front | back] reference by default.")
+            print("Agg TFLOPS sums visible attention work across ranks; Avg/GPU is that value divided by world_size.")
 
         for case in cases:
             if local_rank == 0:

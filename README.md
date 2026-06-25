@@ -152,9 +152,15 @@ torchrun --nproc_per_node=2 test_min_fa3_varlen_ring_multi_rank.py --b 2 --seqle
 Mega-ring varlen tests:
 
 ```bash
-python mega_ring_test_min_fa3_varlen_ring_local.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 1 --num-comm-sm 1 --mode both
-torchrun --standalone --nproc_per_node=2 mega_ring_test_min_fa3_varlen_ring_multi_rank.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 1 --num-comm-sm 1 --mode both
+python mega_ring_test_min_fa3_varlen_ring_local.py --b 1 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 1 --num-comm-sm 1 --mode both
+torchrun --standalone --nproc_per_node=2 mega_ring_test_min_fa3_varlen_ring_multi_rank.py --b 1 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 1 --num-comm-sm 1 --mode both
 ```
+
+Mega-ring causal note:
+
+- Causal mega-ring uses the zigzag `[front half | back half]` sequence layout.
+- The causal path requires `--seqlen` to be divisible by `256` so each half remains `128`-aligned.
+- If this constraint is not met, the causal mega-ring test/benchmark case is skipped or marked unavailable.
 
 Parameterized test examples:
 
@@ -195,6 +201,19 @@ python benchmark_varlen_mega_ring_local.py --b 4 --seqlen 1024 --qhead 32 --kvhe
 nsys profile -t cuda,nvtx,osrt -o my_report --stats=true python benchmark_varlen_mega_ring_local.py --profile --b 16 --seqlen 1024 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 116 --num-comm-sm 16 --mode noncausal
 ```
 
+Distributed ring benchmark:
+
+```bash
+torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py --b 16 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both --methods all --num-comp-sm 128 --num-comm-sm 4 --check
+torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py --b 16 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both --methods all --num-comp-sm 116 --num-comm-sm 16 --no-check
+```
+
+Distributed ring benchmark notes:
+
+- This path is single-node only because `TKParallelTensor` uses local IPC.
+- Causal checks use the zigzag reference layout by default.
+- Output reports both aggregate visible-work `Agg TFLOPS` and per-GPU `Avg/GPU`.
+
 Remote load benchmark:
 
 ```bash
@@ -219,6 +238,11 @@ Default test submission:
 ```bash
 sbatch run.slurm
 ```
+
+Current `run.slurm` notes:
+
+- The checked-in script currently requests `4` GPUs and `16` CPUs on one node.
+- Its active commands run the distributed `ring_test/benchmark_ring_forward.py` sweep with `torchrun --nproc_per_node=2`.
 
 ## Python usage
 

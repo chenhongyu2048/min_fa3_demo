@@ -18,6 +18,14 @@ class MegaRingVarlenDynamicPersistentTileScheduler: public VarlenDynamicPersiste
 
 public:
     static constexpr bool EnableMegaRing = true;
+    // MEGA_RING_ZIGZAG: this scheduler is instantiated with LPT == IsCausal in
+    // the mega-ring launch. Effectively that means:
+    //   - causal instantiations use LPT=true and enable zigzag
+    //   - non-causal instantiations use LPT=false and keep the old path
+    // LPT still originates from the base varlen scheduler's tile-ordering
+    // policy; we reuse it here as the compile-time causal/zigzag gate to avoid
+    // adding another template boolean.
+    static constexpr bool EnableZigzag = LPT;
     // MEGA_RING: one int4 for the original varlen work tile and one int4 for
     // ring metadata shared between producer and consumer warpgroups.
     using SharedStorage = cute::array<typename Base::SharedStorage, 2>;
@@ -30,6 +38,8 @@ public:
         // used later to recover the same Q tile across ring steps.
         int ring_step;
         int global_tile_idx;
+        int step_tile_idx;
+        int reduction_tile_idx;
 
         CUTLASS_DEVICE
         bool
@@ -69,27 +79,75 @@ private:
     WorkTileInfo
     decode_mega_ring_tile(Params const& params,
                           int next_tile_idx, // expanded global tile id
+                          int current_ring_step,
                           typename Base::WorkTileInfo const& current_base_work) const {
-        // MEGA_RING: tile ids are laid out as all original varlen tiles for
-        // step 0, then all original varlen tiles for step 1, and so on.
+        // MEGA_RING_ZIGZAG: non-causal keeps the original equal-sized
+        // [world_size][T_full] stream. Causal uses two constant-width sections:
+        // steps 0..r decode full-Q tiles, steps r+1..N-1 decode half-Q tiles.
         int const tiles_per_step = params.mega_ring_tiles_per_step;
-        int ring_step = tiles_per_step > 0 ? next_tile_idx / tiles_per_step : 0;
-        int step_tile_idx = tiles_per_step > 0 ? next_tile_idx - ring_step * tiles_per_step : next_tile_idx;
+        int const tiles_per_half_step = params.mega_ring_tiles_per_half_step;
+        int ring_step, step_tile_idx;
+        if constexpr (EnableZigzag) {
+            int const full_section_tiles = (params.mega_ring_rank + 1) * tiles_per_step;
+            if (next_tile_idx < full_section_tiles) {
+                ring_step = tiles_per_step > 0 ? next_tile_idx / tiles_per_step : 0;
+                step_tile_idx = tiles_per_step > 0 ? next_tile_idx - ring_step * tiles_per_step : next_tile_idx;
+            } else {
+                int const rem = next_tile_idx - full_section_tiles;
+                int const q = tiles_per_half_step > 0 ? rem / tiles_per_half_step : 0;
+                ring_step = params.mega_ring_rank + 1 + q;
+                step_tile_idx = tiles_per_half_step > 0 ? rem - q * tiles_per_half_step : rem;
+            }
+        } else {
+            ring_step = tiles_per_step > 0 ? next_tile_idx / tiles_per_step : 0;
+            step_tile_idx = tiles_per_step > 0 ? next_tile_idx - ring_step * tiles_per_step : next_tile_idx;
+        }
         if (ring_step >= params.mega_ring_world_size) {
             // MEGA_RING: mark the expanded tile as invalid using the same
             // bidb == num_batch sentinel as the base varlen scheduler while
             // preserving ring_step for validity checks.
-            return {next_tile_idx, 0, 0, params.num_batch, ring_step, next_tile_idx};
+            return {next_tile_idx, 0, 0, params.num_batch, ring_step, next_tile_idx, step_tile_idx, step_tile_idx};
         }
         // MEGA_RING: Base::tile_idx_to_work_tile assumes monotonic tile ids
         // within one varlen stream. Each new ring step restarts at tile 0, so
         // reset the decoder hint when step_tile_idx wraps backward.
         typename Base::WorkTileInfo decode_start =
-            step_tile_idx < current_base_work.tile_idx || current_base_work.bidb >= params.num_batch
+            ring_step != current_ring_step || step_tile_idx < current_base_work.tile_idx || current_base_work.bidb >= params.num_batch
                 ? typename Base::WorkTileInfo{0, 0, 0, 0}
                 : current_base_work;
-        typename Base::WorkTileInfo base_work = Base::tile_idx_to_work_tile(params, step_tile_idx, decode_start);
-        return {base_work.tile_idx, base_work.block, base_work.bidh, base_work.bidb, ring_step, next_tile_idx};
+        bool const q_use_half = EnableZigzag && ring_step > params.mega_ring_rank;
+        typename Base::WorkTileInfo base_work = q_use_half
+            ? Base::template tile_idx_to_work_tile_impl<true>(params, step_tile_idx, decode_start)
+            : Base::template tile_idx_to_work_tile_impl<false>(params, step_tile_idx, decode_start);
+        int reduction_tile_idx = step_tile_idx;
+        if constexpr (EnableZigzag) {
+            if (q_use_half && base_work.bidb < params.num_batch) {
+                // MEGA_RING_ZIGZAG: step_ready is indexed in the full-Q tile
+                // stream. The half-Q scheduler decodes the back half using
+                // num_m_blocks_ptr[b] / 2, then maps the tile back to its full
+                // stream position. This relies on seqlen/2 being 128-aligned.
+                int const full_num_m_blocks = params.num_m_blocks_ptr[base_work.bidb];
+                int const half_num_m_blocks = full_num_m_blocks / 2;
+                int const full_block = base_work.block + half_num_m_blocks;
+                int const full_group_start_tile = base_work.tile_idx * 2;
+                if constexpr (LPT) {
+                    int const nheads_in_l2 = params.num_nheads_in_l2_ptr[base_work.bidb];
+                    int const section_idx = base_work.bidh / nheads_in_l2;
+                    int const bidh_residual = base_work.bidh - section_idx * nheads_in_l2;
+                    int const nheads_remainder = params.num_head - section_idx * nheads_in_l2;
+                    int const nheads_in_this_section = nheads_in_l2 <= nheads_remainder ? nheads_in_l2 : nheads_remainder;
+                    int const block_in_l2_order = full_num_m_blocks - 1 - full_block;
+                    int const mh_block = section_idx * nheads_in_l2 * full_num_m_blocks
+                                       + block_in_l2_order * nheads_in_this_section
+                                       + bidh_residual;
+                    reduction_tile_idx = full_group_start_tile + mh_block;
+                } else {
+                    reduction_tile_idx = full_group_start_tile + base_work.bidh * full_num_m_blocks + full_block;
+                }
+            }
+        }
+        return {base_work.tile_idx, base_work.block, base_work.bidh, base_work.bidb,
+                ring_step, next_tile_idx, step_tile_idx, reduction_tile_idx};
     }
 
 public:
@@ -99,18 +157,18 @@ public:
     get_initial_work(Params const& params) const {
         if constexpr (IsProducerWarp) {
             int const next_tile_idx = Base::virtual_block_idx(params);
-            WorkTileInfo work_info = decode_mega_ring_tile(params, next_tile_idx, {0, 0, 0, 0});
+            WorkTileInfo work_info = decode_mega_ring_tile(params, next_tile_idx, -1, {0, 0, 0, 0});
             if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
                 typename Base::SharedStorage* smem = mega_ring_work_info_smem();
                 smem[0] = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
                 // MEGA_RING: the second int4 slot carries ring_step and the
                 // original global tile id for the matching consumer warpgroup.
-                smem[1] = make_int4(work_info.ring_step, next_tile_idx, 0, 0);
+                smem[1] = make_int4(work_info.ring_step, next_tile_idx, work_info.step_tile_idx, work_info.reduction_tile_idx);
             }
             flash::named_barrier_arrive(Base::kNumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);   // TileCountSmemFull
             return work_info;
         } else {
-            return get_next_work<false>(params, {0, 0, 0, 0, 0, 0});
+            return get_next_work<false>(params, {0, 0, 0, 0, 0, 0, 0, 0});
         }
     }
 
@@ -137,12 +195,12 @@ public:
                                                           current_work.block,
                                                           current_work.bidh,
                                                           current_work.bidb};
-            WorkTileInfo work_info = decode_mega_ring_tile(params, new_tile_idx, current_base_work);
+            WorkTileInfo work_info = decode_mega_ring_tile(params, new_tile_idx, current_work.ring_step, current_base_work);
             flash::named_barrier_sync(Base::kNumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);  // TileCountSmemEmpty
             if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
                 typename Base::SharedStorage* smem = mega_ring_work_info_smem();
                 smem[0] = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
-                smem[1] = make_int4(work_info.ring_step, new_tile_idx, 0, 0);
+                smem[1] = make_int4(work_info.ring_step, new_tile_idx, work_info.step_tile_idx, work_info.reduction_tile_idx);
             }
             flash::named_barrier_arrive(Base::kNumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);  // TileCountSmemFull
             return work_info;
@@ -155,7 +213,8 @@ public:
             // ordering for in-place O/LSE reduction.
             int4 mega_info = smem[1];
             flash::named_barrier_arrive(Base::kNumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);  // TileCountSmemEmpty
-            return WorkTileInfo{work_info.x, work_info.y, work_info.z, work_info.w, mega_info.x, mega_info.y};
+            return WorkTileInfo{work_info.x, work_info.y, work_info.z, work_info.w,
+                                mega_info.x, mega_info.y, mega_info.z, mega_info.w};
         }
     }
 };

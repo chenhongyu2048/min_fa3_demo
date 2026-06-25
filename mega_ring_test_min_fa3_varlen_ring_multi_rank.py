@@ -79,12 +79,21 @@ def reference_mega_ring_varlen(
         k_blocks = []
         v_blocks = []
         key_positions = []
+        seq_len = q_end - q_start
+        half_len = seq_len // 2
+        if is_causal and seq_len % 2 != 0:
+            raise AssertionError(f"causal zigzag reference requires an even sequence length, got {seq_len}")
         for rank_idx in range(local_world_size):
             block_start = rank_idx * local_total_k + k_start
             block_end = rank_idx * local_total_k + k_end
             k_blocks.append(k[block_start:block_end])
             v_blocks.append(v[block_start:block_end])
-            key_positions.append(torch.arange(k_start, k_end, device=q.device, dtype=torch.int64) + rank_idx * local_total_k)
+            if is_causal:
+                front_pos = torch.arange(half_len, device=q.device, dtype=torch.int64) + rank_idx * half_len
+                back_pos = torch.arange(half_len, device=q.device, dtype=torch.int64) + (2 * local_world_size - 1 - rank_idx) * half_len
+                key_positions.append(torch.cat([front_pos, back_pos], dim=0))
+            else:
+                key_positions.append(torch.arange(k_end - k_start, device=q.device, dtype=torch.int64))
 
         k_i = torch.cat(k_blocks, dim=0).float()
         v_i = torch.cat(v_blocks, dim=0).float()
@@ -95,7 +104,9 @@ def reference_mega_ring_varlen(
 
         scores = torch.einsum("qhd,khd->hqk", q_i, k_i) * scale
         if is_causal:
-            query_pos = torch.arange(q_start, q_end, device=q.device, dtype=torch.int64) + local_rank * local_total_k
+            query_front = torch.arange(half_len, device=q.device, dtype=torch.int64) + local_rank * half_len
+            query_back = torch.arange(half_len, device=q.device, dtype=torch.int64) + (2 * local_world_size - 1 - local_rank) * half_len
+            query_pos = torch.cat([query_front, query_back], dim=0)
             causal_mask = key_pos.unsqueeze(0) <= query_pos.unsqueeze(1)
             scores = scores.masked_fill(~causal_mask.unsqueeze(0), float("-inf"))
 
@@ -143,6 +154,7 @@ def run_case(
     total_tokens = batch_size * seqlen
     cu_seqlens_q, cu_seqlens_q_host = make_cu_seqlens(batch_size, seqlen, torch.device("cuda"))
     cu_seqlens_k, cu_seqlens_k_host = make_cu_seqlens(batch_size, seqlen, torch.device("cuda"))
+    half_cu_seqlens, half_cu_seqlens_host = (make_cu_seqlens(batch_size, seqlen // 2, torch.device("cuda")) if is_causal else (None, None))
 
     q, local_k, local_v = make_rank_local_qkv(
         total_tokens,
@@ -191,6 +203,8 @@ def run_case(
         is_causal,
         cu_seqlens_q_host=cu_seqlens_q_host,
         cu_seqlens_k_host=cu_seqlens_k_host,
+        half_cu_seqlens=half_cu_seqlens,
+        half_cu_seqlens_host=half_cu_seqlens_host,
         remote_k=remote_k,
         remote_v=remote_v,
         num_comp_sm=num_comp_sm,
@@ -237,7 +251,7 @@ def parse_args() -> argparse.Namespace:
         "--seqlens",
         dest="seqlen",
         type=str,
-        default="128",
+        default="256",
         help="Comma-separated sequence lengths S. Q and each rank-local K/V block all use the same S.",
     )
     parser.add_argument("--qhead", type=int, default=16, help="Number of query/output heads")
@@ -302,6 +316,13 @@ if __name__ == "__main__":
                         local_world_size,
                     )
                 if args.mode in ("causal", "both"):
+                    if seqlen % 256 != 0:
+                        if local_rank == 0:
+                            print(
+                                "distributed mega ring varlen case causal=True: skipped because zigzag "
+                                f"requires S/2 to be 128-aligned (S={seqlen})"
+                            )
+                        continue
                     run_case(
                         args.b,
                         seqlen,

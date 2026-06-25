@@ -403,6 +403,7 @@ struct CollectiveMainloopFwdSm90 {
         // MEGA_RING: optional default-off metadata. When the mega-ring scheduler is not selected these stay null/zero and are never read.
         int const* const mega_ring_kv_ready_counts = nullptr; // whether the kv block for this step is ready
         int* const mega_ring_step_ready = nullptr; // whether the last step's output has been merged and it's safe to do reduction for current step
+        int const* const mega_ring_half_cu_seqlens = nullptr;
         int const mega_ring_rank = 0;
         int const mega_ring_world_size = 1;
         int const mega_ring_total_k_per_rank = 0;
@@ -466,6 +467,7 @@ struct CollectiveMainloopFwdSm90 {
         // MEGA_RING: optional default-off metadata used only by MegaRingVarlenDynamicPersistentTileScheduler.
         int const* const mega_ring_kv_ready_counts = nullptr;
         int* const mega_ring_step_ready = nullptr;
+        int const* const mega_ring_half_cu_seqlens = nullptr;
         int const mega_ring_rank = 0;
         int const mega_ring_world_size = 1;
         int const mega_ring_total_k_per_rank = 0;
@@ -581,7 +583,7 @@ struct CollectiveMainloopFwdSm90 {
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
-                args.mega_ring_kv_ready_counts, args.mega_ring_step_ready,
+                args.mega_ring_kv_ready_counts, args.mega_ring_step_ready, args.mega_ring_half_cu_seqlens,
                 args.mega_ring_rank, args.mega_ring_world_size, args.mega_ring_total_k_per_rank};
     }
 
@@ -629,25 +631,34 @@ struct CollectiveMainloopFwdSm90 {
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
             params.qhead_per_khead_divmod);
         // MEGA_RING: decode the ring step into the KV rank used by this tile.
-        // Causal ring attention treats lower-numbered rank blocks as past context, the local rank block
-        // as normally causal, and wrapped higher-numbered rank blocks as future context.
+        // MEGA_RING_ZIGZAG: causal mega ring uses a load-balanced zigzag
+        // schedule. Host checks guarantee half_len is 128-aligned, so the half
+        // and full KV block counts are constant within their sections.
         int mega_ring_kv_rank = 0;
-        int mega_ring_rank_delta = 0;
+        int mega_ring_q_row_offset = 0;
+        int mega_ring_seqlen_q = seqlen_info.seqlen_q;
+        int mega_ring_seqlen_k = seqlen_info.seqlen_k;
         if constexpr (EnableMegaRing) {
             mega_ring_kv_rank = (params.mega_ring_rank - mega_ring_step + params.mega_ring_world_size) % params.mega_ring_world_size;
-            mega_ring_rank_delta = params.mega_ring_rank - mega_ring_kv_rank;
             if constexpr (Is_causal) {
-                if (mega_ring_rank_delta < 0) {
-                    // the entire KV tile is in the future, so we can skip loading it
-                    n_block_min = 0;
-                    n_block_max = 0;
-                } else if (mega_ring_rank_delta > 0) {
-                    // the entire KV tile is in the past, so we can load it all
-                    n_block_min = 0;
-                    // MEGA_RING: keep this as a local value so device code
-                    // does not ODR-use the class-level constexpr kBlockN.
-                    int const block_n = get<1>(TileShape_MNK{});
-                    n_block_max = cute::ceil_div(seqlen_info.seqlen_k, block_n);
+                int const half_len = params.mega_ring_half_cu_seqlens[bidb + 1] - params.mega_ring_half_cu_seqlens[bidb];
+                int const block_m = get<0>(TileShape_MNK{});
+                int const block_n = get<1>(TileShape_MNK{});
+                bool const q_use_half = mega_ring_step > params.mega_ring_rank;
+                bool const kv_use_half = mega_ring_step >= 1 && mega_ring_step <= params.mega_ring_rank;
+                bool const is_diag = mega_ring_step == 0;
+                mega_ring_q_row_offset = q_use_half ? half_len : 0;
+                mega_ring_seqlen_q = q_use_half ? half_len : 2 * half_len;
+                mega_ring_seqlen_k = kv_use_half ? half_len : 2 * half_len;
+                n_block_min = 0;
+                if (is_diag) {
+                    int const n_block_causal = cute::ceil_div((m_block + 1) * block_m, block_n);
+                    int const n_block_full = cute::ceil_div(2 * half_len, block_n);
+                    n_block_max = n_block_causal < n_block_full ? n_block_causal : n_block_full;
+                } else if (kv_use_half) {
+                    n_block_max = cute::ceil_div(half_len, block_n);
+                } else {
+                    n_block_max = cute::ceil_div(2 * half_len, block_n);
                 }
             }
         }
@@ -706,7 +717,7 @@ struct CollectiveMainloopFwdSm90 {
             }
         }();
 
-        Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
+        Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q + mega_ring_q_row_offset, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
         // if (cute::thread0()) { printf("Varlen = %d, params.leftpad_k = %p, leftpad_k = %d\n", Varlen, params.leftpad_k, leftpad_k); }
         Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k + mega_ring_kv_offset, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)
         Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k + mega_ring_kv_offset, _0{}), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));  // (K, N, _, _)
@@ -726,7 +737,7 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (HasQv) { // FALSE
                 auto shape_Qv = make_shape(get<0>(params.shape_Q), params.headdim_v, get<2>(params.shape_Q), get<3>(params.shape_Q));
                 Tensor mQv = params.tma_load_Qv.get_tma_tensor(shape_Qv)(_, _, bidh, !is_varlen_q ? bidb : 0);
-                Tensor gQv = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQv), select<0, 2>(TileShape_MNK_QV{}), make_coord(m_block, _0{}));  // (M, Kv)
+                Tensor gQv = local_tile(domain_offset(make_coord(seqlen_info.offset_q + mega_ring_q_row_offset, _0{}), mQv), select<0, 2>(TileShape_MNK_QV{}), make_coord(m_block, _0{}));  // (M, Kv)
                 auto block_tma_Qv = params.tma_load_Qv.get_slice(_0{});
                 Tensor tQvgQv = group_modes<0, 3>(block_tma_Qv.partition_S(gQv));  // (TMA)
                 Tensor tQvsQv = group_modes<0, 3>(block_tma_Qv.partition_D(sQv));  // (TMA)
@@ -745,7 +756,7 @@ struct CollectiveMainloopFwdSm90 {
             params.ptr_K, params.shape_K, params.stride_K,
             params.ptr_V, params.headdim_v, params.stride_V,
             params.page_size_divmod, params.blockN_per_page_size_divmod,
-            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k, bidb_kv_idx
+            bidb_kv, bidh_kv, thread_idx, mega_ring_seqlen_k, seqlen_info.leftpad_k, bidb_kv_idx
         );
 
         // Set up for transposing V, only used if Transpose_V
@@ -889,18 +900,18 @@ struct CollectiveMainloopFwdSm90 {
             }
         } else {  // Load Q with cp.async
             cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
-            Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
+            Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + (seqlen_info.offset_q + mega_ring_q_row_offset) * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
             Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
             using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumProducerThreads, Element>;
-            PackGQAt::load_Q(mQ, sQ_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_info.seqlen_q, m_block);
+            PackGQAt::load_Q(mQ, sQ_pi, params.qhead_per_khead_divmod, thread_idx, mega_ring_seqlen_q, m_block);
             auto &barrier_Q = shared_storage.pipelines.barrier_Q;
             cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Q));
             barrier_Q.arrive();
             if constexpr (HasQv) {
-                Tensor mQv = make_tensor(make_gmem_ptr(params.ptr_Qv + seqlen_info.offset_q * get<0>(params.stride_Qv)), params.shape_Qv_packed, params.stride_Qv_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
+                Tensor mQv = make_tensor(make_gmem_ptr(params.ptr_Qv + (seqlen_info.offset_q + mega_ring_q_row_offset) * get<0>(params.stride_Qv)), params.shape_Qv_packed, params.stride_Qv_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
                 Tensor sQv_pi = cute::as_position_independent_swizzle_tensor(sQv);
                 using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK_QV{}), get<2>(TileShape_MNK_QV{}), NumProducerThreads, Element>;
-                PackGQAt::load_Q(mQv, sQv_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_info.seqlen_q, m_block);
+                PackGQAt::load_Q(mQv, sQv_pi, params.qhead_per_khead_divmod, thread_idx, mega_ring_seqlen_q, m_block);
                 auto &barrier_Qv = shared_storage.pipelines.barrier_Qv;
                 cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Qv));
                 barrier_Qv.arrive();
@@ -1041,25 +1052,29 @@ struct CollectiveMainloopFwdSm90 {
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
             params.qhead_per_khead_divmod);
-        // MEGA_RING: mirror the producer-side KV rank visibility rule before
-        // waiting on any producer pipeline state. Past rank blocks are fully
-        // visible for causal attention; wrapped future rank blocks are empty.
-        int mega_ring_kv_rank = 0;
-        int mega_ring_rank_delta = 0;
+        // MEGA_RING_ZIGZAG: mirror the producer-side full/half KV range before
+        // waiting on any producer pipeline state.
+        int mega_ring_seqlen_q = seqlen_info.seqlen_q;
+        int mega_ring_seqlen_k = seqlen_info.seqlen_k;
         bool mega_ring_use_causal_mask = true;
         if constexpr (EnableMegaRing) {
-            mega_ring_kv_rank = (params.mega_ring_rank - mega_ring_step + params.mega_ring_world_size) % params.mega_ring_world_size;
-            mega_ring_rank_delta = params.mega_ring_rank - mega_ring_kv_rank;
             if constexpr (Is_causal) {
-                if (mega_ring_rank_delta < 0) {
-                    // the entire KV tile is in the future, so we can skip loading it
-                    n_block_min = 0;
-                    n_block_max = 0;
-                } else if (mega_ring_rank_delta > 0) {
-                    // the entire KV tile is in the past, so we can load it all
-                    n_block_min = 0;
-                    n_block_max = cute::ceil_div(seqlen_info.seqlen_k, kBlockN);
-                    mega_ring_use_causal_mask = false;
+                int const half_len = params.mega_ring_half_cu_seqlens[bidb + 1] - params.mega_ring_half_cu_seqlens[bidb];
+                bool const q_use_half = mega_ring_step > params.mega_ring_rank;
+                bool const kv_use_half = mega_ring_step >= 1 && mega_ring_step <= params.mega_ring_rank;
+                bool const is_diag = mega_ring_step == 0;
+                mega_ring_seqlen_q = q_use_half ? half_len : 2 * half_len;
+                mega_ring_seqlen_k = kv_use_half ? half_len : 2 * half_len;
+                mega_ring_use_causal_mask = is_diag;
+                n_block_min = 0;
+                if (is_diag) {
+                    int const n_block_causal = cute::ceil_div((m_block + 1) * kBlockM, kBlockN);
+                    int const n_block_full = cute::ceil_div(2 * half_len, kBlockN);
+                    n_block_max = n_block_causal < n_block_full ? n_block_causal : n_block_full;
+                } else if (kv_use_half) {
+                    n_block_max = cute::ceil_div(half_len, kBlockN);
+                } else {
+                    n_block_max = cute::ceil_div(2 * half_len, kBlockN);
                 }
             }
         }
@@ -1140,8 +1155,8 @@ struct CollectiveMainloopFwdSm90 {
             pipeline.consumer_wait(smem_pipe_read, barrier_token);
         };
 
-        int const seqlen_q = seqlen_info.seqlen_q;
-        int const seqlen_k = seqlen_info.seqlen_k;
+        int const seqlen_q = mega_ring_seqlen_q;
+        int const seqlen_k = mega_ring_seqlen_k;
         int n_block = n_block_max - 1;
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK> mask(

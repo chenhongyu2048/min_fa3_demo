@@ -33,7 +33,9 @@ struct TileSchedulerArguments {
     // MEGA_RING: optional scheduler bounds for the explicit mega-ring path.
     // Default values keep existing varlen and single-step ring paths unchanged.
     int const mega_ring_world_size = 1;
+    int const mega_ring_rank = 0;
     int const mega_ring_tiles_per_step = 0;
+    int const mega_ring_tiles_per_half_step = 0;
 };
 
 template<int kBlockM, int kBlockN, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
@@ -78,7 +80,9 @@ public:
         // MEGA_RING: default-off scheduler extension used only by
         // MegaRingVarlenDynamicPersistentTileScheduler.
         int const mega_ring_world_size;
+        int const mega_ring_rank;
         int const mega_ring_tiles_per_step;
+        int const mega_ring_tiles_per_half_step;
     };
 
     static Params
@@ -106,7 +110,9 @@ public:
                 args.compute_block_offset,
                 args.use_virtual_grid,
                 args.mega_ring_world_size,
-                args.mega_ring_tiles_per_step};
+                args.mega_ring_rank,
+                args.mega_ring_tiles_per_step,
+                args.mega_ring_tiles_per_half_step};
     }
 
     static dim3
@@ -172,12 +178,22 @@ public:
     CUTLASS_DEVICE
     WorkTileInfo
     tile_idx_to_work_tile(Params const& params, int next_tile_idx, WorkTileInfo const& current_work) const {
+        return tile_idx_to_work_tile_impl<false>(params, next_tile_idx, current_work);
+    }
+
+    template<bool HalfMBlocks=false>
+    CUTLASS_DEVICE
+    WorkTileInfo
+    tile_idx_to_work_tile_impl(Params const& params, int next_tile_idx, WorkTileInfo const& current_work) const {
+        if constexpr (HalfMBlocks) {
+            static_assert(Prepared, "HalfMBlocks decode relies on prepared full-sequence scheduler metadata");
+        }
         int lane = threadIdx.x % cutlass::NumThreadsPerWarp;
         auto get_num_m_blocks = [&] (int bidb_start) {
             int batch_idx = lane + bidb_start;
             if constexpr (Prepared) {
                 return batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
-                    ? params.num_m_blocks_ptr[batch_idx] : 0;
+                    ? (!HalfMBlocks ? params.num_m_blocks_ptr[batch_idx] : params.num_m_blocks_ptr[batch_idx] / 2) : 0;
             } else {
                 int seqlen = params.seqlen * (!PackGQA ? 1 : params.qhead_per_khead);
                 if (seqlen > kBlockM) {
@@ -192,8 +208,9 @@ public:
                     }
                     if constexpr (PackGQA) { seqlen *= params.qhead_per_khead; }
                 }
+                int num_m_blocks = cute::ceil_div(seqlen, kBlockM);
                 return batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
-                    ? cute::ceil_div(seqlen, kBlockM) : 0;
+                    ? (!HalfMBlocks ? num_m_blocks : num_m_blocks / 2) : 0;
                     // ? params.num_m_blocks_ptr[batch_idx] : 0;
             }
         };

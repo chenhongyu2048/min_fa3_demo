@@ -81,6 +81,7 @@ def run_case(
     q = torch.randn(total_tokens, q_heads, head_dim, device=device, dtype=torch.bfloat16)
     cu_seqlens_q, cu_seqlens_q_host = make_cu_seqlens(batch_size, seqlen, device)
     cu_seqlens_k, cu_seqlens_k_host = make_cu_seqlens(batch_size, seqlen, device)
+    half_cu_seqlens, half_cu_seqlens_host = (make_cu_seqlens(batch_size, seqlen // 2, device) if is_causal else (None, None))
     remote_k = min_fa3_op.TKParallelTensor(
         [total_tokens, kv_heads, head_dim],
         torch.bfloat16,
@@ -112,6 +113,8 @@ def run_case(
         is_causal,
         cu_seqlens_q_host=cu_seqlens_q_host,
         cu_seqlens_k_host=cu_seqlens_k_host,
+        half_cu_seqlens=half_cu_seqlens,
+        half_cu_seqlens_host=half_cu_seqlens_host,
         remote_k=remote_k,
         remote_v=remote_v,
         num_comp_sm=num_comp_sm,
@@ -149,7 +152,7 @@ def parse_args() -> argparse.Namespace:
         "--seqlens",
         dest="seqlen",
         type=str,
-        default="128",
+        default="256",
         help="Comma-separated sequence lengths S. Q, K, and V all use the same S.",
     )
     parser.add_argument("--qhead", type=int, default=16, help="Number of query/output heads")
@@ -218,6 +221,12 @@ if __name__ == "__main__":
                         f"[{format_oom(exc)}]"
                     )
             if args.mode in ("causal", "both"):
+                if seqlen % 256 != 0:
+                    print(
+                        f"mega ring varlen local case causal=True: skipped because zigzag requires S/2 to be 128-aligned "
+                        f"(S={seqlen})"
+                    )
+                    continue
                 try:
                     run_case(
                         args.b,

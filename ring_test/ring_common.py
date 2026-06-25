@@ -20,6 +20,10 @@ import torch.nn.functional as F
 # A block attention function consumes local Q plus the current rank-local K/V
 # block and returns both block output and softmax LSE for online ring reduction.
 BlockAttention = Callable[[torch.Tensor, torch.Tensor, torch.Tensor, bool], tuple[torch.Tensor, torch.Tensor]]
+ZigzagBlockAttention = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, bool],
+    tuple[torch.Tensor, torch.Tensor],
+]
 
 
 @cache
@@ -75,6 +79,25 @@ def update_out_and_lse(
         lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
         return out, lse
     return _update_out_and_lse(out, lse, block_out, block_lse)
+
+
+def get_half_index(cu_seqlens: torch.Tensor, *, front: bool):
+    """Return the flattened token index for each sequence's front/back half."""
+    total_tokens = int(cu_seqlens[-1].item())
+    if cu_seqlens.numel() == 2:
+        midpoint = total_tokens // 2
+        return slice(None, midpoint) if front else slice(midpoint, None)
+
+    index = torch.zeros((total_tokens,), dtype=torch.bool, device=cu_seqlens.device)
+    for batch_idx in range(cu_seqlens.numel() - 1):
+        start = int(cu_seqlens[batch_idx].item())
+        end = int(cu_seqlens[batch_idx + 1].item())
+        midpoint = start + (end - start) // 2
+        if front:
+            index[start:midpoint] = True
+        else:
+            index[midpoint:end] = True
+    return index
 
 
 def normalize_lse(block_lse: torch.Tensor, total_q: int, num_heads: int) -> torch.Tensor:
@@ -213,6 +236,72 @@ def ring_varlen_forward(
     return out.to(q.dtype)
 
 
+def zigzag_ring_varlen_forward(
+    process_group: Optional[dist.ProcessGroup],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    block_attention: ZigzagBlockAttention,
+) -> torch.Tensor:
+    """Run load-balanced causal zigzag ring attention for one backend.
+
+    Each rank-local sequence is interpreted as [front half | back half]. Step 0
+    computes the local full-sequence causal block. Earlier global KV ranks use
+    full-Q/half-KV dense blocks, while later global KV ranks use half-Q/full-KV
+    dense blocks and update only the back-half output rows.
+    """
+    if max_seqlen % 2 != 0:
+        raise RuntimeError(f"zigzag causal ring requires an even max_seqlen, got {max_seqlen}")
+
+    comm = RingComm(process_group)
+    half_index0 = get_half_index(cu_seqlens, front=True)
+    half_index1 = get_half_index(cu_seqlens, front=False)
+    half_cu_seqlens = cu_seqlens // 2
+    half_max_seqlen = max_seqlen // 2
+
+    out = None
+    lse = None
+    q1 = q[half_index1].contiguous()
+    cur_k = k.contiguous()
+    cur_v = v.contiguous()
+
+    for step in range(comm.world_size):
+        if step + 1 != comm.world_size:
+            next_k, next_v = comm.send_recv_kv(cur_k, cur_v)
+        else:
+            next_k, next_v = None, None
+
+        if step == 0:
+            block_out, block_lse = block_attention(
+                q, cur_k, cur_v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, True
+            )
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+        elif step <= comm.rank:
+            k0 = cur_k[half_index0].contiguous()
+            v0 = cur_v[half_index0].contiguous()
+            block_out, block_lse = block_attention(
+                q, k0, v0, cu_seqlens, half_cu_seqlens, max_seqlen, half_max_seqlen, False
+            )
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+        else:
+            block_out, block_lse = block_attention(
+                q1, cur_k, cur_v, half_cu_seqlens, cu_seqlens, half_max_seqlen, max_seqlen, False
+            )
+            out1, lse1 = update_out_and_lse(out[half_index1], lse[half_index1], block_out, block_lse)
+            out[half_index1] = out1
+            lse[half_index1] = lse1
+
+        if step + 1 != comm.world_size:
+            comm.wait()
+            cur_k, cur_v = next_k, next_v
+
+    if out is None:
+        raise RuntimeError("zigzag ring attention produced no output blocks")
+    return out.to(q.dtype)
+
+
 def pytorch_varlen_block_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -265,9 +354,19 @@ def flash_varlen_block_attention(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run one FA2/FA3 varlen block and return output plus normalized LSE.
 
-    The two FlashAttention Python packages expose different keyword names for
-    returning LSE, so the benchmark method name selects the matching call.
+    FlashAttention package versions expose different keyword names for asking
+    the wrapper to return softmax LSE, so select the supported one from the
+    callable signature.
     """
+    kwargs = {"causal": is_causal}
+    default_args = get_default_args(flash_varlen_func)
+    if "return_attn_probs" in default_args:
+        kwargs["return_attn_probs"] = True
+    elif "return_softmax" in default_args:
+        kwargs["return_softmax"] = True
+    else:
+        raise RuntimeError(f"{method} flash_attn_varlen_func does not expose a softmax LSE return flag")
+
     if method == "fa2":
         result = flash_varlen_func(
             q,
@@ -277,8 +376,7 @@ def flash_varlen_block_attention(
             cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
-            causal=is_causal,
-            return_attn_probs=True,
+            **kwargs,
         )
     elif method == "fa3":
         result = flash_varlen_func(
@@ -289,8 +387,7 @@ def flash_varlen_block_attention(
             cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
-            causal=is_causal,
-            return_softmax=True,
+            **kwargs,
         )
     else:
         raise ValueError(f"unsupported FlashAttention method '{method}'")
@@ -350,6 +447,70 @@ def reference_ring_varlen(
             # sequence. Key positions span all rank-local K/V blocks.
             causal_mask = key_pos.unsqueeze(0) <= query_pos.unsqueeze(1)
             scores = scores.masked_fill(~causal_mask.unsqueeze(0), float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        outputs.append(torch.einsum("hqk,khd->qhd", probs, v_i).to(dtype=q.dtype))
+
+    return torch.cat(outputs, dim=0).contiguous()
+
+
+
+def reference_zigzag_ring_varlen(
+    q: torch.Tensor,
+    k_by_rank: torch.Tensor,
+    v_by_rank: torch.Tensor,
+    batch_size: int,
+    local_seqlen: int,
+    local_rank: int,
+) -> torch.Tensor:
+    """Compute the full-rank reference for causal zigzag [front | back] layout."""
+    if local_seqlen % 2 != 0:
+        raise RuntimeError(f"zigzag reference requires an even local seqlen, got {local_seqlen}")
+
+    world_size = k_by_rank.size(0)
+    q_heads = q.size(1)
+    kv_heads = k_by_rank.size(2)
+    head_dim = q.size(2)
+    qhead_per_kvhead = q_heads // kv_heads
+    half_len = local_seqlen // 2
+    scale = head_dim ** -0.5
+    outputs: list[torch.Tensor] = []
+
+    q_b = q.view(batch_size, local_seqlen, q_heads, head_dim).float()
+    k_rb = k_by_rank.view(world_size, batch_size, local_seqlen, kv_heads, head_dim)
+    v_rb = v_by_rank.view(world_size, batch_size, local_seqlen, kv_heads, head_dim)
+    half_arange = torch.arange(half_len, device=q.device, dtype=torch.int64)
+    key_pos = torch.cat(
+        [
+            torch.cat(
+                [
+                    half_arange + rank_idx * half_len,
+                    half_arange + (2 * world_size - 1 - rank_idx) * half_len,
+                ],
+                dim=0,
+            )
+            for rank_idx in range(world_size)
+        ],
+        dim=0,
+    )
+    query_pos = torch.cat(
+        [
+            half_arange + local_rank * half_len,
+            half_arange + (2 * world_size - 1 - local_rank) * half_len,
+        ],
+        dim=0,
+    )
+
+    for batch_idx in range(batch_size):
+        q_i = q_b[batch_idx]
+        k_i = k_rb[:, batch_idx].reshape(world_size * local_seqlen, kv_heads, head_dim).float()
+        v_i = v_rb[:, batch_idx].reshape(world_size * local_seqlen, kv_heads, head_dim).float()
+        if qhead_per_kvhead != 1:
+            k_i = k_i.repeat_interleave(qhead_per_kvhead, dim=1)
+            v_i = v_i.repeat_interleave(qhead_per_kvhead, dim=1)
+
+        scores = torch.einsum("qhd,khd->hqk", q_i, k_i) * scale
+        causal_mask = key_pos.unsqueeze(0) <= query_pos.unsqueeze(1)
+        scores = scores.masked_fill(~causal_mask.unsqueeze(0), float("-inf"))
         probs = torch.softmax(scores, dim=-1)
         outputs.append(torch.einsum("hqk,khd->qhd", probs, v_i).to(dtype=q.dtype))
 

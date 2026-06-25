@@ -1,0 +1,450 @@
+Running multi-rank ring_test benchmark with correctness checks
+=========================================================
+Config: world_size=2, methods=['pytorch', 'fa2', 'fa3', 'min_varlen', 'min_varlen_ring', 'min_varlen_mega_ring'], B=16, seqlen=512,1024,2048,4096,8192, qhead=32, kvhead=8, D=128, mode=both, num_comp_sm=128, num_comm_sm=4, warmup=20, iters=30, check=True
+Checks compare each rank output against a full-rank PyTorch reference.
+
+Running local_S=512, causal=False
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=1.666, t1=1.662 | max_across_ranks=1.667                             164.9             ok  
+fa2                      t0=0.909, t1=0.899 | max_across_ranks=0.909                             302.3             ok  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=0.323, t1=0.318 | max_across_ranks=0.323                             851.7    timing-only  timing-only local step loop
+min_varlen_ring          t0=1.222, t1=1.230 | max_across_ranks=1.235                             222.6             ok  
+min_varlen_mega_ring     t0=1.420, t1=1.413 | max_across_ranks=1.422                             193.3             ok  
+
+Running local_S=1024, causal=False
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=3.830, t1=3.828 | max_across_ranks=3.832                             286.9             ok  
+fa2                      t0=2.231, t1=2.245 | max_across_ranks=2.245                             489.8             ok  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=0.995, t1=0.991 | max_across_ranks=1.017                            1081.6    timing-only  timing-only local step loop
+min_varlen_ring          t0=2.621, t1=2.617 | max_across_ranks=2.621                             419.5             ok  
+min_varlen_mega_ring     t0=3.057, t1=3.057 | max_across_ranks=3.066                             358.6             ok  
+
+Running local_S=2048, causal=False
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=10.632, t1=10.634 | max_across_ranks=10.644                          413.2             ok  
+fa2                      t0=7.559, t1=7.792 | max_across_ranks=7.814                             562.9             ok  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=4.002, t1=3.839 | max_across_ranks=4.002                            1098.9    timing-only  timing-only local step loop
+min_varlen_ring          t0=5.979, t1=5.967 | max_across_ranks=5.979                             735.5             ok  
+min_varlen_mega_ring     t0=6.867, t1=6.844 | max_across_ranks=6.872                             640.0             ok  
+
+Running local_S=4096, causal=False
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=34.046, t1=34.271 | max_across_ranks=34.441                          510.8             ok  
+fa2                      t0=26.798, t1=26.967 | max_across_ranks=27.058                          650.2             ok  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=14.871, t1=14.908 | max_across_ranks=14.971                         1175.1    timing-only  timing-only local step loop
+min_varlen_ring          t0=16.516, t1=16.396 | max_across_ranks=16.601                         1059.7             ok  
+min_varlen_mega_ring     t0=17.789, t1=17.970 | max_across_ranks=18.176                          967.9             ok  
+
+Running local_S=8192, causal=False
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=117.580, t1=118.453 | max_across_ranks=118.618                       593.2             ok  
+fa2                      t0=99.604, t1=99.633 | max_across_ranks=99.876                          704.6             ok  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=56.269, t1=56.108 | max_across_ranks=56.593                         1243.4    timing-only  timing-only local step loop
+min_varlen_ring          t0=59.468, t1=59.823 | max_across_ranks=60.588                         1161.4             ok  
+min_varlen_mega_ring     t0=59.989, t1=60.047 | max_across_ranks=60.808                         1157.2             ok  
+
+Running local_S=512, causal=True
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=0.871, t1=1.628 | max_across_ranks=1.628                              84.5             ok  
+fa2                      t0=0.541, t1=0.886 | max_across_ranks=0.886                             155.3             ok  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argum
+ent 'return_softmax'
+min_varlen               t0=0.129, t1=0.279 | max_across_ranks=0.279                             493.4    timing-only  timing-only local step loop
+min_varlen_ring          t0=1.031, t1=1.225 | max_across_ranks=1.225                             112.3             ok  
+min_varlen_mega_ring     t0=1.323, t1=1.355 | max_across_ranks=1.355                             101.5    timing-only  zigzag causal timing-only
+
+Running local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=1.713, t1=3.516 | max_across_ranks=3.516                             156.4             ok  
+fa2                      t0=1.010, t1=2.012 | max_across_ranks=2.012                             273.3             ok  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=0.317, t1=0.828 | max_across_ranks=0.828                             664.7    timing-only  timing-only local step loop
+min_varlen_ring          t0=2.065, t1=2.614 | max_across_ranks=2.614                             210.4             ok  
+min_varlen_mega_ring     t0=2.772, t1=2.865 | max_across_ranks=2.865                             192.0    timing-only  zigzag causal timing-only
+
+Running local_S=2048, causal=True
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=3.968, t1=9.298 | max_across_ranks=9.298                             236.6             ok  
+fa2                      t0=2.449, t1=6.318 | max_across_ranks=6.318                             348.2             ok  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=0.964, t1=3.376 | max_across_ranks=3.376                             651.6    timing-only  timing-only local step loop
+min_varlen_ring          t0=4.116, t1=5.939 | max_across_ranks=5.939                             370.4             ok  
+min_varlen_mega_ring     t0=5.955, t1=6.077 | max_across_ranks=6.077                             362.0    timing-only  zigzag causal timing-only
+
+Running local_S=4096, causal=True
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=10.645, t1=28.437 | max_across_ranks=28.437                          309.4             ok  
+fa2                      t0=7.355, t1=21.388 | max_across_ranks=21.388                           411.3             ok  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=3.356, t1=11.454 | max_across_ranks=11.454                           768.0    timing-only  timing-only local step loop
+min_varlen_ring          t0=8.289, t1=15.302 | max_across_ranks=15.302                           574.9             ok  
+min_varlen_mega_ring     t0=13.591, t1=13.760 | max_across_ranks=13.763                          639.2    timing-only  zigzag causal timing-only
+
+Running local_S=8192, causal=True
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=33.053, t1=94.326 | max_across_ranks=94.326                          373.0             ok  
+fa2                      t0=25.174, t1=77.906 | max_across_ranks=77.906                          451.7             ok  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=12.508, t1=43.057 | max_across_ranks=43.057                          817.2    timing-only  timing-only local step loop
+min_varlen_ring          t0=16.978, t1=47.191 | max_across_ranks=47.191                          745.6             ok  
+min_varlen_mega_ring     t0=35.619, t1=36.339 | max_across_ranks=36.540                          963.0    timing-only  zigzag causal timing-only
+Running multi-rank ring_test benchmark without correctness checks
+=========================================================
+Config: world_size=2, methods=['pytorch', 'fa2', 'fa3', 'min_varlen', 'min_varlen_ring', 'min_varlen_mega_ring'], B=16, seqlen=512,1024,2048,4096,8192, qhead=32, kvhead=8, D=128, mode=both, num_comp_sm=128, num_comm_sm=4, warmup=20, iters=30, check=False
+
+Running local_S=512, causal=False
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=1.668, t1=1.670 | max_across_ranks=1.671                             164.5           skip  
+fa2                      t0=0.907, t1=0.905 | max_across_ranks=0.910                             302.2           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=0.321, t1=0.321 | max_across_ranks=0.322                             854.5           skip  timing-only local step loop
+min_varlen_ring          t0=1.224, t1=1.229 | max_across_ranks=1.239                             221.9           skip  
+min_varlen_mega_ring     t0=1.421, t1=1.416 | max_across_ranks=1.424                             193.0           skip  
+
+Running local_S=1024, causal=False
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=3.828, t1=3.827 | max_across_ranks=3.831                             287.0           skip  
+fa2                      t0=2.232, t1=2.260 | max_across_ranks=2.261                             486.3           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=1.000, t1=1.044 | max_across_ranks=1.044                            1052.7           skip  timing-only local step loop
+min_varlen_ring          t0=2.622, t1=2.618 | max_across_ranks=2.624                             419.1           skip  
+min_varlen_mega_ring     t0=3.052, t1=3.053 | max_across_ranks=3.060                             359.4           skip  
+
+Running local_S=2048, causal=False
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=10.644, t1=10.665 | max_across_ranks=10.666                          412.3           skip  
+fa2                      t0=7.812, t1=7.687 | max_across_ranks=7.854                             560.0           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=3.905, t1=4.072 | max_across_ranks=4.072                            1080.0           skip  timing-only local step loop
+min_varlen_ring          t0=5.992, t1=5.982 | max_across_ranks=5.993                             733.9           skip  
+min_varlen_mega_ring     t0=6.873, t1=6.873 | max_across_ranks=6.886                             638.7           skip  
+
+Running local_S=4096, causal=False
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=34.209, t1=34.357 | max_across_ranks=34.604                          508.4           skip  
+fa2                      t0=26.885, t1=27.007 | max_across_ranks=27.093                          649.3           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=14.604, t1=14.733 | max_across_ranks=14.821                         1187.0           skip  timing-only local step loop
+min_varlen_ring          t0=16.357, t1=16.441 | max_across_ranks=16.483                         1067.3           skip  
+min_varlen_mega_ring     t0=17.903, t1=18.030 | max_across_ranks=18.255                          963.7           skip  
+
+Running local_S=8192, causal=False
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=118.103, t1=118.409 | max_across_ranks=118.648                       593.1           skip  
+fa2                      t0=99.868, t1=100.011 | max_across_ranks=100.130                        702.8           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=56.563, t1=55.140 | max_across_ranks=56.618                         1242.9           skip  timing-only local step loop
+min_varlen_ring          t0=60.416, t1=58.626 | max_across_ranks=60.700                         1159.3           skip  
+min_varlen_mega_ring     t0=60.775, t1=58.670 | max_across_ranks=60.983                         1153.9           skip  
+
+Running local_S=512, causal=True
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=0.878, t1=1.629 | max_across_ranks=1.629                              84.5           skip  
+fa2                      t0=0.541, t1=0.887 | max_across_ranks=0.887                             155.1           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=0.128, t1=0.281 | max_across_ranks=0.281                             489.1           skip  timing-only local step loop
+min_varlen_ring          t0=1.021, t1=1.222 | max_across_ranks=1.222                             112.6           skip  
+min_varlen_mega_ring     t0=1.323, t1=1.353 | max_across_ranks=1.354                             101.6           skip  zigzag causal timing-only
+
+Running local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=1.715, t1=3.529 | max_across_ranks=3.529                             155.9           skip  
+fa2                      t0=1.009, t1=2.038 | max_across_ranks=2.038                             269.9           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=0.318, t1=0.804 | max_across_ranks=0.804                             684.5           skip  timing-only local step loop
+min_varlen_ring          t0=2.061, t1=2.607 | max_across_ranks=2.607                             211.0           skip  
+min_varlen_mega_ring     t0=2.767, t1=2.870 | max_across_ranks=2.870                             191.6           skip  zigzag causal timing-only
+
+Running local_S=2048, causal=True
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=3.966, t1=9.322 | max_across_ranks=9.322                             235.9           skip  
+fa2                      t0=2.451, t1=6.244 | max_across_ranks=6.244                             352.2           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=0.960, t1=3.561 | max_across_ranks=3.561                             617.7           skip  timing-only local step loop
+min_varlen_ring          t0=4.111, t1=5.945 | max_across_ranks=5.945                             370.0           skip  
+min_varlen_mega_ring     t0=5.950, t1=6.086 | max_across_ranks=6.086                             361.4           skip  zigzag causal timing-only
+
+Running local_S=4096, causal=True
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=10.633, t1=28.473 | max_across_ranks=28.473                          309.0           skip  
+fa2                      t0=7.358, t1=21.604 | max_across_ranks=21.604                           407.2           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=3.353, t1=11.650 | max_across_ranks=11.650                           755.1           skip  timing-only local step loop
+min_varlen_ring          t0=8.289, t1=15.119 | max_across_ranks=15.119                           581.8           skip  
+min_varlen_mega_ring     t0=13.558, t1=13.751 | max_across_ranks=13.751                          639.7           skip  zigzag causal timing-only
+
+Running local_S=8192, causal=True
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=32.937, t1=93.804 | max_across_ranks=93.804                          375.1           skip  
+fa2                      t0=25.126, t1=77.514 | max_across_ranks=77.514                          453.9           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=12.512, t1=42.776 | max_across_ranks=42.776                          822.6           skip  timing-only local step loop
+min_varlen_ring          t0=16.981, t1=46.736 | max_across_ranks=46.736                          752.9           skip  
+min_varlen_mega_ring     t0=35.881, t1=36.073 | max_across_ranks=36.396                          966.8           skip  zigzag causal timing-only
+Config: world_size=2, methods=['pytorch', 'fa2', 'fa3', 'min_varlen', 'min_varlen_ring', 'min_varlen_mega_ring'], B=16, seqlen=512,1024,2048,4096,8192, qhead=32, kvhead=8, D=128, mode=both, num_comp_sm=124, num_comm_sm=8, warmup=20, iters=30, check=False
+
+Running local_S=512, causal=False
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=1.665, t1=1.664 | max_across_ranks=1.667                             164.9           skip  
+fa2                      t0=0.906, t1=0.902 | max_across_ranks=0.908                             302.7           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=0.333, t1=0.331 | max_across_ranks=0.333                             825.2           skip  timing-only local step loop
+min_varlen_ring          t0=0.757, t1=0.761 | max_across_ranks=0.764                             359.9           skip  
+min_varlen_mega_ring     t0=0.843, t1=0.839 | max_across_ranks=0.844                             325.6           skip  
+
+Running local_S=1024, causal=False
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=3.831, t1=3.821 | max_across_ranks=3.832                             286.9           skip  
+fa2                      t0=2.249, t1=2.255 | max_across_ranks=2.262                             486.1           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=1.053, t1=1.098 | max_across_ranks=1.104                             995.5           skip  timing-only local step loop
+min_varlen_ring          t0=1.679, t1=1.679 | max_across_ranks=1.683                             653.3           skip  
+min_varlen_mega_ring     t0=1.860, t1=1.865 | max_across_ranks=1.868                             588.7           skip  
+
+Running local_S=2048, causal=False
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=10.591, t1=10.634 | max_across_ranks=10.638                          413.4           skip  
+fa2                      t0=7.759, t1=7.645 | max_across_ranks=7.787                             564.8           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=3.920, t1=4.119 | max_across_ranks=4.119                            1067.7           skip  timing-only local step loop
+min_varlen_ring          t0=4.393, t1=4.393 | max_across_ranks=4.421                             994.8           skip  
+min_varlen_mega_ring     t0=4.745, t1=4.805 | max_across_ranks=4.807                             914.9           skip  
+
+Running local_S=4096, causal=False
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=34.118, t1=34.361 | max_across_ranks=34.514                          509.7           skip  
+fa2                      t0=26.976, t1=27.031 | max_across_ranks=27.091                          649.4           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=14.911, t1=15.022 | max_across_ranks=15.102                         1164.9           skip  timing-only local step loop
+min_varlen_ring          t0=16.209, t1=16.099 | max_across_ranks=16.410                         1072.1           skip  
+min_varlen_mega_ring     t0=16.253, t1=16.396 | max_across_ranks=16.487                         1067.0           skip  
+
+Running local_S=8192, causal=False
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=117.975, t1=118.842 | max_across_ranks=118.996                       591.4           skip  
+fa2                      t0=99.774, t1=100.172 | max_across_ranks=100.250                        701.9           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=57.099, t1=57.290 | max_across_ranks=57.413                         1225.7           skip  timing-only local step loop
+min_varlen_ring          t0=60.923, t1=60.830 | max_across_ranks=61.143                         1150.9           skip  
+min_varlen_mega_ring     t0=61.325, t1=61.383 | max_across_ranks=61.575                         1142.8           skip  
+
+Running local_S=512, causal=True
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=0.878, t1=1.629 | max_across_ranks=1.629                              84.4           skip  
+fa2                      t0=0.540, t1=0.886 | max_across_ranks=0.886                             155.2           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=0.132, t1=0.290 | max_across_ranks=0.290                             475.1           skip  timing-only local step loop
+min_varlen_ring          t0=0.559, t1=0.763 | max_across_ranks=0.763                             180.3           skip  
+min_varlen_mega_ring     t0=0.754, t1=0.782 | max_across_ranks=0.782                             175.9           skip  zigzag causal timing-only
+
+Running local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=1.759, t1=3.525 | max_across_ranks=3.525                             156.0           skip  
+fa2                      t0=1.010, t1=2.015 | max_across_ranks=2.015                             272.9           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=0.326, t1=0.878 | max_across_ranks=0.878                             626.7           skip  timing-only local step loop
+min_varlen_ring          t0=1.100, t1=1.671 | max_across_ranks=1.671                             329.3           skip  
+min_varlen_mega_ring     t0=1.605, t1=1.680 | max_across_ranks=1.680                             327.4           skip  zigzag causal timing-only
+
+Running local_S=2048, causal=True
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=3.970, t1=9.309 | max_across_ranks=9.309                             236.3           skip  
+fa2                      t0=2.475, t1=6.255 | max_across_ranks=6.255                             351.6           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=0.987, t1=3.664 | max_across_ranks=3.664                             600.3           skip  timing-only local step loop
+min_varlen_ring          t0=2.188, t1=4.128 | max_across_ranks=4.128                             532.8           skip  
+min_varlen_mega_ring     t0=3.474, t1=3.635 | max_across_ranks=3.635                             605.1           skip  zigzag causal timing-only
+
+Running local_S=4096, causal=True
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=10.653, t1=28.646 | max_across_ranks=28.646                          307.1           skip  
+fa2                      t0=7.373, t1=21.744 | max_across_ranks=21.744                           404.6           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=3.428, t1=11.864 | max_across_ranks=11.864                           741.5           skip  timing-only local step loop
+min_varlen_ring          t0=4.434, t1=12.333 | max_across_ranks=12.333                           713.3           skip  
+min_varlen_mega_ring     t0=9.137, t1=9.815 | max_across_ranks=9.815                             896.3           skip  zigzag causal timing-only
+
+Running local_S=8192, causal=True
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=32.956, t1=94.461 | max_across_ranks=94.461                          372.5           skip  
+fa2                      t0=25.133, t1=77.963 | max_across_ranks=77.963                          451.3           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=12.767, t1=43.807 | max_across_ranks=43.807                          803.2           skip  timing-only local step loop
+min_varlen_ring          t0=13.554, t1=46.473 | max_across_ranks=46.473                          757.1           skip  
+min_varlen_mega_ring     t0=31.298, t1=32.246 | max_across_ranks=32.599                         1079.4           skip  zigzag causal timing-only
+Config: world_size=2, methods=['pytorch', 'fa2', 'fa3', 'min_varlen', 'min_varlen_ring', 'min_varlen_mega_ring'], B=16, seqlen=512,1024,2048,4096,8192, qhead=32, kvhead=8, D=128, mode=both, num_comp_sm=116, num_comm_sm=16, warmup=20, iters=30, check=False
+
+Running local_S=512, causal=False
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=1.675, t1=1.664 | max_across_ranks=1.675                             164.1           skip  
+fa2                      t0=0.912, t1=0.906 | max_across_ranks=0.914                             300.8           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=0.352, t1=0.347 | max_across_ranks=0.352                             781.2           skip  timing-only local step loop
+min_varlen_ring          t0=0.526, t1=0.525 | max_across_ranks=0.528                             520.3           skip  
+min_varlen_mega_ring     t0=0.602, t1=0.603 | max_across_ranks=0.605                             454.7           skip  
+
+Running local_S=1024, causal=False
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=3.836, t1=3.820 | max_across_ranks=3.836                             286.7           skip  
+fa2                      t0=2.262, t1=2.264 | max_across_ranks=2.269                             484.6           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=1.067, t1=1.127 | max_across_ranks=1.128                             974.7           skip  timing-only local step loop
+min_varlen_ring          t0=1.316, t1=1.325 | max_across_ranks=1.326                             829.3           skip  
+min_varlen_mega_ring     t0=1.426, t1=1.414 | max_across_ranks=1.430                             768.8           skip  
+
+Running local_S=2048, causal=False
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=10.615, t1=10.639 | max_across_ranks=10.640                          413.3           skip  
+fa2                      t0=7.727, t1=7.606 | max_across_ranks=7.756                             567.1           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=4.047, t1=4.342 | max_across_ranks=4.342                            1013.0           skip  timing-only local step loop
+min_varlen_ring          t0=4.459, t1=4.532 | max_across_ranks=4.533                             970.3           skip  
+min_varlen_mega_ring     t0=4.595, t1=4.536 | max_across_ranks=4.597                             956.6           skip  
+
+Running local_S=4096, causal=False
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=34.190, t1=34.452 | max_across_ranks=34.608                          508.3           skip  
+fa2                      t0=26.841, t1=27.076 | max_across_ranks=27.112                          648.9           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=15.420, t1=15.580 | max_across_ranks=15.632                         1125.4           skip  timing-only local step loop
+min_varlen_ring          t0=16.513, t1=16.661 | max_across_ranks=16.674                         1055.1           skip  
+min_varlen_mega_ring     t0=16.851, t1=16.768 | max_across_ranks=16.915                         1040.0           skip  
+
+Running local_S=8192, causal=False
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=noncausal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=117.655, t1=118.946 | max_across_ranks=118.976                       591.5           skip  
+fa2                      t0=99.759, t1=100.136 | max_across_ranks=100.230                        702.1           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=58.571, t1=59.551 | max_across_ranks=59.590                         1180.9           skip  timing-only local step loop
+min_varlen_ring          t0=62.841, t1=62.993 | max_across_ranks=63.170                         1114.0           skip  
+min_varlen_mega_ring     t0=63.198, t1=63.274 | max_across_ranks=63.545                         1107.4           skip  
+
+Running local_S=512, causal=True
+
+B=16, local_S=512, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=0.882, t1=1.628 | max_across_ranks=1.628                              84.5           skip  
+fa2                      t0=0.542, t1=0.888 | max_across_ranks=0.888                             155.0           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=0.140, t1=0.302 | max_across_ranks=0.302                             455.6           skip  timing-only local step loop
+min_varlen_ring          t0=0.317, t1=0.523 | max_across_ranks=0.523                             263.3           skip  
+min_varlen_mega_ring     t0=0.478, t1=0.515 | max_across_ranks=0.515                             267.3           skip  zigzag causal timing-only
+
+Running local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=1.726, t1=3.526 | max_across_ranks=3.526                             156.0           skip  
+fa2                      t0=1.011, t1=2.025 | max_across_ranks=2.025                             271.6           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=0.346, t1=0.887 | max_across_ranks=0.887                             619.8           skip  timing-only local step loop
+min_varlen_ring          t0=0.616, t1=1.240 | max_across_ranks=1.240                             443.5           skip  
+min_varlen_mega_ring     t0=1.069, t1=1.167 | max_across_ranks=1.167                             471.3           skip  zigzag causal timing-only
+
+Running local_S=2048, causal=True
+
+B=16, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=3.961, t1=9.295 | max_across_ranks=9.295                             236.7           skip  
+fa2                      t0=2.459, t1=6.336 | max_across_ranks=6.336                             347.2           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=1.077, t1=3.511 | max_across_ranks=3.511                             626.4           skip  timing-only local step loop
+min_varlen_ring          t0=1.265, t1=3.605 | max_across_ranks=3.605                             610.2           skip  
+min_varlen_mega_ring     t0=2.563, t1=2.790 | max_across_ranks=2.790                             788.3           skip  zigzag causal timing-only
+
+Running local_S=4096, causal=True
+
+B=16, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=10.654, t1=28.269 | max_across_ranks=28.269                          311.2           skip  
+fa2                      t0=7.356, t1=21.360 | max_across_ranks=21.360                           411.9           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=3.581, t1=11.903 | max_across_ranks=11.903                           739.1           skip  timing-only local step loop
+min_varlen_ring          t0=4.001, t1=12.921 | max_across_ranks=12.921                           680.9           skip  
+min_varlen_mega_ring     t0=8.555, t1=9.162 | max_across_ranks=9.162                             960.2           skip  zigzag causal timing-only
+
+Running local_S=8192, causal=True
+
+B=16, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                   Time ms                                                                TFLOPS          Check  Note
+pytorch                  t0=32.973, t1=94.474 | max_across_ranks=94.474                          372.4           skip  
+fa2                      t0=25.152, t1=77.908 | max_across_ranks=77.908                          451.6           skip  
+fa3                      N/A                                                                       N/A          error  flash_attn_varlen_func() got an unexpected keyword argument 'return_softmax'
+min_varlen               t0=13.345, t1=45.532 | max_across_ranks=45.532                          772.8           skip  timing-only local step loop
+min_varlen_ring          t0=14.137, t1=48.121 | max_across_ranks=48.121                          731.2           skip  
+min_varlen_mega_ring     t0=32.590, t1=33.305 | max_across_ranks=33.769                         1042.0           skip  zigzag causal timing-only

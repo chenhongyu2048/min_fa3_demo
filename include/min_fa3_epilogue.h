@@ -246,7 +246,9 @@ struct CollectiveEpilogueFwd {
           SharedStorage& shared_storage,
           TiledMma tiled_mma,
           int thread_idx,
-          cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord
+          cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord,
+          int q_row_offset_extra = 0,
+          int seqlen_o_override = -1
           ) {
 
         auto [m_block, bidh, bidb, split_idx] = block_coord;
@@ -302,8 +304,8 @@ struct CollectiveEpilogueFwd {
 
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused};
         bool is_varlen = Varlen && params.cu_seqlens;
-        int offset_o = seqlen_info.offset;
-        int seqlen_o = seqlen_info.seqlen;
+        int offset_o = seqlen_info.offset + q_row_offset_extra;
+        int seqlen_o = seqlen_o_override >= 0 ? seqlen_o_override : seqlen_info.seqlen;
         int warp_group_idx = __shfl_sync(0xFFFFFFFF, thread_idx / cutlass::NumThreadsPerWarpGroup, 0);
 
         // Step 2: Write LSE from rmem -> gmem
@@ -542,7 +544,9 @@ struct CollectiveEpilogueFwd {
     store_zero(
          Params const& params,
          int thread_idx,
-         cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord
+         cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord,
+         int q_row_offset_extra = 0,
+         int seqlen_o_override = -1
          ) {
         static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
         auto [m_block, bidh, bidb, split_idx] = block_coord;
@@ -557,8 +561,8 @@ struct CollectiveEpilogueFwd {
 
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused};
         bool const is_varlen = Varlen && params.cu_seqlens;
-        int offset_o = seqlen_info.offset;
-        int seqlen_o = seqlen_info.seqlen;
+        int offset_o = seqlen_info.offset + q_row_offset_extra;
+        int seqlen_o = seqlen_o_override >= 0 ? seqlen_o_override : seqlen_info.seqlen;
         int qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;
         Tensor mLSE = make_tensor(make_gmem_ptr((!is_split ? params.ptr_LSE : params.ptr_LSE_partial) + offset_o * get<0>(!is_split ? params.stride_LSE : params.stride_LSE_partial)),
                                   params.shape_LSE_packed,

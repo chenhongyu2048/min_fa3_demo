@@ -382,11 +382,15 @@ public:
                  ) {
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 int mega_ring_step = 0;
-                int mega_ring_base_tile_idx = 0;
+                int mega_ring_reduction_tile_idx = 0;
+                int mega_ring_q_row_offset = 0;
+                int mega_ring_seqlen_o = -1;
                 if constexpr (TileScheduler::EnableMegaRing) {
-                    // MEGA_RING: base tile id identifies the same Q/head/batch tile across all ring steps for block-wise online reduction.
+                    // MEGA_RING: reduction_tile_idx identifies the same output
+                    // tile across ring steps. For causal zigzag half-Q steps it
+                    // is already mapped back into the full-Q back-half stream.
                     mega_ring_step = work_tile_info.ring_step;
-                    mega_ring_base_tile_idx = work_tile_info.global_tile_idx - mega_ring_step * params.scheduler.mega_ring_tiles_per_step;
+                    mega_ring_reduction_tile_idx = work_tile_info.reduction_tile_idx;
                 }
                 int const bidb = get<2>(block_coord);
                 SeqlenInfo_t seqlen_info{
@@ -398,6 +402,13 @@ public:
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
                     params.mainloop.seqlens_rotary
                 };
+                if constexpr (TileScheduler::EnableMegaRing && Is_causal) {
+                    if (mega_ring_step > params.mainloop.mega_ring_rank) {
+                        int const half_len = params.mainloop.mega_ring_half_cu_seqlens[bidb + 1] - params.mainloop.mega_ring_half_cu_seqlens[bidb];
+                        mega_ring_q_row_offset = half_len;
+                        mega_ring_seqlen_o = half_len;
+                    }
+                }
                 // if constexpr (AppendKV) {
                 //     bool tile_new_valid = mainloop.store_kv_new(
                 //         params.mainloop, pipeline_k_new, pipeline_v_new, smem_pipe_read_new,
@@ -458,20 +469,21 @@ public:
                         if (mega_ring_step > 0) {
                             if (threadIdx.x == MmaThreadOffset) {
                                 min_fa3_varlen_demo::mega_ring::wait_until_at_least(
-                                    params.mainloop.mega_ring_step_ready + mega_ring_base_tile_idx,
+                                    params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
                                     mega_ring_step);
                             }
                             flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
                         }
                     }
                     epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma_pv,
-                                   threadIdx.x - MmaThreadOffset, block_coord);
+                                   threadIdx.x - MmaThreadOffset, block_coord,
+                                   mega_ring_q_row_offset, mega_ring_seqlen_o);
                     if constexpr (TileScheduler::EnableMegaRing) {
                         // MEGA_RING: publish step completion only after every epilogue thread has finished its part of the in-place O/LSE merge.
                         flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
                         if (threadIdx.x == MmaThreadOffset) {
                             min_fa3_varlen_demo::mega_ring::signal_release(
-                                params.mainloop.mega_ring_step_ready + mega_ring_base_tile_idx,
+                                params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
                                 1);
                         }
                     }
@@ -481,7 +493,7 @@ public:
                         if (mega_ring_step > 0) {
                             if (threadIdx.x == MmaThreadOffset) {
                                 min_fa3_varlen_demo::mega_ring::wait_until_at_least(
-                                    params.mainloop.mega_ring_step_ready + mega_ring_base_tile_idx,
+                                    params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
                                     mega_ring_step);
                             }
                             flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
@@ -491,7 +503,7 @@ public:
                         // neutral initialization; later steps must not
                         // overwrite accumulated O/LSE.
                         if (mega_ring_step == 0) {
-                            epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
+                            epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord, mega_ring_q_row_offset, mega_ring_seqlen_o);
                         }
                         // MEGA_RING: for step 0, make sure zero/-inf
                         // initialization is complete before signaling. For
@@ -500,7 +512,7 @@ public:
                         flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
                         if (threadIdx.x == MmaThreadOffset) {
                             min_fa3_varlen_demo::mega_ring::signal_release(
-                                params.mainloop.mega_ring_step_ready + mega_ring_base_tile_idx,
+                                params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
                                 1);
                         }
                     } else {
