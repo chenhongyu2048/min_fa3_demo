@@ -168,7 +168,8 @@ def forward_varlen(
     cu_seqlens_q_host: torch.Tensor,
     cu_seqlens_k_host: torch.Tensor,
     manual_block_count: Optional[int] = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     return _forward_varlen_cuda(
         q,
         k,
@@ -181,6 +182,7 @@ def forward_varlen(
         int(max_seqlen_k),
         bool(is_causal),
         manual_block_count=manual_block_count,
+        return_lse=bool(return_lse),
     )
 
 

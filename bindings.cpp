@@ -272,17 +272,18 @@ torch::Tensor forward(
     return out;
 }
 
-torch::Tensor forward_varlen(torch::Tensor q,
-                             torch::Tensor k,
-                             torch::Tensor v,
-                             torch::Tensor cu_seqlens_q,
-                             torch::Tensor cu_seqlens_k,
-                             torch::Tensor cu_seqlens_q_host,
-                             torch::Tensor cu_seqlens_k_host,
-                             int64_t max_seqlen_q,
-                             int64_t max_seqlen_k,
-                             bool is_causal,
-                             py::object manual_block_count_obj) {
+py::object forward_varlen(torch::Tensor q,
+                          torch::Tensor k,
+                          torch::Tensor v,
+                          torch::Tensor cu_seqlens_q,
+                          torch::Tensor cu_seqlens_k,
+                          torch::Tensor cu_seqlens_q_host,
+                          torch::Tensor cu_seqlens_k_host,
+                          int64_t max_seqlen_q,
+                          int64_t max_seqlen_k,
+                          bool is_causal,
+                          py::object manual_block_count_obj,
+                          bool return_lse) {
     auto manual_block_count = parse_manual_block_count(manual_block_count_obj);
     check_varlen_qkv(q, "q");
     check_varlen_qkv(k, "k");
@@ -350,7 +351,10 @@ torch::Tensor forward_varlen(torch::Tensor q,
         at::cuda::getDefaultCUDAStream(q.get_device()),
         manual_block_count);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return out;
+    if (return_lse) {
+        return py::make_tuple(out, lse);
+    }
+    return py::cast(out);
 }
 
 py::tuple debug_resolve_launch_grid_shape(
@@ -398,6 +402,7 @@ PYBIND11_MODULE(_min_fa3_op, m) {
         py::arg("is_causal"),
         py::kw_only(),
         py::arg("manual_block_count") = py::none(),
+        py::arg("return_lse") = false,
         "Minimal Hopper varlen forward-only FlashAttention demo.\n\n"
         "manual_block_count is an optional grid.x thread-block count override. "
         "When omitted, the launch grid is computed automatically by get_grid_shape(...).");

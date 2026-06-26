@@ -21,7 +21,18 @@ import torch.nn.functional as F
 # block and returns both block output and softmax LSE for online ring reduction.
 BlockAttention = Callable[[torch.Tensor, torch.Tensor, torch.Tensor, bool], tuple[torch.Tensor, torch.Tensor]]
 ZigzagBlockAttention = Callable[
-    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, bool],
+    [
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        int,
+        bool,
+    ],
     tuple[torch.Tensor, torch.Tensor],
 ]
 
@@ -242,6 +253,7 @@ def zigzag_ring_varlen_forward(
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    cu_seqlens_host: torch.Tensor,
     max_seqlen: int,
     block_attention: ZigzagBlockAttention,
 ) -> torch.Tensor:
@@ -259,6 +271,7 @@ def zigzag_ring_varlen_forward(
     half_index0 = get_half_index(cu_seqlens, front=True)
     half_index1 = get_half_index(cu_seqlens, front=False)
     half_cu_seqlens = cu_seqlens // 2
+    half_cu_seqlens_host = cu_seqlens_host // 2
     half_max_seqlen = max_seqlen // 2
 
     out = None
@@ -275,19 +288,46 @@ def zigzag_ring_varlen_forward(
 
         if step == 0:
             block_out, block_lse = block_attention(
-                q, cur_k, cur_v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, True
+                q,
+                cur_k,
+                cur_v,
+                cu_seqlens,
+                cu_seqlens,
+                cu_seqlens_host,
+                cu_seqlens_host,
+                max_seqlen,
+                max_seqlen,
+                True,
             )
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
         elif step <= comm.rank:
             k0 = cur_k[half_index0].contiguous()
             v0 = cur_v[half_index0].contiguous()
             block_out, block_lse = block_attention(
-                q, k0, v0, cu_seqlens, half_cu_seqlens, max_seqlen, half_max_seqlen, False
+                q,
+                k0,
+                v0,
+                cu_seqlens,
+                half_cu_seqlens,
+                cu_seqlens_host,
+                half_cu_seqlens_host,
+                max_seqlen,
+                half_max_seqlen,
+                False,
             )
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
         else:
             block_out, block_lse = block_attention(
-                q1, cur_k, cur_v, half_cu_seqlens, cu_seqlens, half_max_seqlen, max_seqlen, False
+                q1,
+                cur_k,
+                cur_v,
+                half_cu_seqlens,
+                cu_seqlens,
+                half_cu_seqlens_host,
+                cu_seqlens_host,
+                half_max_seqlen,
+                max_seqlen,
+                False,
             )
             out1, lse1 = update_out_and_lse(out[half_index1], lse[half_index1], block_out, block_lse)
             out[half_index1] = out1
@@ -391,6 +431,36 @@ def flash_varlen_block_attention(
         )
     else:
         raise ValueError(f"unsupported FlashAttention method '{method}'")
+    return take_output_and_lse(result, q.size(0), q.size(1))
+
+
+def min_fa3_varlen_block_attention(
+    forward_varlen_func,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run one min_fa3 varlen block and return output plus normalized LSE."""
+    result = forward_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        is_causal,
+        cu_seqlens_q_host=cu_seqlens_q_host,
+        cu_seqlens_k_host=cu_seqlens_k_host,
+        return_lse=True,
+    )
     return take_output_and_lse(result, q.size(0), q.size(1))
 
 

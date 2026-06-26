@@ -28,6 +28,7 @@ import min_fa3_op
 from ring_common import (
     flash_varlen_block_attention,
     gather_rank_tensor,
+    min_fa3_varlen_block_attention,
     pytorch_varlen_block_attention,
     raise_if_any_rank_failed,
     reference_ring_varlen,
@@ -458,8 +459,9 @@ def build_method_runs(
                         k,
                         v,
                         cu_seqlens_q,
+                        cu_seqlens_q_host,
                         max_seqlen_q,
-                        lambda q_, k_, v_, _cu_q, _cu_k, max_q_, max_k_, causal_: pytorch_varlen_block_attention(
+                        lambda q_, k_, v_, _cu_q, _cu_k, _cu_q_host, _cu_k_host, max_q_, max_k_, causal_: pytorch_varlen_block_attention(
                             q_, k_, v_, case.batch_size, max_q_, max_k_, causal_
                         ),
                     )
@@ -488,8 +490,9 @@ def build_method_runs(
                         k,
                         v,
                         cu_seqlens_q,
+                        cu_seqlens_q_host,
                         max_seqlen_q,
-                        lambda q_, k_, v_, cu_q_, cu_k_, max_q_, max_k_, causal_: flash_varlen_block_attention(
+                        lambda q_, k_, v_, cu_q_, cu_k_, _cu_q_host, _cu_k_host, max_q_, max_k_, causal_: flash_varlen_block_attention(
                             method,
                             flash_attn_varlen_func2,
                             q_,
@@ -525,7 +528,52 @@ def build_method_runs(
             runs.append(MethodRun(method, fn, "zigzag causal" if case.is_causal else ""))
         elif method == "fa3":
             if flash_attn_varlen_func3 is None:
-                runs.append(MethodRun(method, lambda: q, "not available", checkable=False))
+                def fn(method=method):
+                    if case.is_causal:
+                        return zigzag_ring_varlen_forward(
+                            dist.group.WORLD,
+                            q,
+                            k,
+                            v,
+                            cu_seqlens_q,
+                            cu_seqlens_q_host,
+                            max_seqlen_q,
+                            lambda q_, k_, v_, cu_q_, cu_k_, cu_q_host_, cu_k_host_, max_q_, max_k_, causal_: min_fa3_varlen_block_attention(
+                                min_fa3_op.forward_varlen,
+                                q_,
+                                k_,
+                                v_,
+                                cu_q_,
+                                cu_k_,
+                                cu_q_host_,
+                                cu_k_host_,
+                                max_q_,
+                                max_k_,
+                                causal_,
+                            ),
+                        )
+                    return ring_varlen_forward(
+                        dist.group.WORLD,
+                        q,
+                        k,
+                        v,
+                        False,
+                        lambda q_, k_, v_, causal_: min_fa3_varlen_block_attention(
+                            min_fa3_op.forward_varlen,
+                            q_,
+                            k_,
+                            v_,
+                            cu_seqlens_q,
+                            cu_seqlens_k,
+                            cu_seqlens_q_host,
+                            cu_seqlens_k_host,
+                            max_seqlen_q,
+                            max_seqlen_k,
+                            causal_,
+                        ),
+                    )
+
+                runs.append(MethodRun(method, fn, "fallback: min_fa3_varlen block"))
                 continue
 
             def fn(method=method):
@@ -536,8 +584,9 @@ def build_method_runs(
                         k,
                         v,
                         cu_seqlens_q,
+                        cu_seqlens_q_host,
                         max_seqlen_q,
-                        lambda q_, k_, v_, cu_q_, cu_k_, max_q_, max_k_, causal_: flash_varlen_block_attention(
+                        lambda q_, k_, v_, cu_q_, cu_k_, _cu_q_host, _cu_k_host, max_q_, max_k_, causal_: flash_varlen_block_attention(
                             method,
                             flash_attn_varlen_func3,
                             q_,

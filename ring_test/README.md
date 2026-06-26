@@ -10,6 +10,12 @@ The standard PyTorch / FA2 / FA3 methods run a real Python-side ring:
 - each block attention call returns `(out, lse)`
 - per-step outputs are merged with the usual online LSE update
 
+If the FA3 Python package import fails, the `fa3` method falls back to the
+local `min_fa3_op.forward_varlen(..., return_lse=True)` block backend while
+keeping the same Python-side ring and online LSE merge. Result tables mark this
+case with `fallback: min_fa3_varlen block`. FA2 remains optional and is skipped
+when unavailable.
+
 The minimal FA3 methods follow the current local demo APIs:
 
 - `min_varlen` is a timing-only local step loop. The current binding returns
