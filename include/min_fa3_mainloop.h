@@ -638,6 +638,7 @@ struct CollectiveMainloopFwdSm90 {
         int mega_ring_q_row_offset = 0;
         int mega_ring_seqlen_q = seqlen_info.seqlen_q;
         int mega_ring_seqlen_k = seqlen_info.seqlen_k;
+        bool mega_ring_kv_use_half = false;
         if constexpr (EnableMegaRing) {
             mega_ring_kv_rank = (params.mega_ring_rank - mega_ring_step + params.mega_ring_world_size) % params.mega_ring_world_size;
             if constexpr (Is_causal) {
@@ -647,6 +648,7 @@ struct CollectiveMainloopFwdSm90 {
                 bool const q_use_half = mega_ring_step > params.mega_ring_rank;
                 bool const kv_use_half = mega_ring_step >= 1 && mega_ring_step <= params.mega_ring_rank;
                 bool const is_diag = mega_ring_step == 0;
+                mega_ring_kv_use_half = kv_use_half;
                 mega_ring_q_row_offset = q_use_half ? half_len : 0;
                 mega_ring_seqlen_q = q_use_half ? half_len : 2 * half_len;
                 mega_ring_seqlen_k = kv_use_half ? half_len : 2 * half_len;
@@ -863,9 +865,15 @@ struct CollectiveMainloopFwdSm90 {
             // producer thread polls; the barrier releases the rest of the
             // producer threads before they touch Q/K/V pipeline state.
             if (thread_idx == 0) {
+                int kv_ready_target = params.mega_ring_total_k_per_rank * 2;
+                if constexpr (Is_causal) {
+                    if (mega_ring_kv_use_half) {
+                        kv_ready_target = params.mega_ring_total_k_per_rank;
+                    }
+                }
                 min_fa3_varlen_demo::mega_ring::wait_until_at_least(
                     params.mega_ring_kv_ready_counts + mega_ring_kv_rank,
-                    params.mega_ring_total_k_per_rank * 2);
+                    kv_ready_target);
             }
             flash::named_barrier_sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::MegaRingKVReady));
         }

@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=min_fa3_demo_h100
-#SBATCH --partition=gpu_h100
+#SBATCH --job-name=min_fa3_demo_h200
+#SBATCH --partition=gpu_h200
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
@@ -80,22 +80,22 @@ cd /data/home/scyb683/run/min_fa3_demo
 # This script requests a 2-GPU allocation for these examples.
 echo "Running multi-rank ring_test benchmark with correctness checks"
 echo "========================================================="
-torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
+torchrun --standalone --nproc_per_node=4 ring_test/benchmark_ring_forward.py \
     --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 \
     --mode both --methods all --num-comp-sm 128 --num-comm-sm 4 \
     --warmup-iters 20 --num-iters 30 --check
 
 echo "Running multi-rank ring_test benchmark without correctness checks"
 echo "========================================================="
-torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
+torchrun --standalone --nproc_per_node=4 ring_test/benchmark_ring_forward.py \
     --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 \
     --mode both --methods all --num-comp-sm 128 --num-comm-sm 4 \
     --warmup-iters 20 --num-iters 30 --no-check
-torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
+torchrun --standalone --nproc_per_node=4 ring_test/benchmark_ring_forward.py \
     --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 \
     --mode both --methods all --num-comp-sm 124 --num-comm-sm 8 \
     --warmup-iters 20 --num-iters 30 --no-check
-torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
+torchrun --standalone --nproc_per_node=4 ring_test/benchmark_ring_forward.py \
     --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 \
     --mode both --methods all --num-comp-sm 116 --num-comm-sm 16 \
     --warmup-iters 20 --num-iters 30 --no-check

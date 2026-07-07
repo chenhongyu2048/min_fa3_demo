@@ -101,6 +101,7 @@ struct MegaRingKernelConfig {
     using shared_vec = sv_bf<kVecLength>;
     using staging_gl = gl<bf16, 1, 1, -1, kVecLength, shared_vec>;
     using remote_pgl = pgl<staging_gl, NumDevices, false>;
+    static constexpr bool kIsCausal = IsCausal;
 
     // MEGA_RING: kernel params carry full concatenated local K/V storage and a
     // readiness counter instead of a single src_dev/ring_step pair.
@@ -113,8 +114,12 @@ struct MegaRingKernelConfig {
         int num_comp_sm;
         int num_comm_sm;
         int rows_per_rank;
+        int half_rows_per_rank;
+        int num_batch;
         int ring_rank;
         int ring_world_size;
+        int const* cu_seqlens_k;
+        int const* half_cu_seqlens;
         int* kv_ready_counts;
     };
 };
@@ -169,17 +174,60 @@ void run_mega_ring_remote_load(
 
     // MEGA_RING: communication tile id maps directly to
     // (step, K/V selector, token row, destination/source rank block).
-    int const loads_per_step = params.rows_per_rank * 2;
-    int const total_tasks = (params.ring_world_size - 1) * loads_per_step;
+    int const full_loads_per_step = params.rows_per_rank * 2;
+    int const half_loads_per_step = params.half_rows_per_rank * 2;
+    int const half_section_tasks = RingConfig::kIsCausal ? params.ring_rank * half_loads_per_step : 0;
+    int const total_tasks = RingConfig::kIsCausal
+        ? half_section_tasks + (params.ring_world_size - 1 - params.ring_rank) * full_loads_per_step
+        : (params.ring_world_size - 1) * full_loads_per_step;
     int const warp_id = warp::groupid();
     uint32_t phasebits = 0xFFFF0000;
 
+    auto half_row_to_full_row = [&] (int half_row) {
+        int lo = 0;
+        int hi = params.num_batch;
+        while (lo + 1 < hi) {
+            int const mid = (lo + hi) / 2;
+            if (params.half_cu_seqlens[mid] <= half_row) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return params.cu_seqlens_k[lo] + (half_row - params.half_cu_seqlens[lo]);
+    };
+
     auto decode_task = [&] (int task_id) {
-        int const step_minus_one = task_id / loads_per_step;
-        int const step = step_minus_one + 1;
-        int const task_in_step = task_id - step_minus_one * loads_per_step;
-        bool const is_v = task_in_step >= params.rows_per_rank;
-        int const row_idx = is_v ? task_in_step - params.rows_per_rank : task_in_step;
+        int step, task_in_step, rows_this_step;
+        bool kv_use_half = false;
+        if constexpr (RingConfig::kIsCausal) {
+            if (task_id < half_section_tasks) {
+                int const half_step_idx = task_id / half_loads_per_step;
+                step = half_step_idx + 1;
+                task_in_step = task_id - half_step_idx * half_loads_per_step;
+                rows_this_step = params.half_rows_per_rank;
+                kv_use_half = true;
+            } else {
+                int const rem = task_id - half_section_tasks;
+                int const full_step_idx = rem / full_loads_per_step;
+                step = params.ring_rank + 1 + full_step_idx;
+                task_in_step = rem - full_step_idx * full_loads_per_step;
+                rows_this_step = params.rows_per_rank;
+            }
+        } else {
+            int const step_minus_one = task_id / full_loads_per_step;
+            step = step_minus_one + 1;
+            task_in_step = task_id - step_minus_one * full_loads_per_step;
+            rows_this_step = params.rows_per_rank;
+        }
+        bool const is_v = task_in_step >= rows_this_step;
+        int const logical_row = is_v ? task_in_step - rows_this_step : task_in_step;
+        int row_idx = logical_row;
+        if constexpr (RingConfig::kIsCausal) {
+            if (kv_use_half) {
+                row_idx = half_row_to_full_row(logical_row);
+            }
+        }
         int const load_kv_rank = (params.ring_rank - step + params.ring_world_size) % params.ring_world_size;
         int const row_with_rank = load_kv_rank * params.rows_per_rank + row_idx;
         return cute::make_tuple(is_v, row_with_rank, load_kv_rank);
@@ -223,8 +271,9 @@ void run_mega_ring_remote_load(
             // so wait for the TMA store itself, not just its shared-memory read.
             tma::store_async_wait();
 
-            // MEGA_RING: each completed K/V row contributes one count. Compute
-            // CTAs wait until the rank block reaches rows_per_rank * 2.
+            // MEGA_RING: each completed K/V row contributes one count.
+            // Compute CTAs wait until the rank block reaches rows_per_rank * 2.
+            // Causal zigzag half-steps only signal the copied front-half rows.
             min_fa3_varlen_demo::mega_ring::signal_release(params.kv_ready_counts + load_kv_rank, 1);
         }
     }
@@ -430,8 +479,12 @@ void run_mega_ring_min_fa3_varlen_ring_sm90(
         params.num_comp_sm,
         params.num_comm_sm,
         local_total_k,
+        IsCausal ? local_total_k / 2 : 0,
+        params.b,
         params.ring_rank,
         params.ring_world_size,
+        params.cu_seqlens_k,
+        params.mega_ring_half_cu_seqlens,
         params.mega_ring_kv_ready_counts};
 
     bool const launch_with_pdl = params.prepare_varlen_pdl && !params.skip_scheduler_metadata_computation;
