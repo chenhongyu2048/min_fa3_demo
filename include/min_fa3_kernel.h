@@ -393,6 +393,11 @@ public:
                     mega_ring_reduction_tile_idx = work_tile_info.reduction_tile_idx;
                 }
                 int const bidb = get<2>(block_coord);
+                bool mega_ring_is_cp_batch = true;
+                if constexpr (TileScheduler::EnableMegaRing) {
+                    mega_ring_is_cp_batch = params.mainloop.mega_ring_cp_batch_mask == nullptr
+                        || params.mainloop.mega_ring_cp_batch_mask[bidb] != 0;
+                }
                 SeqlenInfo_t seqlen_info{
                     bidb,
                     get<0>(params.mainloop.shape_Q),
@@ -403,7 +408,7 @@ public:
                     params.mainloop.seqlens_rotary
                 };
                 if constexpr (TileScheduler::EnableMegaRing && Is_causal) {
-                    if (mega_ring_step > params.mainloop.mega_ring_rank) {
+                    if (mega_ring_is_cp_batch && mega_ring_step > params.mainloop.mega_ring_rank) {
                         int const half_len = params.mainloop.mega_ring_half_cu_seqlens[bidb + 1] - params.mainloop.mega_ring_half_cu_seqlens[bidb];
                         mega_ring_q_row_offset = half_len;
                         mega_ring_seqlen_o = half_len;
@@ -466,7 +471,7 @@ public:
                         // MEGA_RING: output/LSE are merged in-place. Serialize only the same Q tile across ring steps; different Q
                         // tiles still run independently. One consumer thread polls the per-tile completed-step counter; the barrier
                         // releases the rest of the epilogue threads only after the previous step is ready.
-                        if (mega_ring_step > 0) {
+                        if (mega_ring_is_cp_batch && mega_ring_step > 0) {
                             if (threadIdx.x == MmaThreadOffset) {
                                 min_fa3_varlen_demo::mega_ring::wait_until_at_least(
                                     params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
@@ -480,40 +485,48 @@ public:
                                    mega_ring_q_row_offset, mega_ring_seqlen_o);
                     if constexpr (TileScheduler::EnableMegaRing) {
                         // MEGA_RING: publish step completion only after every epilogue thread has finished its part of the in-place O/LSE merge.
-                        flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-                        if (threadIdx.x == MmaThreadOffset) {
-                            min_fa3_varlen_demo::mega_ring::signal_release(
-                                params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
-                                1);
+                        if (mega_ring_is_cp_batch) {
+                            flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                            if (threadIdx.x == MmaThreadOffset) {
+                                min_fa3_varlen_demo::mega_ring::signal_release(
+                                    params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
+                                    1);
+                            }
                         }
                     }
                 } else {
                     // Write 0 to gO and -inf to gLSE.
                     if constexpr (TileScheduler::EnableMegaRing) {
-                        if (mega_ring_step > 0) {
-                            if (threadIdx.x == MmaThreadOffset) {
-                                min_fa3_varlen_demo::mega_ring::wait_until_at_least(
-                                    params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
-                                    mega_ring_step);
+                        if (!mega_ring_is_cp_batch) {
+                            if (mega_ring_step == 0) {
+                                epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord, mega_ring_q_row_offset, mega_ring_seqlen_o);
                             }
+                        } else {
+                            if (mega_ring_step > 0) {
+                                if (threadIdx.x == MmaThreadOffset) {
+                                    min_fa3_varlen_demo::mega_ring::wait_until_at_least(
+                                        params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
+                                        mega_ring_step);
+                                }
+                                flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                            }
+                            // MEGA_RING: a later ring step can be empty under
+                            // causal masking (future rank). Only step 0 owns
+                            // neutral initialization; later steps must not
+                            // overwrite accumulated O/LSE.
+                            if (mega_ring_step == 0) {
+                                epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord, mega_ring_q_row_offset, mega_ring_seqlen_o);
+                            }
+                            // MEGA_RING: for step 0, make sure zero/-inf
+                            // initialization is complete before signaling. For
+                            // later empty steps, keep the same step-completion
+                            // ordering before releasing the next ring step.
                             flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-                        }
-                        // MEGA_RING: a later ring step can be empty under
-                        // causal masking (future rank). Only step 0 owns
-                        // neutral initialization; later steps must not
-                        // overwrite accumulated O/LSE.
-                        if (mega_ring_step == 0) {
-                            epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord, mega_ring_q_row_offset, mega_ring_seqlen_o);
-                        }
-                        // MEGA_RING: for step 0, make sure zero/-inf
-                        // initialization is complete before signaling. For
-                        // later empty steps, keep the same step-completion
-                        // ordering before releasing the next ring step.
-                        flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-                        if (threadIdx.x == MmaThreadOffset) {
-                            min_fa3_varlen_demo::mega_ring::signal_release(
-                                params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
-                                1);
+                            if (threadIdx.x == MmaThreadOffset) {
+                                min_fa3_varlen_demo::mega_ring::signal_release(
+                                    params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
+                                    1);
+                            }
                         }
                     } else {
                         epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);

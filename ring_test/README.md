@@ -40,6 +40,9 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
   --warmup-iters 5 --num-iters 20
 ```
 
+Use `--sm-configs comp:comm,comp:comm,...` to run multiple SM allocations in one
+invocation, for example `--sm-configs 128:4,124:8,116:16`.
+
 For a faster smoke run:
 
 ```bash
@@ -56,6 +59,38 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
   --b 1 --seqlen 128 --qhead 8 --kvhead 8 --mode both \
   --methods min_varlen_ring --num-comp-sm 1 --num-comm-sm 1 \
   --warmup-iters 1 --num-iters 3
+```
+
+## Hybrid mega-ring benchmark
+
+`benchmark_hybrid_forward.py` compares the same global batch under three
+execution strategies:
+
+- `fa3_all_cp`: Python-side all-CP batched varlen ring using FA3 block kernels
+- `fa3_hybrid`: Python-side hybrid FA3; CP sequences use batched varlen ring, local-only short sequences use one batched local FA call
+- `mega_ring_all_cp`: legacy fused mega-ring CP where every sequence is split across all ranks
+- `mega_ring_hybrid`: fused mega-ring hybrid mode selected by `--cp-threshold`
+
+`--global-seqlens` gives the global sequence lengths. Entries above
+`--cp-threshold` are CP sequences in hybrid mode. Entries at or below the
+threshold are local-only in hybrid mode and are assigned whole to one rank. In
+the all-CP baseline, those shorter sequences are still split across all ranks.
+
+For `mega_ring_hybrid`, CP sequences must appear before local-only short
+sequences in `--global-seqlens`. CP batch offsets must be identical across
+ranks, while local-only batches may be full length on one rank and zero length
+on another. The local-only assignment also needs equal total local-only tokens
+per rank for the current TKParallelTensor layout.
+
+Example:
+
+```bash
+torchrun --standalone --nproc_per_node=2 ring_test/benchmark_hybrid_forward.py \
+  --global-seqlens 4096,1024,1024 \
+  --qhead 16 --kvhead 8 --headdim 128 \
+  --num-comp-sm 1 --num-comm-sm 1 \
+  --cp-threshold 2048 --mode both \
+  --warmup-iters 5 --num-iters 20
 ```
 
 # Result Example

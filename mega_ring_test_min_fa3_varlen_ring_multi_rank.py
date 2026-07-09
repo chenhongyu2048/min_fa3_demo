@@ -53,6 +53,13 @@ def raise_if_any_rank_failed(local_error: str | None, local_rank: int) -> None:
     raise AssertionError(f"another rank failed this case; rank {local_rank} had no local assertion failure")
 
 
+def assert_close_named(name: str, actual: torch.Tensor, expected: torch.Tensor, *, atol: float, rtol: float) -> None:
+    try:
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    except AssertionError as exc:
+        raise AssertionError(f"{name} mismatch\n{exc}") from exc
+
+
 def reference_mega_ring_varlen(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -137,6 +144,31 @@ def gather_rank_blocks(local_tensor: torch.Tensor, local_rank: int, local_world_
     dist.all_gather(blocks, local_tensor)
     blocks[local_rank] = local_tensor
     return torch.cat(blocks, dim=0).contiguous()
+
+
+def expected_loaded_row_mask(
+    batch_size: int,
+    seqlen: int,
+    is_causal: bool,
+    local_rank: int,
+    local_world_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    total_tokens = batch_size * seqlen
+    mask = torch.zeros((local_world_size * total_tokens,), device=device, dtype=torch.bool)
+    local_start = local_rank * total_tokens
+    mask[local_start:local_start + total_tokens] = True
+    for step in range(1, local_world_size):
+        kv_rank = (local_rank - step + local_world_size) % local_world_size
+        rank_start = kv_rank * total_tokens
+        if is_causal and step <= local_rank:
+            half_len = seqlen // 2
+            for batch_idx in range(batch_size):
+                seq_start = rank_start + batch_idx * seqlen
+                mask[seq_start:seq_start + half_len] = True
+        else:
+            mask[rank_start:rank_start + total_tokens] = True
+    return mask
 
 
 def run_case(
@@ -225,12 +257,36 @@ def run_case(
     )
     local_error: str | None = None
     try:
-        torch.testing.assert_close(out.float(), ref.float(), atol=2e-1, rtol=2e-1)
         if num_comm_sm > 0:
-            torch.testing.assert_close(k.float(), expected_k.float(), atol=0.0, rtol=0.0)
-            torch.testing.assert_close(v.float(), expected_v.float(), atol=0.0, rtol=0.0)
+            loaded_rows = expected_loaded_row_mask(
+                batch_size,
+                seqlen,
+                is_causal,
+                local_rank,
+                local_world_size,
+                k.device,
+            )
+            assert_close_named(
+                "loaded K rows",
+                k[loaded_rows].float(),
+                expected_k[loaded_rows].float(),
+                atol=0.0,
+                rtol=0.0,
+            )
+            assert_close_named(
+                "loaded V rows",
+                v[loaded_rows].float(),
+                expected_v[loaded_rows].float(),
+                atol=0.0,
+                rtol=0.0,
+            )
+        assert_close_named("output", out.float(), ref.float(), atol=2e-1, rtol=2e-1)
     except AssertionError as exc:
-        local_error = str(exc)
+        local_error = (
+            f"case causal={is_causal}, world_size={local_world_size}, rank={local_rank}, "
+            f"B={batch_size}, S={seqlen}, QH={q_heads}, KVH={kv_heads}, D={head_dim}, "
+            f"num_comp_sm={num_comp_sm}, num_comm_sm={num_comm_sm}\n{exc}"
+        )
 
     raise_if_any_rank_failed(local_error, local_rank)
 
@@ -239,8 +295,11 @@ def run_case(
             f"distributed mega ring varlen case causal={is_causal}: ok "
             f"(world_size={local_world_size}, B={batch_size}, S={seqlen}, "
             f"QH={q_heads}, KVH={kv_heads}, D={head_dim}, "
-            f"num_comp_sm={num_comp_sm}, num_comm_sm={num_comm_sm})"
+            f"num_comp_sm={num_comp_sm}, num_comm_sm={num_comm_sm})",
+            flush=True,
         )
+    torch.cuda.synchronize()
+    dist.barrier()
 
 
 def parse_args() -> argparse.Namespace:

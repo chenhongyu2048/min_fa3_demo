@@ -1,0 +1,62 @@
+Config: world_size=2, methods=['fa3_all_cp', 'fa3_hybrid', 'mega_ring_all_cp', 'mega_ring_hybrid'], global_seqlens=16384,1024,1024,1024,1024,512,512,512,512, qhead=32, kvhead=8, D=128, mode=both, threshold=2048, sm_configs=128:4,124:8,116:16, warmup=20, iters=30, check=False
+Agg TFLOPS uses the same global workload FLOP count for all methods.
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+Running global hybrid benchmark causal=False
+
+B=9, global_seqlens=[16384, 1024, 1024, 1024, 1024, 512, 512, 512, 512], CP batches=1, threshold=2048, QH=32, KVH=8, D=128, mode=noncausal
+Method               Time ms                                                            Agg TFLOPS    Avg/GPU      Check  Note
+fa3_all_cp           t0=4.109, t1=4.062 | max_across_ranks=4.122                            1087.8      543.9       skip  all-CP FA3 blocks
+fa3_hybrid           t0=4.060, t1=3.984 | max_across_ranks=4.060                            1104.5      552.3       skip  hybrid FA3 batched CP + local
+mega_ring_all_cp     t0=3.667, t1=3.678 | max_across_ranks=3.691                            1214.9      607.5       skip  legacy all-CP mega-ring
+mega_ring_hybrid     t0=3.570, t1=3.515 | max_across_ranks=3.570                            1256.2      628.1       skip  hybrid CP batches=1
+
+Running global hybrid benchmark causal=True
+
+B=9, global_seqlens=[16384, 1024, 1024, 1024, 1024, 512, 512, 512, 512], CP batches=1, threshold=2048, QH=32, KVH=8, D=128, mode=causal
+Method               Time ms                                                            Agg TFLOPS    Avg/GPU      Check  Note
+fa3_all_cp           t0=3.352, t1=3.266 | max_across_ranks=3.352                             668.8      334.4       skip  all-CP FA3 blocks
+fa3_hybrid           t0=2.322, t1=2.339 | max_across_ranks=2.351                             953.6      476.8       skip  hybrid FA3 batched CP + local
+mega_ring_all_cp     t0=2.765, t1=2.077 | max_across_ranks=2.765                             810.8      405.4       skip  legacy all-CP mega-ring
+mega_ring_hybrid     t0=2.621, t1=2.025 | max_across_ranks=2.621                             855.4      427.7       skip  hybrid CP batches=1
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+Running global hybrid benchmark causal=False
+
+B=9, global_seqlens=[16384, 1024, 1024, 1024, 1024, 512, 512, 512, 512], CP batches=1, threshold=2048, QH=32, KVH=8, D=128, mode=noncausal
+Method               Time ms                                                            Agg TFLOPS    Avg/GPU      Check  Note
+fa3_all_cp           t0=4.074, t1=4.006 | max_across_ranks=4.076                            1100.1      550.0       skip  all-CP FA3 blocks
+fa3_hybrid           t0=4.073, t1=4.048 | max_across_ranks=4.076                            1100.0      550.0       skip  hybrid FA3 batched CP + local
+mega_ring_all_cp     t0=3.674, t1=3.646 | max_across_ranks=3.679                            1218.7      609.3       skip  legacy all-CP mega-ring
+mega_ring_hybrid     t0=3.664, t1=3.645 | max_across_ranks=3.667                            1222.7      611.4       skip  hybrid CP batches=1
+
+Running global hybrid benchmark causal=True
+
+B=9, global_seqlens=[16384, 1024, 1024, 1024, 1024, 512, 512, 512, 512], CP batches=1, threshold=2048, QH=32, KVH=8, D=128, mode=causal
+Method               Time ms                                                            Agg TFLOPS    Avg/GPU      Check  Note
+fa3_all_cp           t0=3.377, t1=3.257 | max_across_ranks=3.377                             664.0      332.0       skip  all-CP FA3 blocks
+fa3_hybrid           t0=2.357, t1=2.374 | max_across_ranks=2.375                             943.9      472.0       skip  hybrid FA3 batched CP + local
+mega_ring_all_cp     t0=2.024, t1=1.991 | max_across_ranks=2.024                            1107.7      553.9       skip  legacy all-CP mega-ring
+mega_ring_hybrid     t0=2.072, t1=2.083 | max_across_ranks=2.088                            1073.9      537.0       skip  hybrid CP batches=1
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+Running global hybrid benchmark causal=False
+
+B=9, global_seqlens=[16384, 1024, 1024, 1024, 1024, 512, 512, 512, 512], CP batches=1, threshold=2048, QH=32, KVH=8, D=128, mode=noncausal
+Method               Time ms                                                            Agg TFLOPS    Avg/GPU      Check  Note
+fa3_all_cp           t0=4.084, t1=4.044 | max_across_ranks=4.092                            1095.7      547.9       skip  all-CP FA3 blocks
+fa3_hybrid           t0=4.067, t1=4.006 | max_across_ranks=4.067                            1102.5      551.2       skip  hybrid FA3 batched CP + local
+mega_ring_all_cp     t0=3.844, t1=3.729 | max_across_ranks=3.844                            1166.5      583.3       skip  legacy all-CP mega-ring
+mega_ring_hybrid     t0=3.806, t1=3.754 | max_across_ranks=3.808                            1177.5      588.8       skip  hybrid CP batches=1
+
+Running global hybrid benchmark causal=True
+
+B=9, global_seqlens=[16384, 1024, 1024, 1024, 1024, 512, 512, 512, 512], CP batches=1, threshold=2048, QH=32, KVH=8, D=128, mode=causal
+Method               Time ms                                                            Agg TFLOPS    Avg/GPU      Check  Note
+fa3_all_cp           t0=3.385, t1=3.300 | max_across_ranks=3.402                             659.1      329.5       skip  all-CP FA3 blocks
+fa3_hybrid           t0=2.342, t1=2.377 | max_across_ranks=2.377                             943.2      471.6       skip  hybrid FA3 batched CP + local
+mega_ring_all_cp     t0=2.050, t1=2.145 | max_across_ranks=2.145                            1045.2      522.6       skip  legacy all-CP mega-ring
+mega_ring_hybrid     t0=2.127, t1=2.126 | max_across_ranks=2.136                            1049.8      524.9       skip  hybrid CP batches=1

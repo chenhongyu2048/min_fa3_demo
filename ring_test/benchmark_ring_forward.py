@@ -51,8 +51,8 @@ except ImportError:
 
 
 METHOD_ORDER = [
-    "pytorch",
-    "fa2",
+    # "pytorch",
+    # "fa2",
     "fa3",
     "min_varlen",
     "min_varlen_ring",
@@ -70,6 +70,14 @@ class Case:
     kv_heads: int
     head_dim: int
     is_causal: bool
+
+
+@dataclass(frozen=True)
+class SmConfig:
+    """One compute/communication SM allocation."""
+
+    num_comp_sm: int
+    num_comm_sm: int
 
 
 @dataclass
@@ -143,6 +151,27 @@ def parse_methods(spec: str) -> list[str]:
     return deduped
 
 
+def parse_sm_config_spec(spec: str) -> list[SmConfig]:
+    """Parse comma-separated num_comp_sm:num_comm_sm pairs."""
+    configs: list[SmConfig] = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        parts = token.split(":")
+        if len(parts) != 2:
+            raise SystemExit(f"invalid --sm-configs token '{token}', expected num_comp_sm:num_comm_sm")
+        try:
+            configs.append(SmConfig(int(parts[0]), int(parts[1])))
+        except ValueError as exc:
+            raise SystemExit(
+                f"invalid --sm-configs token '{token}', expected integer num_comp_sm:num_comm_sm"
+            ) from exc
+    if not configs:
+        raise SystemExit("--sm-configs must provide at least one num_comp_sm:num_comm_sm pair")
+    return configs
+
+
 def parse_args() -> argparse.Namespace:
     """Define the ring_test command-line interface."""
     parser = argparse.ArgumentParser(
@@ -174,6 +203,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-comp-sm", type=int, default=1, help="Compute CTAs for min_fa3 ring kernels.")
     parser.add_argument("--num-comm-sm", type=int, default=1, help="Communication CTAs for min_fa3 ring kernels.")
+    parser.add_argument(
+        "--sm-configs",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated num_comp_sm:num_comm_sm pairs to run in one invocation, "
+            "for example 128:4,124:8,116:16. Overrides --num-comp-sm/--num-comm-sm."
+        ),
+    )
     parser.add_argument("--warmup-iters", type=int, default=5, help="Warmup iterations.")
     parser.add_argument("--num-iters", type=int, default=20, help="Measured iterations.")
     parser.add_argument("--seed", type=int, default=1234, help="Base RNG seed.")
@@ -877,16 +915,22 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
     ]
 
 
-def validate_args(args: argparse.Namespace, methods: list[str], local_world_size: int) -> None:
+def validate_args(
+    args: argparse.Namespace,
+    methods: list[str],
+    local_world_size: int,
+    sm_configs: list[SmConfig],
+) -> None:
     """Validate arguments against the minimal demo's supported configuration."""
     if args.headdim != 128:
         raise SystemExit(f"This demo requires D=128, got D={args.headdim}")
     if args.qhead % args.kvhead != 0:
         raise SystemExit(f"qhead must be divisible by kvhead, got qhead={args.qhead}, kvhead={args.kvhead}")
-    if args.num_comp_sm <= 0:
-        raise SystemExit(f"--num-comp-sm must be positive, got {args.num_comp_sm}")
-    if args.num_comm_sm < 0:
-        raise SystemExit(f"--num-comm-sm must be non-negative, got {args.num_comm_sm}")
+    for sm_config in sm_configs:
+        if sm_config.num_comp_sm <= 0:
+            raise SystemExit(f"num_comp_sm must be positive, got {sm_config.num_comp_sm}")
+        if sm_config.num_comm_sm < 0:
+            raise SystemExit(f"num_comm_sm must be non-negative, got {sm_config.num_comm_sm}")
     if args.num_iters <= 0:
         raise SystemExit(f"--num-iters must be positive, got {args.num_iters}")
     if args.warmup_iters < 0:
@@ -897,8 +941,8 @@ def validate_args(args: argparse.Namespace, methods: list[str], local_world_size
                 "min_fa3 ring communication path requires kvhead * headdim == 1024, "
                 f"got kvhead={args.kvhead}, headdim={args.headdim}"
             )
-        if local_world_size > 1 and args.num_comm_sm <= 0:
-            raise SystemExit("multi-rank min_fa3 ring paths require --num-comm-sm > 0")
+        if local_world_size > 1 and any(sm_config.num_comm_sm <= 0 for sm_config in sm_configs):
+            raise SystemExit("multi-rank min_fa3 ring paths require num_comm_sm > 0")
 
 
 def print_results(case: Case, results: dict[str, Result], methods: list[str]) -> None:
@@ -942,6 +986,11 @@ def main() -> None:
 
     args = parse_args()
     methods = parse_methods(args.methods)
+    sm_configs = (
+        parse_sm_config_spec(args.sm_configs)
+        if args.sm_configs is not None
+        else [SmConfig(args.num_comp_sm, args.num_comm_sm)]
+    )
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
@@ -956,15 +1005,18 @@ def main() -> None:
             flash_attn_varlen_func2 = None
         if not available_on_all_ranks(flash_attn_varlen_func3 is not None):
             flash_attn_varlen_func3 = None
-        validate_args(args, methods, local_world_size)
+        validate_args(args, methods, local_world_size, sm_configs)
         cases = make_cases(args)
 
         if local_rank == 0:
+            sm_configs_s = ",".join(
+                f"{sm_config.num_comp_sm}:{sm_config.num_comm_sm}" for sm_config in sm_configs
+            )
             print(
                 f"Config: world_size={local_world_size}, methods={methods}, B={args.b}, "
                 f"seqlen={args.seqlen}, qhead={args.qhead}, kvhead={args.kvhead}, "
-                f"D={args.headdim}, mode={args.mode}, num_comp_sm={args.num_comp_sm}, "
-                f"num_comm_sm={args.num_comm_sm}, warmup={args.warmup_iters}, iters={args.num_iters}, "
+                f"D={args.headdim}, mode={args.mode}, sm_configs={sm_configs_s}, "
+                f"warmup={args.warmup_iters}, iters={args.num_iters}, "
                 f"check={args.check}"
             )
             if args.check:
@@ -972,13 +1024,21 @@ def main() -> None:
                 print("Causal checks use the zigzag [front | back] reference by default.")
             print("Agg TFLOPS sums visible attention work across ranks; Avg/GPU is that value divided by world_size.")
 
-        for case in cases:
+        for sm_config in sm_configs:
+            args.num_comp_sm = sm_config.num_comp_sm
+            args.num_comm_sm = sm_config.num_comm_sm
             if local_rank == 0:
-                print(f"\nRunning local_S={case.seqlen}, causal={case.is_causal}", flush=True)
-            results = run_case(case, methods, local_rank, local_world_size, args)
-            if local_rank == 0:
-                print_results(case, results, methods)
-            cuda_barrier()
+                print(
+                    f"\nSM config: num_comp_sm={args.num_comp_sm}, num_comm_sm={args.num_comm_sm}",
+                    flush=True,
+                )
+            for case in cases:
+                if local_rank == 0:
+                    print(f"\nRunning local_S={case.seqlen}, causal={case.is_causal}", flush=True)
+                results = run_case(case, methods, local_rank, local_world_size, args)
+                if local_rank == 0:
+                    print_results(case, results, methods)
+                cuda_barrier()
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

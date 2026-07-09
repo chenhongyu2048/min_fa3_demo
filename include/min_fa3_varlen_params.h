@@ -108,6 +108,10 @@ struct Ring_fwd_params : public Flash_fwd_params {
     int mega_ring_tiles_per_step = 0;
     int mega_ring_tiles_per_half_step = 0;
     int mega_ring_total_k_per_rank = 0;
+    int mega_ring_cp_total_k_per_rank = 0;
+    int mega_ring_cp_tiles_per_step = 0;
+    int mega_ring_cp_tiles_per_half_step = 0;
+    int* __restrict__ mega_ring_cp_batch_mask = nullptr;
     int* __restrict__ mega_ring_half_cu_seqlens = nullptr;
     int* __restrict__ mega_ring_kv_ready_counts = nullptr;
     // MEGA_RING: per-Q-tile completed-step counters for in-place O/LSE reduction ordering.

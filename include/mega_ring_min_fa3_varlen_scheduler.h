@@ -76,6 +76,96 @@ public:
 
 private:
     CUTLASS_DEVICE
+    int get_actual_batch(Params const& params, int bidb) const {
+        if constexpr (Prepared && Sort) {
+            return bidb < params.num_batch ? params.varlen_batch_idx_ptr[bidb] : bidb;
+        } else {
+            return bidb;
+        }
+    }
+
+    CUTLASS_DEVICE
+    bool is_cp_virtual_batch(Params const& params, int bidb) const {
+        if (params.mega_ring_cp_batch_mask == nullptr) {
+            return true;
+        }
+        int const actual_batch = get_actual_batch(params, bidb);
+        return actual_batch < params.num_batch && params.mega_ring_cp_batch_mask[actual_batch] != 0;
+    }
+
+    template<bool HalfMBlocks=false, bool CpOnly=false>
+    CUTLASS_DEVICE
+    typename Base::WorkTileInfo
+    tile_idx_to_work_tile_linear(Params const& params, int next_tile_idx) const {
+        static_assert(Prepared, "Mega-ring hybrid scheduler requires prepared varlen metadata");
+        static_assert(!Split && !PackGQA, "Mega-ring hybrid scheduler only supports the minimal non-split non-PackGQA path");
+        int group_start_tile = 0;
+        for (int bidb = 0; bidb < params.num_batch; ++bidb) {
+            int num_m_blocks = params.num_m_blocks_ptr[bidb];
+            if constexpr (HalfMBlocks) {
+                num_m_blocks /= 2;
+            }
+            if constexpr (CpOnly) {
+                if (!is_cp_virtual_batch(params, bidb)) {
+                    num_m_blocks = 0;
+                }
+            }
+            int const batch_tiles = num_m_blocks * params.num_head;
+            if (num_m_blocks > 0 && next_tile_idx < group_start_tile + batch_tiles) {
+                int const mh_block = next_tile_idx - group_start_tile;
+                int block, bidh;
+                if constexpr (LPT) {
+                    int const nheads_in_l2 = params.num_nheads_in_l2_ptr[bidb];
+                    int const mh_in_l2 = nheads_in_l2 * num_m_blocks;
+                    int const section_idx = mh_block / mh_in_l2;
+                    int const l2_mod = mh_block - section_idx * mh_in_l2;
+                    int const nheads_remainder = params.num_head - section_idx * nheads_in_l2;
+                    int const nheads_in_this_section = nheads_in_l2 <= nheads_remainder ? nheads_in_l2 : nheads_remainder;
+                    block = l2_mod / nheads_in_this_section;
+                    int const bidh_residual = l2_mod - block * nheads_in_this_section;
+                    bidh = section_idx * nheads_in_l2 + bidh_residual;
+                    block = num_m_blocks - 1 - block;
+                } else {
+                    bidh = mh_block / num_m_blocks;
+                    block = mh_block - bidh * num_m_blocks;
+                }
+                return {group_start_tile, block, bidh, bidb};
+            }
+            group_start_tile += batch_tiles;
+        }
+        return {next_tile_idx, 0, 0, params.num_batch};
+    }
+
+    CUTLASS_DEVICE
+    int cp_full_tile_idx_from_work(Params const& params, typename Base::WorkTileInfo const& work) const {
+        if (work.bidb >= params.num_batch || !is_cp_virtual_batch(params, work.bidb)) {
+            return 0;
+        }
+        int group_start_tile = 0;
+        for (int bidb = 0; bidb < work.bidb; ++bidb) {
+            if (is_cp_virtual_batch(params, bidb)) {
+                group_start_tile += params.num_m_blocks_ptr[bidb] * params.num_head;
+            }
+        }
+        int const num_m_blocks = params.num_m_blocks_ptr[work.bidb];
+        int mh_block;
+        if constexpr (LPT) {
+            int const nheads_in_l2 = params.num_nheads_in_l2_ptr[work.bidb];
+            int const section_idx = work.bidh / nheads_in_l2;
+            int const bidh_residual = work.bidh - section_idx * nheads_in_l2;
+            int const nheads_remainder = params.num_head - section_idx * nheads_in_l2;
+            int const nheads_in_this_section = nheads_in_l2 <= nheads_remainder ? nheads_in_l2 : nheads_remainder;
+            int const block_in_l2_order = num_m_blocks - 1 - work.block;
+            mh_block = section_idx * nheads_in_l2 * num_m_blocks
+                     + block_in_l2_order * nheads_in_this_section
+                     + bidh_residual;
+        } else {
+            mh_block = work.bidh * num_m_blocks + work.block;
+        }
+        return group_start_tile + mh_block;
+    }
+
+    CUTLASS_DEVICE
     WorkTileInfo
     decode_mega_ring_tile(Params const& params,
                           int next_tile_idx, // expanded global tile id
@@ -84,23 +174,70 @@ private:
         // MEGA_RING_ZIGZAG: non-causal keeps the original equal-sized
         // [world_size][T_full] stream. Causal uses two constant-width sections:
         // steps 0..r decode full-Q tiles, steps r+1..N-1 decode half-Q tiles.
+        bool const hybrid_mode = params.mega_ring_cp_batch_mask != nullptr;
         int const tiles_per_step = params.mega_ring_tiles_per_step;
-        int const tiles_per_half_step = params.mega_ring_tiles_per_half_step;
+        int const tiles_per_half_step = hybrid_mode ? params.mega_ring_cp_tiles_per_half_step : params.mega_ring_tiles_per_half_step;
+        int const cp_tiles_per_step = hybrid_mode ? params.mega_ring_cp_tiles_per_step : tiles_per_step;
         int ring_step, step_tile_idx;
-        if constexpr (EnableZigzag) {
-            int const full_section_tiles = (params.mega_ring_rank + 1) * tiles_per_step;
-            if (next_tile_idx < full_section_tiles) {
+        bool use_cp_stream = false;
+        bool q_use_half = false;
+        if (!hybrid_mode) {
+            if constexpr (EnableZigzag) {
+                int const full_section_tiles = (params.mega_ring_rank + 1) * tiles_per_step;
+                if (next_tile_idx < full_section_tiles) {
+                    ring_step = tiles_per_step > 0 ? next_tile_idx / tiles_per_step : 0;
+                    step_tile_idx = tiles_per_step > 0 ? next_tile_idx - ring_step * tiles_per_step : next_tile_idx;
+                } else {
+                    int const rem = next_tile_idx - full_section_tiles;
+                    int const q = tiles_per_half_step > 0 ? rem / tiles_per_half_step : 0;
+                    ring_step = params.mega_ring_rank + 1 + q;
+                    step_tile_idx = tiles_per_half_step > 0 ? rem - q * tiles_per_half_step : rem;
+                    q_use_half = true;
+                }
+            } else {
                 ring_step = tiles_per_step > 0 ? next_tile_idx / tiles_per_step : 0;
                 step_tile_idx = tiles_per_step > 0 ? next_tile_idx - ring_step * tiles_per_step : next_tile_idx;
-            } else {
-                int const rem = next_tile_idx - full_section_tiles;
-                int const q = tiles_per_half_step > 0 ? rem / tiles_per_half_step : 0;
-                ring_step = params.mega_ring_rank + 1 + q;
-                step_tile_idx = tiles_per_half_step > 0 ? rem - q * tiles_per_half_step : rem;
+            }
+        } else if constexpr (EnableZigzag) {
+            if (next_tile_idx < tiles_per_step) {
+                ring_step = 0;
+                step_tile_idx = next_tile_idx;
+            }
+            else {
+                int const rem = next_tile_idx - tiles_per_step;
+                int const cp_full_section_tiles = params.mega_ring_rank * cp_tiles_per_step;
+                if (rem < cp_full_section_tiles) {
+                    if (cp_tiles_per_step <= 0) {
+                        return {next_tile_idx, 0, 0, params.num_batch, params.mega_ring_world_size, next_tile_idx, 0, 0};
+                    }
+                    ring_step = 1 + rem / cp_tiles_per_step;
+                    step_tile_idx = rem - (ring_step - 1) * cp_tiles_per_step;
+                    use_cp_stream = true;
+                } else {
+                    int const rem_half = rem - cp_full_section_tiles;
+                    if (tiles_per_half_step <= 0) {
+                        return {next_tile_idx, 0, 0, params.num_batch, params.mega_ring_world_size, next_tile_idx, 0, 0};
+                    }
+                    int const q = rem_half / tiles_per_half_step;
+                    ring_step = params.mega_ring_rank + 1 + q;
+                    step_tile_idx = rem_half - q * tiles_per_half_step;
+                    use_cp_stream = true;
+                    q_use_half = true;
+                }
             }
         } else {
-            ring_step = tiles_per_step > 0 ? next_tile_idx / tiles_per_step : 0;
-            step_tile_idx = tiles_per_step > 0 ? next_tile_idx - ring_step * tiles_per_step : next_tile_idx;
+            if (next_tile_idx < tiles_per_step) {
+                ring_step = 0;
+                step_tile_idx = next_tile_idx;
+            } else {
+                if (cp_tiles_per_step <= 0) {
+                    return {next_tile_idx, 0, 0, params.num_batch, params.mega_ring_world_size, next_tile_idx, 0, 0};
+                }
+                int const rem = next_tile_idx - tiles_per_step;
+                ring_step = 1 + rem / cp_tiles_per_step;
+                step_tile_idx = rem - (ring_step - 1) * cp_tiles_per_step;
+                use_cp_stream = true;
+            }
         }
         if (ring_step >= params.mega_ring_world_size) {
             // MEGA_RING: mark the expanded tile as invalid using the same
@@ -115,11 +252,14 @@ private:
             ring_step != current_ring_step || step_tile_idx < current_base_work.tile_idx || current_base_work.bidb >= params.num_batch
                 ? typename Base::WorkTileInfo{0, 0, 0, 0}
                 : current_base_work;
-        bool const q_use_half = EnableZigzag && ring_step > params.mega_ring_rank;
-        typename Base::WorkTileInfo base_work = q_use_half
-            ? Base::template tile_idx_to_work_tile_impl<true>(params, step_tile_idx, decode_start)
-            : Base::template tile_idx_to_work_tile_impl<false>(params, step_tile_idx, decode_start);
-        int reduction_tile_idx = step_tile_idx;
+        typename Base::WorkTileInfo base_work = use_cp_stream
+            ? (q_use_half
+                ? tile_idx_to_work_tile_linear<true, true>(params, step_tile_idx)
+                : tile_idx_to_work_tile_linear<false, true>(params, step_tile_idx))
+            : (q_use_half
+                ? Base::template tile_idx_to_work_tile_impl<true>(params, step_tile_idx, decode_start)
+                : Base::template tile_idx_to_work_tile_impl<false>(params, step_tile_idx, decode_start));
+        int reduction_tile_idx = use_cp_stream ? step_tile_idx : (hybrid_mode ? cp_full_tile_idx_from_work(params, base_work) : step_tile_idx);
         if constexpr (EnableZigzag) {
             if (q_use_half && base_work.bidb < params.num_batch) {
                 // MEGA_RING_ZIGZAG: step_ready is indexed in the full-Q tile

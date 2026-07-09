@@ -78,27 +78,38 @@ cd /data/home/scyb683/run/min_fa3_demo
 
 # Multi-Step Multi-rank full Ring-FlashAttention forward benchmark:
 # This script requests a 2-GPU allocation for these examples.
-echo "Running multi-rank ring_test benchmark with correctness checks"
-echo "========================================================="
-torchrun --standalone --nproc_per_node=4 ring_test/benchmark_ring_forward.py \
-    --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 \
-    --mode both --methods all --num-comp-sm 128 --num-comm-sm 4 \
-    --warmup-iters 20 --num-iters 30 --check
+# echo "Running multi-rank ring_test benchmark with correctness checks"
+# echo "========================================================="
+# torchrun --standalone --nproc_per_node=4 ring_test/benchmark_ring_forward.py \
+#     --b 16 --seqlen 512,1024,2048,4096,8192,16384,32768,65536,131072 --qhead 32 --kvhead 8 --headdim 128 \
+#     --mode both --methods all --sm-configs 128:4,124:8,116:16 \
+#     --warmup-iters 10 --num-iters 10 --check
 
 echo "Running multi-rank ring_test benchmark without correctness checks"
 echo "========================================================="
 torchrun --standalone --nproc_per_node=4 ring_test/benchmark_ring_forward.py \
-    --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 \
-    --mode both --methods all --num-comp-sm 128 --num-comm-sm 4 \
+    --b 1 --seqlen 512,1024,2048,4096,8192,16384,32768,65536 --qhead 32 --kvhead 8 --headdim 128 \
+    --mode causal --methods all --sm-configs 128:4,124:8,116:16 \
     --warmup-iters 20 --num-iters 30 --no-check
-torchrun --standalone --nproc_per_node=4 ring_test/benchmark_ring_forward.py \
-    --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 \
-    --mode both --methods all --num-comp-sm 124 --num-comm-sm 8 \
-    --warmup-iters 20 --num-iters 30 --no-check
-torchrun --standalone --nproc_per_node=4 ring_test/benchmark_ring_forward.py \
-    --b 16 --seqlen 512,1024,2048,4096,8192 --qhead 32 --kvhead 8 --headdim 128 \
-    --mode both --methods all --num-comp-sm 116 --num-comm-sm 16 \
-    --warmup-iters 20 --num-iters 30 --no-check
+
+echo "Running multi-rank hybrid ring_test benchmark without correctness checks"
+torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
+    --global-seqlens 16384,1024,1024,1024,1024,512,512,512,512 \
+    --qhead 32 --kvhead 8 --headdim 128 \
+    --sm-configs 128:4,124:8,116:16 --cp-threshold 2048 \
+    --mode both --warmup-iters 20 --num-iters 30 --no-check
+
+torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
+    --global-seqlens 32768,1024,1024,1024,1024,512,512,512,512,512,512,512,512 \
+    --qhead 32 --kvhead 8 --headdim 128 \
+    --sm-configs 128:4,124:8,116:16 --cp-threshold 2048 \
+    --mode both --warmup-iters 20 --num-iters 30 --no-check
+
+torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
+    --global-seqlens 65536,1024,1024,1024,1024,512,512,512,512,512,512,512,512 \
+    --qhead 32 --kvhead 8 --headdim 128 \
+    --sm-configs 128:4,124:8,116:16 --cp-threshold 2048 \
+    --mode both --warmup-iters 20 --num-iters 30 --no-check
 
 # Memory sanitizer runs:
 # compute-sanitizer --tool memcheck python test_min_fa3_varlen_ring_local.py --b 16 --seqlen 1024,4096 --qhead 32 --kvhead 8 --num-comp-sm 128 --num-comm-sm 0 --mode both > memcheck-128-0.log 2>&1

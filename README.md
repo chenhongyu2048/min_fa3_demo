@@ -153,6 +153,7 @@ Mega-ring varlen tests:
 
 ```bash
 python mega_ring_test_min_fa3_varlen_ring_local.py --b 1 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 1 --num-comm-sm 1 --mode both
+python mega_ring_test_min_fa3_varlen_hybrid_local.py --seqlens 1152,4096,1408 --qhead 16 --kvhead 8 --headdim 128 --num-comp-sm 1 --num-comm-sm 0 --mode both
 torchrun --standalone --nproc_per_node=2 mega_ring_test_min_fa3_varlen_ring_multi_rank.py --b 1 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 1 --num-comm-sm 1 --mode both
 ```
 
