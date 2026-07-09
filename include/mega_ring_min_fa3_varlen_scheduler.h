@@ -18,6 +18,7 @@ class MegaRingVarlenDynamicPersistentTileScheduler: public VarlenDynamicPersiste
 
 public:
     static constexpr bool EnableMegaRing = true;
+    static constexpr bool EnableQueuedInitialWork = true;
     // MEGA_RING_ZIGZAG: this scheduler is instantiated with LPT == IsCausal in
     // the mega-ring launch. Effectively that means:
     //   - causal instantiations use LPT=true and enable zigzag
@@ -291,6 +292,19 @@ private:
     }
 
 public:
+    CUTLASS_DEVICE
+    void
+    publish_work_to_smem(WorkTileInfo const& work_info, int global_tile_idx) const {
+        if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+            typename Base::SharedStorage* smem = mega_ring_work_info_smem();
+            smem[0] = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
+            // MEGA_RING: the second int4 slot carries ring_step and the
+            // original global tile id for the matching consumer warpgroup.
+            smem[1] = make_int4(work_info.ring_step, global_tile_idx, work_info.step_tile_idx, work_info.reduction_tile_idx);
+        }
+        flash::named_barrier_arrive(Base::kNumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);   // TileCountSmemFull
+    }
+
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
     WorkTileInfo
@@ -298,14 +312,25 @@ public:
         if constexpr (IsProducerWarp) {
             int const next_tile_idx = Base::virtual_block_idx(params);
             WorkTileInfo work_info = decode_mega_ring_tile(params, next_tile_idx, -1, {0, 0, 0, 0});
-            if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
-                typename Base::SharedStorage* smem = mega_ring_work_info_smem();
-                smem[0] = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
-                // MEGA_RING: the second int4 slot carries ring_step and the
-                // original global tile id for the matching consumer warpgroup.
-                smem[1] = make_int4(work_info.ring_step, next_tile_idx, work_info.step_tile_idx, work_info.reduction_tile_idx);
+            publish_work_to_smem(work_info, next_tile_idx);
+            return work_info;
+        } else {
+            return get_next_work<false>(params, {0, 0, 0, 0, 0, 0, 0, 0});
+        }
+    }
+
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    WorkTileInfo
+    get_initial_work_from_queue(Params const& params) const {
+        if constexpr (IsProducerWarp) {
+            int next_tile_idx = 0;
+            if (threadIdx.x % NumProducerThreads == 0) {
+                next_tile_idx = atomicAdd(params.tile_count_semaphore, 1) + Base::virtual_grid_dim_x(params);
             }
-            flash::named_barrier_arrive(Base::kNumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);   // TileCountSmemFull
+            next_tile_idx = __shfl_sync(0xffffffff, next_tile_idx, 0 /*lane*/);
+            WorkTileInfo work_info = decode_mega_ring_tile(params, next_tile_idx, -1, {0, 0, 0, 0});
+            publish_work_to_smem(work_info, next_tile_idx);
             return work_info;
         } else {
             return get_next_work<false>(params, {0, 0, 0, 0, 0, 0, 0, 0});
@@ -337,12 +362,7 @@ public:
                                                           current_work.bidb};
             WorkTileInfo work_info = decode_mega_ring_tile(params, new_tile_idx, current_work.ring_step, current_base_work);
             flash::named_barrier_sync(Base::kNumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);  // TileCountSmemEmpty
-            if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
-                typename Base::SharedStorage* smem = mega_ring_work_info_smem();
-                smem[0] = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
-                smem[1] = make_int4(work_info.ring_step, new_tile_idx, work_info.step_tile_idx, work_info.reduction_tile_idx);
-            }
-            flash::named_barrier_arrive(Base::kNumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);  // TileCountSmemFull
+            publish_work_to_smem(work_info, new_tile_idx);
             return work_info;
         } else {
             flash::named_barrier_sync(Base::kNumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);  // TileCountSmemFull

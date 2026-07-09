@@ -35,6 +35,7 @@ public:
     using SharedStorage = int;
     // MEGA_RING: default fixed-layout scheduler does not expose ring-step metadata.
     static constexpr bool EnableMegaRing = false;
+    static constexpr bool EnableQueuedInitialWork = false;
 
     struct Params {
         int total_blocks;
@@ -97,6 +98,7 @@ public:
     using SharedStorage = int;
     // MEGA_RING: default fixed-layout scheduler does not expose ring-step metadata.
     static constexpr bool EnableMegaRing = false;
+    static constexpr bool EnableQueuedInitialWork = false;
 
 protected:
     SharedStorage* const tile_count_smem;

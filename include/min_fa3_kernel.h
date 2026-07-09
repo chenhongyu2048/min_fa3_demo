@@ -181,9 +181,23 @@ public:
         return dim3(MaxThreadsPerBlock, 1, 1);
     }
 
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    static typename TileScheduler::WorkTileInfo
+    get_initial_scheduler_work(TileScheduler& scheduler,
+                               TileSchedulerParams const& params,
+                               bool start_from_work_queue) {
+        if constexpr (TileScheduler::EnableQueuedInitialWork) {
+            if (start_from_work_queue) {
+                return scheduler.template get_initial_work_from_queue<IsProducerWarp>(params);
+            }
+        }
+        return scheduler.template get_initial_work<IsProducerWarp>(params);
+    }
+
     CUTLASS_DEVICE
     void
-    operator()(Params const& params, char* smem_buf) {
+    operator()(Params const& params, char* smem_buf, bool start_from_work_queue=false) {
 
         static constexpr int NumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int MmaThreadOffset = NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
@@ -320,7 +334,7 @@ public:
             cutlass::arch::wait_on_dependent_grids();
 
             // Load Q, K, V
-            for (auto work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler) : scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
+            for (auto work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? get_initial_scheduler_work</*IsProducerWarp=*/true>(scheduler, params.scheduler, start_from_work_queue) : get_initial_scheduler_work</*IsProducerWarp=*/false>(scheduler, params.scheduler, start_from_work_queue);
                  work_tile_info.is_valid(params.scheduler);
                  work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info) : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
 
@@ -376,7 +390,7 @@ public:
 
             int work_idx = 0;
             CUTLASS_PRAGMA_NO_UNROLL
-            for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
+            for (auto work_tile_info = get_initial_scheduler_work</*IsProducerWarp=*/false>(scheduler, params.scheduler, start_from_work_queue);
                  work_tile_info.is_valid(params.scheduler);
                  // get_next_work will be called before the epilogue
                  ) {

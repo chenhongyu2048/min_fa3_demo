@@ -332,9 +332,12 @@ void mega_ring_flash_attn_varlen_kernel(CUTLASS_GRID_CONSTANT typename RingConfi
     // MEGA_RING: one grid contains both persistent attention CTAs and remote K/V copy CTAs. Compute CTAs occupy [0, num_comp_sm).
     if (int(blockIdx.x) >= params.num_comp_sm) {
         run_mega_ring_remote_load<RingConfig>(params, int(blockIdx.x) - params.num_comp_sm, smem_buf);
+        __syncthreads();
+        typename RingConfig::AttnKernel attn_kernel;
+        attn_kernel(params.compute, smem_buf, true);
     } else {
         typename RingConfig::AttnKernel attn_kernel;
-        attn_kernel(params.compute, smem_buf);
+        attn_kernel(params.compute, smem_buf, false);
     }
 }
 
