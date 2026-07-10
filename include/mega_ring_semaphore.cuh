@@ -26,6 +26,32 @@ void wait_until_at_least(int const* counter, int target) {
     } while (value < target);
 }
 
+CUTLASS_DEVICE
+int load_acquire(int const* counter) {
+    int value = 0;
+    asm volatile("{ld.acquire.gpu.global.s32 %0, [%1];}" : "=r"(value) : "l"(counter) : "memory");
+    return value;
+}
+
+CUTLASS_DEVICE
+void store_release(int* counter, int value) {
+    asm volatile("{st.release.gpu.global.s32 [%0], %1;}" :: "l"(counter), "r"(value) : "memory");
+}
+
+CUTLASS_DEVICE
+void wait_until_at_least_acquire(int const* counter, int target) {
+    if (counter == nullptr) {
+        return;
+    }
+    int value = 0;
+    do {
+        value = load_acquire(counter);
+        if (value < target) {
+            __nanosleep(64);
+        }
+    } while (value < target);
+}
+
 // MEGA_RING: no-return release add for device-local readiness counters. The
 // consumer CTA observes readiness by polling the counter value, so the producer
 // CTA does not need an atomic return value.
@@ -35,6 +61,19 @@ void signal_release(int* counter, int value) {
         return;
     }
     asm volatile("{red.release.gpu.global.add.s32 [%0], %1;}" :: "l"(counter), "r"(value) : "memory");
+}
+
+CUTLASS_DEVICE
+int signal_release_return_old(int* counter, int value) {
+    if (counter == nullptr) {
+        return 0;
+    }
+    int old_value = 0;
+    asm volatile("{atom.release.gpu.global.add.s32 %0, [%1], %2;}"
+                 : "=r"(old_value)
+                 : "l"(counter), "r"(value)
+                 : "memory");
+    return old_value;
 }
 
 }  // namespace min_fa3_varlen_demo::mega_ring

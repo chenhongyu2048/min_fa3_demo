@@ -8,6 +8,7 @@
 #include <c10/cuda/CUDAException.h>
 
 #include <cmath>
+#include <algorithm>
 #include <limits>
 #include <vector>
 
@@ -25,6 +26,123 @@ using VarlenParams = min_fa3_varlen_demo::Flash_fwd_params;
 
 __global__ void set_mega_ring_local_kv_ready_count(int* counts, int rank, int value) {
     counts[rank] = value;
+}
+
+__device__ int find_batch_for_row(const int* cu_seqlens, int batch_size, int row) {
+    int lo = 0;
+    int hi = batch_size;
+    while (lo + 1 < hi) {
+        int mid = (lo + hi) / 2;
+        if (cu_seqlens[mid] <= row) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+__device__ void add_ready_chunk(int* chunk_done,
+                                int interval_id,
+                                int row_in_interval,
+                                int max_chunks,
+                                int chunk_rows,
+                                int value) {
+    int const chunk_idx = row_in_interval / chunk_rows;
+    atomicAdd(chunk_done + interval_id * max_chunks + chunk_idx, value);
+}
+
+__global__ void pack_ready_once_local_kv_kernel(const uint4* src_k,
+                                                const uint4* src_v,
+                                                uint4* dst_k,
+                                                uint4* dst_v,
+                                                const int* cu_src,
+                                                const int* cu_compact,
+                                                const int* cp_batch_mask,
+                                                const int* half_cu,
+                                                int batch_size,
+                                                int local_total,
+                                                int local_rank,
+                                                int world_size,
+                                                bool is_causal,
+                                                int vecs_per_row,
+                                                int* chunk_done,
+                                                int ready_max_chunks,
+                                                int ready_chunk_rows) {
+    int const local_row_global = int(blockIdx.x);
+    if (local_row_global >= local_total) {
+        return;
+    }
+    int const batch_idx = find_batch_for_row(cu_src, batch_size, local_row_global);
+    int const row_in_batch = local_row_global - cu_src[batch_idx];
+    int const local_len = cu_src[batch_idx + 1] - cu_src[batch_idx];
+    bool const is_cp = cp_batch_mask != nullptr && cp_batch_mask[batch_idx] != 0;
+    int dst_row = cu_compact[batch_idx] + row_in_batch;
+    int signal_interval_a = -1;
+    int signal_row_a = 0;
+    int signal_interval_b = -1;
+    int signal_row_b = 0;
+
+    if (is_cp) {
+        if (is_causal) {
+            int const half_len = half_cu[batch_idx + 1] - half_cu[batch_idx];
+            if (row_in_batch < half_len) {
+                dst_row = cu_compact[batch_idx] + local_rank * half_len + row_in_batch;
+                signal_interval_a = batch_idx * 2;
+                signal_row_a = dst_row - cu_compact[batch_idx];
+                signal_interval_b = batch_idx * 2 + 1;
+                signal_row_b = signal_row_a;
+            } else {
+                int const back_row = row_in_batch - half_len;
+                dst_row = cu_compact[batch_idx] + world_size * half_len
+                        + (world_size - 1 - local_rank) * half_len + back_row;
+                signal_interval_a = batch_idx * 2 + 1;
+                signal_row_a = dst_row - cu_compact[batch_idx];
+            }
+        } else {
+            dst_row = cu_compact[batch_idx] + local_rank * local_len + row_in_batch;
+            signal_interval_a = batch_idx;
+            signal_row_a = dst_row - cu_compact[batch_idx];
+        }
+    }
+
+    int const src_row = local_rank * local_total + local_row_global;
+    int const lane = int(threadIdx.x);
+    if (lane < vecs_per_row) {
+        dst_k[dst_row * vecs_per_row + lane] = src_k[src_row * vecs_per_row + lane];
+        dst_v[dst_row * vecs_per_row + lane] = src_v[src_row * vecs_per_row + lane];
+    }
+    __syncthreads();
+    if (lane == 0 && is_cp) {
+        add_ready_chunk(chunk_done, signal_interval_a, signal_row_a, ready_max_chunks, ready_chunk_rows, 2);
+        if (signal_interval_b >= 0) {
+            add_ready_chunk(chunk_done, signal_interval_b, signal_row_b, ready_max_chunks, ready_chunk_rows, 2);
+        }
+    }
+}
+
+__global__ void initialize_ready_end_from_chunks_kernel(const int* chunk_done,
+                                                        int* ready_end,
+                                                        const int* interval_rows,
+                                                        int intervals,
+                                                        int max_chunks,
+                                                        int chunk_rows) {
+    int const interval_id = int(blockIdx.x);
+    if (interval_id >= intervals || threadIdx.x != 0) {
+        return;
+    }
+    int const total_rows = interval_rows[interval_id];
+    int cursor_rows = 0;
+    for (int chunk_idx = 0; chunk_idx < max_chunks && cursor_rows < total_rows; ++chunk_idx) {
+        int const rows = min(chunk_rows, total_rows - cursor_rows);
+        int const target = 2 * rows;
+        int const done = chunk_done[interval_id * max_chunks + chunk_idx];
+        if (done < target) {
+            break;
+        }
+        cursor_rows += rows;
+    }
+    ready_end[interval_id] = cursor_rows;
 }
 
 int round_multiple(int x, int m) {
@@ -226,7 +344,16 @@ RingVarlenParams make_mega_ring_varlen_params(const torch::Tensor& q,
                                               int* cp_batch_mask,
                                               int* half_cu_seqlens,
                                               torch::Tensor& kv_ready_counts,
-                                              torch::Tensor& step_ready) {
+                                              torch::Tensor& step_ready,
+                                              bool ready_once,
+                                              const torch::Tensor& source_cu_seqlens_k,
+                                              torch::Tensor* ready_end,
+                                              torch::Tensor* chunk_done,
+                                              torch::Tensor* publish_lock,
+                                              torch::Tensor* ready_interval_rows,
+                                              int ready_intervals,
+                                              int ready_max_chunks,
+                                              int ready_chunk_rows) {
     RingVarlenParams params{};
     static_cast<VarlenParams&>(params) = make_varlen_params(
         q,
@@ -258,6 +385,15 @@ RingVarlenParams make_mega_ring_varlen_params(const torch::Tensor& q,
     params.mega_ring_half_cu_seqlens = half_cu_seqlens;
     params.mega_ring_kv_ready_counts = kv_ready_counts.data_ptr<int>();
     params.mega_ring_step_ready = step_ready.data_ptr<int>();
+    params.mega_ring_ready_once = ready_once;
+    params.mega_ring_source_cu_seqlens_k = ready_once ? static_cast<int*>(source_cu_seqlens_k.data_ptr()) : nullptr;
+    params.mega_ring_ready_end = ready_end != nullptr ? ready_end->data_ptr<int>() : nullptr;
+    params.mega_ring_chunk_done = chunk_done != nullptr ? chunk_done->data_ptr<int>() : nullptr;
+    params.mega_ring_publish_lock = publish_lock != nullptr ? publish_lock->data_ptr<int>() : nullptr;
+    params.mega_ring_ready_interval_rows = ready_interval_rows != nullptr ? ready_interval_rows->data_ptr<int>() : nullptr;
+    params.mega_ring_ready_intervals = ready_intervals;
+    params.mega_ring_ready_max_chunks = ready_max_chunks;
+    params.mega_ring_ready_chunk_rows = ready_chunk_rows;
     return params;
 }
 
@@ -330,7 +466,8 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
                                     py::object lse_obj,
                                     bool return_lse,
                                     py::object global_seqlens_host_obj,
-                                    int64_t cp_threshold) {
+                                    int64_t cp_threshold,
+                                    bool ready_once) {
     check_varlen_qkv(q, "q");
     check_varlen_qkv(k, "k");
     check_varlen_qkv(v, "v");
@@ -542,22 +679,110 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     auto kv_ready_counts = torch::zeros({world_size}, q.options().dtype(torch::kInt32));
     int const step_ready_size = hybrid_mode ? std::max(cp_tiles_per_step, 1) : tiles_per_step;
     auto step_ready = torch::zeros({step_ready_size}, q.options().dtype(torch::kInt32));
+    bool const use_ready_once = ready_once && hybrid_mode;
+    torch::Tensor ready_end;
+    torch::Tensor chunk_done;
+    torch::Tensor publish_lock;
+    torch::Tensor ready_interval_rows;
+    torch::Tensor attn_k = k;
+    torch::Tensor attn_v = v;
+    torch::Tensor attn_cu_seqlens_k = cu_seqlens_k;
+    int attn_max_seqlen_k = static_cast<int>(max_seqlen_k);
+    int ready_intervals = 0;
+    int ready_max_chunks = 0;
+    int const ready_chunk_rows = 128;
+    auto stream = at::cuda::getDefaultCUDAStream(q.get_device());
+    if (use_ready_once) {
+        ready_intervals = batch_size * (is_causal ? 2 : 1);
+        int max_compact_rows = 0;
+        auto compact_cu_host = torch::empty({batch_size + 1}, torch::TensorOptions().dtype(torch::kInt32));
+        int* compact_cu_host_ptr = compact_cu_host.data_ptr<int>();
+        compact_cu_host_ptr[0] = 0;
+        for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+            int const start = cu_seqlens_k_host_ptr[batch_idx];
+            int const end = cu_seqlens_k_host_ptr[batch_idx + 1];
+            int const local_len = end - start;
+            int compact_len = local_len;
+            if (cp_batch_mask_host_ptr != nullptr && cp_batch_mask_host_ptr[batch_idx] != 0) {
+                compact_len = local_len * world_size;
+            }
+            compact_cu_host_ptr[batch_idx + 1] = compact_cu_host_ptr[batch_idx] + compact_len;
+            max_compact_rows = std::max(max_compact_rows, compact_len);
+        }
+        attn_max_seqlen_k = max_compact_rows;
+        attn_cu_seqlens_k = torch::empty({batch_size + 1}, q.options().dtype(torch::kInt32));
+        attn_cu_seqlens_k.copy_(compact_cu_host, false);
+        int const compact_total = compact_cu_host_ptr[batch_size];
+        attn_k = torch::empty({compact_total, k.size(1), k.size(2)}, k.options());
+        attn_v = torch::empty({compact_total, v.size(1), v.size(2)}, v.options());
+        ready_max_chunks = std::max(1, round_multiple(max_compact_rows, ready_chunk_rows) / ready_chunk_rows);
+        ready_end = torch::zeros({ready_intervals}, q.options().dtype(torch::kInt32));
+        chunk_done = torch::zeros({ready_intervals * ready_max_chunks}, q.options().dtype(torch::kInt32));
+        publish_lock = torch::zeros({ready_intervals}, q.options().dtype(torch::kInt32));
+        auto ready_interval_rows_host = torch::empty({ready_intervals}, torch::TensorOptions().dtype(torch::kInt32));
+        int* interval_rows_ptr = ready_interval_rows_host.data_ptr<int>();
+        for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+            int const start = cu_seqlens_k_host_ptr[batch_idx];
+            int const end = cu_seqlens_k_host_ptr[batch_idx + 1];
+            int const local_len = end - start;
+            bool const is_cp = cp_batch_mask_host_ptr != nullptr && cp_batch_mask_host_ptr[batch_idx] != 0;
+            if (is_causal) {
+                int const half_len = is_cp ? local_len / 2 : 0;
+                interval_rows_ptr[batch_idx * 2] = is_cp ? (ring_rank + 1) * half_len : 0;
+                interval_rows_ptr[batch_idx * 2 + 1] = is_cp ? (2 * world_size - ring_rank) * half_len : 0;
+            } else {
+                interval_rows_ptr[batch_idx] = is_cp ? world_size * local_len : 0;
+            }
+        }
+        ready_interval_rows = torch::empty({ready_intervals}, q.options().dtype(torch::kInt32));
+        ready_interval_rows.copy_(ready_interval_rows_host, false);
+
+        int const vecs_per_row = static_cast<int>(k.size(1) * k.size(2) * sizeof(at::BFloat16) / sizeof(uint4));
+        TORCH_CHECK(vecs_per_row * int(sizeof(uint4)) == k.size(1) * k.size(2) * int(sizeof(at::BFloat16)),
+                    "ready_once compact pack requires row byte size to be a multiple of uint4");
+        pack_ready_once_local_kv_kernel<<<local_total_k, 128, 0, stream>>>(
+            reinterpret_cast<const uint4*>(k.data_ptr()),
+            reinterpret_cast<const uint4*>(v.data_ptr()),
+            reinterpret_cast<uint4*>(attn_k.data_ptr()),
+            reinterpret_cast<uint4*>(attn_v.data_ptr()),
+            cu_seqlens_k.data_ptr<int>(),
+            attn_cu_seqlens_k.data_ptr<int>(),
+            static_cast<int*>(cp_batch_mask.data_ptr()),
+            is_causal ? static_cast<int*>(half_cu_seqlens.data_ptr()) : nullptr,
+            batch_size,
+            local_total_k,
+            ring_rank,
+            world_size,
+            is_causal,
+            vecs_per_row,
+            chunk_done.data_ptr<int>(),
+            ready_max_chunks,
+            ready_chunk_rows);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        initialize_ready_end_from_chunks_kernel<<<ready_intervals, 1, 0, stream>>>(
+            chunk_done.data_ptr<int>(),
+            ready_end.data_ptr<int>(),
+            ready_interval_rows.data_ptr<int>(),
+            ready_intervals,
+            ready_max_chunks,
+            ready_chunk_rows);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
 
     // MEGA_RING: initial local rank block is already resident in the local
     // concatenated K/V buffer.
-    auto stream = at::cuda::getDefaultCUDAStream(q.get_device());
     set_mega_ring_local_kv_ready_count<<<1, 1, 0, stream>>>(
         kv_ready_counts.data_ptr<int>(), ring_rank, cp_total_k_per_rank * 2);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     auto params = make_mega_ring_varlen_params(
         q,
-        k,
-        v,
+        attn_k,
+        attn_v,
         cu_seqlens_q,
-        cu_seqlens_k,
+        attn_cu_seqlens_k,
         static_cast<int>(max_seqlen_q),
-        static_cast<int>(max_seqlen_k),
+        attn_max_seqlen_k,
         local_total_k,
         out,
         lse,
@@ -575,7 +800,16 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
         hybrid_mode ? static_cast<int*>(cp_batch_mask.data_ptr()) : nullptr,
         is_causal ? static_cast<int*>(half_cu_seqlens.data_ptr()) : nullptr,
         kv_ready_counts,
-        step_ready);
+        step_ready,
+        use_ready_once,
+        cu_seqlens_k,
+        use_ready_once ? &ready_end : nullptr,
+        use_ready_once ? &chunk_done : nullptr,
+        use_ready_once ? &publish_lock : nullptr,
+        use_ready_once ? &ready_interval_rows : nullptr,
+        ready_intervals,
+        ready_max_chunks,
+        ready_chunk_rows);
 
     // MEGA_RING: one fused launch runs communication CTAs and compute CTAs.
     min_fa3_varlen_demo::run_mega_ring_min_fa3_varlen_ring_fwd(params, remote_k, remote_v, stream);
@@ -613,6 +847,7 @@ void bind_varlen_mega_ring(py::module_& m) {
         py::arg("return_lse") = false,
         py::arg("global_seqlens_host") = py::none(),
         py::arg("cp_threshold") = 2048,
+        py::arg("ready_once") = true,
         "MEGA_RING: explicit multi-step fused Hopper varlen ring-attention demo.\n\n"
         "K/V must be contiguous [world_size * local_total_k, kv_heads, 128] buffers. "
         "The kernel performs persistent compute and remote K/V TMA loads in one launch.");

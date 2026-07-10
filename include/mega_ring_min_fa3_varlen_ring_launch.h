@@ -38,7 +38,7 @@ namespace mega_ring_detail {
 
 using namespace kittens;
 
-template <bool IsCausal, int NumDevices>
+template <bool IsCausal, int NumDevices, bool ReadyOnce=false>
 struct MegaRingKernelConfig {
     // MEGA_RING: keep the same copied FA3 varlen mainloop/epilogue stack as
     // the single-step ring path, changing only the scheduler and kernel wrapper.
@@ -77,7 +77,7 @@ struct MegaRingKernelConfig {
         kPackGQA,
         kSplit,
         false,
-        true>;
+        !ReadyOnce>;
     // MEGA_RING: scheduler expands the varlen tile stream across all ring
     // steps and carries per-tile ring metadata through producer/consumer WGs.
     using Scheduler = flash::MegaRingVarlenDynamicPersistentTileScheduler<
@@ -123,6 +123,14 @@ struct MegaRingKernelConfig {
         int const* half_cu_seqlens;
         int const* cp_batch_mask;
         int* kv_ready_counts;
+        bool ready_once;
+        int* ready_end;
+        int* chunk_done;
+        int* publish_lock;
+        int const* ready_interval_rows;
+        int ready_intervals;
+        int ready_max_chunks;
+        int ready_chunk_rows;
     };
 };
 
@@ -146,6 +154,53 @@ struct alignas(128) MegaRingRemoteLoadBarriers {
     semaphore arrived[RingConfig::kNumCommChunks];
     semaphore finished[RingConfig::kNumCommChunks];
 };
+
+template <typename RingConfig>
+CUTLASS_DEVICE
+void try_advance_ready_end(const typename RingConfig::KernelParams& params, int interval_id) {
+    if (!params.ready_once || interval_id < 0 || interval_id >= params.ready_intervals) {
+        return;
+    }
+    if (atomicCAS(params.publish_lock + interval_id, 0, 1) != 0) {
+        return;
+    }
+    int const total_rows = params.ready_interval_rows[interval_id];
+    int cursor_rows = min_fa3_varlen_demo::mega_ring::load_acquire(params.ready_end + interval_id);
+    int cursor_chunk = params.ready_chunk_rows > 0 ? cursor_rows / params.ready_chunk_rows : 0;
+    while (cursor_chunk < params.ready_max_chunks && cursor_rows < total_rows) {
+        int const rows = cute::min(params.ready_chunk_rows, total_rows - cursor_rows);
+        int const target = rows * 2;
+        int const done = min_fa3_varlen_demo::mega_ring::load_acquire(
+            params.chunk_done + interval_id * params.ready_max_chunks + cursor_chunk);
+        if (done < target) {
+            break;
+        }
+        cursor_rows += rows;
+        ++cursor_chunk;
+    }
+    min_fa3_varlen_demo::mega_ring::store_release(params.ready_end + interval_id, cursor_rows);
+    atomicExch(params.publish_lock + interval_id, 0);
+}
+
+template <typename RingConfig>
+CUTLASS_DEVICE
+void signal_ready_once_row(const typename RingConfig::KernelParams& params,
+                           int interval_id,
+                           int row_in_interval) {
+    if (!params.ready_once || interval_id < 0 || row_in_interval < 0) {
+        return;
+    }
+    int const chunk_idx = row_in_interval / params.ready_chunk_rows;
+    int const old_done = min_fa3_varlen_demo::mega_ring::signal_release_return_old(
+        params.chunk_done + interval_id * params.ready_max_chunks + chunk_idx,
+        1);
+    int const chunk_start = chunk_idx * params.ready_chunk_rows;
+    int const total_rows = params.ready_interval_rows[interval_id];
+    int const rows = cute::min(params.ready_chunk_rows, total_rows - chunk_start);
+    if (rows > 0 && old_done + 1 >= rows * 2) {
+        try_advance_ready_end<RingConfig>(params, interval_id);
+    }
+}
 
 template <typename RingConfig>
 CUTLASS_DEVICE
@@ -231,6 +286,49 @@ void run_mega_ring_remote_load(
         return true;
     };
 
+    auto compact_row_for = [&] (int load_kv_rank, int row_idx) {
+        int const batch_idx = row_to_batch(row_idx);
+        int const row_in_batch = row_idx - params.cu_seqlens_k[batch_idx];
+        int const compact_base = params.compute.mainloop.cu_seqlens_k[batch_idx];
+        if constexpr (RingConfig::kIsCausal) {
+            int const half_len = params.half_cu_seqlens[batch_idx + 1] - params.half_cu_seqlens[batch_idx];
+            if (half_len > 0 && row_in_batch < half_len) {
+                return compact_base + load_kv_rank * half_len + row_in_batch;
+            }
+            if (half_len > 0) {
+                return compact_base + params.ring_world_size * half_len
+                    + (params.ring_world_size - 1 - load_kv_rank) * half_len
+                    + (row_in_batch - half_len);
+            }
+        }
+        int const local_len = params.cu_seqlens_k[batch_idx + 1] - params.cu_seqlens_k[batch_idx];
+        return compact_base + load_kv_rank * local_len + row_in_batch;
+    };
+
+    auto signal_ready_once_for = [&] (int load_kv_rank, int row_idx) {
+        int const batch_idx = row_to_batch(row_idx);
+        if (params.cp_batch_mask != nullptr && params.cp_batch_mask[batch_idx] == 0) {
+            return;
+        }
+        int const row_in_batch = row_idx - params.cu_seqlens_k[batch_idx];
+        int const compact_base = params.compute.mainloop.cu_seqlens_k[batch_idx];
+        int const compact_row = compact_row_for(load_kv_rank, row_idx);
+        int const row_in_interval = compact_row - compact_base;
+        if constexpr (RingConfig::kIsCausal) {
+            int const half_len = params.half_cu_seqlens[batch_idx + 1] - params.half_cu_seqlens[batch_idx];
+            if (half_len > 0 && row_in_batch < half_len) {
+                if (load_kv_rank <= params.ring_rank) {
+                    signal_ready_once_row<RingConfig>(params, batch_idx * 2, row_in_interval);
+                }
+                signal_ready_once_row<RingConfig>(params, batch_idx * 2 + 1, row_in_interval);
+            } else if (half_len > 0 && load_kv_rank >= params.ring_rank) {
+                signal_ready_once_row<RingConfig>(params, batch_idx * 2 + 1, row_in_interval);
+            }
+        } else {
+            signal_ready_once_row<RingConfig>(params, batch_idx, row_in_interval);
+        }
+    };
+
     auto decode_task = [&] (int task_id) {
         int step, task_in_step, rows_this_step;
         bool kv_use_half = false;
@@ -300,10 +398,11 @@ void run_mega_ring_remote_load(
             wait(barriers.arrived[chunk_id], get_phasebit<0>(phasebits, 0));
             update_phasebit<0>(phasebits, 0);
 
+            int const dst_row = params.ready_once ? compact_row_for(load_kv_rank, row_idx) : row_with_rank;
             if (!is_v) {
-                tma::store_async(params.local_k, vec[chunk_id], {row_with_rank, 0});
+                tma::store_async(params.local_k, vec[chunk_id], {dst_row, 0});
             } else {
-                tma::store_async(params.local_v, vec[chunk_id], {row_with_rank, 0});
+                tma::store_async(params.local_v, vec[chunk_id], {dst_row, 0});
             }
             tma::store_async_read_wait(); // wait for the store to finish reading from shared memory
             arrive(barriers.finished[chunk_id]);
@@ -314,7 +413,11 @@ void run_mega_ring_remote_load(
             // MEGA_RING: each completed K/V row contributes one count.
             // Compute CTAs wait until the rank block reaches rows_per_rank * 2.
             // Causal zigzag half-steps only signal the copied front-half rows.
-            min_fa3_varlen_demo::mega_ring::signal_release(params.kv_ready_counts + load_kv_rank, 1);
+            if (params.ready_once) {
+                signal_ready_once_for(load_kv_rank, row_idx);
+            } else {
+                min_fa3_varlen_demo::mega_ring::signal_release(params.kv_ready_counts + load_kv_rank, 1);
+            }
         }
     }
 }
@@ -341,13 +444,13 @@ void mega_ring_flash_attn_varlen_kernel(CUTLASS_GRID_CONSTANT typename RingConfi
     }
 }
 
-template <bool IsCausal, int NumDevices>
+template <bool IsCausal, int NumDevices, bool ReadyOnce=false>
 void run_mega_ring_min_fa3_varlen_ring_sm90(
     Ring_fwd_params& params,
     kittens::py::TKParallelTensor& remote_k,
     kittens::py::TKParallelTensor& remote_v,
     cudaStream_t stream) {
-    using RingConfig = MegaRingKernelConfig<IsCausal, NumDevices>;
+    using RingConfig = MegaRingKernelConfig<IsCausal, NumDevices, ReadyOnce>;
     using AttnKernel = typename RingConfig::AttnKernel;
     check_mega_ring_kernel_param_layout<RingConfig>();
 
@@ -357,12 +460,16 @@ void run_mega_ring_min_fa3_varlen_ring_sm90(
     int const batch_q = 1;
     int const batch_k = 1;
     int const local_total_k = params.mega_ring_total_k_per_rank;
-    int const remote_rows = params.total_k;
+    int const compact_rows = params.total_k;
+    int const remote_rows = static_cast<int>(remote_k.data_.size(0));
     using Index = typename Flash_fwd_params::index_t;
 
     TORCH_CHECK(local_total_k > 0, "mega ring requires mega_ring_total_k_per_rank > 0");
-    TORCH_CHECK(remote_rows == local_total_k * params.ring_world_size,
+    TORCH_CHECK(params.mega_ring_ready_once || compact_rows == local_total_k * params.ring_world_size,
                 "mega ring expects total_k to describe the full [world_size * local_total_k] buffer. Got total_k=",
+                compact_rows, ", local_total_k=", local_total_k, ", world_size=", params.ring_world_size);
+    TORCH_CHECK(remote_rows == local_total_k * params.ring_world_size,
+                "mega ring remote_k must describe the full source [world_size * local_total_k] buffer. Got remote rows=",
                 remote_rows, ", local_total_k=", local_total_k, ", world_size=", params.ring_world_size);
     TORCH_CHECK(params.h_k * params.d == RingConfig::kVecLength,
                 "Mega ring communication path currently requires kv_heads * head_dim == ", RingConfig::kVecLength,
@@ -376,7 +483,7 @@ void run_mega_ring_min_fa3_varlen_ring_sm90(
         {seqlen_q, params.d, params.h, batch_q},
         {params.q_row_stride, _1{}, params.q_head_stride, Index{0}},
         static_cast<Element*>(params.k_ptr),
-        {remote_rows, params.d, params.h_k, batch_k},
+        {compact_rows, params.d, params.h_k, batch_k},
         {params.k_row_stride, _1{}, params.k_head_stride, Index{0}},
         static_cast<Element*>(params.v_ptr),
         params.dv,
@@ -422,7 +529,12 @@ void run_mega_ring_min_fa3_varlen_ring_sm90(
         params.ring_world_size,
         local_total_k,
         params.mega_ring_cp_total_k_per_rank,
-        params.mega_ring_cp_batch_mask};
+        params.mega_ring_cp_batch_mask,
+        params.mega_ring_ready_once,
+        params.mega_ring_ready_end,
+        params.mega_ring_ready_intervals,
+        params.mega_ring_ready_max_chunks,
+        params.mega_ring_ready_chunk_rows};
 
     typename RingConfig::CollectiveEpilogue::Arguments epilogue_args{
         static_cast<ElementOut*>(params.o_ptr),
@@ -468,7 +580,8 @@ void run_mega_ring_min_fa3_varlen_ring_sm90(
         params.mega_ring_tiles_per_half_step,
         params.mega_ring_cp_batch_mask,
         params.mega_ring_cp_tiles_per_step,
-        params.mega_ring_cp_tiles_per_half_step};
+        params.mega_ring_cp_tiles_per_half_step,
+        params.mega_ring_ready_once};
 
     if (!params.skip_scheduler_metadata_computation) {
         // MEGA_RING: still uses the copied varlen scheduler metadata prep; the
@@ -522,8 +635,8 @@ void run_mega_ring_min_fa3_varlen_ring_sm90(
         compute_params,
         kittens::py::parallel_tensor_to_pgl<typename RingConfig::remote_pgl>(remote_k, 1, 1, remote_rows, RingConfig::kVecLength),
         kittens::py::parallel_tensor_to_pgl<typename RingConfig::remote_pgl>(remote_v, 1, 1, remote_rows, RingConfig::kVecLength),
-        kittens::make_gl<typename RingConfig::staging_gl>(local_k_dst, 1, 1, remote_rows, RingConfig::kVecLength),
-        kittens::make_gl<typename RingConfig::staging_gl>(local_v_dst, 1, 1, remote_rows, RingConfig::kVecLength),
+        kittens::make_gl<typename RingConfig::staging_gl>(local_k_dst, 1, 1, compact_rows, RingConfig::kVecLength),
+        kittens::make_gl<typename RingConfig::staging_gl>(local_v_dst, 1, 1, compact_rows, RingConfig::kVecLength),
         params.num_comp_sm,
         params.num_comm_sm,
         local_total_k,
@@ -534,10 +647,20 @@ void run_mega_ring_min_fa3_varlen_ring_sm90(
         params.b,
         params.ring_rank,
         params.ring_world_size,
-        params.cu_seqlens_k,
+        params.mega_ring_ready_once && params.mega_ring_source_cu_seqlens_k != nullptr
+            ? params.mega_ring_source_cu_seqlens_k
+            : params.cu_seqlens_k,
         params.mega_ring_half_cu_seqlens,
         params.mega_ring_cp_batch_mask,
-        params.mega_ring_kv_ready_counts};
+        params.mega_ring_kv_ready_counts,
+        params.mega_ring_ready_once,
+        params.mega_ring_ready_end,
+        params.mega_ring_chunk_done,
+        params.mega_ring_publish_lock,
+        params.mega_ring_ready_interval_rows,
+        params.mega_ring_ready_intervals,
+        params.mega_ring_ready_max_chunks,
+        params.mega_ring_ready_chunk_rows};
 
     bool const launch_with_pdl = params.prepare_varlen_pdl && !params.skip_scheduler_metadata_computation;
     if (!launch_with_pdl) {
@@ -566,7 +689,7 @@ void run_mega_ring_min_fa3_varlen_ring_sm90(
     }
 }
 
-template <bool IsCausal>
+template <bool IsCausal, bool ReadyOnce>
 void dispatch_mega_ring_world_size(
     Ring_fwd_params& params,
     kittens::py::TKParallelTensor& remote_k,
@@ -576,28 +699,28 @@ void dispatch_mega_ring_world_size(
     // the same explicit local_world_size dispatch style as the ring path.
     switch (remote_k.local_world_size_) {
         case 1:
-            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 1>(params, remote_k, remote_v, stream);
+            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 1, ReadyOnce>(params, remote_k, remote_v, stream);
             break;
         case 2:
-            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 2>(params, remote_k, remote_v, stream);
+            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 2, ReadyOnce>(params, remote_k, remote_v, stream);
             break;
         case 3:
-            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 3>(params, remote_k, remote_v, stream);
+            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 3, ReadyOnce>(params, remote_k, remote_v, stream);
             break;
         case 4:
-            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 4>(params, remote_k, remote_v, stream);
+            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 4, ReadyOnce>(params, remote_k, remote_v, stream);
             break;
         case 5:
-            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 5>(params, remote_k, remote_v, stream);
+            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 5, ReadyOnce>(params, remote_k, remote_v, stream);
             break;
         case 6:
-            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 6>(params, remote_k, remote_v, stream);
+            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 6, ReadyOnce>(params, remote_k, remote_v, stream);
             break;
         case 7:
-            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 7>(params, remote_k, remote_v, stream);
+            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 7, ReadyOnce>(params, remote_k, remote_v, stream);
             break;
         case 8:
-            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 8>(params, remote_k, remote_v, stream);
+            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 8, ReadyOnce>(params, remote_k, remote_v, stream);
             break;
         default:
             TORCH_CHECK(false, "Unsupported local_world_size for mega ring varlen path: ", remote_k.local_world_size_);

@@ -71,6 +71,9 @@ execution strategies:
 - `mega_ring_all_cp`: legacy fused mega-ring CP where every sequence is split across all ranks
 - `mega_ring_hybrid`: fused mega-ring hybrid mode selected by `--cp-threshold`
 
+`mega_ring_hybrid` uses the ready-once compact-prefix path by default. Pass
+`--no-mega-ring-ready-once` to benchmark the legacy step/reduction path.
+
 `--global-seqlens` gives the global sequence lengths. Entries above
 `--cp-threshold` are CP sequences in hybrid mode. Entries at or below the
 threshold are local-only in hybrid mode and are assigned whole to one rank. In

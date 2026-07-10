@@ -409,6 +409,11 @@ struct CollectiveMainloopFwdSm90 {
         int const mega_ring_total_k_per_rank = 0;
         int const mega_ring_cp_total_k_per_rank = 0;
         int const* const mega_ring_cp_batch_mask = nullptr;
+        bool const mega_ring_ready_once = false;
+        int const* const mega_ring_ready_end = nullptr;
+        int const mega_ring_ready_intervals = 0;
+        int const mega_ring_ready_max_chunks = 0;
+        int const mega_ring_ready_chunk_rows = 0;
     };
 
     // Device side kernel params
@@ -475,6 +480,11 @@ struct CollectiveMainloopFwdSm90 {
         int const mega_ring_total_k_per_rank = 0;
         int const mega_ring_cp_total_k_per_rank = 0;
         int const* const mega_ring_cp_batch_mask = nullptr;
+        bool const mega_ring_ready_once = false;
+        int const* const mega_ring_ready_end = nullptr;
+        int const mega_ring_ready_intervals = 0;
+        int const mega_ring_ready_max_chunks = 0;
+        int const mega_ring_ready_chunk_rows = 0;
     };
 
     static Params
@@ -589,7 +599,10 @@ struct CollectiveMainloopFwdSm90 {
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
                 args.mega_ring_kv_ready_counts, args.mega_ring_step_ready, args.mega_ring_half_cu_seqlens,
                 args.mega_ring_rank, args.mega_ring_world_size, args.mega_ring_total_k_per_rank,
-                args.mega_ring_cp_total_k_per_rank, args.mega_ring_cp_batch_mask};
+                args.mega_ring_cp_total_k_per_rank, args.mega_ring_cp_batch_mask,
+                args.mega_ring_ready_once, args.mega_ring_ready_end,
+                args.mega_ring_ready_intervals, args.mega_ring_ready_max_chunks,
+                args.mega_ring_ready_chunk_rows};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -647,16 +660,42 @@ struct CollectiveMainloopFwdSm90 {
         int mega_ring_seqlen_q = seqlen_info.seqlen_q;
         int mega_ring_seqlen_k = seqlen_info.seqlen_k;
         bool mega_ring_kv_use_half = false;
+        int mega_ring_ready_interval_id = -1;
+        int const block_m = get<0>(TileShape_MNK{});
+        int const block_n = get<1>(TileShape_MNK{});
         if constexpr (EnableMegaRing) {
             mega_ring_kv_rank = (params.mega_ring_rank - mega_ring_step + params.mega_ring_world_size) % params.mega_ring_world_size;
-            if (!mega_ring_is_cp_batch) {
+            if (params.mega_ring_ready_once) {
+                mega_ring_kv_rank = 0;
+                n_block_min = 0;
+                if (mega_ring_is_cp_batch) {
+                    if constexpr (Is_causal) {
+                        int const half_len = params.mega_ring_half_cu_seqlens[bidb + 1] - params.mega_ring_half_cu_seqlens[bidb];
+                        if (mega_ring_step == 2) {  // CP front
+                            mega_ring_q_row_offset = 0;
+                            mega_ring_seqlen_q = half_len;
+                            mega_ring_seqlen_k = (params.mega_ring_rank + 1) * half_len;
+                            mega_ring_ready_interval_id = bidb * 2;
+                        } else if (mega_ring_step == 3) {  // CP back
+                            mega_ring_q_row_offset = half_len;
+                            mega_ring_seqlen_q = half_len;
+                            mega_ring_seqlen_k = (2 * params.mega_ring_world_size - params.mega_ring_rank) * half_len;
+                            mega_ring_ready_interval_id = bidb * 2 + 1;
+                        }
+                        int const n_idx = (m_block + 1) * block_m + mega_ring_seqlen_k - mega_ring_seqlen_q;
+                        n_block_max = cute::ceil_div(n_idx < mega_ring_seqlen_k ? n_idx : mega_ring_seqlen_k, block_n);
+                    } else {
+                        mega_ring_seqlen_k = seqlen_info.seqlen_k;
+                        mega_ring_ready_interval_id = bidb;
+                        n_block_max = cute::ceil_div(mega_ring_seqlen_k, get<1>(TileShape_MNK{}));
+                    }
+                }
+            } else if (!mega_ring_is_cp_batch) {
                 if (mega_ring_step > 0) {
                     n_block_max = 0;
                 }
             } else if constexpr (Is_causal) {
                 int const half_len = params.mega_ring_half_cu_seqlens[bidb + 1] - params.mega_ring_half_cu_seqlens[bidb];
-                int const block_m = get<0>(TileShape_MNK{});
-                int const block_n = get<1>(TileShape_MNK{});
                 bool const q_use_half = mega_ring_step > params.mega_ring_rank;
                 bool const kv_use_half = mega_ring_step >= 1 && mega_ring_step <= params.mega_ring_rank;
                 bool const is_diag = mega_ring_step == 0;
@@ -876,7 +915,12 @@ struct CollectiveMainloopFwdSm90 {
             // K/V row is resident in the local concatenated KV buffer. One
             // producer thread polls; the barrier releases the rest of the
             // producer threads before they touch Q/K/V pipeline state.
-            if (mega_ring_is_cp_batch && thread_idx == 0) {
+            if (params.mega_ring_ready_once && mega_ring_is_cp_batch && mega_ring_ready_interval_id >= 0 && thread_idx == 0) {
+                int const required_end = cute::min(mega_ring_seqlen_k, n_block_max * get<1>(TileShape_MNK{}));
+                min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
+                    params.mega_ring_ready_end + mega_ring_ready_interval_id,
+                    required_end);
+            } else if (!params.mega_ring_ready_once && mega_ring_is_cp_batch && thread_idx == 0) {
                 int const cp_total_k = (params.mega_ring_cp_total_k_per_rank > 0 || params.mega_ring_cp_batch_mask != nullptr)
                     ? params.mega_ring_cp_total_k_per_rank
                     : params.mega_ring_total_k_per_rank;
@@ -1083,8 +1127,30 @@ struct CollectiveMainloopFwdSm90 {
         int mega_ring_seqlen_q = seqlen_info.seqlen_q;
         int mega_ring_seqlen_k = seqlen_info.seqlen_k;
         bool mega_ring_use_causal_mask = true;
+        int const block_m = get<0>(TileShape_MNK{});
+        int const block_n = get<1>(TileShape_MNK{});
         if constexpr (EnableMegaRing) {
-            if (!mega_ring_is_cp_batch) {
+            if (params.mega_ring_ready_once) {
+                n_block_min = 0;
+                if (mega_ring_is_cp_batch) {
+                    if constexpr (Is_causal) {
+                        int const half_len = params.mega_ring_half_cu_seqlens[bidb + 1] - params.mega_ring_half_cu_seqlens[bidb];
+                        if (mega_ring_step == 2) {
+                            mega_ring_seqlen_q = half_len;
+                            mega_ring_seqlen_k = (params.mega_ring_rank + 1) * half_len;
+                        } else if (mega_ring_step == 3) {
+                            mega_ring_seqlen_q = half_len;
+                            mega_ring_seqlen_k = (2 * params.mega_ring_world_size - params.mega_ring_rank) * half_len;
+                        }
+                        int const n_idx = (m_block + 1) * block_m + mega_ring_seqlen_k - mega_ring_seqlen_q;
+                        n_block_max = cute::ceil_div(n_idx < mega_ring_seqlen_k ? n_idx : mega_ring_seqlen_k, block_n);
+                        mega_ring_use_causal_mask = true;
+                    } else {
+                        mega_ring_seqlen_k = seqlen_info.seqlen_k;
+                        n_block_max = cute::ceil_div(mega_ring_seqlen_k, block_n);
+                    }
+                }
+            } else if (!mega_ring_is_cp_batch) {
                 if (mega_ring_step > 0) {
                     n_block_max = 0;
                 }

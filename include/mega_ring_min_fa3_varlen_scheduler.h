@@ -47,7 +47,7 @@ public:
         is_valid(Params const& params) const {
             // MEGA_RING: the expanded stream is valid only while the ring step
             // is in range and the underlying varlen tile decoded to a batch.
-            return ring_step < params.mega_ring_world_size && bidb < params.num_batch;
+            return (params.mega_ring_ready_once || ring_step < params.mega_ring_world_size) && bidb < params.num_batch;
         }
 
         CUTLASS_DEVICE
@@ -94,7 +94,7 @@ private:
         return actual_batch < params.num_batch && params.mega_ring_cp_batch_mask[actual_batch] != 0;
     }
 
-    template<bool HalfMBlocks=false, bool CpOnly=false>
+    template<bool HalfMBlocks=false, bool CpOnly=false, bool LocalOnly=false>
     CUTLASS_DEVICE
     typename Base::WorkTileInfo
     tile_idx_to_work_tile_linear(Params const& params, int next_tile_idx) const {
@@ -108,6 +108,11 @@ private:
             }
             if constexpr (CpOnly) {
                 if (!is_cp_virtual_batch(params, bidb)) {
+                    num_m_blocks = 0;
+                }
+            }
+            if constexpr (LocalOnly) {
+                if (is_cp_virtual_batch(params, bidb)) {
                     num_m_blocks = 0;
                 }
             }
@@ -135,6 +140,49 @@ private:
             group_start_tile += batch_tiles;
         }
         return {next_tile_idx, 0, 0, params.num_batch};
+    }
+
+    CUTLASS_DEVICE
+    WorkTileInfo
+    decode_ready_once_tile(Params const& params, int next_tile_idx) const {
+        static constexpr int kReadyLocal = 0;
+        static constexpr int kReadyCpFull = 1;
+        static constexpr int kReadyCpFront = 2;
+        static constexpr int kReadyCpBack = 3;
+        int const tiles_per_step = params.mega_ring_tiles_per_step;
+        int const cp_tiles_per_step = params.mega_ring_cp_tiles_per_step;
+        int const local_tiles = tiles_per_step - cp_tiles_per_step;
+        if (next_tile_idx < local_tiles) {
+            typename Base::WorkTileInfo base_work =
+                tile_idx_to_work_tile_linear<false, false, true>(params, next_tile_idx);
+            return {base_work.tile_idx, base_work.block, base_work.bidh, base_work.bidb,
+                    kReadyLocal, next_tile_idx, next_tile_idx, next_tile_idx};
+        }
+        int rem = next_tile_idx - local_tiles;
+        if constexpr (EnableZigzag) {
+            int const cp_tiles_per_half_step = params.mega_ring_cp_tiles_per_half_step;
+            if (rem < cp_tiles_per_half_step) {
+                typename Base::WorkTileInfo base_work =
+                    tile_idx_to_work_tile_linear<true, true, false>(params, rem);
+                return {base_work.tile_idx, base_work.block, base_work.bidh, base_work.bidb,
+                        kReadyCpFront, next_tile_idx, rem, rem};
+            }
+            rem -= cp_tiles_per_half_step;
+            if (rem < cp_tiles_per_half_step) {
+                typename Base::WorkTileInfo base_work =
+                    tile_idx_to_work_tile_linear<true, true, false>(params, rem);
+                return {base_work.tile_idx, base_work.block, base_work.bidh, base_work.bidb,
+                        kReadyCpBack, next_tile_idx, rem, rem};
+            }
+        } else {
+            if (rem < cp_tiles_per_step) {
+                typename Base::WorkTileInfo base_work =
+                    tile_idx_to_work_tile_linear<false, true, false>(params, rem);
+                return {base_work.tile_idx, base_work.block, base_work.bidh, base_work.bidb,
+                        kReadyCpFull, next_tile_idx, rem, rem};
+            }
+        }
+        return {next_tile_idx, 0, 0, params.num_batch, -1, next_tile_idx, 0, 0};
     }
 
     CUTLASS_DEVICE
@@ -179,6 +227,9 @@ private:
         int const tiles_per_step = params.mega_ring_tiles_per_step;
         int const tiles_per_half_step = hybrid_mode ? params.mega_ring_cp_tiles_per_half_step : params.mega_ring_tiles_per_half_step;
         int const cp_tiles_per_step = hybrid_mode ? params.mega_ring_cp_tiles_per_step : tiles_per_step;
+        if (params.mega_ring_ready_once) {
+            return decode_ready_once_tile(params, next_tile_idx);
+        }
         int ring_step, step_tile_idx;
         bool use_cp_stream = false;
         bool q_use_half = false;

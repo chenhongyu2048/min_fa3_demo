@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
-#SBATCH --time=00:30:00
+#SBATCH --time=00:10:00
 
 source /etc/profile.d/modules.sh
 source /data/apps/miniforge3/25.11.0-1/etc/profile.d/conda.sh
@@ -23,6 +23,34 @@ export https_proxy=http://u-MS9MdQ:Qixfk8ku@10.248.0.7:3128
 export http_proxy=http://u-MS9MdQ:Qixfk8ku@10.248.0.7:3128
 
 cd /data/home/scyb683/run/min_fa3_demo
+
+echo "== single-GPU hybrid local =="
+CUDA_VISIBLE_DEVICES=0 python mega_ring_test_min_fa3_varlen_hybrid_local.py \
+    --seqlens 1152,4096,1408 \
+    --all-local-seqlens 1152,1408 \
+    --qhead 16 \
+    --kvhead 8 \
+    --headdim 128 \
+    --num-comp-sm 1 \
+    --num-comm-sm 0 \
+    --cp-threshold 2048 \
+    --mode both
+
+echo "== two-GPU distributed hybrid mega-ring =="
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+    mega_ring_test_min_fa3_varlen_hybrid_multi_rank.py \
+    --local-seqlens 1152,2048,1408 \
+    --global-seqlens 1152,4096,1408 \
+    --all-local-seqlens 1152,1408 \
+    --all-cp-local-seqlens 2048,2304 \
+    --all-cp-global-seqlens 4096,4608 \
+    --qhead 16 \
+    --kvhead 8 \
+    --headdim 128 \
+    --num-comp-sm 1 \
+    --num-comm-sm 1 \
+    --cp-threshold 2048 \
+    --mode both
 
 # echo "== single-GPU hybrid local =="
 # CUDA_VISIBLE_DEVICES=0 python mega_ring_test_min_fa3_varlen_hybrid_local.py \

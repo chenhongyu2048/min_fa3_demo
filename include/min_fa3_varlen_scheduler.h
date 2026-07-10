@@ -39,6 +39,7 @@ struct TileSchedulerArguments {
     int const* const mega_ring_cp_batch_mask = nullptr;
     int const mega_ring_cp_tiles_per_step = 0;
     int const mega_ring_cp_tiles_per_half_step = 0;
+    bool const mega_ring_ready_once = false;
 };
 
 template<int kBlockM, int kBlockN, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
@@ -90,6 +91,7 @@ public:
         int const* const mega_ring_cp_batch_mask;
         int const mega_ring_cp_tiles_per_step;
         int const mega_ring_cp_tiles_per_half_step;
+        bool const mega_ring_ready_once;
     };
 
     static Params
@@ -122,7 +124,8 @@ public:
                 args.mega_ring_tiles_per_half_step,
                 args.mega_ring_cp_batch_mask,
                 args.mega_ring_cp_tiles_per_step,
-                args.mega_ring_cp_tiles_per_half_step};
+                args.mega_ring_cp_tiles_per_half_step,
+                args.mega_ring_ready_once};
     }
 
     static dim3

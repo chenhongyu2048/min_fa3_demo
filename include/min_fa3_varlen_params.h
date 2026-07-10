@@ -116,6 +116,18 @@ struct Ring_fwd_params : public Flash_fwd_params {
     int* __restrict__ mega_ring_kv_ready_counts = nullptr;
     // MEGA_RING: per-Q-tile completed-step counters for in-place O/LSE reduction ordering.
     int* __restrict__ mega_ring_step_ready = nullptr;
+    // MEGA_RING_READY_ONCE: compact-prefix K/V readiness metadata. These are
+    // only read by the ready-once mega-ring path; the step path leaves them
+    // null/zero.
+    bool mega_ring_ready_once = false;
+    int* __restrict__ mega_ring_source_cu_seqlens_k = nullptr;
+    int* __restrict__ mega_ring_ready_end = nullptr;
+    int* __restrict__ mega_ring_chunk_done = nullptr;
+    int* __restrict__ mega_ring_publish_lock = nullptr;
+    int* __restrict__ mega_ring_ready_interval_rows = nullptr;
+    int mega_ring_ready_intervals = 0;
+    int mega_ring_ready_max_chunks = 0;
+    int mega_ring_ready_chunk_rows = 0;
     // Communication CTAs prefetch remote K/V into these buffers while compute CTAs
     // continue reading the current K/V from k_ptr / v_ptr.
     void* __restrict__ local_k_staging_ptr = nullptr;

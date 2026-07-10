@@ -28,13 +28,26 @@ void run_mega_ring_min_fa3_varlen_ring_fwd(
     TORCH_CHECK(params.mega_ring_tiles_per_step > 0, "Mega ring varlen kernel requires mega_ring_tiles_per_step > 0. Got ", params.mega_ring_tiles_per_step);
     TORCH_CHECK(params.mega_ring_total_k_per_rank > 0, "Mega ring varlen kernel requires mega_ring_total_k_per_rank > 0. Got ", params.mega_ring_total_k_per_rank);
     TORCH_CHECK(params.mega_ring_kv_ready_counts != nullptr, "Mega ring varlen kernel requires mega_ring_kv_ready_counts storage");
-    TORCH_CHECK(params.mega_ring_step_ready != nullptr, "Mega ring varlen kernel requires mega_ring_step_ready counter storage");
-    TORCH_CHECK(params.num_comm_sm > 0 || params.ring_world_size == 1, "Mega ring varlen kernel requires num_comm_sm > 0 when ring_world_size > 1");
+    TORCH_CHECK(params.mega_ring_ready_once || params.mega_ring_step_ready != nullptr, "Mega ring varlen kernel requires mega_ring_step_ready counter storage");
+    TORCH_CHECK(!params.mega_ring_ready_once || params.mega_ring_ready_end != nullptr, "Ready-once mega ring requires ready_end storage");
+    TORCH_CHECK(!params.mega_ring_ready_once || params.mega_ring_chunk_done != nullptr, "Ready-once mega ring requires chunk_done storage");
+    TORCH_CHECK(!params.mega_ring_ready_once || params.mega_ring_publish_lock != nullptr, "Ready-once mega ring requires publish_lock storage");
+    TORCH_CHECK(!params.mega_ring_ready_once || params.mega_ring_ready_interval_rows != nullptr, "Ready-once mega ring requires ready interval row metadata");
+    TORCH_CHECK(params.num_comm_sm > 0 || params.ring_world_size == 1 || params.mega_ring_cp_total_k_per_rank == 0,
+                "Mega ring varlen kernel requires num_comm_sm > 0 when ring_world_size > 1 and at least one CP sequence is present");
 
     if (params.is_causal) {
-        mega_ring_detail::dispatch_mega_ring_world_size<true>(params, remote_k, remote_v, stream);
+        if (params.mega_ring_ready_once) {
+            mega_ring_detail::dispatch_mega_ring_world_size<true, true>(params, remote_k, remote_v, stream);
+        } else {
+            mega_ring_detail::dispatch_mega_ring_world_size<true, false>(params, remote_k, remote_v, stream);
+        }
     } else {
-        mega_ring_detail::dispatch_mega_ring_world_size<false>(params, remote_k, remote_v, stream);
+        if (params.mega_ring_ready_once) {
+            mega_ring_detail::dispatch_mega_ring_world_size<false, true>(params, remote_k, remote_v, stream);
+        } else {
+            mega_ring_detail::dispatch_mega_ring_world_size<false, false>(params, remote_k, remote_v, stream);
+        }
     }
 }
 

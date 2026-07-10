@@ -261,6 +261,7 @@ def forward_varlen_mega_ring(
     return_lse: bool = False,
     global_seqlens_host: Optional[torch.Tensor] = None,
     cp_threshold: int = 2048,
+    ready_once: bool = True,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     # MEGA_RING: explicit opt-in path. K/V are the local concatenated
     # [world_size * local_total_k, kv_heads, 128] buffers used by the fused
@@ -287,6 +288,7 @@ def forward_varlen_mega_ring(
         bool(return_lse),
         global_seqlens_host,
         int(cp_threshold),
+        bool(ready_once),
     )
 
 

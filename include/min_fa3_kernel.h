@@ -422,7 +422,16 @@ public:
                     params.mainloop.seqlens_rotary
                 };
                 if constexpr (TileScheduler::EnableMegaRing && Is_causal) {
-                    if (mega_ring_is_cp_batch && mega_ring_step > params.mainloop.mega_ring_rank) {
+                    if (params.mainloop.mega_ring_ready_once && mega_ring_is_cp_batch) {
+                        int const half_len = params.mainloop.mega_ring_half_cu_seqlens[bidb + 1] - params.mainloop.mega_ring_half_cu_seqlens[bidb];
+                        // READY_ONCE work kinds: 2 = CP front, 3 = CP back.
+                        if (mega_ring_step == 2) {
+                            mega_ring_seqlen_o = half_len;
+                        } else if (mega_ring_step == 3) {
+                            mega_ring_q_row_offset = half_len;
+                            mega_ring_seqlen_o = half_len;
+                        }
+                    } else if (mega_ring_is_cp_batch && mega_ring_step > params.mainloop.mega_ring_rank) {
                         int const half_len = params.mainloop.mega_ring_half_cu_seqlens[bidb + 1] - params.mainloop.mega_ring_half_cu_seqlens[bidb];
                         mega_ring_q_row_offset = half_len;
                         mega_ring_seqlen_o = half_len;
@@ -485,7 +494,7 @@ public:
                         // MEGA_RING: output/LSE are merged in-place. Serialize only the same Q tile across ring steps; different Q
                         // tiles still run independently. One consumer thread polls the per-tile completed-step counter; the barrier
                         // releases the rest of the epilogue threads only after the previous step is ready.
-                        if (mega_ring_is_cp_batch && mega_ring_step > 0) {
+                        if (!params.mainloop.mega_ring_ready_once && mega_ring_is_cp_batch && mega_ring_step > 0) {
                             if (threadIdx.x == MmaThreadOffset) {
                                 min_fa3_varlen_demo::mega_ring::wait_until_at_least(
                                     params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
@@ -499,7 +508,7 @@ public:
                                    mega_ring_q_row_offset, mega_ring_seqlen_o);
                     if constexpr (TileScheduler::EnableMegaRing) {
                         // MEGA_RING: publish step completion only after every epilogue thread has finished its part of the in-place O/LSE merge.
-                        if (mega_ring_is_cp_batch) {
+                        if (!params.mainloop.mega_ring_ready_once && mega_ring_is_cp_batch) {
                             flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
                             if (threadIdx.x == MmaThreadOffset) {
                                 min_fa3_varlen_demo::mega_ring::signal_release(
@@ -516,7 +525,7 @@ public:
                                 epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord, mega_ring_q_row_offset, mega_ring_seqlen_o);
                             }
                         } else {
-                            if (mega_ring_step > 0) {
+                            if (!params.mainloop.mega_ring_ready_once && mega_ring_step > 0) {
                                 if (threadIdx.x == MmaThreadOffset) {
                                     min_fa3_varlen_demo::mega_ring::wait_until_at_least(
                                         params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
@@ -536,7 +545,7 @@ public:
                             // later empty steps, keep the same step-completion
                             // ordering before releasing the next ring step.
                             flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-                            if (threadIdx.x == MmaThreadOffset) {
+                            if (!params.mainloop.mega_ring_ready_once && threadIdx.x == MmaThreadOffset) {
                                 min_fa3_varlen_demo::mega_ring::signal_release(
                                     params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
                                     1);

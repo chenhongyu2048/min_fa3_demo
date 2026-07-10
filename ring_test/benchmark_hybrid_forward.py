@@ -221,6 +221,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-iters", type=int, default=20, help="Measured iterations.")
     parser.add_argument("--seed", type=int, default=1234, help="Base RNG seed.")
     parser.add_argument("--check", dest="check", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--mega-ring-ready-once",
+        dest="mega_ring_ready_once",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the ready-once compact-prefix hybrid mega-ring path.",
+    )
     parser.add_argument("--atol", type=float, default=2e-1, help="Correctness absolute tolerance.")
     parser.add_argument("--rtol", type=float, default=2e-1, help="Correctness relative tolerance.")
     return parser.parse_args()
@@ -542,6 +549,7 @@ def mega_ring_forward(
     half_cu_seqlens_host: Optional[torch.Tensor],
     global_seqlens_host: Optional[torch.Tensor],
     cp_threshold: int,
+    ready_once: bool,
 ) -> torch.Tensor:
     """Launch legacy all-CP or hybrid fused mega-ring attention."""
     return min_fa3_op.forward_varlen_mega_ring(
@@ -563,6 +571,7 @@ def mega_ring_forward(
         num_comm_sm=num_comm_sm,
         global_seqlens_host=global_seqlens_host,
         cp_threshold=cp_threshold,
+        ready_once=ready_once,
     )
 
 
@@ -801,6 +810,7 @@ def build_all_cp_run(
             half_cu_seqlens_host,
             None,
             case.cp_threshold,
+            False,
         )
 
     return MethodRun("mega_ring_all_cp", fn, ref, "legacy all-CP mega-ring")
@@ -838,9 +848,11 @@ def build_hybrid_run(
             None,
             global_seqlens_host,
             case.cp_threshold,
+            args.mega_ring_ready_once,
         )
 
-    return MethodRun("mega_ring_hybrid", fn, ref, f"hybrid CP batches={cp_count}")
+    path_note = "ready-once" if args.mega_ring_ready_once else "step-path"
+    return MethodRun("mega_ring_hybrid", fn, ref, f"hybrid CP batches={cp_count}, {path_note}")
 
 
 def build_method_runs(

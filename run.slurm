@@ -97,19 +97,19 @@ torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
     --global-seqlens 16384,1024,1024,1024,1024,512,512,512,512 \
     --qhead 32 --kvhead 8 --headdim 128 \
     --sm-configs 128:4,124:8,116:16 --cp-threshold 2048 \
-    --mode both --warmup-iters 20 --num-iters 30 --no-check
+    --mode both --warmup-iters 20 --num-iters 30 --no-check --no-mega-ring-ready-once
 
 torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
     --global-seqlens 32768,1024,1024,1024,1024,512,512,512,512,512,512,512,512 \
     --qhead 32 --kvhead 8 --headdim 128 \
     --sm-configs 128:4,124:8,116:16 --cp-threshold 2048 \
-    --mode both --warmup-iters 20 --num-iters 30 --no-check
+    --mode both --warmup-iters 20 --num-iters 30 --no-check --no-mega-ring-ready-once
 
 torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
     --global-seqlens 65536,1024,1024,1024,1024,512,512,512,512,512,512,512,512 \
     --qhead 32 --kvhead 8 --headdim 128 \
     --sm-configs 128:4,124:8,116:16 --cp-threshold 2048 \
-    --mode both --warmup-iters 20 --num-iters 30 --no-check
+    --mode both --warmup-iters 20 --num-iters 30 --no-check --no-mega-ring-ready-once
 
 # Memory sanitizer runs:
 # compute-sanitizer --tool memcheck python test_min_fa3_varlen_ring_local.py --b 16 --seqlen 1024,4096 --qhead 32 --kvhead 8 --num-comp-sm 128 --num-comm-sm 0 --mode both > memcheck-128-0.log 2>&1
