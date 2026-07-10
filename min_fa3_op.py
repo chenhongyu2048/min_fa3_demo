@@ -1,4 +1,4 @@
-"""Python wrapper for the minimal Hopper forward-only FlashAttention demo."""
+"""Python wrapper for the minimal Hopper FlashAttention forward/backward demo."""
 
 import os
 from typing import Optional, Tuple, Union
@@ -8,6 +8,8 @@ import torch.distributed as dist
 
 from _min_fa3_op import (
     TKParallelTensor,
+    backward as _backward_cuda,
+    backward_varlen as _backward_varlen_cuda,
     parallel_remote_load_out as _parallel_remote_load_out_cuda,
     parallel_remote_load_vec_out as _parallel_remote_load_vec_out_cuda,
     forward,
@@ -17,6 +19,72 @@ from _min_fa3_op import (
     parallel_remote_load as _parallel_remote_load_cuda,
     parallel_remote_load_vec as _parallel_remote_load_vec_cuda,
 )
+
+
+def backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    is_causal: bool,
+    *,
+    deterministic: bool = False,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _backward_cuda(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        bool(is_causal),
+        deterministic=bool(deterministic),
+        dq=dq,
+        dk=dk,
+        dv=dv,
+    )
+
+
+def backward_varlen(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_causal: bool,
+    *,
+    deterministic: bool = False,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _backward_varlen_cuda(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        bool(is_causal),
+        deterministic=bool(deterministic),
+        dq=dq,
+        dk=dk,
+        dv=dv,
+    )
 
 # Resolve the local rank metadata used by the TK parallel IPC path.
 # Args:
@@ -292,6 +360,8 @@ def forward_varlen_mega_ring(
 
 __all__ = [
     "TKParallelTensor",
+    "backward",
+    "backward_varlen",
     "create_parallel_tensor",
     "forward",
     "forward_varlen",

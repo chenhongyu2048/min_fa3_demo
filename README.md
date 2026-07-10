@@ -1,12 +1,12 @@
 # min_fa3_demo
 
-This directory contains a minimal forward-only Hopper FlashAttention demo copied and trimmed from the existing `hopper/` implementation in this repository.
+This directory contains a minimal Hopper FlashAttention forward/backward demo copied and trimmed from the existing `hopper/` implementation in this repository.
 
 ## Source provenance
 
-The demo is built by copying Hopper forward sources into `hopper/min_fa3_demo/` and trimming them down to a fixed configuration.
+The demo is built by copying Hopper forward and backward sources into `hopper/min_fa3_demo/` and trimming them down to a fixed configuration.
 
-The top-level params structure is also copied from the original Hopper forward params path and trimmed, not rewritten from scratch.
+The params structures are copied from the original Hopper forward/backward params paths and trimmed, not rewritten from scratch.
 
 ## Main copied sources
 
@@ -20,6 +20,13 @@ The top-level params structure is also copied from the original Hopper forward p
 - `hopper/tile_size.h`
 - `hopper/named_barrier.hpp`
 - `hopper/instantiations/flash_fwd_hdim128_bf16_sm90.cu`
+- `hopper/flash_bwd_launch_template.h`
+- `hopper/flash_bwd_preprocess_kernel.h`
+- `hopper/flash_bwd_postprocess_kernel.h`
+- `hopper/flash_bwd_kernel_sm90.h`
+- `hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp`
+- `hopper/epilogue_bwd.hpp`
+- `hopper/instantiations/flash_bwd_hdim128_bf16_sm90.cu`
 
 ## Mapping to original Hopper code
 
@@ -38,11 +45,13 @@ The top-level params structure is also copied from the original Hopper forward p
 - `hopper/flash_fwd_launch_template.h` -> `hopper/min_fa3_demo/include/min_fa3_varlen_launch.h`
 - `hopper/flash_prepare_scheduler.cu` -> `hopper/min_fa3_demo/csrc/min_fa3_varlen_prepare_scheduler.cu`
 - `hopper/instantiations/flash_fwd_hdim128_bf16_sm90.cu` -> `hopper/min_fa3_demo/csrc/min_fa3_varlen_kernel.cu`
+- Hopper backward params and launch layers -> `hopper/min_fa3_demo/include/backward/`
+- Hopper backward instantiation and host bindings -> `hopper/min_fa3_demo/csrc/backward/`
 
 ## Fixed supported configuration
 
 - Architecture: Hopper / SM90 only
-- Direction: forward only
+- Direction: forward and backward
 - Dtype: `torch.bfloat16`
 - Head dim: `128`
 - Layout: external API is fixed to `BSHD`
@@ -55,7 +64,7 @@ The top-level params structure is also copied from the original Hopper forward p
 
 ## Varlen sibling kernel
 
-Alongside the fixed-layout BSHD kernel, this demo directory now also contains a separate copied-and-trimmed varlen forward kernel path.
+Alongside the fixed-layout BSHD kernel, this demo directory contains copied-and-trimmed varlen forward and backward paths.
 
 Varlen public API:
 
@@ -71,13 +80,13 @@ Varlen public API:
 Varlen fixed configuration:
 
 - Architecture: Hopper / SM90 only
-- Direction: forward only
+- Direction: forward and backward
 - Dtype: `torch.bfloat16`
 - Head dim: `128`
 - Layout: flattened varlen tensors with per-batch `cu_seqlens`
 - GQA/MQA: supported when `qhead % kvhead == 0`
 
-## Retained Hopper forward features
+## Retained Hopper features
 
 - SM90 WGMMA / GMMA path
 - TMA for Q, K, and V
@@ -88,7 +97,6 @@ Varlen fixed configuration:
 
 ## What was trimmed away
 
-- Backward pass
 - Paged KV
 - Append KV / KV cache growth
 - Rotary
@@ -131,6 +139,15 @@ Varlen test:
 ```bash
 python test_min_fa3_varlen.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --mode both
 python test_min_fa3_varlen.py --b 2 --seqlen 256 --qhead 16 --kvhead 8 --headdim 128 --mode causal
+```
+
+Backward tests:
+
+```bash
+python test_min_fa3_backward.py --b 2 --seqlen 128,129 --qhead 8 --kvhead 8 --headdim 128 --mode both
+python test_min_fa3_backward.py --b 2 --seqlen 128,129 --qhead 8 --kvhead 2 --headdim 128 --mode both --deterministic
+python test_min_fa3_varlen_backward.py --b 3 --seqlen 128,129 --qhead 8 --kvhead 8 --headdim 128 --mode both
+python test_min_fa3_varlen_backward.py --b 3 --seqlen 128,129 --qhead 8 --kvhead 2 --headdim 128 --mode both --deterministic
 ```
 
 Remote load test:
@@ -184,6 +201,17 @@ python benchmark_varlen.py
 python benchmark_varlen.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both
 python benchmark_varlen.py --b 4 --seqlen 256 --qhead 16 --kvhead 8 --headdim 128 --mode causal
 ```
+
+Backward benchmarks against the installed FA3 implementation:
+
+```bash
+python benchmark_backward.py --b 4 --seqlen 512,1024,2048,4096 --qhead 32 --kvhead 32 --headdim 128 --mode both
+python benchmark_backward.py --b 4 --seqlen 512,1024,2048,4096 --qhead 32 --kvhead 8 --headdim 128 --mode both --deterministic
+python benchmark_varlen_backward.py --b 4 --seqlen 512,1024,2048,4096 --qhead 32 --kvhead 32 --headdim 128 --mode both
+python benchmark_varlen_backward.py --b 4 --seqlen 512,1024,2048,4096 --qhead 32 --kvhead 8 --headdim 128 --mode both --deterministic
+```
+
+Both backward implementations receive preallocated `dq`, `dk`, and `dv`. Timing includes internal FP32 workspaces, semaphore initialization, preprocess, the main backward kernel, and postprocess, but excludes allocation of the final gradient tensors. `vs FA3` is `FA3 time / min_fa3 time`, so values above `1.0x` favor the minimal demo.
 
 Ring-local varlen benchmark:
 
@@ -240,6 +268,12 @@ Default test submission:
 sbatch run.slurm
 ```
 
+Backward correctness and FA3 performance comparison:
+
+```bash
+sbatch run_backward.slurm
+```
+
 Current `run.slurm` notes:
 
 - The checked-in script currently requests `4` GPUs and `16` CPUs on one node.
@@ -257,6 +291,18 @@ v = torch.randn(1, 128, 8, 128, device="cuda", dtype=torch.bfloat16)
 
 o = min_fa3_op.forward(q, k, v, False)
 print(o.shape)
+
+o, lse = min_fa3_op.forward(q, k, v, False, return_lse=True)
+dout = torch.randn_like(o)
+dq, dk, dv = min_fa3_op.backward(dout, q, k, v, o, lse, False)
+
+# Optional preallocated outputs are used by the steady-state benchmark.
+dq_buf = torch.empty_like(q)
+dk_buf = torch.empty_like(k)
+dv_buf = torch.empty_like(v)
+dq, dk, dv = min_fa3_op.backward(
+    dout, q, k, v, o, lse, False, dq=dq_buf, dk=dk_buf, dv=dv_buf
+)
 
 # Optional: override the automatically computed grid.x thread-block count.
 o_manual = min_fa3_op.forward(q, k, v, False, manual_block_count=132)

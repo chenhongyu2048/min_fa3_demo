@@ -49,4 +49,15 @@ enum class FwdNamedBarriers {
     PEmpty = 7,
 };
 
+enum class BwdNamedBarriers {
+    KVEmpty = 0,
+    PdS = 1,
+    dQEmptyWG1 = 2,
+    dQEmptyWG2 = 3,
+    dQEmptyWG3 = 4,
+    dQFullWG1 = 5,
+    dQFullWG2 = 6,
+    dQFullWG3 = 7,
+};
+
 }  // namespace flash

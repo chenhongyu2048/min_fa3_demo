@@ -18,6 +18,7 @@ namespace py = pybind11;
 void bind_parallel_remote_load(py::module_& m);
 void bind_varlen_ring(py::module_& m);
 void bind_varlen_mega_ring(py::module_& m);
+void bind_min_fa3_backward(py::module_& m);
 
 namespace {
 
@@ -236,12 +237,13 @@ VarlenParams make_varlen_params(const torch::Tensor& q,
     return params;
 }
 
-torch::Tensor forward(
+py::object forward(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
     bool is_causal,
-    py::object manual_block_count_obj) {
+    py::object manual_block_count_obj,
+    bool return_lse) {
     auto manual_block_count = parse_manual_block_count(manual_block_count_obj);
     check_bshd(q, "q");
     check_bshd(k, "k");
@@ -267,9 +269,12 @@ torch::Tensor forward(
     auto semaphore = is_causal ? torch::zeros({1}, q.options().dtype(torch::kInt32)) : torch::Tensor();
 
     auto params = make_bshd_params(q, k, v, out, lse, semaphore, is_causal);
-    run_min_fa3_fwd(params, at::cuda::getDefaultCUDAStream(q.get_device()), manual_block_count);
+    run_min_fa3_fwd(params, at::cuda::getCurrentCUDAStream(q.get_device()), manual_block_count);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return out;
+    if (return_lse) {
+        return py::make_tuple(out, lse);
+    }
+    return py::cast(out);
 }
 
 py::object forward_varlen(torch::Tensor q,
@@ -348,7 +353,7 @@ py::object forward_varlen(torch::Tensor q,
                                      is_causal);
     min_fa3_varlen_demo::run_min_fa3_varlen_fwd(
         params,
-        at::cuda::getDefaultCUDAStream(q.get_device()),
+        at::cuda::getCurrentCUDAStream(q.get_device()),
         manual_block_count);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     if (return_lse) {
@@ -384,7 +389,8 @@ PYBIND11_MODULE(_min_fa3_op, m) {
         py::arg("is_causal"),
         py::kw_only(),
         py::arg("manual_block_count") = py::none(),
-        "Minimal Hopper forward-only FlashAttention demo.\n\n"
+        py::arg("return_lse") = false,
+        "Minimal Hopper FlashAttention forward demo.\n\n"
         "manual_block_count is an optional grid.x thread-block count override. "
         "When omitted, the launch grid is computed automatically by get_grid_shape(...).");
     m.def(
@@ -403,7 +409,7 @@ PYBIND11_MODULE(_min_fa3_op, m) {
         py::kw_only(),
         py::arg("manual_block_count") = py::none(),
         py::arg("return_lse") = false,
-        "Minimal Hopper varlen forward-only FlashAttention demo.\n\n"
+        "Minimal Hopper varlen FlashAttention forward demo.\n\n"
         "manual_block_count is an optional grid.x thread-block count override. "
         "When omitted, the launch grid is computed automatically by get_grid_shape(...).");
     m.def(
@@ -416,6 +422,7 @@ PYBIND11_MODULE(_min_fa3_op, m) {
         py::arg("manual_block_count") = py::none(),
         "Internal CPU-side helper for testing launch-grid override resolution.");
     bind_parallel_remote_load(m);
+    bind_min_fa3_backward(m);
     bind_varlen_ring(m);
     // MEGA_RING: explicit default-off multi-step fused ring-attention entry.
     bind_varlen_mega_ring(m);
