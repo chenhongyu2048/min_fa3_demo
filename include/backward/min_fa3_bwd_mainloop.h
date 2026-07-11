@@ -417,7 +417,7 @@ struct CollectiveMainloopBwdSm90 {
         cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
     }
 
-    template <typename SchedulerPrefetch, typename SharedStorage>
+    template <bool IsPersistent, typename SchedulerPrefetch, typename SharedStorage>
     CUTLASS_DEVICE void
     load(Params const& params,
          MainloopPipeline pipeline_q,
@@ -437,6 +437,13 @@ struct CollectiveMainloopBwdSm90 {
         auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
             seqlen_info, n_block, bidb,
             params.window_size_left, params.window_size_right, 0 /*sink_token_length*/);
+        if constexpr (IsPersistent) {
+            // Every scheduled tile, including a fully masked tile, consumes one
+            // barrier phase so all warp roles stay on the same iteration.
+            cutlass::arch::NamedBarrier::sync(
+                NumMmaThreads + cutlass::NumThreadsPerWarp,
+                static_cast<uint32_t>(BwdNamedBarriers::KVEmpty));
+        }
         // It's possible to have m_block_max <= m_block_min. Loading Q, K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) {
@@ -513,9 +520,6 @@ struct CollectiveMainloopBwdSm90 {
             copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
                  gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
         }
-
-        // // Wait for the MMA warpgroups to say that smem_k and smem_v are ready
-        // cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
 
         if (lane_predicate) {
             // Copy K tile and V tile from GMEM to SMEM.
@@ -665,11 +669,15 @@ struct CollectiveMainloopBwdSm90 {
         }
     }
 
+    template <bool IsPersistent>
     CUTLASS_DEVICE void
     mma_init() {
-        // We're not currently using this bc we're not using persistent scheduler
-        // // Tell producer (warp 0) that smem_k and smem_v are ready
-        // cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
+        if constexpr (IsPersistent) {
+            // Tell the K/V load warp that shared memory is ready for the first tile.
+            cutlass::arch::NamedBarrier::arrive(
+                NumMmaThreads + cutlass::NumThreadsPerWarp,
+                static_cast<uint32_t>(BwdNamedBarriers::KVEmpty));
+        }
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         if constexpr (dQacc_use_TMA) {
             if (warp_idx_in_warpgroup == 0) {

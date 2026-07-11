@@ -206,6 +206,8 @@ py::tuple backward(
     }
     auto dq_semaphore = torch::empty(
         {(q.size(1) + block_m - 1) / block_m, q.size(0), q.size(2)}, int_options);
+    auto tile_count_semaphore = is_causal && !deterministic
+        ? torch::zeros({1}, int_options) : torch::Tensor();
     torch::Tensor dk_semaphore;
     torch::Tensor dv_semaphore;
     if (q.size(2) != k.size(2) && deterministic) {
@@ -237,6 +239,8 @@ py::tuple backward(
     params.dq_semaphore = dq_semaphore.data_ptr<int>();
     params.dk_semaphore = dk_semaphore.defined() ? dk_semaphore.data_ptr<int>() : nullptr;
     params.dv_semaphore = dv_semaphore.defined() ? dv_semaphore.data_ptr<int>() : nullptr;
+    params.tile_count_semaphore = tile_count_semaphore.defined()
+        ? tile_count_semaphore.data_ptr<int>() : nullptr;
 
     min_fa3_backward::run_min_fa3_bwd(
         params, at::cuda::getCurrentCUDAStream(q.get_device()).stream());
@@ -315,6 +319,8 @@ py::tuple backward_varlen(
     }
     auto dq_semaphore = torch::empty(
         {(max_seqlen_q + block_m - 1) / block_m, batch_size, q.size(1)}, int_options);
+    auto tile_count_semaphore = is_causal && !deterministic
+        ? torch::zeros({1}, int_options) : torch::Tensor();
     torch::Tensor dk_semaphore;
     torch::Tensor dv_semaphore;
     if (q.size(1) != k.size(1) && deterministic) {
@@ -340,6 +346,8 @@ py::tuple backward_varlen(
     params.dq_semaphore = dq_semaphore.data_ptr<int>();
     params.dk_semaphore = dk_semaphore.defined() ? dk_semaphore.data_ptr<int>() : nullptr;
     params.dv_semaphore = dv_semaphore.defined() ? dv_semaphore.data_ptr<int>() : nullptr;
+    params.tile_count_semaphore = tile_count_semaphore.defined()
+        ? tile_count_semaphore.data_ptr<int>() : nullptr;
 
     min_fa3_backward::run_min_fa3_bwd(
         params, at::cuda::getCurrentCUDAStream(q.get_device()).stream());

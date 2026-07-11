@@ -90,8 +90,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     >;
     using Scheduler = std::conditional_t<
         Is_causal,
-        flash::SingleTileBwdLPTScheduler<Varlen, kBlockN, Is_causal && Deterministic /*SPT*/>,
-        flash::SingleTileBwdScheduler<Varlen, kBlockN>
+        flash::SingleTileBwdLPTScheduler<Varlen, kBlockN, Is_causal && Deterministic /*SPT*/, !Deterministic /*Persistent*/, CollectiveMainloop::NumMmaThreads>,
+        flash::SingleTileBwdScheduler<Varlen, kBlockN, !Deterministic /*Persistent*/>
     >;
     using AttnKernel = flash::enable_sm90<
         flash::FlashAttnBwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
@@ -172,7 +172,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.h / params.h_k,
         params.seqlen_k,
         params.seqlen_q, params.d, params.dv, sizeof(Element),
-        params.cu_seqlens_k, params.seqused_k
+        params.cu_seqlens_k, params.seqused_k,
+        params.tile_count_semaphore
     };
 
     int device;

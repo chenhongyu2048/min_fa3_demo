@@ -223,8 +223,9 @@ public:
                     auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
                         scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                     };
-                    mainloop.load(params.mainloop, pipeline_q, pipeline_do, smem_pipe_write,
-                                  smem_pipe_write_do, shared_storage, scheduler_prefetch, block_coord);
+                    mainloop.template load<TileScheduler::IsPersistent>(
+                        params.mainloop, pipeline_q, pipeline_do, smem_pipe_write,
+                        smem_pipe_write_do, shared_storage, scheduler_prefetch, block_coord);
                 }
                 mainloop.load_tail(pipeline_q, pipeline_do, smem_pipe_write, smem_pipe_write_do);
             } else if (warp_idx_in_warpgroup == 1) {
@@ -245,7 +246,7 @@ public:
             PipelineState smem_pipe_read;
             PipelineState_dO smem_pipe_read_do;
 
-            mainloop.mma_init();
+            mainloop.template mma_init<TileScheduler::IsPersistent>();
             scheduler.init_consumer();
 
             int work_idx = 0;
@@ -268,6 +269,14 @@ public:
                                    threadIdx.x - NumCopyThreads, block_coord);
                 } else {
                     epilogue.store_zero(params.epilogue, threadIdx.x - NumCopyThreads, block_coord);
+                }
+                if constexpr (TileScheduler::IsPersistent) {
+                    // Release K/V shared memory only after the epilogue has
+                    // finished all reads for this logical tile.
+                    cutlass::arch::fence_view_async_shared();
+                    cutlass::arch::NamedBarrier::arrive(
+                        NumMmaThreads + cutlass::NumThreadsPerWarp,
+                        static_cast<uint32_t>(BwdNamedBarriers::KVEmpty));
                 }
 
             }

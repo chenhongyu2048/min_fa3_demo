@@ -90,6 +90,7 @@ struct Flash_bwd_params : public Flash_fwd_params {
     int* __restrict__ dq_semaphore;
     int* __restrict__ dk_semaphore;
     int* __restrict__ dv_semaphore;
+    int* __restrict__ tile_count_semaphore;
 
     bool deterministic;
 };
