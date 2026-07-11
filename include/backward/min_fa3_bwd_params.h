@@ -7,6 +7,10 @@
 #include <cuda.h>
 #include <cstdint>
 
+namespace kittens::py {
+struct TKParallelTensor;
+}
+
 namespace min_fa3_backward {
 
 struct Qkv_params {
@@ -92,9 +96,34 @@ struct Flash_bwd_params : public Flash_fwd_params {
     int* __restrict__ dv_semaphore;
     int* __restrict__ tile_count_semaphore;
 
+    // MEGA_RING_BWD: explicit causal-zigzag persistent launch metadata.
+    int ring_rank;
+    int ring_world_size;
+    int num_comp_sm;
+    int num_comm_sm;
+    int local_total_k;
+    int64_t dkv_step_stride;
+    int* __restrict__ half_cu_seqlens;
+    int* __restrict__ ring_local_ready;
+    int* __restrict__ ring_expected_ready;
+    int* __restrict__ ring_kv_ready;
+    int* __restrict__ ring_kv_expected_ready;
+    int* __restrict__ ring_dkv_comm_done;
+    int* __restrict__ ring_completion;
+    float* __restrict__ remote_dk_accum[8];
+    float* __restrict__ remote_dv_accum[8];
+    int* __restrict__ remote_dkv_completion[8];
+
     bool deterministic;
 };
 
 void run_min_fa3_bwd(Flash_bwd_params& params, cudaStream_t stream);
+void run_min_fa3_bwd_mega_ring(
+    Flash_bwd_params& params,
+    kittens::py::TKParallelTensor& remote_k,
+    kittens::py::TKParallelTensor& remote_v,
+    kittens::py::TKParallelTensor& remote_dk_accum,
+    kittens::py::TKParallelTensor& remote_dv_accum,
+    cudaStream_t stream);
 
 }  // namespace min_fa3_backward

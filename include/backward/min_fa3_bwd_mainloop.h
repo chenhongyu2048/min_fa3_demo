@@ -21,6 +21,7 @@
 #include "hopper_compat/softmax.h"
 #include "hopper_compat/utils.h"
 #include "backward/min_fa3_bwd_copy_sm90_bulk_reduce.h"
+#include "mega_ring_semaphore.cuh"
 
 namespace flash {
 
@@ -30,7 +31,7 @@ template <int Stages, int Stages_dO, int Stages_dS, class ClusterShape_, class T
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool Deterministic,
         bool SdP_swapAB_, bool dKV_swapAB_, bool dQ_swapAB_,
         int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-        bool Mma_dP_is_RS=false>
+        bool Mma_dP_is_RS=false, bool MegaRing=false>
 struct CollectiveMainloopBwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -59,7 +60,25 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
-    using SeqlenInfo_t = flash::SeqlenInfoQK<Varlen, kBlockM>;
+    struct SeqlenInfo_t {
+        int offset_q, offset_k, offset_q_padded;
+        int seqlen_q, seqlen_k;
+
+        CUTLASS_DEVICE
+        SeqlenInfo_t(int bidb, int seqlen_q_static, int seqlen_k_static,
+                     int const* cu_seqlens_q, int const* cu_seqlens_k,
+                     int const* seqused_q, int const* seqused_k)
+            : offset_q(!Varlen || cu_seqlens_q == nullptr ? 0 : cu_seqlens_q[bidb])
+            , offset_k(!Varlen || cu_seqlens_k == nullptr ? 0 : cu_seqlens_k[bidb])
+            , offset_q_padded(!Varlen || cu_seqlens_q == nullptr ? 0 :
+                (cu_seqlens_q[bidb] + bidb * kBlockM) / kBlockM * kBlockM)
+            , seqlen_q(!Varlen ? seqlen_q_static :
+                (seqused_q ? seqused_q[bidb] :
+                 (cu_seqlens_q ? cu_seqlens_q[bidb + 1] - cu_seqlens_q[bidb] : seqlen_q_static)))
+            , seqlen_k(!Varlen ? seqlen_k_static :
+                (seqused_k ? seqused_k[bidb] :
+                 (cu_seqlens_k ? cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb] : seqlen_k_static))) {}
+    };
     using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local>;
 
     static_assert(ArchTag::kMinComputeCapability >= 90);
@@ -319,6 +338,13 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        // MEGA_RING_BWD: full concatenated KV storage and zigzag metadata.
+        int const ring_rank = 0;
+        int const ring_world_size = 1;
+        int const local_total_k = 0;
+        int const* const half_cu_seqlens = nullptr;
+        int const* const kv_ready_counts = nullptr;
+        int const* const kv_expected_ready = nullptr;
     };
 
     // Device side kernel params
@@ -349,6 +375,12 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        int const ring_rank;
+        int const ring_world_size;
+        int const local_total_k;
+        int const* const half_cu_seqlens;
+        int const* const kv_ready_counts;
+        int const* const kv_expected_ready;
     };
 
     static Params
@@ -405,7 +437,57 @@ struct CollectiveMainloopBwdSm90 {
                 args.window_size_left, args.window_size_right, attention_chunk_divmod,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
+                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
+                args.ring_rank, args.ring_world_size, args.local_total_k,
+                args.half_cu_seqlens, args.kv_ready_counts, args.kv_expected_ready};
+    }
+
+    CUTLASS_DEVICE
+    static int ring_kv_rank(Params const& params, int ring_step) {
+        int rank = params.ring_rank - ring_step;
+        return rank < 0 ? rank + params.ring_world_size : rank;
+    }
+
+    CUTLASS_DEVICE
+    static SeqlenInfo_t get_seqlen_info(Params const& params, int bidb, int ring_step) {
+        SeqlenInfo_t info{
+            bidb, get<0>(params.shape_Q), params.local_total_k > 0 ? params.local_total_k : size<0>(params.shape_K),
+            params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k};
+        if constexpr (MegaRing) {
+            info.offset_k += ring_kv_rank(params, ring_step) * params.local_total_k;
+            if (ring_step > 0 && ring_step <= params.ring_rank) {
+                info.seqlen_k = params.half_cu_seqlens
+                    ? params.half_cu_seqlens[bidb + 1] - params.half_cu_seqlens[bidb]
+                    : info.seqlen_k / 2;
+            } else if (ring_step > params.ring_rank) {
+                int const half_q = params.half_cu_seqlens
+                    ? params.half_cu_seqlens[bidb + 1] - params.half_cu_seqlens[bidb]
+                    : info.seqlen_q / 2;
+                // Match the reference backward(q1, ...): the back half is a
+                // standalone local Q sequence whose first m-block is zero.
+                info.offset_q += half_q;
+                info.offset_q_padded += half_q;
+                info.seqlen_q = half_q;
+            }
+        }
+        return info;
+    }
+
+    CUTLASS_DEVICE
+    static cute::tuple<int, int> get_m_block_min_max(
+            Params const& params, SeqlenInfo_t const& info,
+            int n_block, int bidb, int ring_step) {
+        constexpr int kBlockMValue = decltype(get<0>(TileShape_MNK{}))::value;
+        if constexpr (!MegaRing) {
+            return BlockMN_t::get_m_block_min_max(
+                info, n_block, bidb, params.window_size_left, params.window_size_right, 0);
+        } else {
+            if (ring_step == 0) {
+                return BlockMN_t::get_m_block_min_max(
+                    info, n_block, bidb, params.window_size_left, params.window_size_right, 0);
+            }
+            return {0, cute::ceil_div(info.seqlen_q, kBlockMValue)};
+        }
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -426,17 +508,22 @@ struct CollectiveMainloopBwdSm90 {
          PipelineState_dO& smem_pipe_write_do,
          SharedStorage &shared_storage,
          SchedulerPrefetch const& scheduler_prefetch,
-         cute::tuple<int32_t, int32_t, int32_t> block_coord
+         cute::tuple<int32_t, int32_t, int32_t> block_coord,
+         int ring_step = 0
          ) {
 
         auto [n_block, bidh, bidb] = block_coord;
-        SeqlenInfo_t seqlen_info{
-            bidb, get<0>(params.shape_Q), size<0>(params.shape_K),
-            params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k
-        };
-        auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
-            seqlen_info, n_block, bidb,
-            params.window_size_left, params.window_size_right, 0 /*sink_token_length*/);
+        if constexpr (MegaRing) {
+            if (cute::elect_one_sync()) {
+                min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
+                    params.kv_ready_counts + ring_step,
+                    params.kv_expected_ready[ring_step]);
+            }
+            __syncwarp();
+        }
+        SeqlenInfo_t seqlen_info = get_seqlen_info(params, bidb, ring_step);
+        auto [m_block_min, m_block_max] = get_m_block_min_max(
+            params, seqlen_info, n_block, bidb, ring_step);
         if constexpr (IsPersistent) {
             // Every scheduled tile, including a fully masked tile, consumes one
             // barrier phase so all warp roles stay on the same iteration.
@@ -597,18 +684,15 @@ struct CollectiveMainloopBwdSm90 {
     CUTLASS_DEVICE void
     store_dq(Params const& params,
              SharedStorage &shared_storage,
-             cute::tuple<int32_t, int32_t, int32_t> block_coord
+             cute::tuple<int32_t, int32_t, int32_t> block_coord,
+             int ring_step = 0
              ) {
         if constexpr (!dQacc_use_TMA) { return; }
 
         auto [n_block, bidh, bidb] = block_coord;
-        SeqlenInfo_t seqlen_info{
-            bidb, get<0>(params.shape_Q), size<0>(params.shape_K),
-            params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k
-        };
-        auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
-            seqlen_info, n_block, bidb, params.window_size_left,
-            params.window_size_right, 0 /*sink_token_length*/);
+        SeqlenInfo_t seqlen_info = get_seqlen_info(params, bidb, ring_step);
+        auto [m_block_min, m_block_max] = get_m_block_min_max(
+            params, seqlen_info, n_block, bidb, ring_step);
         // It's possible to have m_block_max <= m_block_min. Exit early
         // Though if local and deterministic, still need to increment dq semaphore
         if constexpr ((Is_causal || Is_local || Varlen) && !(Is_local && Deterministic)) {
@@ -698,19 +782,16 @@ struct CollectiveMainloopBwdSm90 {
         int thread_idx,
         int &work_idx,
         cute::tuple<int32_t, int32_t, int32_t> block_coord,
-        SharedStorage& shared_storage
+        SharedStorage& shared_storage,
+        int ring_step = 0
         ) {
         static_assert(is_rmem<FrgTensordKV>::value, "dK and dV tensor must be rmem resident.");
 
         int n_block = get<0>(block_coord);
         int bidb = get<2>(block_coord);
-        SeqlenInfo_t seqlen_info{
-            bidb, get<0>(params.shape_Q), size<0>(params.shape_K),
-            params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k
-        };
-        auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
-            seqlen_info, n_block, bidb, params.window_size_left,
-            params.window_size_right, 0 /*sink_token_length*/);
+        SeqlenInfo_t seqlen_info = get_seqlen_info(params, bidb, ring_step);
+        auto [m_block_min, m_block_max] = get_m_block_min_max(
+            params, seqlen_info, n_block, bidb, ring_step);
         // It's possible to have m_block_max <= m_block_min. Exit early
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return false; }
@@ -1010,7 +1091,17 @@ struct CollectiveMainloopBwdSm90 {
         // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
         // this helps quite a bit to not have to do causal masking for most of the iterations.
         if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {
-            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+            auto mask_fn = [&](auto& tSrS, int m_block) {
+                if constexpr (MegaRing) {
+                    if (ring_step == 0) {
+                        mask.template apply<true, Is_causal, Is_local>(tSrS, m_block, n_block);
+                    } else {
+                        mask.template apply<true, false, false>(tSrS, m_block, n_block);
+                    }
+                } else {
+                    mask.template apply<true, Is_causal, Is_local>(tSrS, m_block, n_block);
+                }
+            };
             static constexpr int kBlockM = get<0>(TileShape_MNK{});
             int const m_block_masking_max = ((n_block + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1;
             CUTLASS_PRAGMA_NO_UNROLL
@@ -1025,7 +1116,17 @@ struct CollectiveMainloopBwdSm90 {
             ? m_block_max
             : std::min(m_block_max, (n_block * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
 
-        auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
+        auto mask_fn = [&](auto& tSrS, int m_block) {
+            if constexpr (MegaRing) {
+                if (ring_step == 0) {
+                    mask.template apply<true, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block);
+                } else {
+                    mask.template apply<true, false, false>(tSrS, m_block, n_block);
+                }
+            } else {
+                mask.template apply<true, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block);
+            }
+        };
         CUTLASS_PRAGMA_NO_UNROLL
         for (; m_block < m_block_max_before_local_mask; ++m_block) {
             bwd_step(m_block, mask_fn);

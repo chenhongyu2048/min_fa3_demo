@@ -22,6 +22,11 @@ struct TileSchedulerArguments {
     int const* const cu_seqlens = nullptr;
     int const* const seqused = nullptr;
     int* const tile_count_semaphore = nullptr;
+    // MEGA_RING_BWD: optional multi-step causal-zigzag scheduling metadata.
+    int const ring_world_size = 1;
+    int const ring_rank = 0;
+    int const num_comp_sm = 0;
+    int const* const half_cu_seqlens = nullptr;
 };
 
 template <bool Varlen, int kBlock = 128, bool Persistent = false>
@@ -60,6 +65,7 @@ public:
         int bidh = 0;
         int bidb = 0;
         int tile_idx = 0;
+        int ring_step = 0;
 
         CUTLASS_DEVICE bool is_valid(Params const&) const { return bidb >= 0; }
 
@@ -85,10 +91,10 @@ public:
                         : params.seqlen);
                 is_valid_tile = block_idx * kBlock < seqlen;
             }
-            if (is_valid_tile) { return {block_idx, bidh, bidb, tile_idx}; }
+            if (is_valid_tile) { return {block_idx, bidh, bidb, tile_idx, 0}; }
             tile_idx += int(gridDim.x);
         }
-        return {0, 0, -1, tile_idx};
+        return {0, 0, -1, tile_idx, 0};
     }
 
     template <bool IsProducerWarp = false>
@@ -96,7 +102,7 @@ public:
         if constexpr (Persistent) {
             return get_work(params, int(blockIdx.x));
         } else {
-            WorkTileInfo work_info{int(blockIdx.x), int(blockIdx.y), int(blockIdx.z), 0};
+            WorkTileInfo work_info{int(blockIdx.x), int(blockIdx.y), int(blockIdx.z), 0, 0};
             if constexpr (Varlen) {
                 int seqlen = params.seqused
                     ? params.seqused[work_info.bidb]
@@ -117,7 +123,7 @@ public:
         if constexpr (Persistent) {
             return get_work(params, current_work.tile_idx + int(gridDim.x));
         } else {
-            return {0, 0, -1, 0};
+            return {0, 0, -1, 0, 0};
         }
     }
 };
@@ -180,6 +186,7 @@ public:
         int bidh;
         int bidb;
         int tile_idx;
+        int ring_step = 0;
 
         CUTLASS_DEVICE bool is_valid(Params const&) const { return bidb >= 0; }
 
@@ -193,7 +200,7 @@ public:
         : tile_idx_smem(smem_scheduler) {}
 
     CUTLASS_DEVICE WorkTileInfo decode_work(Params const& params, int tile_idx) const {
-        if (tile_idx >= params.total_blocks) { return {0, 0, -1, tile_idx}; }
+        if (tile_idx >= params.total_blocks) { return {0, 0, -1, tile_idx, 0}; }
         int l2_mod, bidhb_residual;
         int bidhb = params.l2_major_divmod.divmod(l2_mod, tile_idx);
         int block = bidhb < params.num_hb_quotient
@@ -216,7 +223,7 @@ public:
             num_blocks = params.block_divmod.divisor;
         }
         if constexpr (SPT) { block = num_blocks - block - 1; }
-        return {block, bidh, is_valid_tile ? bidb : -1, tile_idx};
+        return {block, bidh, is_valid_tile ? bidb : -1, tile_idx, 0};
     }
 
     CUTLASS_DEVICE WorkTileInfo get_static_work(Params const& params, int tile_idx) const {
@@ -276,7 +283,7 @@ public:
     template <bool IsProducerWarp = false>
     CUTLASS_DEVICE WorkTileInfo get_next_work(Params const& params, WorkTileInfo const& current_work) const {
         if constexpr (!Persistent) {
-            return {0, 0, -1, 0};
+            return {0, 0, -1, 0, 0};
         } else if constexpr (IsProducerWarp) {
             int tile_idx = __shfl_sync(0xffffffff, current_work.tile_idx, 0);
             flash::named_barrier_sync(
@@ -291,6 +298,146 @@ public:
             flash::named_barrier_sync(
                 NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);
             int tile_idx = *tile_idx_smem;
+            flash::named_barrier_arrive(
+                NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);
+            return decode_work(params, tile_idx);
+        }
+    }
+};
+
+// MEGA_RING_BWD: causal zigzag scheduler layered on the copied backward LPT
+// scheduler. The base scheduler remains responsible for the original
+// n-block/head/batch order; this class only expands it across ring steps and
+// filters the front-half KV steps.
+template <bool Varlen, int kBlock,
+          int NumMmaThreads = 2 * cutlass::NumThreadsPerWarpGroup>
+class MegaRingSingleTileBwdLPTScheduler {
+    using Base = SingleTileBwdLPTScheduler<Varlen, kBlock, false, true, NumMmaThreads>;
+
+public:
+    static constexpr bool IsPersistent = true;
+    static constexpr bool EnableMegaRing = true;
+    static constexpr int NumSchedulerThreads =
+        NumMmaThreads + 2 * cutlass::NumThreadsPerWarp;
+    using SharedStorage = int;
+    SharedStorage* const tile_idx_smem;
+
+    struct Params {
+        typename Base::Params base;
+        int total_blocks;
+        int ring_world_size;
+        int ring_rank;
+        int num_comp_sm;
+        int const* half_cu_seqlens;
+    };
+
+    struct WorkTileInfo {
+        int block;
+        int bidh;
+        int bidb;
+        int tile_idx;
+        int ring_step;
+
+        CUTLASS_DEVICE bool is_valid(Params const&) const { return bidb >= 0; }
+
+        CUTLASS_DEVICE cute::tuple<int32_t, int32_t, int32_t, int32_t>
+        get_block_coord(Params const&) const {
+            return {block, bidh, bidb, 0};
+        }
+    };
+
+    static Params to_underlying_arguments(TileSchedulerArguments const& args) {
+        assert(args.ring_world_size >= 1);
+        assert(args.num_comp_sm >= 1);
+        auto base = Base::to_underlying_arguments(args);
+        return {base, base.total_blocks * args.ring_world_size,
+                args.ring_world_size, args.ring_rank, args.num_comp_sm,
+                args.half_cu_seqlens};
+    }
+
+    static dim3 get_grid_shape(Params const& params, int) {
+        return {uint32_t(cutlass::fast_min(params.total_blocks, params.num_comp_sm))};
+    }
+
+    CUTLASS_DEVICE MegaRingSingleTileBwdLPTScheduler(SharedStorage* smem_scheduler)
+        : tile_idx_smem(smem_scheduler) {}
+
+    CUTLASS_DEVICE WorkTileInfo decode_work(Params const& params, int tile_idx) const {
+        if (tile_idx >= params.total_blocks) { return {0, 0, -1, tile_idx, params.ring_world_size}; }
+        int const tiles_per_step = params.base.total_blocks;
+        int const ring_step = tile_idx / tiles_per_step;
+        int const step_tile_idx = tile_idx - ring_step * tiles_per_step;
+        Base base_scheduler(nullptr);
+        auto base_work = base_scheduler.decode_work(params.base, step_tile_idx);
+        if (!base_work.is_valid(params.base)) {
+            return {0, 0, -1, tile_idx, ring_step};
+        }
+        // For steps 1..rank, zigzag consumes only the front half of KV.
+        if (ring_step > 0 && ring_step <= params.ring_rank) {
+            int half_len = params.half_cu_seqlens
+                ? params.half_cu_seqlens[base_work.bidb + 1] - params.half_cu_seqlens[base_work.bidb]
+                : 0;
+            if (base_work.block * kBlock >= half_len) {
+                return {0, 0, -1, tile_idx, ring_step};
+            }
+        }
+        return {base_work.block, base_work.bidh, base_work.bidb, tile_idx, ring_step};
+    }
+
+    CUTLASS_DEVICE int claim_dynamic_tile(Params const& params, int tile_idx) const {
+        WorkTileInfo work = decode_work(params, tile_idx);
+        while (tile_idx < params.total_blocks && !work.is_valid(params)) {
+            tile_idx = atomicAdd(params.base.tile_count_semaphore, 1) + params.num_comp_sm;
+            work = decode_work(params, tile_idx);
+        }
+        return tile_idx;
+    }
+
+    template <bool IsProducerWarp = false>
+    CUTLASS_DEVICE WorkTileInfo get_initial_work(Params const& params) const {
+        if constexpr (IsProducerWarp) {
+            int tile_idx = int(blockIdx.x);
+            if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+                tile_idx = claim_dynamic_tile(params, tile_idx);
+            }
+            tile_idx = __shfl_sync(0xffffffff, tile_idx, 0);
+            if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) { *tile_idx_smem = tile_idx; }
+            flash::named_barrier_arrive(
+                NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);
+            return decode_work(params, tile_idx);
+        } else {
+            flash::named_barrier_sync(
+                NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);
+            int const tile_idx = *tile_idx_smem;
+            flash::named_barrier_arrive(
+                NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);
+            return decode_work(params, tile_idx);
+        }
+    }
+
+    CUTLASS_DEVICE void init_consumer() const {}
+
+    CUTLASS_DEVICE void prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {
+        if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+            int tile_idx = atomicAdd(params.base.tile_count_semaphore, 1) + params.num_comp_sm;
+            current_work.tile_idx = claim_dynamic_tile(params, tile_idx);
+        }
+    }
+
+    template <bool IsProducerWarp = false>
+    CUTLASS_DEVICE WorkTileInfo get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+        if constexpr (IsProducerWarp) {
+            int const tile_idx = __shfl_sync(0xffffffff, current_work.tile_idx, 0);
+            flash::named_barrier_sync(
+                NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);
+            if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) { *tile_idx_smem = tile_idx; }
+            flash::named_barrier_arrive(
+                NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);
+            return decode_work(params, tile_idx);
+        } else {
+            flash::named_barrier_sync(
+                NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);
+            int const tile_idx = *tile_idx_smem;
             flash::named_barrier_arrive(
                 NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);
             return decode_work(params, tile_idx);

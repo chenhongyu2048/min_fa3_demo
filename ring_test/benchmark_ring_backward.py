@@ -1,0 +1,762 @@
+"""Torchrun benchmark for causal mega-ring varlen backward.
+
+The script compares a complete Python/NCCL zigzag ring built from the local
+min_fa3 varlen backward with the fused mega-ring backward kernel. Forward
+preparation, allocations, and fused remote-workspace resets are outside the
+CUDA-event timing interval.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+import torch
+import torch.distributed as dist
+
+THIS_DIR = Path(__file__).resolve().parent
+DEMO_DIR = THIS_DIR.parent
+if str(DEMO_DIR) not in sys.path:
+    sys.path.insert(0, str(DEMO_DIR))
+
+import min_fa3_op
+
+from ring_common import RingComm, raise_if_any_rank_failed
+
+
+METHOD_ORDER = ["min_varlen_python_ring", "min_varlen_mega_ring"]
+
+
+@dataclass(frozen=True)
+class Case:
+    batch_size: int
+    seqlen: int
+    q_heads: int
+    kv_heads: int
+    head_dim: int
+
+
+@dataclass(frozen=True)
+class SmConfig:
+    num_comp_sm: int
+    num_comm_sm: int
+
+
+@dataclass
+class MethodRun:
+    name: str
+    prepare_fn: Callable[[], None]
+    timing_fn: Callable[[], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    note: str = ""
+
+
+@dataclass
+class TimingResult:
+    max_time_ms: float
+    rank_times_ms: list[float] | None
+
+
+@dataclass
+class Result:
+    time_ms: float | None
+    aggregate_tflops: float | None
+    avg_gpu_tflops: float | None
+    check: str
+    note: str = ""
+    rank_times_ms: list[float] | None = None
+
+
+def parse_seqlen_spec(spec: str) -> list[int]:
+    values = [int(token.strip()) for token in spec.split(",") if token.strip()]
+    if not values:
+        raise SystemExit("--seqlen must provide at least one case")
+    return values
+
+
+def parse_methods(spec: str) -> list[str]:
+    methods: list[str] = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token == "all":
+            methods.extend(METHOD_ORDER)
+        elif token in METHOD_ORDER:
+            methods.append(token)
+        else:
+            raise SystemExit(f"unknown method '{token}', expected one of {METHOD_ORDER} or all")
+    deduped: list[str] = []
+    for method in methods:
+        if method not in deduped:
+            deduped.append(method)
+    if not deduped:
+        raise SystemExit("--methods must provide at least one method")
+    return deduped
+
+
+def parse_sm_config_spec(spec: str) -> list[SmConfig]:
+    configs: list[SmConfig] = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        parts = token.split(":")
+        if len(parts) != 2:
+            raise SystemExit(f"invalid SM config '{token}', expected num_comp_sm:num_comm_sm")
+        try:
+            configs.append(SmConfig(int(parts[0]), int(parts[1])))
+        except ValueError as exc:
+            raise SystemExit(f"invalid SM config '{token}', expected two integers") from exc
+    if not configs:
+        raise SystemExit("--sm-configs must provide at least one configuration")
+    return configs
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Distributed causal mega-ring varlen backward benchmark")
+    parser.add_argument("--b", type=int, default=1, help="Batch size per rank")
+    parser.add_argument(
+        "--seqlen", "--seqlens", dest="seqlen", type=str, default="256,512,1024",
+        help="Comma-separated local sequence lengths",
+    )
+    parser.add_argument("--qhead", type=int, default=32)
+    parser.add_argument("--kvhead", type=int, default=8)
+    parser.add_argument("--headdim", type=int, default=128)
+    parser.add_argument("--methods", type=str, default="all")
+    parser.add_argument("--num-comp-sm", type=int, default=64)
+    parser.add_argument("--num-comm-sm", type=int, default=8)
+    parser.add_argument(
+        "--sm-configs",
+        type=str,
+        default=None,
+        help="Comma-separated compute:communication SM pairs; overrides the individual SM arguments",
+    )
+    parser.add_argument("--warmup-iters", type=int, default=5)
+    parser.add_argument("--num-iters", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--atol", type=float, default=0.3)
+    parser.add_argument("--rtol", type=float, default=0.3)
+    return parser.parse_args()
+
+
+def init_distributed() -> tuple[int, int]:
+    if "LOCAL_RANK" not in os.environ or "LOCAL_WORLD_SIZE" not in os.environ:
+        raise SystemExit("Run with torchrun so LOCAL_RANK and LOCAL_WORLD_SIZE are set")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
+    if dist.get_world_size() != local_world_size:
+        raise SystemExit(
+            "This benchmark is single-node only because TKParallelTensor uses local IPC: "
+            f"world_size={dist.get_world_size()}, local_world_size={local_world_size}"
+        )
+    return local_rank, local_world_size
+
+
+def cuda_barrier() -> None:
+    dist.barrier(device_ids=[torch.cuda.current_device()])
+
+
+def make_cu_seqlens(case: Case, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    host = torch.arange(
+        0,
+        (case.batch_size + 1) * case.seqlen,
+        case.seqlen,
+        dtype=torch.int32,
+    )
+    return host.to(device=device), host
+
+
+def make_inputs(
+    case: Case,
+    local_rank: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(seed + local_rank * 1009 + case.seqlen)
+    total_tokens = case.batch_size * case.seqlen
+
+    def randn(shape: tuple[int, ...]) -> torch.Tensor:
+        return (
+            torch.randn(shape, device="cuda", dtype=torch.float32, generator=generator) * 0.25
+        ).to(torch.bfloat16).contiguous()
+
+    q = randn((total_tokens, case.q_heads, case.head_dim))
+    k = randn((total_tokens, case.kv_heads, case.head_dim))
+    v = randn((total_tokens, case.kv_heads, case.head_dim))
+    dout = randn((total_tokens, case.q_heads, case.head_dim))
+    return q, k, v, dout
+
+
+def pack_half(tensor: torch.Tensor, case: Case, *, front: bool) -> torch.Tensor:
+    half = case.seqlen // 2
+    pieces = []
+    for batch_idx in range(case.batch_size):
+        start = batch_idx * case.seqlen
+        middle = start + half
+        end = start + case.seqlen
+        pieces.append(tensor[start:middle] if front else tensor[middle:end])
+    return torch.cat(pieces, dim=0).contiguous()
+
+
+def pack_half_lse(lse: torch.Tensor, case: Case, *, front: bool) -> torch.Tensor:
+    half = case.seqlen // 2
+    pieces = []
+    for batch_idx in range(case.batch_size):
+        start = batch_idx * case.seqlen
+        middle = start + half
+        end = start + case.seqlen
+        pieces.append(lse[:, start:middle] if front else lse[:, middle:end])
+    return torch.cat(pieces, dim=1).contiguous()
+
+
+def add_packed_half(
+    destination: torch.Tensor,
+    packed: torch.Tensor,
+    case: Case,
+    *,
+    front: bool,
+) -> None:
+    half = case.seqlen // 2
+    packed_offset = 0
+    for batch_idx in range(case.batch_size):
+        start = batch_idx * case.seqlen
+        middle = start + half
+        end = start + case.seqlen
+        dst_start, dst_end = (start, middle) if front else (middle, end)
+        destination[dst_start:dst_end] += packed[packed_offset : packed_offset + half]
+        packed_offset += half
+
+
+class PythonRingBackward:
+    """Complete zigzag ring backward using min_fa3 block kernels and NCCL P2P."""
+
+    def __init__(
+        self,
+        case: Case,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dout: torch.Tensor,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> None:
+        self.case = case
+        self.q = q
+        self.k = k
+        self.v = v
+        self.dout = dout
+        self.out = out
+        self.lse = lse
+        self.cu = cu_seqlens
+        self.half_cu = cu_seqlens // 2
+        self.half_seqlen = case.seqlen // 2
+        self.half_tokens = case.batch_size * self.half_seqlen
+
+        self.q_back = pack_half(q, case, front=False)
+        self.dout_back = pack_half(dout, case, front=False)
+        self.out_back = pack_half(out, case, front=False)
+        self.lse_back = pack_half_lse(lse, case, front=False)
+
+        self.dq_scratch = torch.empty_like(q)
+        self.dk_scratch = torch.empty_like(k)
+        self.dv_scratch = torch.empty_like(v)
+        self.dq_accum = torch.empty_like(q, dtype=torch.float32)
+        self.k_ring = [torch.empty_like(k), torch.empty_like(k)]
+        self.v_ring = [torch.empty_like(v), torch.empty_like(v)]
+        self.dk_ring = [torch.empty_like(k, dtype=torch.float32) for _ in range(2)]
+        self.dv_ring = [torch.empty_like(v, dtype=torch.float32) for _ in range(2)]
+
+    def block_backward(
+        self,
+        dout: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        *,
+        causal: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        half_q = q.size(0) == self.half_tokens
+        half_k = k.size(0) == self.half_tokens
+        return min_fa3_op.backward_varlen(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            self.half_cu if half_q else self.cu,
+            self.half_cu if half_k else self.cu,
+            self.half_seqlen if half_q else self.case.seqlen,
+            self.half_seqlen if half_k else self.case.seqlen,
+            causal,
+            deterministic=False,
+            dq=self.dq_scratch[: q.size(0)],
+            dk=self.dk_scratch[: k.size(0)],
+            dv=self.dv_scratch[: v.size(0)],
+        )
+
+    def __call__(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        kv_comm = RingComm(dist.group.WORLD)
+        dkv_comm = RingComm(dist.group.WORLD)
+        cur_k, cur_v = self.k, self.v
+        cur_dk, cur_dv = self.dk_ring[0], self.dv_ring[0]
+        next_dk = next_dv = None
+
+        for step in range(kv_comm.world_size):
+            if step + 1 < kv_comm.world_size:
+                buffer_idx = step % 2
+                next_k, next_v = kv_comm.send_recv_kv(
+                    cur_k,
+                    cur_v,
+                    self.k_ring[buffer_idx],
+                    self.v_ring[buffer_idx],
+                )
+            else:
+                next_k = next_v = None
+
+            if step == 0:
+                dq_block, dk_block, dv_block = self.block_backward(
+                    self.dout,
+                    self.q,
+                    cur_k,
+                    cur_v,
+                    self.out,
+                    self.lse,
+                    causal=True,
+                )
+                self.dq_accum.copy_(dq_block)
+                cur_dk.copy_(dk_block)
+                cur_dv.copy_(dv_block)
+            else:
+                if step <= kv_comm.rank:
+                    k_front = pack_half(cur_k, self.case, front=True)
+                    v_front = pack_half(cur_v, self.case, front=True)
+                    dq_block, dk_block, dv_block = self.block_backward(
+                        self.dout,
+                        self.q,
+                        k_front,
+                        v_front,
+                        self.out,
+                        self.lse,
+                        causal=False,
+                    )
+                    self.dq_accum += dq_block
+                else:
+                    dq_block, dk_block, dv_block = self.block_backward(
+                        self.dout_back,
+                        self.q_back,
+                        cur_k,
+                        cur_v,
+                        self.out_back,
+                        self.lse_back,
+                        causal=False,
+                    )
+                    add_packed_half(self.dq_accum, dq_block, self.case, front=False)
+
+                dkv_comm.wait()
+                if next_dk is None or next_dv is None:
+                    raise RuntimeError("dKV ring did not produce a receive buffer")
+                cur_dk, cur_dv = next_dk, next_dv
+                if step <= kv_comm.rank:
+                    add_packed_half(cur_dk, dk_block, self.case, front=True)
+                    add_packed_half(cur_dv, dv_block, self.case, front=True)
+                else:
+                    cur_dk += dk_block
+                    cur_dv += dv_block
+
+            if step + 1 < kv_comm.world_size:
+                kv_comm.wait()
+                if next_k is None or next_v is None:
+                    raise RuntimeError("KV ring did not produce a receive buffer")
+                cur_k, cur_v = next_k, next_v
+
+            recv_idx = (step + 1) % 2
+            next_dk, next_dv = dkv_comm.send_recv_kv(
+                cur_dk,
+                cur_dv,
+                self.dk_ring[recv_idx],
+                self.dv_ring[recv_idx],
+            )
+
+        dkv_comm.wait()
+        if next_dk is None or next_dv is None:
+            raise RuntimeError("dKV ring did not return the owner gradients")
+        return self.dq_accum.to(self.q.dtype), next_dk.to(self.k.dtype), next_dv.to(self.v.dtype)
+
+
+def make_mega_parallel_tensors(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    local_rank: int,
+    local_world_size: int,
+) -> tuple[min_fa3_op.TKParallelTensor, min_fa3_op.TKParallelTensor]:
+    full_shape = [local_world_size * k.size(0), k.size(1), k.size(2)]
+    remote_k = min_fa3_op.TKParallelTensor(full_shape, torch.bfloat16, local_rank, local_world_size, False)
+    remote_v = min_fa3_op.TKParallelTensor(full_shape, torch.bfloat16, local_rank, local_world_size, False)
+    remote_k.data_.zero_()
+    remote_v.data_.zero_()
+    start = local_rank * k.size(0)
+    remote_k.data_[start : start + k.size(0)].copy_(k)
+    remote_v.data_[start : start + v.size(0)].copy_(v)
+    return remote_k, remote_v
+
+
+def build_method_runs(
+    case: Case,
+    local_rank: int,
+    local_world_size: int,
+    sm_config: SmConfig,
+    seed: int,
+) -> dict[str, MethodRun]:
+    q, local_k, local_v, dout = make_inputs(case, local_rank, seed)
+    cu, cu_host = make_cu_seqlens(case, q.device)
+    half_cu, half_cu_host = make_cu_seqlens(
+        Case(case.batch_size, case.seqlen // 2, case.q_heads, case.kv_heads, case.head_dim),
+        q.device,
+    )
+    remote_k, remote_v = make_mega_parallel_tensors(local_k, local_v, local_rank, local_world_size)
+    torch.cuda.synchronize()
+    cuda_barrier()
+
+    out, lse = min_fa3_op.forward_varlen_mega_ring(
+        q,
+        remote_k.data_,
+        remote_v.data_,
+        cu,
+        cu,
+        case.seqlen,
+        case.seqlen,
+        True,
+        cu_seqlens_q_host=cu_host,
+        cu_seqlens_k_host=cu_host,
+        half_cu_seqlens=half_cu,
+        half_cu_seqlens_host=half_cu_host,
+        remote_k=remote_k,
+        remote_v=remote_v,
+        num_comp_sm=sm_config.num_comp_sm,
+        num_comm_sm=sm_config.num_comm_sm,
+        return_lse=True,
+    )
+    torch.cuda.synchronize()
+    cuda_barrier()
+
+    python_ring = PythonRingBackward(case, q, local_k, local_v, dout, out, lse, cu)
+    total_tokens = case.batch_size * case.seqlen
+    total_k_padded = ((total_tokens + case.batch_size * 128 + 127) // 128) * 128
+    accum_numel = case.kv_heads * total_k_padded * case.head_dim
+    remote_dk = min_fa3_op.TKParallelTensor(
+        [accum_numel], torch.float32, local_rank, local_world_size, False
+    )
+    remote_dv = min_fa3_op.TKParallelTensor(
+        [accum_numel], torch.float32, local_rank, local_world_size, False
+    )
+    remote_completion = min_fa3_op.TKParallelTensor(
+        [1], torch.int32, local_rank, local_world_size, False
+    )
+
+    def prepare_mega() -> None:
+        remote_dk.data_.zero_()
+        remote_dv.data_.zero_()
+        remote_completion.data_.zero_()
+
+    def run_mega() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return min_fa3_op.backward_varlen_mega_ring(
+            dout,
+            q,
+            remote_k.data_,
+            remote_v.data_,
+            out,
+            lse,
+            cu,
+            cu,
+            case.seqlen,
+            case.seqlen,
+            cu_seqlens_q_host=cu_host,
+            cu_seqlens_k_host=cu_host,
+            half_cu_seqlens=half_cu,
+            half_cu_seqlens_host=half_cu_host,
+            remote_k=remote_k,
+            remote_v=remote_v,
+            remote_dk_accum=remote_dk,
+            remote_dv_accum=remote_dv,
+            remote_dkv_completion=remote_completion,
+            num_comp_sm=sm_config.num_comp_sm,
+            num_comm_sm=sm_config.num_comm_sm,
+        )
+
+    return {
+        "min_varlen_python_ring": MethodRun(
+            "min_varlen_python_ring",
+            lambda: None,
+            python_ring,
+            "min_fa3 block kernels + NCCL P2P",
+        ),
+        "min_varlen_mega_ring": MethodRun(
+            "min_varlen_mega_ring",
+            prepare_mega,
+            run_mega,
+            "fused; remote workspace reset excluded",
+        ),
+    }
+
+
+def prepare_method(run: MethodRun) -> None:
+    run.prepare_fn()
+    torch.cuda.synchronize()
+    cuda_barrier()
+
+
+def measure_distributed_ms(
+    run: MethodRun,
+    warmup_iters: int,
+    num_iters: int,
+) -> TimingResult:
+    for _ in range(warmup_iters):
+        prepare_method(run)
+        run.timing_fn()
+    torch.cuda.synchronize()
+    cuda_barrier()
+
+    local_samples: list[float] = []
+    max_samples: list[float] = []
+    for _ in range(num_iters):
+        prepare_method(run)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        run.timing_fn()
+        end.record()
+        end.synchronize()
+        elapsed_ms = start.elapsed_time(end)
+
+        max_elapsed = torch.tensor([elapsed_ms], device="cuda", dtype=torch.float64)
+        dist.all_reduce(max_elapsed, op=dist.ReduceOp.MAX)
+        local_samples.append(elapsed_ms)
+        max_samples.append(max_elapsed.item())
+    cuda_barrier()
+
+    local_avg = sum(local_samples) / len(local_samples)
+    max_avg = sum(max_samples) / len(max_samples)
+    local_avg_tensor = torch.tensor([local_avg], device="cuda", dtype=torch.float64)
+    gathered = [torch.empty_like(local_avg_tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, local_avg_tensor)
+    rank_times = [value.item() for value in gathered] if dist.get_rank() == 0 else None
+    return TimingResult(max_avg, rank_times)
+
+
+def aggregate_backward_tflops(case: Case, world_size: int, time_ms: float) -> float:
+    global_seqlen = world_size * case.seqlen
+    flops = (
+        5.0
+        * case.batch_size
+        * global_seqlen
+        * global_seqlen
+        * case.q_heads
+        * case.head_dim
+    )
+    return flops / (time_ms * 1.0e-3) / 1.0e12
+
+
+def check_gradients(
+    method: str,
+    run: MethodRun,
+    reference: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    atol: float,
+    rtol: float,
+) -> str:
+    local_error = None
+    try:
+        prepare_method(run)
+        actual = run.timing_fn()
+        torch.cuda.synchronize()
+        for name, actual_grad, reference_grad in zip(("dQ", "dK", "dV"), actual, reference):
+            torch.testing.assert_close(
+                actual_grad.float(), reference_grad.float(), atol=atol, rtol=rtol
+            )
+    except Exception as exc:
+        local_error = f"{method}: {exc}"
+    raise_if_any_rank_failed(local_error, dist.group.WORLD)
+    return "ok"
+
+
+def run_case(
+    case: Case,
+    methods: list[str],
+    local_rank: int,
+    local_world_size: int,
+    sm_config: SmConfig,
+    args: argparse.Namespace,
+) -> dict[str, Result]:
+    runs = build_method_runs(case, local_rank, local_world_size, sm_config, args.seed)
+    reference = None
+    if args.check:
+        reference_run = runs["min_varlen_python_ring"]
+        prepare_method(reference_run)
+        reference = reference_run.timing_fn()
+        torch.cuda.synchronize()
+        cuda_barrier()
+
+    results: dict[str, Result] = {}
+    for method in methods:
+        run = runs[method]
+        try:
+            timing = measure_distributed_ms(run, args.warmup_iters, args.num_iters)
+            aggregate_tflops = aggregate_backward_tflops(case, local_world_size, timing.max_time_ms)
+            check = "skip"
+            if args.check and method == "min_varlen_python_ring":
+                check = "reference"
+            elif args.check and reference is not None:
+                check = check_gradients(method, run, reference, args.atol, args.rtol)
+            results[method] = Result(
+                timing.max_time_ms,
+                aggregate_tflops,
+                aggregate_tflops / local_world_size,
+                check,
+                run.note,
+                timing.rank_times_ms,
+            )
+        except torch.OutOfMemoryError as exc:
+            torch.cuda.empty_cache()
+            results[method] = Result(None, None, None, "oom", str(exc).splitlines()[0])
+        except Exception as exc:
+            results[method] = Result(None, None, None, "error", str(exc))
+        cuda_barrier()
+    return results
+
+
+def print_results(case: Case, methods: list[str], results: dict[str, Result]) -> None:
+    baseline = results.get("min_varlen_python_ring")
+    print(
+        f"\nB={case.batch_size}, local_S={case.seqlen}, QH={case.q_heads}, "
+        f"KVH={case.kv_heads}, D={case.head_dim}, mode=causal"
+    )
+    rows: list[tuple[str, str, str, str, str, str, str]] = []
+    for method in methods:
+        result = results[method]
+        if result.time_ms is None:
+            time_s = "N/A"
+        elif result.rank_times_ms is None:
+            time_s = f"max_across_ranks={result.time_ms:.3f}"
+        else:
+            rank_s = ", ".join(
+                f"t{rank}={time_ms:.3f}" for rank, time_ms in enumerate(result.rank_times_ms)
+            )
+            time_s = f"{rank_s} | max_across_ranks={result.time_ms:.3f}"
+        aggregate_s = "N/A" if result.aggregate_tflops is None else f"{result.aggregate_tflops:.1f}"
+        per_gpu_s = "N/A" if result.avg_gpu_tflops is None else f"{result.avg_gpu_tflops:.1f}"
+        if result.time_ms is None or baseline is None or baseline.time_ms is None:
+            speedup_s = "N/A"
+        else:
+            speedup_s = f"{baseline.time_ms / result.time_ms:.3f}x"
+        rows.append((method, time_s, aggregate_s, per_gpu_s, speedup_s, result.check, result.note))
+
+    time_width = max((64, *(len(row[1]) for row in rows)))
+    print(
+        f"{'Method':<25} {'Time ms':<{time_width}} {'Agg TFLOPS':>11} "
+        f"{'Avg/GPU':>9} {'vs Python':>10} {'Check':>10}  Note"
+    )
+    for method, time_s, aggregate_s, per_gpu_s, speedup_s, check, note in rows:
+        print(
+            f"{method:<25} {time_s:<{time_width}} {aggregate_s:>11} "
+            f"{per_gpu_s:>9} {speedup_s:>10} {check:>10}  {note}"
+        )
+
+
+def validate_args(
+    args: argparse.Namespace,
+    seqlens: list[int],
+    sm_configs: list[SmConfig],
+    local_world_size: int,
+) -> None:
+    if args.b <= 0:
+        raise SystemExit(f"--b must be positive, got {args.b}")
+    invalid = [seqlen for seqlen in seqlens if seqlen <= 0 or seqlen % 256 != 0]
+    if invalid:
+        raise SystemExit(
+            "causal mega-ring backward requires positive local sequence lengths divisible by 256; "
+            f"invalid lengths: {invalid}"
+        )
+    if args.headdim != 128:
+        raise SystemExit(f"This benchmark requires D=128, got {args.headdim}")
+    if args.qhead % args.kvhead != 0:
+        raise SystemExit("qhead must be divisible by kvhead")
+    if args.kvhead * args.headdim != 1024:
+        raise SystemExit("mega-ring communication requires kvhead * headdim == 1024")
+    if not 1 <= local_world_size <= 8:
+        raise SystemExit(f"mega-ring backward requires world_size in [1, 8], got {local_world_size}")
+    if args.warmup_iters < 0 or args.num_iters <= 0:
+        raise SystemExit("--warmup-iters must be non-negative and --num-iters must be positive")
+    sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    for config in sm_configs:
+        if config.num_comp_sm <= 0 or config.num_comm_sm <= 0:
+            raise SystemExit("mega-ring backward requires positive compute and communication SM counts")
+        if config.num_comp_sm + config.num_comm_sm > sm_count:
+            raise SystemExit(
+                f"SM config {config.num_comp_sm}:{config.num_comm_sm} exceeds device SM count {sm_count}"
+            )
+
+
+def main() -> None:
+    args = parse_args()
+    methods = parse_methods(args.methods)
+    seqlens = parse_seqlen_spec(args.seqlen)
+    sm_configs = (
+        parse_sm_config_spec(args.sm_configs)
+        if args.sm_configs is not None
+        else [SmConfig(args.num_comp_sm, args.num_comm_sm)]
+    )
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is required")
+
+    local_rank, local_world_size = init_distributed()
+    try:
+        if torch.cuda.get_device_capability() != (9, 0):
+            raise SystemExit(f"This benchmark requires SM90, got {torch.cuda.get_device_capability()}")
+        validate_args(args, seqlens, sm_configs, local_world_size)
+        if local_rank == 0:
+            configs = ",".join(f"{cfg.num_comp_sm}:{cfg.num_comm_sm}" for cfg in sm_configs)
+            print(
+                f"Config: world_size={local_world_size}, methods={methods}, B={args.b}, "
+                f"seqlen={args.seqlen}, QH={args.qhead}, KVH={args.kvhead}, D={args.headdim}, "
+                f"sm_configs={configs}, warmup={args.warmup_iters}, iters={args.num_iters}, "
+                f"check={args.check}"
+            )
+            print("Timing excludes forward preparation, allocations, and fused remote-workspace reset.")
+            print("Agg TFLOPS uses 10 FLOPs per visible score for causal backward.")
+
+        for sm_config in sm_configs:
+            if local_rank == 0:
+                print(
+                    f"\nSM config: num_comp_sm={sm_config.num_comp_sm}, "
+                    f"num_comm_sm={sm_config.num_comm_sm}",
+                    flush=True,
+                )
+            for seqlen in seqlens:
+                case = Case(args.b, seqlen, args.qhead, args.kvhead, args.headdim)
+                if local_rank == 0:
+                    print(f"\nRunning local_S={seqlen}, causal=True", flush=True)
+                results = run_case(
+                    case, methods, local_rank, local_world_size, sm_config, args
+                )
+                if local_rank == 0:
+                    print_results(case, methods, results)
+                cuda_barrier()
+                torch.cuda.empty_cache()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

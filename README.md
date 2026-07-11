@@ -172,6 +172,8 @@ Mega-ring varlen tests:
 python mega_ring_test_min_fa3_varlen_ring_local.py --b 1 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 1 --num-comm-sm 1 --mode both
 python mega_ring_test_min_fa3_varlen_hybrid_local.py --seqlens 1152,4096,1408 --qhead 16 --kvhead 8 --headdim 128 --num-comp-sm 1 --num-comm-sm 0 --mode both
 torchrun --standalone --nproc_per_node=2 mega_ring_test_min_fa3_varlen_ring_multi_rank.py --b 1 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 1 --num-comm-sm 1 --mode both
+torchrun --standalone --nproc_per_node=1 mega_ring_test_min_fa3_varlen_backward_multi_rank.py --b 1 --seqlen 256,512 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 64 --num-comm-sm 8
+torchrun --standalone --nproc_per_node=2 mega_ring_test_min_fa3_varlen_backward_multi_rank.py --b 1 --seqlen 256,512 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 64 --num-comm-sm 8
 ```
 
 Mega-ring causal note:
@@ -179,6 +181,8 @@ Mega-ring causal note:
 - Causal mega-ring uses the zigzag `[front half | back half]` sequence layout.
 - The causal path requires `--seqlen` to be divisible by `256` so each half remains `128`-aligned.
 - If this constraint is not met, the causal mega-ring test/benchmark case is skipped or marked unavailable.
+- Mega-ring backward is currently causal and non-deterministic only. Its VMM-backed FP32 dK/dV accumulators and owner completion counter must be zeroed on every rank and globally synchronized before calling `backward_varlen_mega_ring`.
+- Mega-ring backward communication uses row-granular TMA pipelines for remote K/V load/store and FP32 dK/dV load/remote reduce-add. K/V rows contain `KVH * D = 1024` bf16 values; dKV communication rows are contiguous groups of 1024 floats in the existing padded accumulator layout.
 
 Parameterized test examples:
 
@@ -235,6 +239,7 @@ Distributed ring benchmark:
 ```bash
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py --b 16 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both --methods all --num-comp-sm 128 --num-comm-sm 4 --check
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py --b 16 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both --methods all --num-comp-sm 116 --num-comm-sm 16 --no-check
+torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_backward.py --b 4 --seqlen 256,512,1024 --qhead 32 --kvhead 8 --headdim 128 --methods all --num-comp-sm 64 --num-comm-sm 8 --check
 ```
 
 Distributed ring benchmark notes:

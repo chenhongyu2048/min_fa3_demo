@@ -11,6 +11,7 @@
 
 #include "hopper_compat/seqlen.h"
 #include "min_fa3_named_barrier.h"
+#include "mega_ring_semaphore.cuh"
 #include "hopper_compat/utils.h"
 
 namespace flash {
@@ -114,6 +115,8 @@ struct CollectiveEpilogueBwd {
         int* dv_semaphore;
         int const* cu_seqlens;
         int const* seqused;
+        int64_t ring_step_stride = 0;
+        int* ring_local_ready = nullptr;
     };
 
     // Device side kernel params
@@ -168,7 +171,8 @@ struct CollectiveEpilogueBwd {
           SharedStorage& shared_storage,
           TiledMma tiled_mma,
           int thread_idx,
-          cute::tuple<int32_t, int32_t, int32_t> const& block_coord
+          cute::tuple<int32_t, int32_t, int32_t> const& block_coord,
+          int ring_step = 0
           ) {
 
         auto [n_block, bidh, bidb] = block_coord;
@@ -279,7 +283,8 @@ struct CollectiveEpilogueBwd {
     store_zero(
          Params const& params,
          int thread_idx,
-         cute::tuple<int32_t, int32_t, int32_t> const& block_coord
+         cute::tuple<int32_t, int32_t, int32_t> const& block_coord,
+         int ring_step = 0
          ) {
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
         auto [n_block, bidh, bidb] = block_coord;
@@ -375,6 +380,8 @@ struct CollectiveEpilogueBwdGQA {
         int* dv_semaphore;
         int const* cu_seqlens;
         int const* seqused;
+        int64_t ring_step_stride = 0;
+        int* ring_local_ready = nullptr;
     };
 
     // Device side kernel params
@@ -391,6 +398,8 @@ struct CollectiveEpilogueBwdGQA {
         int const num_batch;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        int64_t ring_step_stride;
+        int* ring_local_ready;
     };
 
     static Params
@@ -402,7 +411,8 @@ struct CollectiveEpilogueBwdGQA {
         return {args.ptr_dKaccum, args.shape_dKaccum, args.stride_dKaccum, args.ptr_dVaccum, args.shape_dVaccum, args.stride_dVaccum,
                 cutlass::FastDivmod(cute::ceil_div(args.num_heads_q, get<1>(args.shape_dKaccum))),
                 args.dk_semaphore, args.dv_semaphore,
-                args.num_batch, args.cu_seqlens, args.seqused};
+                args.num_batch, args.cu_seqlens, args.seqused,
+                args.ring_step_stride, args.ring_local_ready};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -418,7 +428,8 @@ struct CollectiveEpilogueBwdGQA {
           SharedStorage& shared_storage,
           TiledMma tiled_mma,
           int thread_idx,
-          cute::tuple<int32_t, int32_t, int32_t> const& block_coord
+          cute::tuple<int32_t, int32_t, int32_t> const& block_coord,
+          int ring_step = 0
           ) {
 
         auto [n_block, bidh, bidb] = block_coord;
@@ -430,8 +441,10 @@ struct CollectiveEpilogueBwdGQA {
 
         flash::SeqlenInfo<Varlen, kBlockN> seqlen_info{bidb, size<0>(params.shape_dKaccum), params.cu_seqlens, params.seqused};
         bool const is_varlen = Varlen && params.cu_seqlens;
-        Tensor mdKaccum = make_tensor(make_gmem_ptr(params.ptr_dKaccum), params.shape_dKaccum, params.stride_dKaccum)(_, bidh_kv, !is_varlen ? bidb : 0);
-        Tensor mdVaccum = make_tensor(make_gmem_ptr(params.ptr_dVaccum), params.shape_dVaccum, params.stride_dVaccum)(_, bidh_kv, !is_varlen ? bidb : 0);
+        ElementAccum* ptr_dKaccum = params.ptr_dKaccum + int64_t(ring_step) * params.ring_step_stride;
+        ElementAccum* ptr_dVaccum = params.ptr_dVaccum + int64_t(ring_step) * params.ring_step_stride;
+        Tensor mdKaccum = make_tensor(make_gmem_ptr(ptr_dKaccum), params.shape_dKaccum, params.stride_dKaccum)(_, bidh_kv, !is_varlen ? bidb : 0);
+        Tensor mdVaccum = make_tensor(make_gmem_ptr(ptr_dVaccum), params.shape_dVaccum, params.stride_dVaccum)(_, bidh_kv, !is_varlen ? bidb : 0);
         Tensor gdKaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdKaccum), Shape<Int<kBlockN * kHeadDim>>{}, make_coord(n_block));  // (M * K)
         Tensor gdVaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdVaccum), Shape<Int<kBlockN * kHeadDim>>{}, make_coord(n_block));  // (M * K)
 
@@ -481,7 +494,6 @@ struct CollectiveEpilogueBwdGQA {
         if constexpr (Deterministic) {
             Barrier::arrive_inc(lock_ptr, thread_idx, n_block * num_batch * num_head_kv);
         }
-
         if constexpr (Use_TMA) {
             cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
             Tensor taccdKVrdK = r2s_thr_copy_dKVaccum.retile_S(tdKrdK); // ((Atom,AtomNum), MMA_M, MMA_N)
@@ -512,6 +524,10 @@ struct CollectiveEpilogueBwdGQA {
         if constexpr (Deterministic) {
             Barrier::arrive_inc(lock_ptr, thread_idx, n_block * num_batch * num_head_kv);
         }
+        if (params.ring_local_ready != nullptr && thread_idx == 0) {
+            min_fa3_varlen_demo::mega_ring::signal_release(
+                params.ring_local_ready + ring_step, 1);
+        }
         // // Tell warp 0 that smem_k and smem_v are ready
         // flash::named_barrier_arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
     }
@@ -525,9 +541,14 @@ struct CollectiveEpilogueBwdGQA {
     store_zero(
          Params const& params,
          int thread_idx,
-         cute::tuple<int32_t, int32_t, int32_t> const& block_coord
+         cute::tuple<int32_t, int32_t, int32_t> const& block_coord,
+         int ring_step = 0
          ) {
         // Don't need to do anything since dKaccum and dVaccum are already zero-initialized
+        if (params.ring_local_ready != nullptr && thread_idx == 0) {
+            min_fa3_varlen_demo::mega_ring::signal_release(
+                params.ring_local_ready + ring_step, 1);
+        }
     }
 
 };

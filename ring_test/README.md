@@ -61,6 +61,35 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
   --warmup-iters 1 --num-iters 3
 ```
 
+## Mega-ring backward benchmark
+
+`benchmark_ring_backward.py` benchmarks the causal varlen backward paths:
+
+- `min_varlen_python_ring` is a complete zigzag ring baseline using local
+  min_fa3 varlen backward block kernels plus NCCL K/V and FP32 dK/dV P2P.
+- `min_varlen_mega_ring` is the fused persistent compute/communication kernel.
+
+The fused backward communication CTAs use TMA for remote K/V load, local K/V
+store, local FP32 dK/dV load, and remote FP32 reduce-add. Row tasks are spread
+across all communication CTAs instead of assigning one CTA to an entire ring
+step.
+
+Forward preparation, tensor allocation, and the fused path's required remote
+dK/dV accumulator and completion-counter reset are outside the CUDA-event
+timing interval. Correctness checks compare fused dQ/dK/dV against the Python
+ring baseline and are enabled by default.
+
+```bash
+torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_backward.py \
+  --b 4 --seqlen 256,512,1024 --qhead 32 --kvhead 8 --headdim 128 \
+  --methods all --sm-configs 64:8,70:8 \
+  --warmup-iters 5 --num-iters 20 --check
+```
+
+Use `--no-check` for timing-only sweeps. Local sequence lengths must be
+divisible by 256, and the current fused backward requires causal mode,
+`D=128`, `qhead % kvhead == 0`, and `kvhead * D == 1024`.
+
 ## Hybrid mega-ring benchmark
 
 `benchmark_hybrid_forward.py` compares the same global batch under three

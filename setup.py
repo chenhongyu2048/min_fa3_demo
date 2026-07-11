@@ -93,7 +93,7 @@ ext_modules = [
             "csrc/min_fa3_varlen_prepare_scheduler.cu",
             "csrc/min_fa3_varlen_launch.cu",
             "csrc/min_fa3_varlen_kernel.cu",
-            "csrc/backward/min_fa3_bwd_bindings.cpp",
+            "csrc/backward/min_fa3_bwd_bindings.cu",
             "csrc/backward/min_fa3_bwd_launch.cu",
             "csrc/backward/min_fa3_bwd_kernel.cu",
             "csrc/min_fa3_varlen_ring_launch.cu",
