@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <vector>
 
@@ -419,6 +420,8 @@ py::tuple backward_varlen_mega_ring(
     TORCH_CHECK(out.sizes() == q.sizes() && dout.sizes() == q.sizes(),
                 "out and dout must have the same shape as q");
     TORCH_CHECK(q.size(1) % k.size(1) == 0, "qhead must be divisible by kvhead");
+    TORCH_CHECK(q.size(1) <= 65535,
+                "mega-ring backward packed dKV contributor state supports at most 65535 Q heads");
     TORCH_CHECK(k.size(1) == v.size(1) && k.size(2) == v.size(2), "k/v shapes must match");
     TORCH_CHECK(k.size(1) * k.size(2) == 1024,
                 "mega-ring backward currently requires kvhead * head_dim == 1024");
@@ -462,19 +465,18 @@ py::tuple backward_varlen_mega_ring(
     TORCH_CHECK(k.size(0) == int64_t(world_size) * local_total_k && v.size(0) == k.size(0),
                 "k/v must use [world_size * local_total_k, KVH, D] mega-ring storage");
     TORCH_CHECK(q_host[batch_size] == q.size(0), "cu_seqlens_q_host[-1] must equal q.size(0)");
-    std::vector<int> expected(world_size, 0);
     std::vector<int> kv_expected(world_size, 0);
+    std::vector<int> dkv_tiles_expected(world_size, 0);
     for (int b = 0; b < batch_size; ++b) {
         int const q_len = q_host[b + 1] - q_host[b];
         int const k_len = k_host[b + 1] - k_host[b];
         int const half_len = half_host[b + 1] - half_host[b];
         TORCH_CHECK(q_len == k_len && q_len == 2 * half_len && half_len > 0 && half_len % 128 == 0,
                     "causal mega-ring backward requires q_len == k_len == 2 * half_len and 128-aligned halves");
-        int const full_work = (k_len + 127) / 128 * q.size(1);
-        int const half_work = (half_len + 127) / 128 * q.size(1);
         for (int step = 0; step < world_size; ++step) {
-            expected[step] += step > 0 && step <= rank ? half_work : full_work;
             kv_expected[step] += step == 0 ? 0 : 2 * (step <= rank ? half_len : k_len);
+            int const rows_this_step = step > 0 && step <= rank ? half_len : k_len;
+            dkv_tiles_expected[step] += (rows_this_step + 127) / 128 * k.size(1);
         }
     }
 
@@ -501,15 +503,29 @@ py::tuple backward_varlen_mega_ring(
     auto dq_semaphore = torch::empty(
         {(max_seqlen_q + block_m - 1) / block_m, batch_size, q.size(1)}, int_options);
     auto tile_count = torch::zeros({1}, int_options);
-    auto local_ready = torch::zeros({world_size}, int_options);
     auto kv_ready = torch::zeros({world_size}, int_options);
     auto kv_expected_ready = torch::empty({world_size}, int_options);
-    auto dkv_comm_done = torch::zeros({world_size}, int_options);
-    auto expected_ready = torch::empty({world_size}, int_options);
-    auto expected_host = torch::from_blob(expected.data(), {world_size}, torch::TensorOptions().dtype(torch::kInt32)).clone();
     auto kv_expected_host = torch::from_blob(kv_expected.data(), {world_size}, torch::TensorOptions().dtype(torch::kInt32)).clone();
-    expected_ready.copy_(expected_host, false);
     kv_expected_ready.copy_(kv_expected_host, false);
+    int const max_k_blocks = (max_seqlen_k + block_n - 1) / block_n;
+    int64_t const dkv_total_tiles_i64 = std::accumulate(
+        dkv_tiles_expected.begin(), dkv_tiles_expected.end(), int64_t{0});
+    TORCH_CHECK(dkv_total_tiles_i64 <= std::numeric_limits<int>::max(),
+                "mega-ring backward dKV task workspace exceeds int32 indexing");
+    int const dkv_total_tiles = static_cast<int>(dkv_total_tiles_i64);
+    auto dkv_tiles_expected_host = torch::from_blob(
+        dkv_tiles_expected.data(), {world_size},
+        torch::TensorOptions().dtype(torch::kInt32)).clone();
+    auto dkv_tiles_expected_device = torch::empty({world_size}, int_options);
+    dkv_tiles_expected_device.copy_(dkv_tiles_expected_host, false);
+    auto dkv_tile_state = torch::zeros(
+        {world_size, batch_size, max_k_blocks, k.size(1)}, int_options);
+    auto dkv_task_queue = torch::empty({dkv_total_tiles, 4}, int_options);
+    auto dkv_task_ready = torch::zeros({dkv_total_tiles}, int_options);
+    auto dkv_task_reserve = torch::zeros({1}, int_options);
+    auto dkv_task_claim = torch::zeros({1}, int_options);
+    auto dkv_producers_done = torch::zeros({1}, int_options);
+    auto dkv_tiles_done = torch::zeros({world_size}, int_options);
 
     Flash_bwd_params params{};
     fill_common_params(params, dout, q, k, v, out, softmax_lse, dq, dk, dv,
@@ -533,12 +549,19 @@ py::tuple backward_varlen_mega_ring(
     params.local_total_k = local_total_k;
     params.dkv_step_stride = step_stride;
     params.half_cu_seqlens = half_cu_seqlens.data_ptr<int>();
-    params.ring_local_ready = local_ready.data_ptr<int>();
-    params.ring_expected_ready = expected_ready.data_ptr<int>();
     params.ring_kv_ready = kv_ready.data_ptr<int>();
     params.ring_kv_expected_ready = kv_expected_ready.data_ptr<int>();
-    params.ring_dkv_comm_done = dkv_comm_done.data_ptr<int>();
     params.ring_completion = remote_dkv_completion.data_.data_ptr<int>();
+    params.ring_dkv_tile_state = reinterpret_cast<uint32_t*>(dkv_tile_state.data_ptr<int>());
+    params.ring_dkv_task_queue = dkv_task_queue.data_ptr<int>();
+    params.ring_dkv_task_ready = dkv_task_ready.data_ptr<int>();
+    params.ring_dkv_task_reserve = dkv_task_reserve.data_ptr<int>();
+    params.ring_dkv_task_claim = dkv_task_claim.data_ptr<int>();
+    params.ring_dkv_producers_done = dkv_producers_done.data_ptr<int>();
+    params.ring_dkv_tiles_done = dkv_tiles_done.data_ptr<int>();
+    params.ring_dkv_tiles_expected = dkv_tiles_expected_device.data_ptr<int>();
+    params.ring_dkv_max_blocks = max_k_blocks;
+    params.ring_dkv_total_tiles = dkv_total_tiles;
     for (int i = 0; i < world_size; ++i) {
         params.remote_dk_accum[i] = static_cast<float*>(remote_dk_accum.raw_ptrs_[i]);
         params.remote_dv_accum[i] = static_cast<float*>(remote_dv_accum.raw_ptrs_[i]);

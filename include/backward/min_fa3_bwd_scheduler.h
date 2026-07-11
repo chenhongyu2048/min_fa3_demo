@@ -76,6 +76,7 @@ public:
     };
 
     CUTLASS_DEVICE SingleTileBwdScheduler(SharedStorage*) {}
+    CUTLASS_DEVICE void set_post_comm(bool) {}
 
     CUTLASS_DEVICE WorkTileInfo get_work(Params const& params, int tile_idx) const {
         while (tile_idx < params.total_blocks) {
@@ -198,6 +199,7 @@ public:
 
     CUTLASS_DEVICE SingleTileBwdLPTScheduler(SharedStorage* smem_scheduler)
         : tile_idx_smem(smem_scheduler) {}
+    CUTLASS_DEVICE void set_post_comm(bool) {}
 
     CUTLASS_DEVICE WorkTileInfo decode_work(Params const& params, int tile_idx) const {
         if (tile_idx >= params.total_blocks) { return {0, 0, -1, tile_idx, 0}; }
@@ -321,6 +323,7 @@ public:
         NumMmaThreads + 2 * cutlass::NumThreadsPerWarp;
     using SharedStorage = int;
     SharedStorage* const tile_idx_smem;
+    bool post_comm = false;
 
     struct Params {
         typename Base::Params base;
@@ -362,6 +365,8 @@ public:
     CUTLASS_DEVICE MegaRingSingleTileBwdLPTScheduler(SharedStorage* smem_scheduler)
         : tile_idx_smem(smem_scheduler) {}
 
+    CUTLASS_DEVICE void set_post_comm(bool value) { post_comm = value; }
+
     CUTLASS_DEVICE WorkTileInfo decode_work(Params const& params, int tile_idx) const {
         if (tile_idx >= params.total_blocks) { return {0, 0, -1, tile_idx, params.ring_world_size}; }
         int const tiles_per_step = params.base.total_blocks;
@@ -398,6 +403,9 @@ public:
         if constexpr (IsProducerWarp) {
             int tile_idx = int(blockIdx.x);
             if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
+                if (post_comm) {
+                    tile_idx = atomicAdd(params.base.tile_count_semaphore, 1) + params.num_comp_sm;
+                }
                 tile_idx = claim_dynamic_tile(params, tile_idx);
             }
             tile_idx = __shfl_sync(0xffffffff, tile_idx, 0);

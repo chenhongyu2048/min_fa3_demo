@@ -110,6 +110,16 @@ struct Flash_bwd_params : public Flash_fwd_params {
     int* __restrict__ ring_kv_expected_ready;
     int* __restrict__ ring_dkv_comm_done;
     int* __restrict__ ring_completion;
+    uint32_t* __restrict__ ring_dkv_tile_state;
+    int* __restrict__ ring_dkv_task_queue;
+    int* __restrict__ ring_dkv_task_ready;
+    int* __restrict__ ring_dkv_task_reserve;
+    int* __restrict__ ring_dkv_task_claim;
+    int* __restrict__ ring_dkv_producers_done;
+    int* __restrict__ ring_dkv_tiles_done;
+    int* __restrict__ ring_dkv_tiles_expected;
+    int ring_dkv_max_blocks;
+    int ring_dkv_total_tiles;
     float* __restrict__ remote_dk_accum[8];
     float* __restrict__ remote_dv_accum[8];
     int* __restrict__ remote_dkv_completion[8];

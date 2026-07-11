@@ -40,16 +40,17 @@ using namespace kittens;
 
 template <typename AttnKernel, int NumDevices>
 struct MegaRingBwdCommConfig {
-    static constexpr int kVecLength = 1024;
+    static constexpr int kKVVecLength = 1024;
+    static constexpr int kDVecLength = 128;
     static constexpr int kNumWarps = AttnKernel::MaxThreadsPerBlock / cutlass::NumThreadsPerWarp;
     static constexpr int kNumChunks = kNumWarps / 2;
     static_assert(kNumChunks > 0);
 
-    using KShared = sv_bf<kVecLength>;
-    using KGlobal = gl<bf16, 1, 1, -1, kVecLength, KShared>;
+    using KShared = sv_bf<kKVVecLength>;
+    using KGlobal = gl<bf16, 1, 1, -1, kKVVecLength, KShared>;
     using KRemote = pgl<KGlobal, NumDevices, false>;
-    using DShared = sv_fl<kVecLength>;
-    using DGlobal = gl<float, 1, 1, -1, kVecLength, DShared>;
+    using DShared = sv_fl<kDVecLength>;
+    using DGlobal = gl<float, 1, 1, -1, kDVecLength, DShared>;
     using DRemote = pgl<DGlobal, NumDevices, false>;
 };
 
@@ -61,20 +62,26 @@ struct alignas(128) MegaRingBwdKernelParams {
     typename Comm::KRemote remote_v;
     typename Comm::KGlobal local_k;
     typename Comm::KGlobal local_v;
-    typename Comm::DGlobal local_dk_steps;
-    typename Comm::DGlobal local_dv_steps;
     typename Comm::DRemote remote_dk_accum;
     typename Comm::DRemote remote_dv_accum;
     int rows_per_rank;
     int half_rows_per_rank;
     int dkv_rows_per_step;
+    int total_k_padded;
     int num_batch;
     int const* cu_seqlens_k;
     int const* half_cu_seqlens;
     int* kv_ready;
-    int* local_ready;
-    int* expected_ready;
-    int* dkv_comm_done;
+    float* local_dk_ptr;
+    float* local_dv_ptr;
+    int* dkv_task_queue;
+    int* dkv_task_ready;
+    int* dkv_task_reserve;
+    int* dkv_task_claim;
+    int* dkv_producers_done;
+    int* dkv_tiles_done;
+    int const* dkv_tiles_expected;
+    int dkv_total_tiles;
     int ring_rank;
     int ring_world_size;
     int num_comp_sm;
@@ -88,10 +95,16 @@ struct alignas(128) MegaRingBwdTmaBarriers {
     semaphore finished[Comm::kNumChunks];
 };
 
+struct alignas(128) MegaRingBwdTaskShared {
+    int task_info[32];
+};
+
+static_assert(sizeof(MegaRingBwdTaskShared) == 128);
+
 template <typename Comm>
 constexpr void check_mega_ring_bwd_tma_layout() {
-    static_assert(sizeof(typename Comm::KShared) == Comm::kVecLength * sizeof(bf16));
-    static_assert(sizeof(typename Comm::DShared) == Comm::kVecLength * sizeof(float));
+    static_assert(sizeof(typename Comm::KShared) == Comm::kKVVecLength * sizeof(bf16));
+    static_assert(sizeof(typename Comm::DShared) == Comm::kDVecLength * sizeof(float));
     static_assert(sizeof(MegaRingBwdTmaBarriers<Comm>) % 128 == 0);
 }
 
@@ -183,79 +196,110 @@ CUTLASS_DEVICE void run_mega_ring_bwd_kv_load(
             tma::store_async_read_wait();
             arrive(barriers.finished[chunk]);
             tma::store_async_wait();
+            min_fa3_varlen_demo::mega_ring::fence_proxy_async_global();
             min_fa3_varlen_demo::mega_ring::signal_release(params.kv_ready + step, 1);
         }
     }
 }
 
 template <typename AttnKernel, int NumDevices>
-CUTLASS_DEVICE void run_mega_ring_bwd_dkv_store(
+CUTLASS_DEVICE void run_mega_ring_bwd_dkv_task_drain(
         MegaRingBwdKernelParams<AttnKernel, NumDevices> const& params,
-        int comm_bid,
         char* smem_buf) {
     using Comm = MegaRingBwdCommConfig<AttnKernel, NumDevices>;
     tma_swizzle_allocator allocator(reinterpret_cast<int*>(smem_buf));
-    typename Comm::DShared (&vec)[Comm::kNumChunks] =
-        allocator.allocate<typename Comm::DShared, Comm::kNumChunks>();
-    __shared__ MegaRingBwdTmaBarriers<Comm> barriers;
-    if (threadIdx.x == 0) {
-        #pragma unroll
-        for (int i = 0; i < Comm::kNumChunks; ++i) {
-            init_semaphore(barriers.arrived[i], 0, 1);
-            init_semaphore(barriers.finished[i], 0, 1);
-        }
-    }
-    __syncthreads();
+    typename Comm::DShared (&staging_vec)[1] =
+        allocator.allocate<typename Comm::DShared, 1>();
+    typename Comm::DShared& staging = staging_vec[0];
+    __shared__ MegaRingBwdTaskShared task_shared;
+    int* task_info = task_shared.task_info;  // slot, step, kv_head, padded row, row count
 
-    int const warp_id = warp::groupid();
-    uint32_t phasebits = 0xFFFF0000;
-    for (int step = 0; step < params.ring_world_size; ++step) {
-        if (warp_id < 2 * Comm::kNumChunks && laneid() == 0) {
-            min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
-                params.local_ready + step, params.expected_ready[step]);
-        }
-
-        int owner = params.ring_rank - step;
-        if (owner < 0) { owner += params.ring_world_size; }
-        int const tasks_per_step = params.dkv_rows_per_step * 2;
-        if (warp_id < Comm::kNumChunks && laneid() == 0) {
-            int const chunk = warp_id;
-            for (int task = Comm::kNumChunks * comm_bid + chunk;
-                 task < tasks_per_step;
-                 task += Comm::kNumChunks * params.num_comm_sm) {
-                bool const is_v = task >= params.dkv_rows_per_step;
-                int const row = is_v ? task - params.dkv_rows_per_step : task;
-                int const local_row = step * params.dkv_rows_per_step + row;
-                wait(barriers.finished[chunk], get_phasebit<1>(phasebits, 0));
-                update_phasebit<1>(phasebits, 0);
-                tma::expect_bytes(barriers.arrived[chunk], sizeof(typename Comm::DShared));
-                if (is_v) { tma::load_async(vec[chunk], params.local_dv_steps, {local_row, 0}, barriers.arrived[chunk]); }
-                else { tma::load_async(vec[chunk], params.local_dk_steps, {local_row, 0}, barriers.arrived[chunk]); }
+    int const total_k_padded = params.total_k_padded;
+    while (true) {
+        if (threadIdx.x == 0) {
+            int slot = -1;
+            while (slot == -1) {
+                int const claim = min_fa3_varlen_demo::mega_ring::load_acquire_gpu(
+                    params.dkv_task_claim);
+                int const reserved = min_fa3_varlen_demo::mega_ring::load_acquire_gpu(
+                    params.dkv_task_reserve);
+                if (claim < reserved) {
+                    int const previous = min_fa3_varlen_demo::mega_ring::atomic_cas_acq_rel_gpu(
+                        params.dkv_task_claim, claim, claim + 1);
+                    if (previous == claim) { slot = claim; }
+                } else {
+                    int const producers_done =
+                        min_fa3_varlen_demo::mega_ring::load_acquire_gpu(
+                            params.dkv_producers_done);
+                    if (producers_done >= params.dkv_total_tiles) {
+                        // Re-read after acquiring the final producer count.
+                        // The earlier reserve load may predate the last task's
+                        // release publication.
+                        int const final_reserved =
+                            min_fa3_varlen_demo::mega_ring::load_acquire_gpu(
+                                params.dkv_task_reserve);
+                        int const final_claim =
+                            min_fa3_varlen_demo::mega_ring::load_acquire_gpu(
+                                params.dkv_task_claim);
+                        if (final_claim >= final_reserved) { slot = -2; }
+                    }
+                    if (slot == -1) { __nanosleep(64); }
+                }
             }
-        } else if (warp_id < 2 * Comm::kNumChunks && laneid() == 0) {
-            int const chunk = warp_id - Comm::kNumChunks;
-            for (int task = Comm::kNumChunks * comm_bid + chunk;
-                 task < tasks_per_step;
-                 task += Comm::kNumChunks * params.num_comm_sm) {
-                bool const is_v = task >= params.dkv_rows_per_step;
-                int const row = is_v ? task - params.dkv_rows_per_step : task;
-                wait(barriers.arrived[chunk], get_phasebit<0>(phasebits, 0));
-                update_phasebit<0>(phasebits, 0);
-                if (is_v) { tma::store_add_async(params.remote_dv_accum[owner], vec[chunk], {row, 0}); }
-                else { tma::store_add_async(params.remote_dk_accum[owner], vec[chunk], {row, 0}); }
-                tma::store_async_read_wait();
-                arrive(barriers.finished[chunk]);
+            task_info[0] = slot;
+            if (slot >= 0) {
+                min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
+                    params.dkv_task_ready + slot, 1);
+                int const* task = params.dkv_task_queue + slot * 4;
+                task_info[1] = task[0];
+                task_info[2] = task[1];
+                task_info[3] = task[2];
+                task_info[4] = task[3];
             }
-            tma::store_async_wait();
         }
         __syncthreads();
+        if (task_info[0] == -2) { return; }
+
+        int const ring_step = task_info[1];
+        int const kv_head = task_info[2];
+        int const padded_row = task_info[3];
+        int const rows = task_info[4];
+        int owner = params.ring_rank - ring_step;
+        if (owner < 0) { owner += params.ring_world_size; }
+        int const local_head_row = kv_head * total_k_padded + padded_row;
+
+        for (int is_v = 0; is_v < 2; ++is_v) {
+            float const* source = is_v ? params.local_dv_ptr : params.local_dk_ptr;
+            auto const& remote = is_v ? params.remote_dv_accum : params.remote_dk_accum;
+            for (int row = 0; row < rows; ++row) {
+                if (threadIdx.x < Comm::kDVecLength) {
+                    int const source_row = ring_step * params.dkv_rows_per_step
+                        + local_head_row + row;
+                    staging[threadIdx.x] = source[
+                        int64_t(source_row) * Comm::kDVecLength + threadIdx.x];
+                }
+                __syncthreads();
+                if (threadIdx.x == 0) {
+                    cutlass::arch::fence_view_async_shared();
+                    tma::store_add_async(
+                        remote[owner], staging, {local_head_row + row, 0});
+                    tma::store_async_read_wait();
+                    tma::store_async_wait();
+                }
+                __syncthreads();
+            }
+        }
+
         if (threadIdx.x == 0) {
-            int const previous = atomicAdd(params.dkv_comm_done + step, 1);
-            if (previous + 1 == params.num_comm_sm) {
+            min_fa3_varlen_demo::mega_ring::fence_proxy_async_global();
+            int const previous = min_fa3_varlen_demo::mega_ring::atomic_add_acq_rel_gpu(
+                params.dkv_tiles_done + ring_step, 1);
+            if (previous + 1 == params.dkv_tiles_expected[ring_step]) {
                 min_fa3_varlen_demo::mega_ring::signal_release_system(
                     params.remote_completion[owner], 1);
             }
         }
+        __syncthreads();
     }
 }
 
@@ -269,13 +313,16 @@ void mega_ring_flash_attn_bwd_kernel(
     extern __shared__ char smem_buf[];
     if (int(blockIdx.x) < params.num_comp_sm) {
         AttnKernel kernel;
-        kernel(params.compute, smem_buf);
-        return;
+        kernel(params.compute, smem_buf, false);
+    } else {
+        int const comm_bid = int(blockIdx.x) - params.num_comp_sm;
+        run_mega_ring_bwd_kv_load<AttnKernel, NumDevices>(params, comm_bid, smem_buf);
+        __syncthreads();
+        AttnKernel kernel;
+        kernel(params.compute, smem_buf, true);
     }
-
-    int const comm_bid = int(blockIdx.x) - params.num_comp_sm;
-    run_mega_ring_bwd_kv_load<AttnKernel, NumDevices>(params, comm_bid, smem_buf);
-    run_mega_ring_bwd_dkv_store<AttnKernel, NumDevices>(params, comm_bid, smem_buf);
+    __syncthreads();
+    run_mega_ring_bwd_dkv_task_drain<AttnKernel, NumDevices>(params, smem_buf);
 }
 
 static __global__ void mega_ring_bwd_wait_for_completion(int const* completion, int expected) {
@@ -438,7 +485,21 @@ void run_flash_bwd(
         params.cu_seqlens_k,
         params.seqused_k,
         MegaRing ? params.dkv_step_stride : 0,
-        MegaRing ? params.ring_local_ready : nullptr,
+        nullptr,
+        MegaRing ? params.ring_dkv_tile_state : nullptr,
+        MegaRing ? params.ring_dkv_task_queue : nullptr,
+        MegaRing ? params.ring_dkv_task_ready : nullptr,
+        MegaRing ? params.ring_dkv_task_reserve : nullptr,
+        MegaRing ? params.ring_dkv_producers_done : nullptr,
+        MegaRing ? params.ring_dkv_tiles_done : nullptr,
+        MegaRing ? params.ring_dkv_tiles_expected : nullptr,
+        MegaRing ? params.ring_dkv_max_blocks : 0,
+        MegaRing ? params.ring_rank : 0,
+        MegaRing ? params.ring_world_size : 1,
+        {params.remote_dkv_completion[0], params.remote_dkv_completion[1],
+         params.remote_dkv_completion[2], params.remote_dkv_completion[3],
+         params.remote_dkv_completion[4], params.remote_dkv_completion[5],
+         params.remote_dkv_completion[6], params.remote_dkv_completion[7]},
     };
 
     int num_blocks_n = cutlass::ceil_div(params.seqlen_k, get<1>(TileShape_MNK{}));
@@ -489,12 +550,14 @@ void run_flash_bwd(
         check_mega_ring_bwd_tma_layout<Comm>();
         auto kernel = mega_ring_flash_attn_bwd_kernel<AttnKernel, NumDevices>;
         int const remote_rows = params.total_k;
-        int const dkv_rows_per_step = int(params.dkv_step_stride / Comm::kVecLength);
-        TORCH_CHECK(params.h_k * params.d == Comm::kVecLength,
-                    "mega-ring backward K/V TMA row must contain KVH * D == ", Comm::kVecLength);
-        TORCH_CHECK(params.dkv_step_stride % Comm::kVecLength == 0,
+        int const dkv_rows_per_step = int(params.dkv_step_stride / Comm::kDVecLength);
+        TORCH_CHECK(params.h_k * params.d == Comm::kKVVecLength,
+                    "mega-ring backward K/V TMA row must contain KVH * D == ", Comm::kKVVecLength);
+        TORCH_CHECK(params.dkv_step_stride % Comm::kDVecLength == 0,
                     "mega-ring backward dKV accumulator must be divisible by the TMA row width");
-        int const comm_smem_size = int(sizeof(typename Comm::DShared)) * Comm::kNumChunks + 1024;
+        int const kv_comm_smem_size = int(sizeof(typename Comm::KShared)) * Comm::kNumChunks + 1024;
+        int const dkv_comm_smem_size = int(sizeof(typename Comm::DShared)) + 1024;
+        int const comm_smem_size = std::max(kv_comm_smem_size, dkv_comm_smem_size);
         smem_size = smem_size > comm_smem_size ? smem_size : comm_smem_size;
         if (smem_size >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -515,33 +578,35 @@ void run_flash_bwd(
         KernelParams mega_params{
             kernel_params,
             kittens::py::parallel_tensor_to_pgl<typename Comm::KRemote>(
-                *remote_k_tensor, 1, 1, remote_rows, Comm::kVecLength),
+                *remote_k_tensor, 1, 1, remote_rows, Comm::kKVVecLength),
             kittens::py::parallel_tensor_to_pgl<typename Comm::KRemote>(
-                *remote_v_tensor, 1, 1, remote_rows, Comm::kVecLength),
+                *remote_v_tensor, 1, 1, remote_rows, Comm::kKVVecLength),
             kittens::make_gl<typename Comm::KGlobal>(
-                reinterpret_cast<uint64_t>(params.k_ptr), 1, 1, remote_rows, Comm::kVecLength),
+                reinterpret_cast<uint64_t>(params.k_ptr), 1, 1, remote_rows, Comm::kKVVecLength),
             kittens::make_gl<typename Comm::KGlobal>(
-                reinterpret_cast<uint64_t>(params.v_ptr), 1, 1, remote_rows, Comm::kVecLength),
-            kittens::make_gl<typename Comm::DGlobal>(
-                reinterpret_cast<uint64_t>(params.dk_accum_ptr), 1, 1,
-                params.ring_world_size * dkv_rows_per_step, Comm::kVecLength),
-            kittens::make_gl<typename Comm::DGlobal>(
-                reinterpret_cast<uint64_t>(params.dv_accum_ptr), 1, 1,
-                params.ring_world_size * dkv_rows_per_step, Comm::kVecLength),
+                reinterpret_cast<uint64_t>(params.v_ptr), 1, 1, remote_rows, Comm::kKVVecLength),
             kittens::py::parallel_tensor_to_pgl<typename Comm::DRemote>(
-                *remote_dk_tensor, 1, 1, dkv_rows_per_step, Comm::kVecLength),
+                *remote_dk_tensor, 1, 1, dkv_rows_per_step, Comm::kDVecLength),
             kittens::py::parallel_tensor_to_pgl<typename Comm::DRemote>(
-                *remote_dv_tensor, 1, 1, dkv_rows_per_step, Comm::kVecLength),
+                *remote_dv_tensor, 1, 1, dkv_rows_per_step, Comm::kDVecLength),
             params.local_total_k,
             params.local_total_k / 2,
             dkv_rows_per_step,
+            total_k_padded_rounded,
             params.b,
             params.cu_seqlens_k,
             params.half_cu_seqlens,
             params.ring_kv_ready,
-            params.ring_local_ready,
-            params.ring_expected_ready,
-            params.ring_dkv_comm_done,
+            static_cast<float*>(params.dk_accum_ptr),
+            static_cast<float*>(params.dv_accum_ptr),
+            params.ring_dkv_task_queue,
+            params.ring_dkv_task_ready,
+            params.ring_dkv_task_reserve,
+            params.ring_dkv_task_claim,
+            params.ring_dkv_producers_done,
+            params.ring_dkv_tiles_done,
+            params.ring_dkv_tiles_expected,
+            params.ring_dkv_total_tiles,
             params.ring_rank,
             params.ring_world_size,
             params.num_comp_sm,

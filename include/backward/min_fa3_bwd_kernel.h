@@ -145,7 +145,7 @@ public:
 
     CUTLASS_DEVICE
     void
-    operator()(Params const& params, char* smem_buf) {
+    operator()(Params const& params, char* smem_buf, bool post_comm = false) {
 
         static constexpr int NumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int NumCopyThreads = NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
@@ -206,6 +206,7 @@ public:
         }
 
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
+        scheduler.set_post_comm(post_comm);
 
         if (warp_group_idx == 0) {  // Producer
             cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "cutlass/cutlass.h"
 #include "cutlass/barrier.h"
 #include "cute/tensor.hpp"
@@ -117,6 +119,17 @@ struct CollectiveEpilogueBwd {
         int const* seqused;
         int64_t ring_step_stride = 0;
         int* ring_local_ready = nullptr;
+        uint32_t* ring_dkv_tile_state = nullptr;
+        int* ring_dkv_task_queue = nullptr;
+        int* ring_dkv_task_ready = nullptr;
+        int* ring_dkv_task_reserve = nullptr;
+        int* ring_dkv_producers_done = nullptr;
+        int* ring_dkv_tiles_done = nullptr;
+        int const* ring_dkv_tiles_expected = nullptr;
+        int ring_dkv_max_blocks = 0;
+        int ring_rank = 0;
+        int ring_world_size = 1;
+        int* remote_dkv_completion[8] = {};
     };
 
     // Device side kernel params
@@ -382,6 +395,17 @@ struct CollectiveEpilogueBwdGQA {
         int const* seqused;
         int64_t ring_step_stride = 0;
         int* ring_local_ready = nullptr;
+        uint32_t* ring_dkv_tile_state = nullptr;
+        int* ring_dkv_task_queue = nullptr;
+        int* ring_dkv_task_ready = nullptr;
+        int* ring_dkv_task_reserve = nullptr;
+        int* ring_dkv_producers_done = nullptr;
+        int* ring_dkv_tiles_done = nullptr;
+        int const* ring_dkv_tiles_expected = nullptr;
+        int ring_dkv_max_blocks = 0;
+        int ring_rank = 0;
+        int ring_world_size = 1;
+        int* remote_dkv_completion[8] = {};
     };
 
     // Device side kernel params
@@ -400,6 +424,17 @@ struct CollectiveEpilogueBwdGQA {
         int const* seqused = nullptr;
         int64_t ring_step_stride;
         int* ring_local_ready;
+        uint32_t* ring_dkv_tile_state;
+        int* ring_dkv_task_queue;
+        int* ring_dkv_task_ready;
+        int* ring_dkv_task_reserve;
+        int* ring_dkv_producers_done;
+        int* ring_dkv_tiles_done;
+        int const* ring_dkv_tiles_expected;
+        int ring_dkv_max_blocks;
+        int ring_rank;
+        int ring_world_size;
+        int* remote_dkv_completion[8];
     };
 
     static Params
@@ -408,11 +443,63 @@ struct CollectiveEpilogueBwdGQA {
             assert(args.dk_semaphore != nullptr);
             assert(args.dv_semaphore != nullptr);
         }
-        return {args.ptr_dKaccum, args.shape_dKaccum, args.stride_dKaccum, args.ptr_dVaccum, args.shape_dVaccum, args.stride_dVaccum,
+        Params params {args.ptr_dKaccum, args.shape_dKaccum, args.stride_dKaccum, args.ptr_dVaccum, args.shape_dVaccum, args.stride_dVaccum,
                 cutlass::FastDivmod(cute::ceil_div(args.num_heads_q, get<1>(args.shape_dKaccum))),
                 args.dk_semaphore, args.dv_semaphore,
                 args.num_batch, args.cu_seqlens, args.seqused,
-                args.ring_step_stride, args.ring_local_ready};
+                args.ring_step_stride, args.ring_local_ready,
+                args.ring_dkv_tile_state, args.ring_dkv_task_queue, args.ring_dkv_task_ready,
+                args.ring_dkv_task_reserve, args.ring_dkv_producers_done,
+                args.ring_dkv_tiles_done, args.ring_dkv_tiles_expected,
+                args.ring_dkv_max_blocks, args.ring_rank, args.ring_world_size, {}};
+        for (int i = 0; i < 8; ++i) {
+            params.remote_dkv_completion[i] = args.remote_dkv_completion[i];
+        }
+        return params;
+    }
+
+    CUTLASS_DEVICE
+    static void complete_remote_tile(Params const& params, int ring_step) {
+        int const previous = min_fa3_varlen_demo::mega_ring::atomic_add_acq_rel_gpu(
+            params.ring_dkv_tiles_done + ring_step, 1);
+        if (previous + 1 == params.ring_dkv_tiles_expected[ring_step]) {
+            int owner = params.ring_rank - ring_step;
+            if (owner < 0) { owner += params.ring_world_size; }
+            min_fa3_varlen_demo::mega_ring::signal_release_system(
+                params.remote_dkv_completion[owner], 1);
+        }
+    }
+
+    CUTLASS_DEVICE
+    static void publish_remote_tile(
+            Params const& params, int ring_step, int bidb, int n_block,
+            int bidh_kv, int row_start, int rows, bool tile_valid) {
+        if (params.ring_dkv_tile_state == nullptr) { return; }
+        int const num_heads_kv = get<1>(params.shape_dKaccum);
+        int const state_idx = (((ring_step * params.num_batch + bidb)
+            * params.ring_dkv_max_blocks + n_block) * num_heads_kv + bidh_kv);
+        uint32_t const contribution = 1u | (tile_valid ? (1u << 16) : 0u);
+        uint32_t const previous = min_fa3_varlen_demo::mega_ring::atomic_add_acq_rel_gpu(
+            params.ring_dkv_tile_state + state_idx, contribution);
+        int const contributors = int(previous & 0xffffu) + 1;
+        if (contributors != params.qhead_per_khead_divmod.divisor) { return; }
+
+        bool const any_valid = ((previous >> 16) != 0) || tile_valid;
+        if (any_valid) {
+            int const slot = min_fa3_varlen_demo::mega_ring::atomic_add_acq_rel_gpu(
+                params.ring_dkv_task_reserve, 1);
+            int* task = params.ring_dkv_task_queue + slot * 4;
+            task[0] = ring_step;
+            task[1] = bidh_kv;
+            task[2] = row_start;
+            task[3] = rows;
+            min_fa3_varlen_demo::mega_ring::store_release_gpu(
+                params.ring_dkv_task_ready + slot, 1);
+        } else {
+            complete_remote_tile(params, ring_step);
+        }
+        min_fa3_varlen_demo::mega_ring::signal_release(
+            params.ring_dkv_producers_done, 1);
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -524,9 +611,17 @@ struct CollectiveEpilogueBwdGQA {
         if constexpr (Deterministic) {
             Barrier::arrive_inc(lock_ptr, thread_idx, n_block * num_batch * num_head_kv);
         }
-        if (params.ring_local_ready != nullptr && thread_idx == 0) {
-            min_fa3_varlen_demo::mega_ring::signal_release(
-                params.ring_local_ready + ring_step, 1);
+        if (params.ring_dkv_tile_state != nullptr && thread_idx == 0) {
+            if constexpr (Use_TMA) {
+                min_fa3_varlen_demo::mega_ring::fence_proxy_async_global();
+            }
+            int const remaining_rows = seqlen_info.seqlen - n_block * kBlockN;
+            int const rows = remaining_rows < kBlockN ? remaining_rows : kBlockN;
+            publish_remote_tile(
+                params, ring_step, bidb, n_block, bidh_kv,
+                seqlen_info.offset_padded + n_block * kBlockN, rows, true);
+        } else if (params.ring_local_ready != nullptr && thread_idx == 0) {
+            min_fa3_varlen_demo::mega_ring::signal_release(params.ring_local_ready + ring_step, 1);
         }
         // // Tell warp 0 that smem_k and smem_v are ready
         // flash::named_barrier_arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
@@ -545,9 +640,20 @@ struct CollectiveEpilogueBwdGQA {
          int ring_step = 0
          ) {
         // Don't need to do anything since dKaccum and dVaccum are already zero-initialized
-        if (params.ring_local_ready != nullptr && thread_idx == 0) {
-            min_fa3_varlen_demo::mega_ring::signal_release(
-                params.ring_local_ready + ring_step, 1);
+        if (params.ring_dkv_tile_state != nullptr && thread_idx == 0) {
+            auto [n_block, bidh, bidb] = block_coord;
+            int bidh_idx_in_group;
+            int const bidh_kv = params.qhead_per_khead_divmod.divmod(bidh_idx_in_group, bidh);
+            flash::SeqlenInfo<Varlen, kBlockN> seqlen_info{
+                bidb, get<0>(params.shape_dKaccum) / kHeadDim,
+                params.cu_seqlens, params.seqused};
+            int const remaining_rows = seqlen_info.seqlen - n_block * kBlockN;
+            int const rows = remaining_rows < kBlockN ? remaining_rows : kBlockN;
+            publish_remote_tile(
+                params, ring_step, bidb, n_block, bidh_kv,
+                seqlen_info.offset_padded + n_block * kBlockN, rows, false);
+        } else if (params.ring_local_ready != nullptr && thread_idx == 0) {
+            min_fa3_varlen_demo::mega_ring::signal_release(params.ring_local_ready + ring_step, 1);
         }
     }
 
