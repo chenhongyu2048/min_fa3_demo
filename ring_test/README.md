@@ -10,6 +10,30 @@ The standard PyTorch / FA2 / FA3 methods run a real Python-side ring:
 - each block attention call returns `(out, lse)`
 - per-step outputs are merged with the usual online LSE update
 
+`allgather_attention` is the all-CP baseline. It gathers every rank's K/V,
+reorders the gathered tensors into one batch-major global sequence, and runs
+varlen FlashAttention for the local Q. The timed forward includes K/V
+all-gather, reordering, and attention. The baseline uses the external FA3
+varlen forward/backward implementation when it is importable on every rank;
+otherwise every rank consistently falls back to the local
+`min_fa3_op.forward_varlen` / `backward_varlen` implementation. The result Note
+column reports the backend that was selected.
+
+For causal attention, each rank keeps the same zigzag `[front | back]` layout
+used by the mega-ring path. Gathered K/V are ordered as:
+
+```text
+rank0.front, rank1.front, ..., rankN.front,
+rankN.back, ..., rank1.back, rank0.back
+```
+
+The two local Q halves are non-adjacent in that global sequence, so the
+baseline runs two bottom-right-aligned causal varlen calls. For rank `r`, local
+half length `H`, and world size `W`, the front call uses `Sk=(r+1)*H` and the
+back call uses `Sk=(2*W-r)*H`. Their total KV work is identical on every rank,
+which preserves zigzag load balancing. This path is all-CP only and is not
+used by `benchmark_hybrid_forward.py`.
+
 If the FA3 Python package import fails, the `fa3` method falls back to the
 local `min_fa3_op.forward_varlen(..., return_lse=True)` block backend while
 keeping the same Python-side ring and online LSE merge. Result tables mark this
@@ -52,6 +76,15 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
   --warmup-iters 1 --num-iters 3
 ```
 
+To run only the end-to-end all-gather baseline:
+
+```bash
+torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
+  --b 1 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 \
+  --mode both --methods allgather_attention \
+  --warmup-iters 1 --num-iters 3 --check
+```
+
 To run only the single-step min ring path with correctness checks:
 
 ```bash
@@ -65,6 +98,9 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
 
 `benchmark_ring_backward.py` benchmarks the causal varlen backward paths:
 
+- `allgather_attention` prepares its all-gather zigzag forward outside the
+  timed interval, then times both varlen backward calls, global dK/dV gradient
+  merging and inverse reordering, and the FP32 dK/dV reduce-scatter
 - `min_varlen_python_ring` is a complete zigzag ring baseline using local
   min_fa3 varlen backward block kernels plus NCCL K/V and FP32 dK/dV P2P.
 - `min_varlen_mega_ring` is the fused persistent compute/communication kernel.
@@ -77,7 +113,17 @@ step.
 Forward preparation, tensor allocation, and the fused path's required remote
 dK/dV accumulator and completion-counter reset are outside the CUDA-event
 timing interval. Correctness checks compare fused dQ/dK/dV against the Python
-ring baseline and are enabled by default.
+ring baseline and are enabled by default. The all-gather baseline is checked
+against the same dQ/dK/dV reference.
+
+Run only the all-gather backward baseline with correctness checking:
+
+```bash
+torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_backward.py \
+  --b 1 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 \
+  --methods allgather_attention \
+  --warmup-iters 1 --num-iters 3 --check
+```
 
 ```bash
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_backward.py \

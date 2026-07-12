@@ -1,9 +1,9 @@
-"""Torchrun entry point for multi-rank forward ring-attention benchmarks.
+"""Torchrun entry point for multi-rank forward attention benchmarks.
 
-The script compares Python-side ring attention using PyTorch/FA2/FA3 block
-kernels with the local min_fa3 varlen, min_fa3 single-step ring, and fused
-min_fa3 mega-ring paths. Timing is end-to-end per method call and reports the
-maximum elapsed time across ranks.
+The script compares an all-gather baseline and Python-side ring attention using
+PyTorch/FA2/FA3 block kernels with the local min_fa3 varlen, min_fa3
+single-step ring, and fused min_fa3 mega-ring paths. Timing is end-to-end per
+method call and reports the maximum elapsed time across ranks.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ if str(DEMO_DIR) not in sys.path:
 
 import min_fa3_op
 
+from allgather_attention import AllGatherAttention, select_allgather_backend
 from ring_common import (
     flash_varlen_block_attention,
     gather_rank_tensor,
@@ -51,6 +52,7 @@ except ImportError:
 
 
 METHOD_ORDER = [
+    "allgather_attention",
     # "pytorch",
     # "fa2",
     "fa3",
@@ -486,7 +488,19 @@ def build_method_runs(
         half_cu_seqlens, half_cu_seqlens_host = make_cu_seqlens(case.batch_size, case.seqlen // 2, q.device)
 
     for method in methods:
-        if method == "pytorch":
+        if method == "allgather_attention":
+            runner = AllGatherAttention(
+                dist.group.WORLD,
+                q,
+                k,
+                v,
+                case.batch_size,
+                case.seqlen,
+                case.is_causal,
+                args.allgather_backend,
+            )
+            runs.append(MethodRun(method, runner.forward, runner.note))
+        elif method == "pytorch":
             def fn(method=method):
                 # Full Python-side ring: P2P K/V exchange, one PyTorch block
                 # attention call per visible step, and online LSE merge.
@@ -1005,6 +1019,7 @@ def main() -> None:
             flash_attn_varlen_func2 = None
         if not available_on_all_ranks(flash_attn_varlen_func3 is not None):
             flash_attn_varlen_func3 = None
+        args.allgather_backend = select_allgather_backend(dist.group.WORLD)
         validate_args(args, methods, local_world_size, sm_configs)
         cases = make_cases(args)
 

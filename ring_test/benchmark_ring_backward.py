@@ -1,9 +1,9 @@
-"""Torchrun benchmark for causal mega-ring varlen backward.
+"""Torchrun benchmark for causal all-CP varlen backward.
 
-The script compares a complete Python/NCCL zigzag ring built from the local
-min_fa3 varlen backward with the fused mega-ring backward kernel. Forward
-preparation, allocations, and fused remote-workspace resets are outside the
-CUDA-event timing interval.
+The script compares an all-gather baseline, a complete Python/NCCL zigzag ring
+built from the local min_fa3 varlen backward, and the fused mega-ring backward
+kernel. Forward preparation, allocations, and fused remote-workspace resets
+are outside the CUDA-event timing interval.
 """
 
 from __future__ import annotations
@@ -25,10 +25,11 @@ if str(DEMO_DIR) not in sys.path:
 
 import min_fa3_op
 
+from allgather_attention import AllGatherAttention, select_allgather_backend
 from ring_common import RingComm, raise_if_any_rank_failed
 
 
-METHOD_ORDER = ["min_varlen_python_ring", "min_varlen_mega_ring"]
+METHOD_ORDER = ["allgather_attention", "min_varlen_python_ring", "min_varlen_mega_ring"]
 
 
 @dataclass(frozen=True)
@@ -418,12 +419,30 @@ def build_method_runs(
     local_world_size: int,
     sm_config: SmConfig,
     seed: int,
+    allgather_backend: str,
 ) -> dict[str, MethodRun]:
     q, local_k, local_v, dout = make_inputs(case, local_rank, seed)
     cu, cu_host = make_cu_seqlens(case, q.device)
     half_cu, half_cu_host = make_cu_seqlens(
         Case(case.batch_size, case.seqlen // 2, case.q_heads, case.kv_heads, case.head_dim),
         q.device,
+    )
+    allgather_attention = AllGatherAttention(
+        dist.group.WORLD,
+        q,
+        local_k,
+        local_v,
+        case.batch_size,
+        case.seqlen,
+        True,
+        allgather_backend,
+        enable_backward=True,
+    )
+    allgather_run = MethodRun(
+        "allgather_attention",
+        allgather_attention.forward,
+        lambda: allgather_attention.backward(dout),
+        allgather_attention.note,
     )
     remote_k, remote_v = make_mega_parallel_tensors(local_k, local_v, local_rank, local_world_size)
     torch.cuda.synchronize()
@@ -496,6 +515,7 @@ def build_method_runs(
         )
 
     return {
+        "allgather_attention": allgather_run,
         "min_varlen_python_ring": MethodRun(
             "min_varlen_python_ring",
             lambda: None,
@@ -598,7 +618,14 @@ def run_case(
     sm_config: SmConfig,
     args: argparse.Namespace,
 ) -> dict[str, Result]:
-    runs = build_method_runs(case, local_rank, local_world_size, sm_config, args.seed)
+    runs = build_method_runs(
+        case,
+        local_rank,
+        local_world_size,
+        sm_config,
+        args.seed,
+        args.allgather_backend,
+    )
     reference = None
     if args.check:
         reference_run = runs["min_varlen_python_ring"]
@@ -723,6 +750,7 @@ def main() -> None:
     try:
         if torch.cuda.get_device_capability() != (9, 0):
             raise SystemExit(f"This benchmark requires SM90, got {torch.cuda.get_device_capability()}")
+        args.allgather_backend = select_allgather_backend(dist.group.WORLD)
         validate_args(args, seqlens, sm_configs, local_world_size)
         if local_rank == 0:
             configs = ",".join(f"{cfg.num_comp_sm}:{cfg.num_comm_sm}" for cfg in sm_configs)
