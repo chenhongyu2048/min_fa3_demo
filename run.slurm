@@ -101,20 +101,28 @@ torchrun --standalone --nproc_per_node=4 ring_test/benchmark_ring_forward.py \
 echo "Running multi-rank hybrid ring_test benchmark without correctness checks"
 torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
     --global-seqlens 16384,1024,1024,1024,1024,512,512,512,512 \
+    --ring-sizes 4,1,1,1,1,1,1,1,1 --ring-starts 0,0,1,2,3,0,1,2,3 \
     --qhead 32 --kvhead 8 --headdim 128 \
-    --sm-configs 128:4,124:8,116:16 --cp-threshold 2048 \
+    --methods allgather_attention,fa3_ring,mega_ring_hybrid \
+    --sm-configs 128:4,124:8,116:16 \
     --mode both --warmup-iters 20 --num-iters 30 --no-check
 
 torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
     --global-seqlens 32768,1024,1024,1024,1024,512,512,512,512,512,512,512,512 \
+    --ring-sizes 4,1,1,1,1,1,1,1,1,1,1,1,1 \
+    --ring-starts 0,0,1,2,3,0,1,2,3,0,1,2,3 \
     --qhead 32 --kvhead 8 --headdim 128 \
-    --sm-configs 128:4,124:8,116:16 --cp-threshold 2048 \
+    --methods allgather_attention,fa3_ring,mega_ring_hybrid \
+    --sm-configs 128:4,124:8,116:16 \
     --mode both --warmup-iters 20 --num-iters 30 --no-check
 
 torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
     --global-seqlens 65536,1024,1024,1024,1024,512,512,512,512,512,512,512,512 \
+    --ring-sizes 4,1,1,1,1,1,1,1,1,1,1,1,1 \
+    --ring-starts 0,0,1,2,3,0,1,2,3,0,1,2,3 \
     --qhead 32 --kvhead 8 --headdim 128 \
-    --sm-configs 128:4,124:8,116:16 --cp-threshold 2048 \
+    --methods allgather_attention,fa3_ring,mega_ring_hybrid \
+    --sm-configs 128:4,124:8,116:16 \
     --mode both --warmup-iters 20 --num-iters 30 --no-check
 
 # Memory sanitizer runs:

@@ -38,7 +38,7 @@ HYBRID_GLOBAL_SEQLENS_4=${HYBRID_GLOBAL_SEQLENS_4:-"8192,4096,4096,1024,1024,102
 HYBRID_RING_SIZES_4=${HYBRID_RING_SIZES_4:-"4,2,2,1,1,1,1"}
 HYBRID_RING_STARTS_4=${HYBRID_RING_STARTS_4:-"0,0,2,0,1,2,3"}
 
-HYBRID_GLOBAL_SEQLENS_8=${HYBRID_GLOBAL_SEQLENS_8:-"131072,8192,8192,4096,4096,4096,4096,1024,1024,1024,1024,1024,1024,1024,1024"}
+HYBRID_GLOBAL_SEQLENS_8=${HYBRID_GLOBAL_SEQLENS_8:-"131072,8192,8192,4096,4096,4096,4096,2048,2048,2048,2048,2048,2048,2048,2048"}
 HYBRID_RING_SIZES_8=${HYBRID_RING_SIZES_8:-"8,4,4,2,2,2,2,1,1,1,1,1,1,1,1"}
 HYBRID_RING_STARTS_8=${HYBRID_RING_STARTS_8:-"0,0,4,0,2,4,6,0,1,2,3,4,5,6,7"}
 
@@ -194,7 +194,7 @@ run_hierarchical_hybrid() {
         --ring-sizes "$ring_sizes" \
         --ring-starts "$ring_starts" \
         --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM" \
-        --mode causal --sm-configs "$sm_configs" \
+        --mode causal --methods all --sm-configs "$sm_configs" \
         --warmup-iters "$WARMUP_ITERS" --num-iters "$NUM_ITERS" \
         "${CHECK_ARGS[@]}"
 }

@@ -482,10 +482,6 @@ def build_method_runs(
     runs: list[MethodRun] = []
     max_seqlen_q = case.seqlen
     max_seqlen_k = case.seqlen
-    half_cu_seqlens = None
-    half_cu_seqlens_host = None
-    if case.is_causal and case.seqlen % 256 == 0:
-        half_cu_seqlens, half_cu_seqlens_host = make_cu_seqlens(case.batch_size, case.seqlen // 2, q.device)
 
     for method in methods:
         if method == "allgather_attention":
@@ -727,10 +723,17 @@ def build_method_runs(
                 )
             )
         elif method == "min_varlen_mega_ring":
-            if case.is_causal and half_cu_seqlens is None:
+            if case.is_causal and case.seqlen % 256 != 0:
                 runs.append(MethodRun(method, lambda: q, "not available", checkable=False))
                 continue
             remote_k, remote_v = make_mega_parallel_tensors(k, v, local_rank, local_world_size)
+            global_seqlens_host = torch.full(
+                (case.batch_size,), case.seqlen * local_world_size, dtype=torch.int32
+            )
+            ring_sizes_host = torch.full(
+                (case.batch_size,), local_world_size, dtype=torch.int32
+            )
+            ring_starts_host = torch.zeros(case.batch_size, dtype=torch.int32)
 
             def fn(method=method, remote_k=remote_k, remote_v=remote_v):
                 # Fused mega-ring path: one kernel launch covers all ring steps,
@@ -746,12 +749,13 @@ def build_method_runs(
                     case.is_causal,
                     cu_seqlens_q_host=cu_seqlens_q_host,
                     cu_seqlens_k_host=cu_seqlens_k_host,
-                    half_cu_seqlens=half_cu_seqlens,
-                    half_cu_seqlens_host=half_cu_seqlens_host,
                     remote_k=remote_k,
                     remote_v=remote_v,
                     num_comp_sm=args.num_comp_sm,
                     num_comm_sm=args.num_comm_sm,
+                    global_seqlens_host=global_seqlens_host,
+                    ring_sizes_host=ring_sizes_host,
+                    ring_starts_host=ring_starts_host,
                 )
 
             runs.append(

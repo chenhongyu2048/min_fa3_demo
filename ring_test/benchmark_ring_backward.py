@@ -427,6 +427,13 @@ def build_method_runs(
         Case(case.batch_size, case.seqlen // 2, case.q_heads, case.kv_heads, case.head_dim),
         q.device,
     )
+    global_seqlens_host = torch.full(
+        (case.batch_size,), case.seqlen * local_world_size, dtype=torch.int32
+    )
+    ring_sizes_host = torch.full(
+        (case.batch_size,), local_world_size, dtype=torch.int32
+    )
+    ring_starts_host = torch.zeros(case.batch_size, dtype=torch.int32)
     allgather_attention = AllGatherAttention(
         dist.group.WORLD,
         q,
@@ -459,12 +466,13 @@ def build_method_runs(
         True,
         cu_seqlens_q_host=cu_host,
         cu_seqlens_k_host=cu_host,
-        half_cu_seqlens=half_cu,
-        half_cu_seqlens_host=half_cu_host,
         remote_k=remote_k,
         remote_v=remote_v,
         num_comp_sm=sm_config.num_comp_sm,
         num_comm_sm=sm_config.num_comm_sm,
+        global_seqlens_host=global_seqlens_host,
+        ring_sizes_host=ring_sizes_host,
+        ring_starts_host=ring_starts_host,
         return_lse=True,
     )
     torch.cuda.synchronize()

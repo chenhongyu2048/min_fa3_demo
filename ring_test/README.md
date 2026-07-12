@@ -138,33 +138,33 @@ divisible by 256, and the current fused backward requires causal mode,
 
 ## Hybrid mega-ring benchmark
 
-`benchmark_hybrid_forward.py` compares the same global batch under three
-execution strategies:
+`benchmark_hybrid_forward.py` compares the same global varlen batch with four
+methods:
 
-- `fa3_all_cp`: Python-side all-CP batched varlen ring using FA3 block kernels
-- `fa3_hybrid`: Python-side hybrid FA3; CP sequences use batched varlen ring, local-only short sequences use one batched local FA call
-- `mega_ring_all_cp`: legacy fused mega-ring CP where every sequence is split across all ranks
-- `mega_ring_hybrid`: fused mega-ring hybrid mode selected by `--cp-threshold`
+- `allgather_attention`: all-CP K/V all-gather followed by batched varlen attention
+- `fa3_ring`: all-CP Python ring using FA3 blocks plus NCCL P2P
+- `mega_ring_all_cp`: fused mega-ring with every sequence split across all ranks
+- `mega_ring_hybrid`: fused mega-ring using the requested per-batch ring hierarchy
 
-`--global-seqlens` gives the global sequence lengths. Entries above
-`--cp-threshold` are CP sequences in hybrid mode. Entries at or below the
-threshold are local-only in hybrid mode and are assigned whole to one rank. In
-the all-CP baseline, those shorter sequences are still split across all ranks.
+The first three methods are baselines. Every global sequence is divided evenly
+over all physical ranks. `mega_ring_hybrid` instead uses `--ring-sizes` and
+`--ring-starts`; rank-local length is `global_len / ring_size` for members of
+that batch's ring and zero for other ranks. External FA3 is used by the first
+two baselines when available, otherwise they fall back to the local min-FA3
+varlen block.
 
-For `mega_ring_hybrid`, CP sequences must appear before local-only short
-sequences in `--global-seqlens`. CP batch offsets must be identical across
-ranks, while local-only batches may be full length on one rank and zero length
-on another. The local-only assignment also needs equal total local-only tokens
-per rank for the current TKParallelTensor layout.
+All-CP baseline lengths must be divisible by the physical world size. Causal
+all-CP mega-ring additionally requires each rank-local half length to be
+128-aligned. Use `--methods` to select a subset or `--methods all` for all four.
 
 Example:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_hybrid_forward.py \
-  --global-seqlens 4096,1024,1024 \
-  --qhead 16 --kvhead 8 --headdim 128 \
-  --num-comp-sm 1 --num-comm-sm 1 \
-  --cp-threshold 2048 --mode both \
+  --global-seqlens 8192,1024,1024 \
+  --ring-sizes 2,1,1 --ring-starts 0,0,1 \
+  --qhead 16 --kvhead 8 --headdim 128 --methods all \
+  --sm-configs 128:4,116:16 --mode both \
   --warmup-iters 5 --num-iters 20
 ```
 

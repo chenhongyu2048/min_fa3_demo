@@ -173,7 +173,7 @@ sbatch mega_ring_test_hybrid.slurm
 
 torchrun --standalone --nproc_per_node=8 \
   mega_ring_test_min_fa3_varlen_hybrid_multi_rank.py \
-  --global-seqlens 8192,4096,2048,1024 \
+  --global-seqlens 8192,4096,2048,2048 \
   --ring-sizes 8,4,2,1 \
   --ring-starts 0,4,2,7 \
   --qhead 16 --kvhead 8 --headdim 128 \
@@ -242,13 +242,20 @@ torchrun --standalone --nproc_per_node=8 \
   --global-seqlens 8192,4096,2048,1024 \
   --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
   --qhead 32 --kvhead 8 --headdim 128 \
+  --methods all \
   --sm-configs 128:4,124:8,120:12,116:16 \
   --mode both --warmup-iters 10 --num-iters 40 --no-check
 
 GPU_COUNTS="2 4 8" ./benchmark_ring_1_2_4_8.sh
 ```
 
-`ring_test/benchmark_hybrid_forward.py` measures the complete Python op with CUDA events, reports the maximum elapsed time across ranks, and prints aggregate and average-per-GPU TFLOPS for each SM configuration. `--check` adds O/LSE reference validation after timing; arena row/padding validation remains in the separate correctness test.
+`ring_test/benchmark_hybrid_forward.py` compares all-CP all-gather attention,
+FA3+NCCL ring attention, all-CP fused mega-ring, and hierarchical hybrid
+mega-ring. The first three split every global sequence evenly over all ranks;
+the hybrid method follows `--ring-sizes` and `--ring-starts`. It measures the
+complete Python op with CUDA events, reports maximum elapsed time across ranks,
+and prints aggregate and average-per-GPU TFLOPS. `--check` adds output reference
+validation after timing.
 
 Distributed ring benchmark:
 
