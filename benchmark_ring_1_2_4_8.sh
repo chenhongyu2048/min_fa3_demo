@@ -28,12 +28,19 @@ BACKWARD_GLOBAL_SEQLENS=${BACKWARD_GLOBAL_SEQLENS:-"4096,8192,16384,32768,65536"
 BACKWARD_BATCH=${BACKWARD_BATCH:-1}
 BACKWARD_METHODS=${BACKWARD_METHODS:-all}
 
-# The eight identical short sequences give every rank the same local-only
-# token count for world sizes 1, 2, 4, and 8. Length 2048 also keeps the causal
-# all-CP comparison inside benchmark_hybrid_forward.py 256-aligned at 8 GPUs.
-HYBRID_GLOBAL_SEQLENS=${HYBRID_GLOBAL_SEQLENS:-"65536,2048,2048,2048,2048,2048,2048,2048,2048"}
-HYBRID_CP_THRESHOLD=${HYBRID_CP_THRESHOLD:-2048}
-HYBRID_METHODS=${HYBRID_METHODS:-"fa3_all_cp,fa3_hybrid,mega_ring_all_cp,mega_ring_hybrid"}
+# Hierarchical hybrid metadata for each supported physical world size. Each
+# case fuses every legal group size for that world in one persistent launch.
+HYBRID_GLOBAL_SEQLENS_2=${HYBRID_GLOBAL_SEQLENS_2:-"8192,1024,1024"}
+HYBRID_RING_SIZES_2=${HYBRID_RING_SIZES_2:-"2,1,1"}
+HYBRID_RING_STARTS_2=${HYBRID_RING_STARTS_2:-"0,0,1"}
+
+HYBRID_GLOBAL_SEQLENS_4=${HYBRID_GLOBAL_SEQLENS_4:-"8192,4096,4096,1024,1024,1024,1024"}
+HYBRID_RING_SIZES_4=${HYBRID_RING_SIZES_4:-"4,2,2,1,1,1,1"}
+HYBRID_RING_STARTS_4=${HYBRID_RING_STARTS_4:-"0,0,2,0,1,2,3"}
+
+HYBRID_GLOBAL_SEQLENS_8=${HYBRID_GLOBAL_SEQLENS_8:-"131072,8192,8192,4096,4096,4096,4096,1024,1024,1024,1024,1024,1024,1024,1024"}
+HYBRID_RING_SIZES_8=${HYBRID_RING_SIZES_8:-"8,4,4,2,2,2,2,1,1,1,1,1,1,1,1"}
+HYBRID_RING_STARTS_8=${HYBRID_RING_STARTS_8:-"0,0,4,0,2,4,6,0,1,2,3,4,5,6,7"}
 
 # Defaults follow the H200 configurations used by the existing Slurm scripts.
 # A one-GPU forward run does not need communication CTAs.
@@ -152,6 +159,46 @@ run_benchmark() {
     CUDA_VISIBLE_DEVICES="$visible_devices" "${command[@]}" 2>&1 | tee -a "$LOG_FILE"
 }
 
+run_hierarchical_hybrid() {
+    local world_size=$1
+    local visible_devices=$2
+    local sm_configs=$3
+    local global_seqlens ring_sizes ring_starts
+
+    case "$world_size" in
+        2)
+            global_seqlens=$HYBRID_GLOBAL_SEQLENS_2
+            ring_sizes=$HYBRID_RING_SIZES_2
+            ring_starts=$HYBRID_RING_STARTS_2
+            ;;
+        4)
+            global_seqlens=$HYBRID_GLOBAL_SEQLENS_4
+            ring_sizes=$HYBRID_RING_SIZES_4
+            ring_starts=$HYBRID_RING_STARTS_4
+            ;;
+        8)
+            global_seqlens=$HYBRID_GLOBAL_SEQLENS_8
+            ring_sizes=$HYBRID_RING_SIZES_8
+            ring_starts=$HYBRID_RING_STARTS_8
+            ;;
+        1)
+            echo "Skipping hierarchical hybrid forward for world_size=1"
+            return
+            ;;
+        *) die "hierarchical hybrid forward does not support world_size=$world_size" ;;
+    esac
+
+    run_benchmark forward_hybrid "$world_size" "$visible_devices" \
+        ring_test/benchmark_hybrid_forward.py \
+        --global-seqlens "$global_seqlens" \
+        --ring-sizes "$ring_sizes" \
+        --ring-starts "$ring_starts" \
+        --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM" \
+        --mode causal --sm-configs "$sm_configs" \
+        --warmup-iters "$WARMUP_ITERS" --num-iters "$NUM_ITERS" \
+        "${CHECK_ARGS[@]}"
+}
+
 mkdir -p "$(dirname -- "$LOG_FILE")"
 if ((DRY_RUN == 0)); then
     : > "$LOG_FILE"
@@ -170,6 +217,9 @@ for world_size in "${GPU_COUNT_LIST[@]}"; do
         forward_sm_configs=$FORWARD_SM_CONFIGS_MULTI
     fi
 
+    # Ordinary all-CP forward takes a rank-local --seqlen list. Each value is
+    # ALL_CP_GLOBAL_SEQLENS / physical world_size, so every rank holds an equal
+    # shard and every GPU-count run represents the same global sequence list.
     divide_global_seqlens "$ALL_CP_GLOBAL_SEQLENS" "$world_size" 256 ALL_CP_GLOBAL_SEQLENS
     all_cp_local_seqlens=$LOCAL_SEQLENS
     run_benchmark forward_all_cp "$world_size" "$visible_devices" \
@@ -182,16 +232,14 @@ for world_size in "${GPU_COUNT_LIST[@]}"; do
         --warmup-iters "$WARMUP_ITERS" --num-iters "$NUM_ITERS" \
         "${CHECK_ARGS[@]}"
 
-    run_benchmark forward_hybrid "$world_size" "$visible_devices" \
-        ring_test/benchmark_hybrid_forward.py \
-        --global-seqlens "$HYBRID_GLOBAL_SEQLENS" \
-        --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM" \
-        --cp-threshold "$HYBRID_CP_THRESHOLD" \
-        --mode causal --methods "$HYBRID_METHODS" \
-        --sm-configs "$forward_sm_configs" \
-        --warmup-iters "$WARMUP_ITERS" --num-iters "$NUM_ITERS" \
-        "${CHECK_ARGS[@]}"
+    # Hierarchical hybrid forward takes a global --global-seqlens list. Each
+    # entry's rank-local length is global_seqlen / ring_size on ranks belonging
+    # to [ring_start, ring_start + ring_size), and zero on all other ranks.
+    run_hierarchical_hybrid "$world_size" "$visible_devices" "$forward_sm_configs"
 
+    # Ordinary all-CP backward takes a rank-local --seqlen list, with the same
+    # definition as ordinary forward: BACKWARD_GLOBAL_SEQLENS / physical
+    # world_size for every rank in the process group.
     divide_global_seqlens "$BACKWARD_GLOBAL_SEQLENS" "$world_size" 256 BACKWARD_GLOBAL_SEQLENS
     backward_local_seqlens=$LOCAL_SEQLENS
     run_benchmark backward "$world_size" "$visible_devices" \
@@ -207,4 +255,3 @@ done
 
 echo
 echo "Benchmark sweep complete. Log: $LOG_FILE"
-

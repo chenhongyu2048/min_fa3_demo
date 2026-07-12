@@ -166,21 +166,30 @@ python test_min_fa3_varlen_ring_local.py --b 3 --seqlen 128,256 --qhead 16 --kvh
 torchrun --nproc_per_node=2 test_min_fa3_varlen_ring_multi_rank.py --b 2 --seqlen 128,256 --qhead 16 --kvhead 8 --src-rank 0 --num-comp-sm 1 --num-comm-sm 1 --mode both
 ```
 
-Mega-ring varlen tests:
+Hierarchical hybrid mega-ring forward test:
 
 ```bash
-python mega_ring_test_min_fa3_varlen_ring_local.py --b 1 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 1 --num-comm-sm 1 --mode both
-python mega_ring_test_min_fa3_varlen_hybrid_local.py --seqlens 1152,4096,1408 --qhead 16 --kvhead 8 --headdim 128 --num-comp-sm 1 --num-comm-sm 0 --mode both
-torchrun --standalone --nproc_per_node=2 mega_ring_test_min_fa3_varlen_ring_multi_rank.py --b 1 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 1 --num-comm-sm 1 --mode both
-torchrun --standalone --nproc_per_node=1 mega_ring_test_min_fa3_varlen_backward_multi_rank.py --b 1 --seqlen 256,512 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 64 --num-comm-sm 8
-torchrun --standalone --nproc_per_node=2 mega_ring_test_min_fa3_varlen_backward_multi_rank.py --b 1 --seqlen 256,512 --qhead 8 --kvhead 8 --headdim 128 --num-comp-sm 64 --num-comm-sm 8
+sbatch mega_ring_test_hybrid.slurm
+
+torchrun --standalone --nproc_per_node=8 \
+  mega_ring_test_min_fa3_varlen_hybrid_multi_rank.py \
+  --global-seqlens 8192,4096,2048,1024 \
+  --ring-sizes 8,4,2,1 \
+  --ring-starts 0,4,2,7 \
+  --qhead 16 --kvhead 8 --headdim 128 \
+  --num-comp-sm 116 --num-comm-sm 16 \
+  --mode both --check-arena --repeat 20
 ```
 
-Mega-ring causal note:
+Hierarchical mega-ring forward notes:
 
-- Causal mega-ring uses the zigzag `[front half | back half]` sequence layout.
-- The causal path requires `--seqlen` to be divisible by `256` so each half remains `128`-aligned.
-- If this constraint is not met, the causal mega-ring test/benchmark case is skipped or marked unavailable.
+- This path supports one node with 2, 4, or 8 SM90 GPUs. A ring size cannot exceed the physical world size.
+- The 8-GPU path uses one fused persistent launch for G8/G4/G2/G1 sequences; the 2-GPU path similarly fuses G2/G1.
+- Batches are ordered by non-increasing ring size and explicitly pass global lengths, ring sizes, and aligned ring starts.
+- K/V use a shared rank-major capacity arena; the current row-granular communication path requires `KVH * D = 1024`.
+- Causal G8/G4/G2 uses the zigzag `[front half | back half]` layout and requires each local half to be 128-aligned.
+- The caller must synchronize owner-local K/V initialization across ranks before entering the op.
+- Ranks with no local sequence still enter the fused kernel and exit with an empty scheduler work stream.
 - Mega-ring backward is currently causal and non-deterministic only. Its VMM-backed FP32 dK/dV accumulators and owner completion counter must be zeroed on every rank and globally synchronized before calling `backward_varlen_mega_ring`.
 - Mega-ring backward communication uses row-granular TMA pipelines for remote K/V load/store and FP32 dK/dV load/remote reduce-add. K/V rows contain `KVH * D = 1024` bf16 values; dKV communication rows are contiguous groups of 1024 floats in the existing padded accumulator layout.
 
@@ -225,14 +234,21 @@ python benchmark_varlen_ring_local.py --b 4 --seqlen 512,1024,2048 --qhead 32 --
 python benchmark_varlen_ring_local.py --b 4 --seqlen 1024 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 4 --mode causal
 ```
 
-Mega-ring local varlen benchmark:
+Hierarchical mega-ring forward benchmark:
 
 ```bash
-python benchmark_varlen_mega_ring_local.py
-python benchmark_varlen_mega_ring_local.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 0 --mode both
-python benchmark_varlen_mega_ring_local.py --b 4 --seqlen 1024 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 4 --mode causal
-nsys profile -t cuda,nvtx,osrt -o my_report --stats=true python benchmark_varlen_mega_ring_local.py --profile --b 16 --seqlen 1024 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 116 --num-comm-sm 16 --mode noncausal
+torchrun --standalone --nproc_per_node=8 \
+  ring_test/benchmark_hybrid_forward.py \
+  --global-seqlens 8192,4096,2048,1024 \
+  --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
+  --qhead 32 --kvhead 8 --headdim 128 \
+  --sm-configs 128:4,124:8,120:12,116:16 \
+  --mode both --warmup-iters 10 --num-iters 40 --no-check
+
+GPU_COUNTS="2 4 8" ./benchmark_ring_1_2_4_8.sh
 ```
+
+`ring_test/benchmark_hybrid_forward.py` measures the complete Python op with CUDA events, reports the maximum elapsed time across ranks, and prints aggregate and average-per-GPU TFLOPS for each SM configuration. `--check` adds O/LSE reference validation after timing; arena row/padding validation remains in the separate correctness test.
 
 Distributed ring benchmark:
 

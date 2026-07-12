@@ -408,9 +408,12 @@ public:
                 }
                 int const bidb = get<2>(block_coord);
                 bool mega_ring_is_cp_batch = true;
+                int mega_ring_local_rank = params.mainloop.mega_ring_rank;
                 if constexpr (TileScheduler::EnableMegaRing) {
-                    mega_ring_is_cp_batch = params.mainloop.mega_ring_cp_batch_mask == nullptr
-                        || params.mainloop.mega_ring_cp_batch_mask[bidb] != 0;
+                    int const ring_size = params.mainloop.mega_ring_ring_sizes[bidb];
+                    int const ring_base = (params.mainloop.mega_ring_rank / ring_size) * ring_size;
+                    mega_ring_local_rank = params.mainloop.mega_ring_rank - ring_base;
+                    mega_ring_is_cp_batch = ring_size > 1;
                 }
                 SeqlenInfo_t seqlen_info{
                     bidb,
@@ -422,7 +425,7 @@ public:
                     params.mainloop.seqlens_rotary
                 };
                 if constexpr (TileScheduler::EnableMegaRing && Is_causal) {
-                    if (mega_ring_is_cp_batch && mega_ring_step > params.mainloop.mega_ring_rank) {
+                    if (mega_ring_is_cp_batch && mega_ring_step > mega_ring_local_rank) {
                         int const half_len = params.mainloop.mega_ring_half_cu_seqlens[bidb + 1] - params.mainloop.mega_ring_half_cu_seqlens[bidb];
                         mega_ring_q_row_offset = half_len;
                         mega_ring_seqlen_o = half_len;

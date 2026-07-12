@@ -368,21 +368,18 @@ def forward_varlen_mega_ring(
     *,
     cu_seqlens_q_host: torch.Tensor,
     cu_seqlens_k_host: torch.Tensor,
-    half_cu_seqlens: Optional[torch.Tensor] = None,
-    half_cu_seqlens_host: Optional[torch.Tensor] = None,
     remote_k: TKParallelTensor,
     remote_v: TKParallelTensor,
     num_comp_sm: int,
     num_comm_sm: int,
+    global_seqlens_host: torch.Tensor,
+    ring_sizes_host: torch.Tensor,
+    ring_starts_host: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
-    global_seqlens_host: Optional[torch.Tensor] = None,
-    cp_threshold: int = 2048,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    # MEGA_RING: explicit opt-in path. K/V are the local concatenated
-    # [world_size * local_total_k, kv_heads, 128] buffers used by the fused
-    # persistent kernel; default forward_varlen_ring remains single-step.
+    # K/V are rank-major [world_size * rank_kv_capacity, 8, 128] IPC arenas.
     return _forward_varlen_mega_ring_cuda(
         q,
         k,
@@ -398,13 +395,12 @@ def forward_varlen_mega_ring(
         bool(is_causal),
         int(num_comp_sm),
         int(num_comm_sm),
-        half_cu_seqlens,
-        half_cu_seqlens_host,
+        global_seqlens_host,
+        ring_sizes_host,
+        ring_starts_host,
         out,
         lse,
         bool(return_lse),
-        global_seqlens_host,
-        int(cp_threshold),
     )
 
 

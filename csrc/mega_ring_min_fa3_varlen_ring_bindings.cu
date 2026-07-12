@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <vector>
@@ -22,10 +23,6 @@ namespace {
 
 using RingVarlenParams = min_fa3_varlen_demo::Ring_fwd_params;
 using VarlenParams = min_fa3_varlen_demo::Flash_fwd_params;
-
-__global__ void set_mega_ring_local_kv_ready_count(int* counts, int rank, int value) {
-    counts[rank] = value;
-}
 
 int round_multiple(int x, int m) {
     return (x + m - 1) / m * m;
@@ -97,7 +94,7 @@ void check_cu_seqlens_host(const torch::Tensor& t, const torch::Tensor& device_t
                 name, " must have the same length as its CUDA cu_seqlens tensor");
 }
 
-void check_global_seqlens_host(const torch::Tensor& t, int64_t batch_size, const char* name) {
+void check_ring_metadata_host(const torch::Tensor& t, int64_t batch_size, const char* name) {
     TORCH_CHECK(!t.is_cuda(), name, " must be a CPU tensor");
     TORCH_CHECK(t.scalar_type() == torch::kInt32, name, " must have dtype torch.int32");
     TORCH_CHECK(t.dim() == 1, name, " must be 1D");
@@ -209,7 +206,7 @@ RingVarlenParams make_mega_ring_varlen_params(const torch::Tensor& q,
                                               const torch::Tensor& cu_seqlens_k,
                                               int max_seqlen_q,
                                               int max_seqlen_k,
-                                              int local_total_k,
+                                              int rank_kv_capacity,
                                               torch::Tensor& out,
                                               torch::Tensor& softmax_lse,
                                               torch::Tensor& scheduler_metadata,
@@ -218,15 +215,14 @@ RingVarlenParams make_mega_ring_varlen_params(const torch::Tensor& q,
                                               int num_comm_sm,
                                               int ring_rank,
                                               int ring_world_size,
-                                              int tiles_per_step,
-                                              int tiles_per_half_step,
-                                              int cp_total_k_per_rank,
-                                              int cp_tiles_per_step,
-                                              int cp_tiles_per_half_step,
-                                              int* cp_batch_mask,
+                                              int* ring_sizes,
+                                              const min_fa3_varlen_demo::MegaRingHierarchyDesc& hierarchy,
                                               int* half_cu_seqlens,
                                               torch::Tensor& kv_ready_counts,
-                                              torch::Tensor& step_ready) {
+                                              torch::Tensor& step_ready,
+                                              void* q_descriptor_ptr,
+                                              void* o_descriptor_ptr,
+                                              void* lse_descriptor_ptr) {
     RingVarlenParams params{};
     static_cast<VarlenParams&>(params) = make_varlen_params(
         q,
@@ -248,63 +244,43 @@ RingVarlenParams make_mega_ring_varlen_params(const torch::Tensor& q,
     params.ring_rank = ring_rank;
     params.ring_world_size = ring_world_size;
     params.ring_step = 0;
-    params.mega_ring_tiles_per_step = tiles_per_step;
-    params.mega_ring_tiles_per_half_step = tiles_per_half_step;
-    params.mega_ring_total_k_per_rank = local_total_k;
-    params.mega_ring_cp_total_k_per_rank = cp_total_k_per_rank;
-    params.mega_ring_cp_tiles_per_step = cp_tiles_per_step;
-    params.mega_ring_cp_tiles_per_half_step = cp_tiles_per_half_step;
-    params.mega_ring_cp_batch_mask = cp_batch_mask;
+    params.mega_ring_rank_kv_capacity = rank_kv_capacity;
+    params.mega_ring_ring_sizes = ring_sizes;
+    params.mega_ring_hierarchy = hierarchy;
     params.mega_ring_half_cu_seqlens = half_cu_seqlens;
     params.mega_ring_kv_ready_counts = kv_ready_counts.data_ptr<int>();
     params.mega_ring_step_ready = step_ready.data_ptr<int>();
+    params.q_ptr = q_descriptor_ptr;
+    params.o_ptr = o_descriptor_ptr;
+    params.softmax_lse_ptr = lse_descriptor_ptr;
     return params;
 }
 
 // MEGA_RING: step counters are indexed by the original per-step varlen Q tile
 // id. Each counter tracks how many ring steps have completed for that Q tile.
-int compute_tiles_per_step(const int* cu_seqlens_q_host, int batch_size, int q_heads) {
-    int tiles = 0;
+int64_t compute_tiles_per_step(const int* cu_seqlens_q_host, int batch_size, int q_heads) {
+    int64_t tiles = 0;
     for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
         int const start = cu_seqlens_q_host[batch_idx];
         int const end = cu_seqlens_q_host[batch_idx + 1];
         TORCH_CHECK(end >= start, "cu_seqlens_q_host must be nondecreasing");
-        tiles += round_multiple(end - start, 128) / 128 * q_heads;
+        tiles += ((int64_t(end - start) + 127) / 128) * q_heads;
     }
     return tiles;
 }
 
-int compute_tiles_per_step_masked(const int* cu_seqlens_q_host,
-                                  const int* cp_batch_mask_host,
-                                  int batch_size,
-                                  int q_heads) {
-    int tiles = 0;
-    for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-        if (cp_batch_mask_host != nullptr && cp_batch_mask_host[batch_idx] == 0) {
-            continue;
-        }
+int64_t compute_tiles_for_batch_range(const int* cu_seqlens_q_host,
+                                      int batch_begin,
+                                      int batch_end,
+                                      int q_heads) {
+    int64_t tiles = 0;
+    for (int batch_idx = batch_begin; batch_idx < batch_end; ++batch_idx) {
         int const start = cu_seqlens_q_host[batch_idx];
         int const end = cu_seqlens_q_host[batch_idx + 1];
         TORCH_CHECK(end >= start, "cu_seqlens_q_host must be nondecreasing");
-        tiles += round_multiple(end - start, 128) / 128 * q_heads;
+        tiles += ((int64_t(end - start) + 127) / 128) * q_heads;
     }
     return tiles;
-}
-
-int compute_total_k_masked(const int* cu_seqlens_k_host,
-                           const int* cp_batch_mask_host,
-                           int batch_size) {
-    int total = 0;
-    for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-        if (cp_batch_mask_host != nullptr && cp_batch_mask_host[batch_idx] == 0) {
-            continue;
-        }
-        int const start = cu_seqlens_k_host[batch_idx];
-        int const end = cu_seqlens_k_host[batch_idx + 1];
-        TORCH_CHECK(end >= start, "cu_seqlens_k_host must be nondecreasing");
-        total += end - start;
-    }
-    return total;
 }
 
 // MEGA_RING: public binding launches all ring steps in one CUDA kernel. The
@@ -324,13 +300,12 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
                                     bool is_causal,
                                     int64_t num_comp_sm,
                                     int64_t num_comm_sm,
-                                    py::object half_cu_seqlens_obj,
-                                    py::object half_cu_seqlens_host_obj,
+                                    torch::Tensor global_seqlens_host,
+                                    torch::Tensor ring_sizes_host,
+                                    torch::Tensor ring_starts_host,
                                     py::object out_obj,
                                     py::object lse_obj,
-                                    bool return_lse,
-                                    py::object global_seqlens_host_obj,
-                                    int64_t cp_threshold) {
+                                    bool return_lse) {
     check_varlen_qkv(q, "q");
     check_varlen_qkv(k, "k");
     check_varlen_qkv(v, "v");
@@ -340,28 +315,20 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     check_cu_seqlens(cu_seqlens_k, "cu_seqlens_k");
     check_cu_seqlens_host(cu_seqlens_q_host, cu_seqlens_q, "cu_seqlens_q_host");
     check_cu_seqlens_host(cu_seqlens_k_host, cu_seqlens_k, "cu_seqlens_k_host");
-    bool const hybrid_mode = !global_seqlens_host_obj.is_none();
-    torch::Tensor half_cu_seqlens;
-    torch::Tensor half_cu_seqlens_host;
-    if (is_causal && !hybrid_mode) {
-        TORCH_CHECK(!half_cu_seqlens_obj.is_none(), "causal mega ring zigzag requires half_cu_seqlens");
-        TORCH_CHECK(!half_cu_seqlens_host_obj.is_none(), "causal mega ring zigzag requires half_cu_seqlens_host");
-        half_cu_seqlens = half_cu_seqlens_obj.cast<torch::Tensor>();
-        half_cu_seqlens_host = half_cu_seqlens_host_obj.cast<torch::Tensor>();
-        check_cu_seqlens(half_cu_seqlens, "half_cu_seqlens");
-        check_cu_seqlens_host(half_cu_seqlens_host, half_cu_seqlens, "half_cu_seqlens_host");
-    }
+    int const batch_size = cu_seqlens_q_host.size(0) - 1;
+    check_ring_metadata_host(global_seqlens_host, batch_size, "global_seqlens_host");
+    check_ring_metadata_host(ring_sizes_host, batch_size, "ring_sizes_host");
+    check_ring_metadata_host(ring_starts_host, batch_size, "ring_starts_host");
 
     TORCH_CHECK(q.device() == k.device() && q.device() == v.device(), "q, k, v must be on the same CUDA device");
     TORCH_CHECK(q.device() == cu_seqlens_q.device() && q.device() == cu_seqlens_k.device(),
                 "q, k, v, cu_seqlens_q, and cu_seqlens_k must be on the same CUDA device");
-    if (is_causal && !hybrid_mode) {
-        TORCH_CHECK(half_cu_seqlens.device() == q.device(), "half_cu_seqlens must be on the same CUDA device as q");
-    }
     TORCH_CHECK(remote_k.data_.device() == q.device(), "remote_k must be created on the same local CUDA device as q");
     TORCH_CHECK(remote_v.data_.device() == q.device(), "remote_v must be created on the same local CUDA device as q");
     TORCH_CHECK(remote_k.data_.sizes().vec() == k.sizes().vec(), "remote_k must have the same shape as local k");
     TORCH_CHECK(remote_v.data_.sizes().vec() == v.sizes().vec(), "remote_v must have the same shape as local v");
+    TORCH_CHECK(remote_k.data_.data_ptr() == k.data_ptr(), "k must be remote_k.data_ so compute and IPC use the same arena");
+    TORCH_CHECK(remote_v.data_.data_ptr() == v.data_ptr(), "v must be remote_v.data_ so compute and IPC use the same arena");
     TORCH_CHECK(remote_k.data_.data_ptr() != remote_v.data_.data_ptr(),
                 "remote_k and remote_v must be separate TKParallelTensor allocations");
     // MEGA_RING: K and V are separate VMM-backed tensors, but they must describe
@@ -372,6 +339,9 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
                 "remote_k and remote_v must have the same local_world_size");
     TORCH_CHECK(remote_k.local_rank_ == remote_v.local_rank_,
                 "remote_k and remote_v must have the same local_rank");
+    TORCH_CHECK(remote_k.local_world_size_ == 2 || remote_k.local_world_size_ == 4 || remote_k.local_world_size_ == 8,
+                "hierarchical mega ring forward requires world_size in {2, 4, 8}. Got ",
+                remote_k.local_world_size_);
     TORCH_CHECK(k.size(1) == v.size(1), "k and v must have the same KV head count");
     TORCH_CHECK(q.size(1) % k.size(1) == 0,
                 "This demo requires qhead % kvhead == 0 for GQA/MQA. Got qhead=",
@@ -391,110 +361,33 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     TORCH_CHECK(props->major == 9 && props->minor == 0,
                 "min_fa3_demo only supports Hopper SM90. Current device capability is ",
                 props->major, ".", props->minor);
+    TORCH_CHECK(num_comp_sm + num_comm_sm <= props->multiProcessorCount,
+                "num_comp_sm + num_comm_sm must not exceed the device SM count (",
+                props->multiProcessorCount, "). Got ", num_comp_sm + num_comm_sm);
 
-    int const batch_size = cu_seqlens_q_host.size(0) - 1;
     int const* cu_seqlens_q_host_ptr = cu_seqlens_q_host.data_ptr<int>();
     int const* cu_seqlens_k_host_ptr = cu_seqlens_k_host.data_ptr<int>();
-    TORCH_CHECK(cp_threshold >= 0 && cp_threshold <= std::numeric_limits<int>::max(),
-                "cp_threshold must fit in non-negative int32. Got ", cp_threshold);
-    torch::Tensor cp_batch_mask;
-    std::vector<int> cp_batch_mask_host_vec;
-    int const* cp_batch_mask_host_ptr = nullptr;
-    if (hybrid_mode) {
-        auto global_seqlens_host = global_seqlens_host_obj.cast<torch::Tensor>();
-        check_global_seqlens_host(global_seqlens_host, batch_size, "global_seqlens_host");
-        int const* global_seqlens_host_ptr = global_seqlens_host.data_ptr<int>();
-        cp_batch_mask_host_vec.resize(batch_size);
-        auto cp_batch_mask_host = torch::empty({batch_size}, torch::TensorOptions().dtype(torch::kInt32));
-        int* cp_batch_mask_host_tensor_ptr = cp_batch_mask_host.data_ptr<int>();
-        for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-            int const is_cp = global_seqlens_host_ptr[batch_idx] > static_cast<int>(cp_threshold) ? 1 : 0;
-            cp_batch_mask_host_vec[batch_idx] = is_cp;
-            cp_batch_mask_host_tensor_ptr[batch_idx] = is_cp;
-        }
-        cp_batch_mask = torch::empty({batch_size}, q.options().dtype(torch::kInt32));
-        cp_batch_mask.copy_(cp_batch_mask_host, false);
-        cp_batch_mask_host_ptr = cp_batch_mask_host_vec.data();
-    }
-    int const* half_cu_seqlens_host_ptr = (!hybrid_mode && is_causal) ? half_cu_seqlens_host.data_ptr<int>() : nullptr;
-    // MEGA_RING: ring identity is taken from the TKParallelTensor allocation.
+    int const* global_seqlens_host_ptr = global_seqlens_host.data_ptr<int>();
+    int const* ring_sizes_host_ptr = ring_sizes_host.data_ptr<int>();
+    int const* ring_starts_host_ptr = ring_starts_host.data_ptr<int>();
     int const world_size = remote_k.local_world_size_;
     int const ring_rank = remote_k.local_rank_;
     TORCH_CHECK(batch_size >= 1, "varlen demo requires batch size B >= 1");
     TORCH_CHECK(cu_seqlens_q_host_ptr[0] == 0, "cu_seqlens_q_host must start with 0");
     TORCH_CHECK(cu_seqlens_k_host_ptr[0] == 0, "cu_seqlens_k_host must start with 0");
-    if (is_causal && !hybrid_mode) {
-        TORCH_CHECK(half_cu_seqlens_host.size(0) == cu_seqlens_q_host.size(0),
-                    "half_cu_seqlens_host must have the same length as cu_seqlens_q_host");
-        TORCH_CHECK(half_cu_seqlens_host_ptr[0] == 0, "half_cu_seqlens_host must start with 0");
-    }
     TORCH_CHECK(cu_seqlens_q_host_ptr[batch_size] == q.size(0),
                 "cu_seqlens_q_host[-1] must equal q.size(0). Got ", cu_seqlens_q_host_ptr[batch_size],
                 " vs ", q.size(0));
-    // MEGA_RING: cu_seqlens_k describes one rank-local KV block, while K/V
-    // storage contains one such block for every rank in local rank order.
     int const local_total_k = cu_seqlens_k_host_ptr[batch_size];
-    TORCH_CHECK(local_total_k > 0, "cu_seqlens_k_host[-1] must be positive");
-    int tiles_per_half_step = 0;
-    if (is_causal) {
-        if (hybrid_mode) {
-            half_cu_seqlens_host = torch::empty({batch_size + 1}, torch::TensorOptions().dtype(torch::kInt32));
-            int* half_host_ptr = half_cu_seqlens_host.data_ptr<int>();
-            half_host_ptr[0] = 0;
-            for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-                int const q_len = cu_seqlens_q_host_ptr[batch_idx + 1] - cu_seqlens_q_host_ptr[batch_idx];
-                int const k_len = cu_seqlens_k_host_ptr[batch_idx + 1] - cu_seqlens_k_host_ptr[batch_idx];
-                TORCH_CHECK(q_len >= 0 && k_len >= 0, "cu_seqlens must be nondecreasing");
-                int half_len = 0;
-                if (cp_batch_mask_host_ptr[batch_idx] != 0) {
-                    TORCH_CHECK(q_len == k_len,
-                                "causal hybrid mega ring requires q/k local lengths to match for CP batch=",
-                                batch_idx, ". Got q_len=", q_len, ", k_len=", k_len);
-                    TORCH_CHECK(q_len % 2 == 0,
-                                "causal hybrid mega ring requires even local length for CP batch=",
-                                batch_idx, ". Got q_len=", q_len);
-                    half_len = q_len / 2;
-                    TORCH_CHECK(half_len > 0, "causal hybrid mega ring requires positive half_len for CP batch=", batch_idx);
-                    TORCH_CHECK(half_len % 128 == 0,
-                                "causal hybrid mega ring requires CP half_len to be 128-aligned. batch=",
-                                batch_idx, ", half_len=", half_len);
-                }
-                half_host_ptr[batch_idx + 1] = half_host_ptr[batch_idx] + half_len;
-            }
-            half_cu_seqlens = torch::empty({batch_size + 1}, q.options().dtype(torch::kInt32));
-            half_cu_seqlens.copy_(half_cu_seqlens_host, false);
-            half_cu_seqlens_host_ptr = half_cu_seqlens_host.data_ptr<int>();
-            tiles_per_half_step = compute_tiles_per_step_masked(
-                half_cu_seqlens_host_ptr,
-                cp_batch_mask_host_ptr,
-                batch_size,
-                q.size(1));
-        } else {
-            for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-                int const q_len = cu_seqlens_q_host_ptr[batch_idx + 1] - cu_seqlens_q_host_ptr[batch_idx];
-                int const k_len = cu_seqlens_k_host_ptr[batch_idx + 1] - cu_seqlens_k_host_ptr[batch_idx];
-                int const half_len = half_cu_seqlens_host_ptr[batch_idx + 1] - half_cu_seqlens_host_ptr[batch_idx];
-                TORCH_CHECK(half_len > 0, "causal mega ring zigzag requires positive half_len for every batch");
-                TORCH_CHECK(q_len == 2 * half_len,
-                            "causal mega ring zigzag requires q seqlen == 2 * half_len. batch=", batch_idx,
-                            ", q_len=", q_len, ", half_len=", half_len);
-                TORCH_CHECK(k_len == 2 * half_len,
-                            "causal mega ring zigzag requires k seqlen == 2 * half_len. batch=", batch_idx,
-                            ", k_len=", k_len, ", half_len=", half_len);
-                TORCH_CHECK(half_len % 128 == 0,
-                            "causal mega ring zigzag requires half_len to be 128-aligned. batch=", batch_idx,
-                            ", half_len=", half_len);
-            }
-            tiles_per_half_step = compute_tiles_per_step(half_cu_seqlens_host_ptr, batch_size, q.size(1));
-            TORCH_CHECK(tiles_per_half_step > 0, "causal mega ring zigzag requires at least one half-Q tile per step");
-        }
-    }
-    TORCH_CHECK(k.size(0) == int64_t(world_size) * local_total_k,
-                "mega ring k must have shape [world_size * local_total_k, KVH, D]. Got k.size(0)=",
-                k.size(0), ", world_size=", world_size, ", local_total_k=", local_total_k);
-    TORCH_CHECK(v.size(0) == int64_t(world_size) * local_total_k,
-                "mega ring v must have shape [world_size * local_total_k, KVH, D]. Got v.size(0)=",
-                v.size(0), ", world_size=", world_size, ", local_total_k=", local_total_k);
+    TORCH_CHECK(cu_seqlens_k_host_ptr[batch_size] >= 0, "cu_seqlens_k_host[-1] must be non-negative");
+    TORCH_CHECK(k.size(0) == v.size(0) && k.size(0) % world_size == 0,
+                "k and v arena rows must match and be divisible by world_size");
+    int64_t const rank_kv_capacity_i64 = k.size(0) / world_size;
+    TORCH_CHECK(rank_kv_capacity_i64 > 0 && rank_kv_capacity_i64 <= std::numeric_limits<int>::max(),
+                "rank_kv_capacity must be positive and fit in int32. Got ", rank_kv_capacity_i64);
+    int const rank_kv_capacity = static_cast<int>(rank_kv_capacity_i64);
+    TORCH_CHECK(local_total_k <= rank_kv_capacity,
+                "local_total_k exceeds rank_kv_capacity. Got ", local_total_k, " vs ", rank_kv_capacity);
     TORCH_CHECK(
         k.size(0) * k.size(1) <= std::numeric_limits<int>::max(),
         "Mega ring varlen path requires total_k * kv_heads to fit in int32. Got total_k=",
@@ -506,8 +399,119 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     TORCH_CHECK(k.size(1) * k.size(2) == 1024,
                 "Mega ring communication path currently requires kv_heads * head_dim == 1024. Got kv_heads=",
                 k.size(1), ", head_dim=", k.size(2));
+
+    auto half_cu_seqlens_host = torch::zeros({batch_size + 1}, torch::TensorOptions().dtype(torch::kInt32));
+    int* half_host_ptr = half_cu_seqlens_host.data_ptr<int>();
+    int previous_ring_size = 8;
+    int max_local_q = 0;
+    int max_local_k = 0;
+    for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        int const q_len = cu_seqlens_q_host_ptr[batch_idx + 1] - cu_seqlens_q_host_ptr[batch_idx];
+        int const k_len = cu_seqlens_k_host_ptr[batch_idx + 1] - cu_seqlens_k_host_ptr[batch_idx];
+        TORCH_CHECK(q_len >= 0 && k_len >= 0, "cu_seqlens must be nondecreasing at batch=", batch_idx);
+        int const global_len = global_seqlens_host_ptr[batch_idx];
+        int const ring_size = ring_sizes_host_ptr[batch_idx];
+        int const ring_start = ring_starts_host_ptr[batch_idx];
+        TORCH_CHECK(global_len > 0, "global_seqlens_host must be positive at batch=", batch_idx);
+        TORCH_CHECK(ring_size == 1 || ring_size == 2 || ring_size == 4 || ring_size == 8,
+                    "ring_sizes_host must contain only 1, 2, 4, or 8. batch=", batch_idx, ", value=", ring_size);
+        TORCH_CHECK(ring_size <= previous_ring_size,
+                    "batch must be ordered by non-increasing ring size. batch=", batch_idx);
+        previous_ring_size = ring_size;
+        TORCH_CHECK(ring_start >= 0 && ring_start % ring_size == 0 && ring_start + ring_size <= world_size,
+                    "invalid aligned ring range at batch=", batch_idx, ": start=", ring_start, ", size=", ring_size);
+        TORCH_CHECK(global_len % ring_size == 0,
+                    "global length must be divisible by ring size at batch=", batch_idx);
+        bool const is_member = ring_rank >= ring_start && ring_rank < ring_start + ring_size;
+        int const expected_local_len = is_member ? global_len / ring_size : 0;
+        TORCH_CHECK(q_len == expected_local_len && k_len == expected_local_len,
+                    "local q/k length does not match hierarchical ring metadata at batch=", batch_idx,
+                    ". expected=", expected_local_len, ", q_len=", q_len, ", k_len=", k_len);
+        int half_len = 0;
+        if (is_causal && ring_size > 1 && is_member) {
+            TORCH_CHECK(q_len % 2 == 0, "causal CP local length must be even at batch=", batch_idx);
+            half_len = q_len / 2;
+            TORCH_CHECK(half_len % 128 == 0,
+                        "causal CP half length must be 128-aligned at batch=", batch_idx,
+                        ". half_len=", half_len);
+        }
+        half_host_ptr[batch_idx + 1] = half_host_ptr[batch_idx] + half_len;
+        max_local_q = std::max(max_local_q, q_len);
+        max_local_k = std::max(max_local_k, k_len);
+    }
+    TORCH_CHECK(max_local_q <= max_seqlen_q && max_local_k <= max_seqlen_k,
+                "max_seqlen_q/max_seqlen_k must cover every local sequence");
+
+    auto ring_sizes = torch::empty({batch_size}, q.options().dtype(torch::kInt32));
+    ring_sizes.copy_(ring_sizes_host, false);
+    torch::Tensor half_cu_seqlens;
+    if (is_causal) {
+        half_cu_seqlens = torch::empty({batch_size + 1}, q.options().dtype(torch::kInt32));
+        half_cu_seqlens.copy_(half_cu_seqlens_host, false);
+    }
+
+    min_fa3_varlen_demo::MegaRingHierarchyDesc hierarchy{};
+    constexpr int kRingSizes[4] = {8, 4, 2, 1};
+    constexpr int kKvReadyBases[4] = {0, 7, 10, 11};
+    int batch_cursor = 0;
+    int64_t reduction_tiles = 0;
+    int64_t total_comm_tasks = 0;
+    int64_t total_work_tiles = compute_tiles_per_step(cu_seqlens_q_host_ptr, batch_size, q.size(1));
+    for (int level_idx = 0; level_idx < 4; ++level_idx) {
+        int const ring_size = kRingSizes[level_idx];
+        int const batch_begin = batch_cursor;
+        while (batch_cursor < batch_size && ring_sizes_host_ptr[batch_cursor] == ring_size) {
+            ++batch_cursor;
+        }
+        int const batch_end = batch_cursor;
+        int64_t const full_tiles = compute_tiles_for_batch_range(
+            cu_seqlens_q_host_ptr, batch_begin, batch_end, q.size(1));
+        int64_t const half_tiles = is_causal
+            ? compute_tiles_for_batch_range(half_host_ptr, batch_begin, batch_end, q.size(1))
+            : 0;
+        TORCH_CHECK(full_tiles <= std::numeric_limits<int>::max() && half_tiles <= std::numeric_limits<int>::max(),
+                    "per-level tile count must fit in int32");
+        auto& level = hierarchy.levels[level_idx];
+        level.ring_size = ring_size;
+        level.batch_begin = batch_begin;
+        level.batch_end = batch_end;
+        level.row_begin = cu_seqlens_k_host_ptr[batch_begin];
+        level.full_rows = cu_seqlens_k_host_ptr[batch_end] - level.row_begin;
+        level.half_row_begin = half_host_ptr[batch_begin];
+        level.half_rows = half_host_ptr[batch_end] - level.half_row_begin;
+        level.full_tiles = static_cast<int>(full_tiles);
+        level.half_tiles = static_cast<int>(half_tiles);
+        level.reduction_base = static_cast<int>(reduction_tiles);
+        level.kv_ready_base = kKvReadyBases[level_idx];
+        if (ring_size > 1) {
+            int const ring_base = (ring_rank / ring_size) * ring_size;
+            int const ring_local_rank = ring_rank - ring_base;
+            total_work_tiles += is_causal
+                ? int64_t(ring_local_rank) * full_tiles + int64_t(ring_size - 1 - ring_local_rank) * half_tiles
+                : int64_t(ring_size - 1) * full_tiles;
+            total_comm_tasks += is_causal
+                ? 2 * (int64_t(ring_local_rank) * level.half_rows
+                       + int64_t(ring_size - 1 - ring_local_rank) * level.full_rows)
+                : 2 * int64_t(ring_size - 1) * level.full_rows;
+            reduction_tiles += full_tiles;
+        }
+    }
+    TORCH_CHECK(batch_cursor == batch_size, "failed to partition all batches into hierarchical ring levels");
+    TORCH_CHECK(total_work_tiles <= std::numeric_limits<int>::max() && reduction_tiles <= std::numeric_limits<int>::max(),
+                "mega-ring total work and reduction tile counts must fit in int32");
+    TORCH_CHECK(total_comm_tasks <= std::numeric_limits<int>::max(),
+                "mega-ring communication task count must fit in int32");
+    hierarchy.total_work_tiles = static_cast<int>(total_work_tiles);
+    hierarchy.reduction_tiles = static_cast<int>(reduction_tiles);
+    TORCH_CHECK(num_comm_sm > 0 || reduction_tiles == 0,
+                "num_comm_sm must be positive when this rank has G8/G4/G2 replay work");
+
     auto out = resolve_out(out_obj, q);
     auto lse = resolve_lse(lse_obj, q);
+    // The reduction epilogue treats O/LSE as running state starting at
+    // (zero, -inf), including step 0 and caller-provided output buffers.
+    out.zero_();
+    lse.fill_(-std::numeric_limits<float>::infinity());
 
     int b_rounded = round_multiple(batch_size, 4);
     bool varlen_sort_batches = true;
@@ -516,39 +520,18 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     int metadata_size = 1 + b_rounded * num_prepare_batch_vectors;
     auto scheduler_metadata = torch::empty({metadata_size}, q.options().dtype(torch::kInt32));
 
-    // MEGA_RING: device counters coordinate remote K/V availability and
-    // per-Q-tile reduction ordering across ring steps.
-    int const tiles_per_step = compute_tiles_per_step(cu_seqlens_q_host_ptr, batch_size, q.size(1));
-    int const cp_tiles_per_step = hybrid_mode
-        ? compute_tiles_per_step_masked(cu_seqlens_q_host_ptr, cp_batch_mask_host_ptr, batch_size, q.size(1))
-        : tiles_per_step;
-    int const cp_tiles_per_half_step = hybrid_mode ? tiles_per_half_step : tiles_per_half_step;
-    int const cp_total_k_per_rank = hybrid_mode
-        ? compute_total_k_masked(cu_seqlens_k_host_ptr, cp_batch_mask_host_ptr, batch_size)
-        : local_total_k;
-    TORCH_CHECK(tiles_per_step > 0, "mega ring requires at least one Q tile per step");
-    if (is_causal && !hybrid_mode) {
-        TORCH_CHECK(tiles_per_step == 2 * tiles_per_half_step,
-                    "causal mega ring zigzag requires T_full == 2 * T_half. Got T_full=",
-                    tiles_per_step, ", T_half=", tiles_per_half_step);
-    }
-    if (is_causal && hybrid_mode && cp_tiles_per_step > 0) {
-        TORCH_CHECK(cp_tiles_per_step == 2 * cp_tiles_per_half_step,
-                    "causal hybrid mega ring requires CP T_full == 2 * CP T_half. Got CP T_full=",
-                    cp_tiles_per_step, ", CP T_half=", cp_tiles_per_half_step);
-    }
-    TORCH_CHECK(world_size == 1 || num_comm_sm > 0 || cp_total_k_per_rank == 0,
-                "mega ring requires num_comm_sm > 0 when world_size > 1 and at least one CP sequence is present");
-    auto kv_ready_counts = torch::zeros({world_size}, q.options().dtype(torch::kInt32));
-    int const step_ready_size = hybrid_mode ? std::max(cp_tiles_per_step, 1) : tiles_per_step;
-    auto step_ready = torch::zeros({step_ready_size}, q.options().dtype(torch::kInt32));
+    auto kv_ready_counts = torch::zeros({11}, q.options().dtype(torch::kInt32));
+    auto step_ready = torch::zeros({std::max<int64_t>(reduction_tiles, 1)}, q.options().dtype(torch::kInt32));
 
-    // MEGA_RING: initial local rank block is already resident in the local
-    // concatenated K/V buffer.
-    auto stream = at::cuda::getDefaultCUDAStream(q.get_device());
-    set_mega_ring_local_kv_ready_count<<<1, 1, 0, stream>>>(
-        kv_ready_counts.data_ptr<int>(), ring_rank, cp_total_k_per_rank * 2);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    torch::Tensor q_descriptor = q;
+    torch::Tensor out_descriptor = out;
+    torch::Tensor lse_descriptor = lse;
+    if (q.size(0) == 0) {
+        q_descriptor = torch::empty({1, q.size(1), q.size(2)}, q.options());
+        out_descriptor = torch::empty_like(q_descriptor);
+        lse_descriptor = torch::empty({q.size(1), 1}, q.options().dtype(torch::kFloat));
+    }
+    auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
 
     auto params = make_mega_ring_varlen_params(
         q,
@@ -558,7 +541,7 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
         cu_seqlens_k,
         static_cast<int>(max_seqlen_q),
         static_cast<int>(max_seqlen_k),
-        local_total_k,
+        rank_kv_capacity,
         out,
         lse,
         scheduler_metadata,
@@ -567,15 +550,14 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
         static_cast<int>(num_comm_sm),
         ring_rank,
         world_size,
-        tiles_per_step,
-        tiles_per_half_step,
-        cp_total_k_per_rank,
-        cp_tiles_per_step,
-        cp_tiles_per_half_step,
-        hybrid_mode ? static_cast<int*>(cp_batch_mask.data_ptr()) : nullptr,
+        ring_sizes.data_ptr<int>(),
+        hierarchy,
         is_causal ? static_cast<int*>(half_cu_seqlens.data_ptr()) : nullptr,
         kv_ready_counts,
-        step_ready);
+        step_ready,
+        q_descriptor.data_ptr(),
+        out_descriptor.data_ptr(),
+        lse_descriptor.data_ptr());
 
     // MEGA_RING: one fused launch runs communication CTAs and compute CTAs.
     min_fa3_varlen_demo::run_mega_ring_min_fa3_varlen_ring_fwd(params, remote_k, remote_v, stream);
@@ -606,14 +588,13 @@ void bind_varlen_mega_ring(py::module_& m) {
         py::arg("is_causal"),
         py::arg("num_comp_sm"),
         py::arg("num_comm_sm"),
-        py::arg("half_cu_seqlens") = py::none(),
-        py::arg("half_cu_seqlens_host") = py::none(),
+        py::arg("global_seqlens_host"),
+        py::arg("ring_sizes_host"),
+        py::arg("ring_starts_host"),
         py::arg("out") = py::none(),
         py::arg("lse") = py::none(),
         py::arg("return_lse") = false,
-        py::arg("global_seqlens_host") = py::none(),
-        py::arg("cp_threshold") = 2048,
-        "MEGA_RING: explicit multi-step fused Hopper varlen ring-attention demo.\n\n"
-        "K/V must be contiguous [world_size * local_total_k, kv_heads, 128] buffers. "
+        "MEGA_RING: hierarchical fused Hopper varlen ring-attention forward.\n\n"
+        "K/V must be contiguous [world_size * rank_kv_capacity, 8, 128] arenas. "
         "The kernel performs persistent compute and remote K/V TMA loads in one launch.");
 }

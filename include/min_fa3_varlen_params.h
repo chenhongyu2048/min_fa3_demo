@@ -12,6 +12,26 @@
 
 namespace min_fa3_varlen_demo {
 
+struct MegaRingLevelDesc {
+    int ring_size = 1;
+    int batch_begin = 0;
+    int batch_end = 0;
+    int row_begin = 0;
+    int full_rows = 0;
+    int half_row_begin = 0;
+    int half_rows = 0;
+    int full_tiles = 0;
+    int half_tiles = 0;
+    int reduction_base = 0;
+    int kv_ready_base = 0;
+};
+
+struct MegaRingHierarchyDesc {
+    MegaRingLevelDesc levels[4]{};
+    int total_work_tiles = 0;
+    int reduction_tiles = 0;
+};
+
 struct Qkv_params {
     using index_t = int64_t;
 
@@ -105,13 +125,9 @@ struct Ring_fwd_params : public Flash_fwd_params {
     int ring_step = 0;
     // MEGA_RING: explicit multi-step fused path metadata. The default
     // single-step ring path leaves these null/zero and does not read them.
-    int mega_ring_tiles_per_step = 0;
-    int mega_ring_tiles_per_half_step = 0;
-    int mega_ring_total_k_per_rank = 0;
-    int mega_ring_cp_total_k_per_rank = 0;
-    int mega_ring_cp_tiles_per_step = 0;
-    int mega_ring_cp_tiles_per_half_step = 0;
-    int* __restrict__ mega_ring_cp_batch_mask = nullptr;
+    int mega_ring_rank_kv_capacity = 0;
+    int* __restrict__ mega_ring_ring_sizes = nullptr;
+    MegaRingHierarchyDesc mega_ring_hierarchy{};
     int* __restrict__ mega_ring_half_cu_seqlens = nullptr;
     int* __restrict__ mega_ring_kv_ready_counts = nullptr;
     // MEGA_RING: per-Q-tile completed-step counters for in-place O/LSE reduction ordering.

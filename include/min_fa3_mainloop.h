@@ -18,6 +18,7 @@
 #include "cutlass/gemm/collective/builders/sm90_common.inl"
 
 #include "min_fa3_named_barrier.h"
+#include "min_fa3_varlen_params.h"
 #include "seqlen.h"
 #include "block.h"
 #include "mask.h"
@@ -406,9 +407,9 @@ struct CollectiveMainloopFwdSm90 {
         int const* const mega_ring_half_cu_seqlens = nullptr;
         int const mega_ring_rank = 0;
         int const mega_ring_world_size = 1;
-        int const mega_ring_total_k_per_rank = 0;
-        int const mega_ring_cp_total_k_per_rank = 0;
-        int const* const mega_ring_cp_batch_mask = nullptr;
+        int const mega_ring_rank_kv_capacity = 0;
+        int const* const mega_ring_ring_sizes = nullptr;
+        min_fa3_varlen_demo::MegaRingHierarchyDesc const mega_ring_hierarchy{};
     };
 
     // Device side kernel params
@@ -472,9 +473,9 @@ struct CollectiveMainloopFwdSm90 {
         int const* const mega_ring_half_cu_seqlens = nullptr;
         int const mega_ring_rank = 0;
         int const mega_ring_world_size = 1;
-        int const mega_ring_total_k_per_rank = 0;
-        int const mega_ring_cp_total_k_per_rank = 0;
-        int const* const mega_ring_cp_batch_mask = nullptr;
+        int const mega_ring_rank_kv_capacity = 0;
+        int const* const mega_ring_ring_sizes = nullptr;
+        min_fa3_varlen_demo::MegaRingHierarchyDesc const mega_ring_hierarchy{};
     };
 
     static Params
@@ -588,8 +589,8 @@ struct CollectiveMainloopFwdSm90 {
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
                 args.mega_ring_kv_ready_counts, args.mega_ring_step_ready, args.mega_ring_half_cu_seqlens,
-                args.mega_ring_rank, args.mega_ring_world_size, args.mega_ring_total_k_per_rank,
-                args.mega_ring_cp_total_k_per_rank, args.mega_ring_cp_batch_mask};
+                args.mega_ring_rank, args.mega_ring_world_size, args.mega_ring_rank_kv_capacity,
+                args.mega_ring_ring_sizes, args.mega_ring_hierarchy};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -631,9 +632,22 @@ struct CollectiveMainloopFwdSm90 {
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
-        bool const mega_ring_is_cp_batch = !EnableMegaRing
-            || params.mega_ring_cp_batch_mask == nullptr
-            || params.mega_ring_cp_batch_mask[bidb] != 0;
+        int mega_ring_size = 1;
+        int mega_ring_local_rank = 0;
+        int mega_ring_level_idx = 3;
+        bool mega_ring_is_cp_batch = false;
+        if constexpr (EnableMegaRing) {
+            mega_ring_size = params.mega_ring_ring_sizes[bidb];
+            int const ring_base = (params.mega_ring_rank / mega_ring_size) * mega_ring_size;
+            mega_ring_local_rank = params.mega_ring_rank - ring_base;
+            mega_ring_is_cp_batch = mega_ring_size > 1;
+            #pragma unroll
+            for (int level_idx = 0; level_idx < 4; ++level_idx) {
+                if (params.mega_ring_hierarchy.levels[level_idx].ring_size == mega_ring_size) {
+                    mega_ring_level_idx = level_idx;
+                }
+            }
+        }
         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
@@ -648,7 +662,9 @@ struct CollectiveMainloopFwdSm90 {
         int mega_ring_seqlen_k = seqlen_info.seqlen_k;
         bool mega_ring_kv_use_half = false;
         if constexpr (EnableMegaRing) {
-            mega_ring_kv_rank = (params.mega_ring_rank - mega_ring_step + params.mega_ring_world_size) % params.mega_ring_world_size;
+            int const ring_base = (params.mega_ring_rank / mega_ring_size) * mega_ring_size;
+            mega_ring_kv_rank = ring_base
+                + (mega_ring_local_rank - mega_ring_step + mega_ring_size) % mega_ring_size;
             if (!mega_ring_is_cp_batch) {
                 if (mega_ring_step > 0) {
                     n_block_max = 0;
@@ -657,8 +673,8 @@ struct CollectiveMainloopFwdSm90 {
                 int const half_len = params.mega_ring_half_cu_seqlens[bidb + 1] - params.mega_ring_half_cu_seqlens[bidb];
                 int const block_m = get<0>(TileShape_MNK{});
                 int const block_n = get<1>(TileShape_MNK{});
-                bool const q_use_half = mega_ring_step > params.mega_ring_rank;
-                bool const kv_use_half = mega_ring_step >= 1 && mega_ring_step <= params.mega_ring_rank;
+                bool const q_use_half = mega_ring_step > mega_ring_local_rank;
+                bool const kv_use_half = mega_ring_step >= 1 && mega_ring_step <= mega_ring_local_rank;
                 bool const is_diag = mega_ring_step == 0;
                 mega_ring_kv_use_half = kv_use_half;
                 mega_ring_q_row_offset = q_use_half ? half_len : 0;
@@ -725,7 +741,7 @@ struct CollectiveMainloopFwdSm90 {
         Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(shape_V)(_, _, bidh_kv, _);
         int const mega_ring_kv_offset = [&] {
             if constexpr (EnableMegaRing) {
-                return mega_ring_kv_rank * params.mega_ring_total_k_per_rank;
+                return mega_ring_kv_rank * params.mega_ring_rank_kv_capacity;
             } else {
                 return 0;
             }
@@ -876,18 +892,16 @@ struct CollectiveMainloopFwdSm90 {
             // K/V row is resident in the local concatenated KV buffer. One
             // producer thread polls; the barrier releases the rest of the
             // producer threads before they touch Q/K/V pipeline state.
-            if (mega_ring_is_cp_batch && thread_idx == 0) {
-                int const cp_total_k = (params.mega_ring_cp_total_k_per_rank > 0 || params.mega_ring_cp_batch_mask != nullptr)
-                    ? params.mega_ring_cp_total_k_per_rank
-                    : params.mega_ring_total_k_per_rank;
-                int kv_ready_target = cp_total_k * 2;
+            if (mega_ring_is_cp_batch && mega_ring_step > 0 && thread_idx == 0) {
+                auto const& level = params.mega_ring_hierarchy.levels[mega_ring_level_idx];
+                int kv_ready_target = level.full_rows * 2;
                 if constexpr (Is_causal) {
                     if (mega_ring_kv_use_half) {
-                        kv_ready_target = cp_total_k;
+                        kv_ready_target = level.half_rows * 2;
                     }
                 }
                 min_fa3_varlen_demo::mega_ring::wait_until_at_least(
-                    params.mega_ring_kv_ready_counts + mega_ring_kv_rank,
+                    params.mega_ring_kv_ready_counts + level.kv_ready_base + mega_ring_step - 1,
                     kv_ready_target);
             }
             flash::named_barrier_sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::MegaRingKVReady));
@@ -1071,9 +1085,15 @@ struct CollectiveMainloopFwdSm90 {
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
-        bool const mega_ring_is_cp_batch = !EnableMegaRing
-            || params.mega_ring_cp_batch_mask == nullptr
-            || params.mega_ring_cp_batch_mask[bidb] != 0;
+        int mega_ring_size = 1;
+        int mega_ring_local_rank = 0;
+        bool mega_ring_is_cp_batch = false;
+        if constexpr (EnableMegaRing) {
+            mega_ring_size = params.mega_ring_ring_sizes[bidb];
+            int const ring_base = (params.mega_ring_rank / mega_ring_size) * mega_ring_size;
+            mega_ring_local_rank = params.mega_ring_rank - ring_base;
+            mega_ring_is_cp_batch = mega_ring_size > 1;
+        }
         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
@@ -1090,8 +1110,8 @@ struct CollectiveMainloopFwdSm90 {
                 }
             } else if constexpr (Is_causal) {
                 int const half_len = params.mega_ring_half_cu_seqlens[bidb + 1] - params.mega_ring_half_cu_seqlens[bidb];
-                bool const q_use_half = mega_ring_step > params.mega_ring_rank;
-                bool const kv_use_half = mega_ring_step >= 1 && mega_ring_step <= params.mega_ring_rank;
+                bool const q_use_half = mega_ring_step > mega_ring_local_rank;
+                bool const kv_use_half = mega_ring_step >= 1 && mega_ring_step <= mega_ring_local_rank;
                 bool const is_diag = mega_ring_step == 0;
                 mega_ring_seqlen_q = q_use_half ? half_len : 2 * half_len;
                 mega_ring_seqlen_k = kv_use_half ? half_len : 2 * half_len;

@@ -11,6 +11,7 @@
 #include "cutlass/arch/barrier.h"
 
 #include "min_fa3_named_barrier.h"
+#include "min_fa3_varlen_params.h"
 #include "utils.h"
 
 namespace flash {
@@ -34,11 +35,8 @@ struct TileSchedulerArguments {
     // Default values keep existing varlen and single-step ring paths unchanged.
     int const mega_ring_world_size = 1;
     int const mega_ring_rank = 0;
-    int const mega_ring_tiles_per_step = 0;
-    int const mega_ring_tiles_per_half_step = 0;
-    int const* const mega_ring_cp_batch_mask = nullptr;
-    int const mega_ring_cp_tiles_per_step = 0;
-    int const mega_ring_cp_tiles_per_half_step = 0;
+    int const* const mega_ring_ring_sizes = nullptr;
+    min_fa3_varlen_demo::MegaRingHierarchyDesc const mega_ring_hierarchy{};
 };
 
 template<int kBlockM, int kBlockN, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
@@ -85,11 +83,8 @@ public:
         // MegaRingVarlenDynamicPersistentTileScheduler.
         int const mega_ring_world_size;
         int const mega_ring_rank;
-        int const mega_ring_tiles_per_step;
-        int const mega_ring_tiles_per_half_step;
-        int const* const mega_ring_cp_batch_mask;
-        int const mega_ring_cp_tiles_per_step;
-        int const mega_ring_cp_tiles_per_half_step;
+        int const* const mega_ring_ring_sizes;
+        min_fa3_varlen_demo::MegaRingHierarchyDesc const mega_ring_hierarchy;
     };
 
     static Params
@@ -118,11 +113,8 @@ public:
                 args.use_virtual_grid,
                 args.mega_ring_world_size,
                 args.mega_ring_rank,
-                args.mega_ring_tiles_per_step,
-                args.mega_ring_tiles_per_half_step,
-                args.mega_ring_cp_batch_mask,
-                args.mega_ring_cp_tiles_per_step,
-                args.mega_ring_cp_tiles_per_half_step};
+                args.mega_ring_ring_sizes,
+                args.mega_ring_hierarchy};
     }
 
     static dim3

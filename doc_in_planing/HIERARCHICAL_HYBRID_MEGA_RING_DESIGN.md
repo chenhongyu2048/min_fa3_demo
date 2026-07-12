@@ -2,8 +2,7 @@
 
 ## Status
 
-本文记录 `world_size=8` 下层级 hybrid mega-ring forward 的实现方案。
-本文档本身不修改 CUDA、Python、构建或 Slurm 行为。
+本文记录 `world_size=8` 下层级 hybrid mega-ring forward 的实现方案与当前实现约束。
 
 目标是在现有一次 fused mega-ring attention/communication launch 中同时支持：
 
@@ -60,7 +59,6 @@ forward_varlen_mega_ring(
     cu_seqlens_k_host,
     remote_k,
     remote_v,
-    remote_barrier,
     num_comp_sm,
     num_comm_sm,
     global_seqlens_host,
@@ -116,6 +114,22 @@ CPU, int32, contiguous, shape [B]
 ```
 
 所有 rank 必须传入相同的三组全局 metadata。
+
+调用方必须在写入 owner-local K/V 后完成 CUDA 同步和 distributed barrier，
+再进入 forward op。当前 API 不包含未定义的 device-side `remote_barrier`。
+
+当前 row-granular communication vector 固定为 1024 个 BF16，因此额外要求：
+
+```text
+KVH * 128 == 1024
+```
+
+本 rank 可以没有任何有效序列。该 rank 仍然 launch fused kernel，scheduler
+首次解码即返回无效 work，compute 和 communication CTA 空转退出。
+
+实现同时保留物理 `world_size=2/4` 的缩减模式，用于较少 GPU 的正确性验证。
+逻辑 ring size 不能超过物理 world size，因此两卡模式支持 G2/G1，四卡模式
+支持 G4/G2/G1；完整 G8/G4/G2/G1 混合仍要求八卡。
 
 ## Input Layout Contract
 
@@ -827,4 +841,3 @@ reference 计算：
 - 出现更多 ring size 时不能增加 attention kernel launch 数量。
 - 现有 varlen metadata preparation 只执行一次，不按 level 重复。
 - 分别记录 compute、communication 和总 op 时间，避免只比较 kernel body。
-
