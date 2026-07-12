@@ -122,6 +122,39 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_hybrid_forward.py \
   --warmup-iters 5 --num-iters 20
 ```
 
+## 1/2/4/8-GPU causal sweep
+
+`benchmark_ring_1_2_4_8.sh` runs the all-CP forward, hybrid forward, and
+backward varlen benchmarks on 1, 2, 4, and 8 GPUs. It fixes QH/KVH at 32/8,
+head dim at 128, warmup iterations at 10, and measured iterations at 40. Run
+it inside a single-node allocation exposing eight SM90 GPUs:
+
+```bash
+./benchmark_ring_1_2_4_8.sh
+```
+
+The all-CP forward and backward defaults are strong-scaling workloads: their
+configured global sequence lengths are divided by the GPU count before being
+passed to the Python entry points. The hybrid workload keeps one fixed global
+batch and balances its eight local-only sequences across all tested world
+sizes. All runs are appended to one timestamped
+`benchmark_logs/<timestamp>/benchmark_ring_1_2_4_8.log` file, with a separator,
+run label, GPU count, and full command before each result section.
+
+Environment variables can override the workload without editing the script.
+For example:
+
+```bash
+GPU_COUNTS="2 4 8" \
+ALL_CP_GLOBAL_SEQLENS="8192,16384,32768" \
+BACKWARD_GLOBAL_SEQLENS="4096,8192" \
+LOG_DIR=benchmark_logs/selected \
+./benchmark_ring_1_2_4_8.sh
+```
+
+Set `DRY_RUN=1` to print the complete commands without launching `torchrun`,
+or `CHECK=1` to enable the benchmark entry points' correctness checks.
+
 # Result Example
 
 ```
