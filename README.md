@@ -260,9 +260,9 @@ validation after timing.
 Distributed ring benchmark:
 
 ```bash
-torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py --b 16 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both --methods all --num-comp-sm 128 --num-comm-sm 4 --check
-torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py --b 16 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both --methods all --num-comp-sm 116 --num-comm-sm 16 --no-check
-torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_backward.py --b 4 --seqlen 256,512,1024 --qhead 32 --kvhead 8 --headdim 128 --methods all --num-comp-sm 64 --num-comm-sm 8 --check
+torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py --b 16,16,16 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both --methods all --num-comp-sm 128 --num-comm-sm 4 --check
+torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py --b 16,16,16 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both --methods all --num-comp-sm 116 --num-comm-sm 16 --no-check
+torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_backward.py --b 4,4,4 --seqlen 256,512,1024 --qhead 32 --kvhead 8 --headdim 128 --methods all --num-comp-sm 64 --num-comm-sm 8 --check
 ```
 
 Distributed ring benchmark notes:
@@ -296,7 +296,7 @@ Default test submission:
 sbatch run.slurm
 ```
 
-Backward correctness and FA3 performance comparison:
+Backward correctness, FA3 performance comparison, and causal ring backward:
 
 ```bash
 sbatch run_backward.slurm
@@ -305,7 +305,9 @@ sbatch run_backward.slurm
 Current `run.slurm` notes:
 
 - The checked-in script currently requests `4` GPUs and `16` CPUs on one node.
-- Its active commands run the distributed `ring_test/benchmark_ring_forward.py` sweep with `torchrun --nproc_per_node=2`.
+- Its active commands run the distributed `ring_test/benchmark_ring_forward.py` sweep with `torchrun --nproc_per_node=4`.
+- `run_backward.slurm` requests one GPU and includes a single-rank
+  `ring_test/benchmark_ring_backward.py` sweep after the local backward tests.
 
 ## Python usage
 

@@ -82,6 +82,12 @@ python benchmark_varlen_backward.py \
     --b 4 --seqlen 512,1024,2048,4096 --qhead 32 --kvhead 8 --headdim 128 \
     --mode both --deterministic --warmup-iters 10 --num-iters 50
 
+echo "Benchmarking causal ring backward"
+torchrun --standalone --nproc_per_node=1 ring_test/benchmark_ring_backward.py \
+    --b 4,4,4 --seqlen 256,512,1024 --qhead 32 --kvhead 8 --headdim 128 \
+    --methods all --num-comp-sm 64 --num-comm-sm 8 \
+    --warmup-iters 5 --num-iters 20 --check
+
 # Optional memory checks for the non-tile-aligned GQA paths:
 # compute-sanitizer --tool memcheck python test_min_fa3_backward.py \
 #     --b 2 --seqlen 129 --qhead 8 --kvhead 2 --headdim 128 --mode both --deterministic

@@ -66,6 +66,8 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
 
 Use `--sm-configs comp:comm,comp:comm,...` to run multiple SM allocations in one
 invocation, for example `--sm-configs 128:4,124:8,116:16`.
+`--b` and `--seqlen` are comma-separated lists of equal length; each benchmark
+shape pairs `b[i]` with `seqlen[i]`.
 
 For a faster smoke run:
 
@@ -127,7 +129,7 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_backward.py \
 
 ```bash
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_backward.py \
-  --b 4 --seqlen 256,512,1024 --qhead 32 --kvhead 8 --headdim 128 \
+  --b 4,4,4 --seqlen 256,512,1024 --qhead 32 --kvhead 8 --headdim 128 \
   --methods all --sm-configs 64:8,70:8 \
   --warmup-iters 5 --num-iters 20 --check
 ```
@@ -179,11 +181,12 @@ it inside a single-node allocation exposing eight SM90 GPUs:
 ./benchmark_ring_1_2_4_8.sh
 ```
 
-The all-CP forward and backward defaults are strong-scaling workloads: their
-configured global sequence lengths are divided by the GPU count before being
-passed to the Python entry points. The hybrid workload keeps one fixed global
-batch and balances its eight local-only sequences across all tested world
-sizes. All runs are appended to one timestamped
+The all-CP forward and backward defaults pair batch sizes `16,8,4,2,1` with
+local sequence lengths `1K,2K,4K,8K,16K`. This keeps each setting at 16K local
+tokens per rank. The corresponding global token totals are 16K, 32K, 64K, and
+128K for 1, 2, 4, and 8 GPUs. The hybrid workload keeps one fixed global batch
+and balances its local-only sequences across all tested world sizes. All runs
+are appended to one timestamped
 `benchmark_logs/<timestamp>/benchmark_ring_1_2_4_8.log` file, with a separator,
 run label, GPU count, and full command before each result section.
 
@@ -192,8 +195,12 @@ For example:
 
 ```bash
 GPU_COUNTS="2 4 8" \
-ALL_CP_GLOBAL_SEQLENS="8192,16384,32768" \
-BACKWARD_GLOBAL_SEQLENS="4096,8192" \
+ALL_CP_GLOBAL_SEQLENS_2="2048,4096,8192,16384,32768" \
+ALL_CP_GLOBAL_SEQLENS_4="4096,8192,16384,32768,65536" \
+ALL_CP_GLOBAL_SEQLENS_8="8192,16384,32768,65536,131072" \
+BACKWARD_GLOBAL_SEQLENS_2="2048,4096,8192,16384,32768" \
+BACKWARD_GLOBAL_SEQLENS_4="4096,8192,16384,32768,65536" \
+BACKWARD_GLOBAL_SEQLENS_8="8192,16384,32768,65536,131072" \
 LOG_DIR=benchmark_logs/selected \
 ./benchmark_ring_1_2_4_8.sh
 ```

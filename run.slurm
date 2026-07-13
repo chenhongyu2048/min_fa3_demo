@@ -81,20 +81,20 @@ cd /data/home/scyb683/run/min_fa3_demo
 # echo "Running multi-rank ring_test benchmark with correctness checks"
 # echo "========================================================="
 # torchrun --standalone --nproc_per_node=4 ring_test/benchmark_ring_forward.py \
-#     --b 16 --seqlen 512,1024,2048,4096,8192,16384,32768,65536,131072 --qhead 32 --kvhead 8 --headdim 128 \
+#     --b 16,16,16,16,16,16,16,16,16 --seqlen 512,1024,2048,4096,8192,16384,32768,65536,131072 --qhead 32 --kvhead 8 --headdim 128 \
 #     --mode both --methods all --sm-configs 128:4,124:8,116:16 \
 #     --warmup-iters 10 --num-iters 10 --check
 
 # Multi-rank causal mega-ring backward benchmark:
 # torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_backward.py \
-#     --b 4 --seqlen 256,512,1024 --qhead 32 --kvhead 8 --headdim 128 \
+#     --b 4,4,4 --seqlen 256,512,1024 --qhead 32 --kvhead 8 --headdim 128 \
 #     --methods all --num-comp-sm 64 --num-comm-sm 8 \
 #     --warmup-iters 5 --num-iters 20 --check
 
 echo "Running multi-rank ring_test benchmark without correctness checks"
 echo "========================================================="
 torchrun --standalone --nproc_per_node=4 ring_test/benchmark_ring_forward.py \
-    --b 1 --seqlen 512,1024,2048,4096,8192,16384,32768,65536 --qhead 32 --kvhead 8 --headdim 128 \
+    --b 1,1,1,1,1,1,1,1 --seqlen 512,1024,2048,4096,8192,16384,32768,65536 --qhead 32 --kvhead 8 --headdim 128 \
     --mode causal --methods all --sm-configs 128:4,124:8,116:16 \
     --warmup-iters 20 --num-iters 30 --no-check
 

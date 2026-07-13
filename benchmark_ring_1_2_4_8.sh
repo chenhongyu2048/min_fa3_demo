@@ -17,15 +17,23 @@ HEADDIM=${HEADDIM:-128}
 CHECK=${CHECK:-0}
 DRY_RUN=${DRY_RUN:-0}
 TORCHRUN=${TORCHRUN:-torchrun}
+LOG_DIR=${LOG_DIR:-"benchmark_logs/$(date +%Y%m%d-%H%M%S)"}
+LOG_FILE=${LOG_FILE:-"$LOG_DIR/benchmark_ring_1_2_4_8.log"}
 
-# These are global lengths. The all-CP and backward local lengths passed to
-# Python are divided by world size, so every GPU count measures the same work.
-ALL_CP_GLOBAL_SEQLENS=${ALL_CP_GLOBAL_SEQLENS:-"4096,8192,16384,32768,65536"}
-ALL_CP_BATCH=${ALL_CP_BATCH:-1}
+# Each setting keeps 16K tokens per rank: B=16,8,4,2,1 is paired with local
+# S=1K,2K,4K,8K,16K. Global sequence lengths therefore scale with world size.
+ALL_CP_BATCH=${ALL_CP_BATCH:-"16,8,4,2,1"}
+ALL_CP_GLOBAL_SEQLENS_1=${ALL_CP_GLOBAL_SEQLENS_1:-"1024,2048,4096,8192,16384"}
+ALL_CP_GLOBAL_SEQLENS_2=${ALL_CP_GLOBAL_SEQLENS_2:-"2048,4096,8192,16384,32768"}
+ALL_CP_GLOBAL_SEQLENS_4=${ALL_CP_GLOBAL_SEQLENS_4:-"4096,8192,16384,32768,65536"}
+ALL_CP_GLOBAL_SEQLENS_8=${ALL_CP_GLOBAL_SEQLENS_8:-"8192,16384,32768,65536,131072"}
 ALL_CP_METHODS=${ALL_CP_METHODS:-all}
 
-BACKWARD_GLOBAL_SEQLENS=${BACKWARD_GLOBAL_SEQLENS:-"4096,8192,16384,32768,65536"}
-BACKWARD_BATCH=${BACKWARD_BATCH:-1}
+BACKWARD_BATCH=${BACKWARD_BATCH:-"16,8,4,2,1"}
+BACKWARD_GLOBAL_SEQLENS_1=${BACKWARD_GLOBAL_SEQLENS_1:-"1024,2048,4096,8192,16384"}
+BACKWARD_GLOBAL_SEQLENS_2=${BACKWARD_GLOBAL_SEQLENS_2:-"2048,4096,8192,16384,32768"}
+BACKWARD_GLOBAL_SEQLENS_4=${BACKWARD_GLOBAL_SEQLENS_4:-"4096,8192,16384,32768,65536"}
+BACKWARD_GLOBAL_SEQLENS_8=${BACKWARD_GLOBAL_SEQLENS_8:-"8192,16384,32768,65536,131072"}
 BACKWARD_METHODS=${BACKWARD_METHODS:-all}
 
 # Hierarchical hybrid metadata for each supported physical world size. Each
@@ -34,13 +42,13 @@ HYBRID_GLOBAL_SEQLENS_2=${HYBRID_GLOBAL_SEQLENS_2:-"8192,1024,1024"}
 HYBRID_RING_SIZES_2=${HYBRID_RING_SIZES_2:-"2,1,1"}
 HYBRID_RING_STARTS_2=${HYBRID_RING_STARTS_2:-"0,0,1"}
 
-HYBRID_GLOBAL_SEQLENS_4=${HYBRID_GLOBAL_SEQLENS_4:-"8192,4096,4096,1024,1024,1024,1024"}
-HYBRID_RING_SIZES_4=${HYBRID_RING_SIZES_4:-"4,2,2,1,1,1,1"}
-HYBRID_RING_STARTS_4=${HYBRID_RING_STARTS_4:-"0,0,2,0,1,2,3"}
+HYBRID_GLOBAL_SEQLENS_4=${HYBRID_GLOBAL_SEQLENS_4:-"49152,4096,2048,2048,1024,1024,1024,1024,1024,1024,1024,1024"}
+HYBRID_RING_SIZES_4=${HYBRID_RING_SIZES_4:-"4,4,2,2,1,1,1,1,1,1,1,1"}
+HYBRID_RING_STARTS_4=${HYBRID_RING_STARTS_4:-"0,0,0,2,0,0,1,1,2,2,3,3"}
 
-HYBRID_GLOBAL_SEQLENS_8=${HYBRID_GLOBAL_SEQLENS_8:-"131072,8192,8192,4096,4096,4096,4096,2048,2048,2048,2048,2048,2048,2048,2048"}
-HYBRID_RING_SIZES_8=${HYBRID_RING_SIZES_8:-"8,4,4,2,2,2,2,1,1,1,1,1,1,1,1"}
-HYBRID_RING_STARTS_8=${HYBRID_RING_STARTS_8:-"0,0,4,0,2,4,6,0,1,2,3,4,5,6,7"}
+HYBRID_GLOBAL_SEQLENS_8=${HYBRID_GLOBAL_SEQLENS_8:-"98304,8192,4096,4096,2048,2048,2048,2048,2048,2048,2048,2048"}
+HYBRID_RING_SIZES_8=${HYBRID_RING_SIZES_8:-"8,8,4,4,1,1,1,1,1,1,1,1"}
+HYBRID_RING_STARTS_8=${HYBRID_RING_STARTS_8:-"0,0,0,4,0,1,2,3,4,5,6,7"}
 
 # Defaults follow the H200 configurations used by the existing Slurm scripts.
 # A one-GPU forward run does not need communication CTAs.
@@ -48,8 +56,6 @@ FORWARD_SM_CONFIGS_SINGLE=${FORWARD_SM_CONFIGS_SINGLE:-"132:0"}
 FORWARD_SM_CONFIGS_MULTI=${FORWARD_SM_CONFIGS_MULTI:-"128:4,124:8,120:12,116:16"}
 BACKWARD_SM_CONFIGS=${BACKWARD_SM_CONFIGS:-"128:4,124:8,120:12,116:16"}
 
-LOG_DIR=${LOG_DIR:-"benchmark_logs/$(date +%Y%m%d-%H%M%S)"}
-LOG_FILE=${LOG_FILE:-"$LOG_DIR/benchmark_ring_1_2_4_8.log"}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
 die() {
@@ -211,16 +217,35 @@ for world_size in "${GPU_COUNT_LIST[@]}"; do
     select_devices "$world_size"
     visible_devices=$SELECTED_DEVICES
 
-    if ((world_size == 1)); then
-        forward_sm_configs=$FORWARD_SM_CONFIGS_SINGLE
-    else
-        forward_sm_configs=$FORWARD_SM_CONFIGS_MULTI
-    fi
+    case "$world_size" in
+        1)
+            forward_sm_configs=$FORWARD_SM_CONFIGS_SINGLE
+            all_cp_global_seqlens=$ALL_CP_GLOBAL_SEQLENS_1
+            backward_global_seqlens=$BACKWARD_GLOBAL_SEQLENS_1
+            ;;
+        2)
+            forward_sm_configs=$FORWARD_SM_CONFIGS_MULTI
+            all_cp_global_seqlens=$ALL_CP_GLOBAL_SEQLENS_2
+            backward_global_seqlens=$BACKWARD_GLOBAL_SEQLENS_2
+            ;;
+        4)
+            forward_sm_configs=$FORWARD_SM_CONFIGS_MULTI
+            all_cp_global_seqlens=$ALL_CP_GLOBAL_SEQLENS_4
+            backward_global_seqlens=$BACKWARD_GLOBAL_SEQLENS_4
+            ;;
+        8)
+            forward_sm_configs=$FORWARD_SM_CONFIGS_MULTI
+            all_cp_global_seqlens=$ALL_CP_GLOBAL_SEQLENS_8
+            backward_global_seqlens=$BACKWARD_GLOBAL_SEQLENS_8
+            ;;
+        *)
+            die "no all-CP workload is configured for world size $world_size"
+            ;;
+    esac
 
     # Ordinary all-CP forward takes a rank-local --seqlen list. Each value is
-    # ALL_CP_GLOBAL_SEQLENS / physical world_size, so every rank holds an equal
-    # shard and every GPU-count run represents the same global sequence list.
-    divide_global_seqlens "$ALL_CP_GLOBAL_SEQLENS" "$world_size" 256 ALL_CP_GLOBAL_SEQLENS
+    # the selected global sequence length divided by physical world size.
+    divide_global_seqlens "$all_cp_global_seqlens" "$world_size" 256 "ALL_CP_GLOBAL_SEQLENS_$world_size"
     all_cp_local_seqlens=$LOCAL_SEQLENS
     run_benchmark forward_all_cp "$world_size" "$visible_devices" \
         ring_test/benchmark_ring_forward.py \
@@ -238,9 +263,8 @@ for world_size in "${GPU_COUNT_LIST[@]}"; do
     run_hierarchical_hybrid "$world_size" "$visible_devices" "$forward_sm_configs"
 
     # Ordinary all-CP backward takes a rank-local --seqlen list, with the same
-    # definition as ordinary forward: BACKWARD_GLOBAL_SEQLENS / physical
-    # world_size for every rank in the process group.
-    divide_global_seqlens "$BACKWARD_GLOBAL_SEQLENS" "$world_size" 256 BACKWARD_GLOBAL_SEQLENS
+    # world-size selection and division as ordinary forward.
+    divide_global_seqlens "$backward_global_seqlens" "$world_size" 256 "BACKWARD_GLOBAL_SEQLENS_$world_size"
     backward_local_seqlens=$LOCAL_SEQLENS
     run_benchmark backward "$world_size" "$visible_devices" \
         ring_test/benchmark_ring_backward.py \

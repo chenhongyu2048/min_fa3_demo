@@ -78,6 +78,13 @@ def parse_seqlen_spec(spec: str) -> list[int]:
     return values
 
 
+def parse_batch_spec(spec: str) -> list[int]:
+    values = [int(token.strip()) for token in spec.split(",") if token.strip()]
+    if not values:
+        raise SystemExit("--b must provide at least one case")
+    return values
+
+
 def parse_methods(spec: str) -> list[str]:
     methods: list[str] = []
     for token in spec.split(","):
@@ -119,7 +126,10 @@ def parse_sm_config_spec(spec: str) -> list[SmConfig]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Distributed causal mega-ring varlen backward benchmark")
-    parser.add_argument("--b", type=int, default=1, help="Batch size per rank")
+    parser.add_argument(
+        "--b", type=str, default="1,1,1",
+        help="Comma-separated batch sizes per rank, paired one-to-one with --seqlen",
+    )
     parser.add_argument(
         "--seqlen", "--seqlens", dest="seqlen", type=str, default="256,512,1024",
         help="Comma-separated local sequence lengths",
@@ -710,12 +720,14 @@ def print_results(case: Case, methods: list[str], results: dict[str, Result]) ->
 
 def validate_args(
     args: argparse.Namespace,
-    seqlens: list[int],
+    cases: list[Case],
     sm_configs: list[SmConfig],
     local_world_size: int,
 ) -> None:
-    if args.b <= 0:
-        raise SystemExit(f"--b must be positive, got {args.b}")
+    invalid_batches = [case.batch_size for case in cases if case.batch_size <= 0]
+    if invalid_batches:
+        raise SystemExit(f"--b values must be positive, got {invalid_batches}")
+    seqlens = [case.seqlen for case in cases]
     invalid = [seqlen for seqlen in seqlens if seqlen <= 0 or seqlen % 256 != 0]
     if invalid:
         raise SystemExit(
@@ -742,10 +754,23 @@ def validate_args(
             )
 
 
+def make_cases(args: argparse.Namespace) -> list[Case]:
+    batches = parse_batch_spec(args.b)
+    seqlens = parse_seqlen_spec(args.seqlen)
+    if len(batches) != len(seqlens):
+        raise SystemExit(
+            f"--b and --seqlen must contain the same number of cases, got {len(batches)} and {len(seqlens)}"
+        )
+    return [
+        Case(batch, seqlen, args.qhead, args.kvhead, args.headdim)
+        for batch, seqlen in zip(batches, seqlens)
+    ]
+
+
 def main() -> None:
     args = parse_args()
     methods = parse_methods(args.methods)
-    seqlens = parse_seqlen_spec(args.seqlen)
+    cases = make_cases(args)
     sm_configs = (
         parse_sm_config_spec(args.sm_configs)
         if args.sm_configs is not None
@@ -759,7 +784,7 @@ def main() -> None:
         if torch.cuda.get_device_capability() != (9, 0):
             raise SystemExit(f"This benchmark requires SM90, got {torch.cuda.get_device_capability()}")
         args.allgather_backend = select_allgather_backend(dist.group.WORLD)
-        validate_args(args, seqlens, sm_configs, local_world_size)
+        validate_args(args, cases, sm_configs, local_world_size)
         if local_rank == 0:
             configs = ",".join(f"{cfg.num_comp_sm}:{cfg.num_comm_sm}" for cfg in sm_configs)
             print(
@@ -778,10 +803,12 @@ def main() -> None:
                     f"num_comm_sm={sm_config.num_comm_sm}",
                     flush=True,
                 )
-            for seqlen in seqlens:
-                case = Case(args.b, seqlen, args.qhead, args.kvhead, args.headdim)
+            for case in cases:
                 if local_rank == 0:
-                    print(f"\nRunning local_S={seqlen}, causal=True", flush=True)
+                    print(
+                        f"\nRunning B={case.batch_size}, local_S={case.seqlen}, causal=True",
+                        flush=True,
+                    )
                 results = run_case(
                     case, methods, local_rank, local_world_size, sm_config, args
                 )

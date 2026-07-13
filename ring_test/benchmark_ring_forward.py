@@ -132,6 +132,14 @@ def parse_seqlen_spec(spec: str) -> list[int]:
     return cases
 
 
+def parse_batch_spec(spec: str) -> list[int]:
+    """Parse the comma-separated batch sizes paired with --seqlen."""
+    batches = [int(token.strip()) for token in spec.split(",") if token.strip()]
+    if not batches:
+        raise SystemExit("--b must provide at least one case")
+    return batches
+
+
 def parse_methods(spec: str) -> list[str]:
     """Parse the method list while preserving user order and removing duplicates."""
     methods: list[str] = []
@@ -179,7 +187,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Distributed forward-only ring-attention test/benchmark for varlen backends."
     )
-    parser.add_argument("--b", type=int, default=1, help="Batch size B per rank.")
+    parser.add_argument(
+        "--b",
+        type=str,
+        default="1",
+        help="Comma-separated batch sizes B per rank, paired one-to-one with --seqlen.",
+    )
     parser.add_argument(
         "--seqlen",
         "--seqlens",
@@ -921,15 +934,24 @@ def run_case(
 
 def make_cases(args: argparse.Namespace) -> list[Case]:
     """Expand CLI arguments into concrete benchmark cases."""
+    batches = parse_batch_spec(args.b)
+    seqlens = parse_seqlen_spec(args.seqlen)
+    if len(batches) != len(seqlens):
+        raise SystemExit(
+            f"--b and --seqlen must contain the same number of cases, got {len(batches)} and {len(seqlens)}"
+        )
+    invalid_batches = [batch for batch in batches if batch <= 0]
+    if invalid_batches:
+        raise SystemExit(f"--b values must be positive, got {invalid_batches}")
     causal_values = {
         "noncausal": [False],
         "causal": [True],
         "both": [False, True],
     }[args.mode]
     return [
-        Case(args.b, seqlen, args.qhead, args.kvhead, args.headdim, is_causal)
+        Case(batch, seqlen, args.qhead, args.kvhead, args.headdim, is_causal)
         for is_causal in causal_values
-        for seqlen in parse_seqlen_spec(args.seqlen)
+        for batch, seqlen in zip(batches, seqlens)
     ]
 
 
@@ -1009,6 +1031,7 @@ def main() -> None:
         if args.sm_configs is not None
         else [SmConfig(args.num_comp_sm, args.num_comm_sm)]
     )
+    cases = make_cases(args)
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
@@ -1025,7 +1048,6 @@ def main() -> None:
             flash_attn_varlen_func3 = None
         args.allgather_backend = select_allgather_backend(dist.group.WORLD)
         validate_args(args, methods, local_world_size, sm_configs)
-        cases = make_cases(args)
 
         if local_rank == 0:
             sm_configs_s = ",".join(
@@ -1053,7 +1075,10 @@ def main() -> None:
                 )
             for case in cases:
                 if local_rank == 0:
-                    print(f"\nRunning local_S={case.seqlen}, causal={case.is_causal}", flush=True)
+                    print(
+                        f"\nRunning B={case.batch_size}, local_S={case.seqlen}, causal={case.is_causal}",
+                        flush=True,
+                    )
                 results = run_case(case, methods, local_rank, local_world_size, args)
                 if local_rank == 0:
                     print_results(case, results, methods)
