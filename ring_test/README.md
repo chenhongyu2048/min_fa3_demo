@@ -19,6 +19,15 @@ otherwise every rank consistently falls back to the local
 `min_fa3_op.forward_varlen` / `backward_varlen` implementation. The result Note
 column reports the backend that was selected.
 
+`llama3_allgather_attention` is the whole-packed all-CP baseline. Instead of
+zigzag-partitioning every sequence independently, it concatenates the global
+varlen batch into one packed token stream, divides that stream into `2 * W`
+equal blocks, and gives rank `r` blocks `r` and `2 * W - 1 - r`. Its two local
+blocks may cross sequence boundaries. The timed path includes full K/V
+all-gather, restoration of global packed order, and two varlen attention calls.
+It uses the same external-FA3/local-min-FA3 backend selection as
+`allgather_attention`.
+
 For causal attention, each rank keeps the same zigzag `[front | back]` layout
 used by the mega-ring path. Gathered K/V are ordered as:
 
@@ -78,12 +87,12 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
   --warmup-iters 1 --num-iters 3
 ```
 
-To run only the end-to-end all-gather baseline:
+To compare the per-sequence and whole-packed all-gather baselines:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
-  --b 1 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 \
-  --mode both --methods allgather_attention \
+  --b 3 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 \
+  --mode both --methods allgather_attention,llama3_allgather_attention \
   --warmup-iters 1 --num-iters 3 --check
 ```
 
@@ -103,6 +112,10 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
 - `allgather_attention` prepares its all-gather zigzag forward outside the
   timed interval, then times both varlen backward calls, global dK/dV gradient
   merging and inverse reordering, and the FP32 dK/dV reduce-scatter
+- `llama3_allgather_attention` uses the same timing boundary but partitions the
+  complete packed batch into two zigzag blocks per rank; its dK/dV contributions
+  are accumulated in global packed order before inverse reordering and FP32
+  reduce-scatter.
 - `min_varlen_python_ring` is a complete zigzag ring baseline using local
   min_fa3 varlen backward block kernels plus NCCL K/V and FP32 dK/dV P2P.
 - `min_varlen_mega_ring` is the fused persistent compute/communication kernel.
@@ -115,15 +128,15 @@ step.
 Forward preparation, tensor allocation, and the fused path's required remote
 dK/dV accumulator and completion-counter reset are outside the CUDA-event
 timing interval. Correctness checks compare fused dQ/dK/dV against the Python
-ring baseline and are enabled by default. The all-gather baseline is checked
-against the same dQ/dK/dV reference.
+ring baseline and are enabled by default. Both all-gather baselines are checked
+against the same logical dQ/dK/dV reference after layout conversion.
 
-Run only the all-gather backward baseline with correctness checking:
+Compare both all-gather backward baselines with correctness checking:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_backward.py \
-  --b 1 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 \
-  --methods allgather_attention \
+  --b 3 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 \
+  --methods allgather_attention,llama3_allgather_attention,min_varlen_python_ring \
   --warmup-iters 1 --num-iters 3 --check
 ```
 
@@ -140,10 +153,11 @@ divisible by 256, and the current fused backward requires causal mode,
 
 ## Hybrid mega-ring benchmark
 
-`benchmark_hybrid_forward.py` compares the same global varlen batch with four
+`benchmark_hybrid_forward.py` compares the same global varlen batch with five
 methods:
 
 - `allgather_attention`: all-CP K/V all-gather followed by batched varlen attention
+- `llama3_allgather_attention`: all-CP K/V all-gather with whole-packed zigzag partitioning
 - `fa3_ring`: all-CP Python ring using FA3 blocks plus NCCL P2P
 - `mega_ring_all_cp`: fused mega-ring with every sequence split across all ranks
 - `mega_ring_hybrid`: fused mega-ring using the requested per-batch ring hierarchy
@@ -155,9 +169,11 @@ that batch's ring and zero for other ranks. External FA3 is used by the first
 two baselines when available, otherwise they fall back to the local min-FA3
 varlen block.
 
-All-CP baseline lengths must be divisible by the physical world size. Causal
-all-CP mega-ring additionally requires each rank-local half length to be
-128-aligned. Use `--methods` to select a subset or `--methods all` for all four.
+All-CP baseline lengths must be divisible by the physical world size. The total
+global token count for `llama3_allgather_attention` must also be divisible by
+`2 * world_size`. Causal all-CP mega-ring additionally requires each rank-local
+half length to be 128-aligned. Use `--methods` to select a subset or
+`--methods all` for all five.
 
 Example:
 

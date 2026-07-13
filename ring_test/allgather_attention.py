@@ -4,10 +4,11 @@ The all-gather/FlashAttention/reduce-scatter structure is adapted from
 ring-flash-attention's ``llama3_flash_attn_varlen.py``. The zigzag sequence
 packing is local to this demo and matches its existing ring benchmarks.
 
-The causal path follows the repository's zigzag local layout: every rank owns
-``[front | back]`` halves from two non-adjacent positions in the global
-sequence.  Standard causal FlashAttention can express those positions with two
-bottom-right-aligned varlen calls after K/V have been gathered and reordered.
+The original runner zigzag-partitions every sequence independently. The
+Llama3-style runner instead partitions the complete packed varlen batch into
+two non-adjacent blocks per rank; either block may cross sequence boundaries.
+Both paths express causal positions with bottom-right-aligned varlen calls
+after K/V have been gathered and reordered.
 """
 
 from __future__ import annotations
@@ -202,6 +203,174 @@ def _local_backward(
 def _uniform_cu(batch_size: int, seqlen: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     host = torch.arange(0, (batch_size + 1) * seqlen, seqlen, dtype=torch.int32)
     return host.to(device=device), host
+
+
+def sequence_shards_to_global_order(
+    global_seqlens: list[int], world_size: int, causal: bool
+) -> list[int]:
+    """Map rank-major per-sequence shards to the original packed sequence order."""
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+    if any(length <= 0 or length % world_size for length in global_seqlens):
+        raise ValueError("every global sequence length must be positive and divisible by world_size")
+
+    local_lengths = [length // world_size for length in global_seqlens]
+    local_total = sum(local_lengths)
+    order: list[int] = []
+    local_offset = 0
+    for local_len in local_lengths:
+        if causal:
+            if local_len % 2:
+                raise ValueError("causal per-sequence shards require even local sequence lengths")
+            half = local_len // 2
+            for source_rank in range(world_size):
+                source = source_rank * local_total + local_offset
+                order.extend(range(source, source + half))
+            for source_rank in reversed(range(world_size)):
+                source = source_rank * local_total + local_offset + half
+                order.extend(range(source, source + half))
+        else:
+            for source_rank in range(world_size):
+                source = source_rank * local_total + local_offset
+                order.extend(range(source, source + local_len))
+        local_offset += local_len
+    return order
+
+
+def llama3_rank_local_global_indices(
+    total_tokens: int, world_size: int, rank: int
+) -> list[int]:
+    """Return the two global packed intervals owned by one Llama3-zigzag rank."""
+    if world_size <= 0 or not 0 <= rank < world_size:
+        raise ValueError(f"invalid rank/world_size pair: rank={rank}, world_size={world_size}")
+    if total_tokens <= 0 or total_tokens % (2 * world_size):
+        raise ValueError(
+            f"total token count must be divisible by 2 * world_size, got {total_tokens}"
+        )
+    chunk = total_tokens // (2 * world_size)
+    front = range(rank * chunk, (rank + 1) * chunk)
+    back_block = 2 * world_size - 1 - rank
+    back = range(back_block * chunk, (back_block + 1) * chunk)
+    return [*front, *back]
+
+
+def llama3_rank_major_to_global_order(total_tokens: int, world_size: int) -> list[int]:
+    """Map gathered Llama3-zigzag rank blocks back to global packed order."""
+    if total_tokens <= 0 or total_tokens % (2 * world_size):
+        raise ValueError(
+            f"total token count must be divisible by 2 * world_size, got {total_tokens}"
+        )
+    chunk = total_tokens // (2 * world_size)
+    local_tokens = 2 * chunk
+    order: list[int] = []
+    for source_rank in range(world_size):
+        source = source_rank * local_tokens
+        order.extend(range(source, source + chunk))
+    for source_rank in reversed(range(world_size)):
+        source = source_rank * local_tokens + chunk
+        order.extend(range(source, source + chunk))
+    return order
+
+
+def repartition_sequence_shards_to_llama3(
+    process_group: Optional[dist.ProcessGroup],
+    tensor: torch.Tensor,
+    global_seqlens: list[int],
+    causal: bool,
+) -> torch.Tensor:
+    """Repartition existing per-sequence rank shards into whole-packed zigzag shards."""
+    world_size = dist.get_world_size(process_group)
+    rank = dist.get_rank(process_group)
+    expected_local = sum(global_seqlens) // world_size
+    if tensor.size(0) != expected_local:
+        raise ValueError(
+            f"local tensor has {tensor.size(0)} tokens, expected {expected_local}"
+        )
+
+    gathered = torch.empty(
+        (world_size * tensor.size(0), *tensor.shape[1:]),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    dist.all_gather_into_tensor(gathered, tensor, group=process_group)
+    sequence_order = torch.tensor(
+        sequence_shards_to_global_order(global_seqlens, world_size, causal),
+        dtype=torch.int64,
+        device=tensor.device,
+    )
+    packed = torch.index_select(gathered, 0, sequence_order)
+    local_order = torch.tensor(
+        llama3_rank_local_global_indices(sum(global_seqlens), world_size, rank),
+        dtype=torch.int64,
+        device=tensor.device,
+    )
+    return torch.index_select(packed, 0, local_order).contiguous()
+
+
+@dataclass(frozen=True)
+class _Llama3BlockMetadata:
+    local_slice: slice
+    global_k_slice: slice
+    cu_q: torch.Tensor
+    cu_k: torch.Tensor
+    cu_q_host: torch.Tensor
+    cu_k_host: torch.Tensor
+    max_q: int
+    max_k: int
+
+
+def _cumulative_lengths(lengths: list[int]) -> torch.Tensor:
+    result = torch.zeros((len(lengths) + 1,), dtype=torch.int32)
+    for idx, length in enumerate(lengths):
+        result[idx + 1] = result[idx] + length
+    return result
+
+
+def _llama3_block_metadata(
+    global_seqlens: list[int],
+    global_begin: int,
+    global_end: int,
+    local_begin: int,
+    causal: bool,
+    device: torch.device,
+) -> _Llama3BlockMetadata:
+    q_lengths: list[int] = []
+    k_lengths: list[int] = []
+    sequence_begin = 0
+    k_begin = None
+    k_end = None
+    for sequence_length in global_seqlens:
+        sequence_end = sequence_begin + sequence_length
+        q_begin = max(sequence_begin, global_begin)
+        q_end = min(sequence_end, global_end)
+        if q_begin < q_end:
+            q_lengths.append(q_end - q_begin)
+            k_lengths.append(q_end - sequence_begin if causal else sequence_length)
+            if k_begin is None:
+                k_begin = sequence_begin
+            k_end = q_end if causal else sequence_end
+        sequence_begin = sequence_end
+
+    if not q_lengths or k_begin is None or k_end is None:
+        raise ValueError(f"packed block [{global_begin}, {global_end}) intersects no sequence")
+    block_tokens = global_end - global_begin
+    if sum(q_lengths) != block_tokens:
+        raise ValueError("global sequence metadata does not cover the packed block")
+
+    cu_q_host = _cumulative_lengths(q_lengths)
+    cu_k_host = _cumulative_lengths(k_lengths)
+    if int(cu_k_host[-1]) != k_end - k_begin:
+        raise ValueError("K/V metadata is not contiguous in the global packed tensor")
+    return _Llama3BlockMetadata(
+        local_slice=slice(local_begin, local_begin + block_tokens),
+        global_k_slice=slice(k_begin, k_end),
+        cu_q=cu_q_host.to(device=device),
+        cu_k=cu_k_host.to(device=device),
+        cu_q_host=cu_q_host,
+        cu_k_host=cu_k_host,
+        max_q=max(q_lengths),
+        max_k=max(k_lengths),
+    )
 
 
 @dataclass
@@ -577,9 +746,241 @@ class AllGatherAttention:
         return dq, self.local_dk, self.local_dv
 
 
+class Llama3AllGatherAttention:
+    """All-gather attention over a whole-packed two-block zigzag partition."""
+
+    def __init__(
+        self,
+        process_group: Optional[dist.ProcessGroup],
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        global_seqlens: list[int],
+        causal: bool,
+        backend: str,
+        *,
+        enable_backward: bool = False,
+    ) -> None:
+        if backend not in ("external_fa3", "min_fa3"):
+            raise ValueError(f"unsupported all-gather attention backend: {backend}")
+        if not global_seqlens or any(length <= 0 for length in global_seqlens):
+            raise ValueError("global_seqlens must contain positive lengths")
+        if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+            raise ValueError("Q/K/V must use flattened [tokens, heads, head_dim] layout")
+        if k.shape != v.shape:
+            raise ValueError("K and V must have matching shapes")
+
+        self.process_group = process_group
+        self.rank = dist.get_rank(process_group)
+        self.world_size = dist.get_world_size(process_group)
+        self.global_seqlens = list(global_seqlens)
+        self.total_tokens = sum(global_seqlens)
+        if self.total_tokens % (2 * self.world_size):
+            raise ValueError(
+                "whole-packed zigzag requires total tokens divisible by 2 * world_size: "
+                f"total={self.total_tokens}, world_size={self.world_size}"
+            )
+
+        self.chunk = self.total_tokens // (2 * self.world_size)
+        self.local_tokens = 2 * self.chunk
+        if q.size(0) != self.local_tokens or k.size(0) != self.local_tokens:
+            raise ValueError(
+                f"Q/K/V must each contain {self.local_tokens} local tokens"
+            )
+
+        self.q = q
+        self.k = k
+        self.v = v
+        self.causal = causal
+        self.backend = backend
+        self.enable_backward = enable_backward
+        self.out = torch.empty_like(q)
+        self.forward_out: list[torch.Tensor] = []
+        self.forward_lse: list[torch.Tensor] = []
+
+        global_order = torch.tensor(
+            llama3_rank_major_to_global_order(self.total_tokens, self.world_size),
+            dtype=torch.int64,
+            device=q.device,
+        )
+        self.global_order = global_order
+        self.inverse_global_order = torch.argsort(global_order)
+        global_shape = (self.total_tokens, k.size(1), k.size(2))
+        self.gathered_k = torch.empty(global_shape, dtype=k.dtype, device=k.device)
+        self.gathered_v = torch.empty_like(self.gathered_k)
+        self.ordered_k = torch.empty_like(self.gathered_k)
+        self.ordered_v = torch.empty_like(self.gathered_v)
+
+        front_begin = self.rank * self.chunk
+        back_block = 2 * self.world_size - 1 - self.rank
+        back_begin = back_block * self.chunk
+        self.blocks = [
+            _llama3_block_metadata(
+                self.global_seqlens,
+                front_begin,
+                front_begin + self.chunk,
+                0,
+                causal,
+                q.device,
+            ),
+            _llama3_block_metadata(
+                self.global_seqlens,
+                back_begin,
+                back_begin + self.chunk,
+                self.chunk,
+                causal,
+                q.device,
+            ),
+        ]
+
+        if enable_backward:
+            self.dq = torch.empty_like(q)
+            self.ordered_dk = torch.empty(global_shape, dtype=torch.float32, device=k.device)
+            self.ordered_dv = torch.empty_like(self.ordered_dk)
+            self.rank_major_dk = torch.empty_like(self.ordered_dk)
+            self.rank_major_dv = torch.empty_like(self.ordered_dv)
+            self.local_dk_fp32 = torch.empty_like(k, dtype=torch.float32)
+            self.local_dv_fp32 = torch.empty_like(v, dtype=torch.float32)
+            self.local_dk = torch.empty_like(k)
+            self.local_dv = torch.empty_like(v)
+            self.block_dk = [
+                torch.empty_like(self.ordered_k[block.global_k_slice]) for block in self.blocks
+            ]
+            self.block_dv = [
+                torch.empty_like(self.ordered_v[block.global_k_slice]) for block in self.blocks
+            ]
+
+    @property
+    def note(self) -> str:
+        backend = "external FA3" if self.backend == "external_fa3" else "local min_fa3 fallback"
+        mode = "causal" if self.causal else "noncausal"
+        return f"whole-packed zigzag all-gather; {backend}; {mode}"
+
+    def _run_forward_block(
+        self, block: _Llama3BlockMetadata
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q = self.q[block.local_slice]
+        k = self.ordered_k[block.global_k_slice]
+        v = self.ordered_v[block.global_k_slice]
+        if self.backend == "external_fa3":
+            return _external_forward(
+                q, k, v, block.cu_q, block.cu_k, block.max_q, block.max_k, self.causal
+            )
+        return _local_forward(
+            q,
+            k,
+            v,
+            block.cu_q,
+            block.cu_k,
+            block.cu_q_host,
+            block.cu_k_host,
+            block.max_q,
+            block.max_k,
+            self.causal,
+        )
+
+    def forward(self) -> torch.Tensor:
+        dist.all_gather_into_tensor(self.gathered_k, self.k, group=self.process_group)
+        dist.all_gather_into_tensor(self.gathered_v, self.v, group=self.process_group)
+        torch.index_select(self.gathered_k, 0, self.global_order, out=self.ordered_k)
+        torch.index_select(self.gathered_v, 0, self.global_order, out=self.ordered_v)
+
+        self.forward_out = []
+        self.forward_lse = []
+        for block in self.blocks:
+            out, lse = self._run_forward_block(block)
+            self.out[block.local_slice].copy_(out)
+            self.forward_out.append(out)
+            self.forward_lse.append(lse)
+        return self.out
+
+    def _run_backward_block(
+        self,
+        block_idx: int,
+        dout: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        block = self.blocks[block_idx]
+        q = self.q[block.local_slice]
+        k = self.ordered_k[block.global_k_slice]
+        v = self.ordered_v[block.global_k_slice]
+        dq = self.dq[block.local_slice]
+        dk = self.block_dk[block_idx]
+        dv = self.block_dv[block_idx]
+        if self.backend == "external_fa3":
+            return _external_backward(
+                dout,
+                q,
+                k,
+                v,
+                self.forward_out[block_idx],
+                self.forward_lse[block_idx],
+                block.cu_q,
+                block.cu_k,
+                block.max_q,
+                block.max_k,
+                self.causal,
+                dq,
+                dk,
+                dv,
+            )
+        return _local_backward(
+            dout,
+            q,
+            k,
+            v,
+            self.forward_out[block_idx],
+            self.forward_lse[block_idx],
+            block.cu_q,
+            block.cu_k,
+            block.max_q,
+            block.max_k,
+            self.causal,
+            dq,
+            dk,
+            dv,
+        )
+
+    def backward(self, dout: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.enable_backward:
+            raise RuntimeError("Llama3 all-gather runner was created without backward workspaces")
+        if len(self.forward_out) != 2 or len(self.forward_lse) != 2:
+            raise RuntimeError("Llama3 all-gather backward requires a prepared forward")
+        if dout.shape != self.q.shape:
+            raise ValueError("dout must match the local Q shape")
+
+        self.ordered_dk.zero_()
+        self.ordered_dv.zero_()
+        for block_idx, block in enumerate(self.blocks):
+            dq, dk, dv = self._run_backward_block(block_idx, dout[block.local_slice])
+            self.dq[block.local_slice].copy_(dq)
+            self.ordered_dk[block.global_k_slice].add_(dk)
+            self.ordered_dv[block.global_k_slice].add_(dv)
+
+        torch.index_select(
+            self.ordered_dk, 0, self.inverse_global_order, out=self.rank_major_dk
+        )
+        torch.index_select(
+            self.ordered_dv, 0, self.inverse_global_order, out=self.rank_major_dv
+        )
+        dist.reduce_scatter_tensor(
+            self.local_dk_fp32, self.rank_major_dk, group=self.process_group
+        )
+        dist.reduce_scatter_tensor(
+            self.local_dv_fp32, self.rank_major_dv, group=self.process_group
+        )
+        self.local_dk.copy_(self.local_dk_fp32)
+        self.local_dv.copy_(self.local_dv_fp32)
+        return self.dq, self.local_dk, self.local_dv
+
+
 __all__ = [
     "AllGatherAttention",
     "EXTERNAL_FA3_AVAILABLE",
+    "Llama3AllGatherAttention",
     "backend_note",
+    "llama3_rank_local_global_indices",
+    "llama3_rank_major_to_global_order",
+    "repartition_sequence_shards_to_llama3",
     "select_allgather_backend",
+    "sequence_shards_to_global_order",
 ]

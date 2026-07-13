@@ -103,7 +103,7 @@ torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
     --global-seqlens 16384,1024,1024,1024,1024,512,512,512,512 \
     --ring-sizes 4,1,1,1,1,1,1,1,1 --ring-starts 0,0,1,2,3,0,1,2,3 \
     --qhead 32 --kvhead 8 --headdim 128 \
-    --methods allgather_attention,fa3_ring,mega_ring_hybrid \
+    --methods allgather_attention,llama3_allgather_attention,fa3_ring,mega_ring_hybrid \
     --sm-configs 128:4,124:8,116:16 \
     --mode both --warmup-iters 20 --num-iters 30 --no-check
 
@@ -112,7 +112,7 @@ torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
     --ring-sizes 4,1,1,1,1,1,1,1,1,1,1,1,1 \
     --ring-starts 0,0,1,2,3,0,1,2,3,0,1,2,3 \
     --qhead 32 --kvhead 8 --headdim 128 \
-    --methods allgather_attention,fa3_ring,mega_ring_hybrid \
+    --methods allgather_attention,llama3_allgather_attention,fa3_ring,mega_ring_hybrid \
     --sm-configs 128:4,124:8,116:16 \
     --mode both --warmup-iters 20 --num-iters 30 --no-check
 
@@ -121,7 +121,7 @@ torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
     --ring-sizes 4,1,1,1,1,1,1,1,1,1,1,1,1 \
     --ring-starts 0,0,1,2,3,0,1,2,3,0,1,2,3 \
     --qhead 32 --kvhead 8 --headdim 128 \
-    --methods allgather_attention,fa3_ring,mega_ring_hybrid \
+    --methods allgather_attention,llama3_allgather_attention,fa3_ring,mega_ring_hybrid \
     --sm-configs 128:4,124:8,116:16 \
     --mode both --warmup-iters 20 --num-iters 30 --no-check
 

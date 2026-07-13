@@ -18,6 +18,11 @@ if str(DEMO_DIR) not in sys.path:
     sys.path.insert(0, str(DEMO_DIR))
 
 import min_fa3_op
+from allgather_attention import (
+    Llama3AllGatherAttention,
+    repartition_sequence_shards_to_llama3,
+    select_allgather_backend,
+)
 from mega_ring_test_min_fa3_varlen_hybrid_multi_rank import (
     hierarchical_reference,
     local_lengths_for_rank,
@@ -40,6 +45,7 @@ except ImportError:
 
 METHOD_ORDER = [
     "allgather_attention",
+    "llama3_allgather_attention",
     "fa3_ring",
     "mega_ring_all_cp",
     "mega_ring_hybrid",
@@ -150,7 +156,12 @@ def validate_metadata(
             raise SystemExit(f"causal local half length is not 128-aligned at batch {idx}")
         previous_size = ring_size
 
-    all_cp_methods = {"allgather_attention", "fa3_ring", "mega_ring_all_cp"}
+    all_cp_methods = {
+        "allgather_attention",
+        "llama3_allgather_attention",
+        "fa3_ring",
+        "mega_ring_all_cp",
+    }
     if all_cp_methods.intersection(methods):
         for idx, global_len in enumerate(global_lengths):
             if global_len % world_size:
@@ -172,6 +183,14 @@ def validate_metadata(
                     "causal all-CP mega-ring requires local_len / 2 to be 128-aligned: "
                     f"batch={idx}, local_len={local_len}"
                 )
+    if (
+        "llama3_allgather_attention" in methods
+        and sum(global_lengths) % (2 * world_size)
+    ):
+        raise SystemExit(
+            "llama3_allgather_attention requires total global tokens divisible by "
+            f"2 * world_size, got total={sum(global_lengths)}, world_size={world_size}"
+        )
 
 
 def fa3_or_min_block_attention(
@@ -544,6 +563,11 @@ def main() -> None:
         if not fa_available.item():
             flash_attn_varlen_func3 = None
         backend_note = "external FA3" if flash_attn_varlen_func3 is not None else "local min_fa3 fallback"
+        llama3_backend = (
+            select_allgather_backend(dist.group.WORLD)
+            if "llama3_allgather_attention" in methods
+            else None
+        )
 
         modes = {
             "noncausal": [False],
@@ -564,6 +588,7 @@ def main() -> None:
             all_cp_runs: dict[str, tuple[Callable[[], object], str]] = {}
             expected_all_cp_out = None
             expected_all_cp_lse = None
+            expected_llama3_out = None
             if any(method != "mega_ring_hybrid" for method in methods):
                 all_cp_lengths = [length // world_size for length in global_lengths]
                 all_cp_total = sum(all_cp_lengths)
@@ -598,6 +623,29 @@ def main() -> None:
                         allgather_runner.forward,
                         f"all-CP all-gather; {backend_note}",
                     )
+                if "llama3_allgather_attention" in methods:
+                    llama3_q = repartition_sequence_shards_to_llama3(
+                        dist.group.WORLD, all_cp_q, global_lengths, is_causal
+                    )
+                    llama3_k = repartition_sequence_shards_to_llama3(
+                        dist.group.WORLD, all_cp_k, global_lengths, is_causal
+                    )
+                    llama3_v = repartition_sequence_shards_to_llama3(
+                        dist.group.WORLD, all_cp_v, global_lengths, is_causal
+                    )
+                    llama3_runner = Llama3AllGatherAttention(
+                        dist.group.WORLD,
+                        llama3_q,
+                        llama3_k,
+                        llama3_v,
+                        global_lengths,
+                        is_causal,
+                        llama3_backend,
+                    )
+                    all_cp_runs["llama3_allgather_attention"] = (
+                        llama3_runner.forward,
+                        llama3_runner.note,
+                    )
                 if "fa3_ring" in methods:
                     all_cp_runs["fa3_ring"] = (
                         lambda: fa3_ring_forward(
@@ -631,6 +679,13 @@ def main() -> None:
                         rank,
                         is_causal,
                     )
+                    if "llama3_allgather_attention" in methods:
+                        expected_llama3_out = repartition_sequence_shards_to_llama3(
+                            dist.group.WORLD,
+                            expected_all_cp_out,
+                            global_lengths,
+                            is_causal,
+                        )
 
             hybrid_run_data = None
             if "mega_ring_hybrid" in methods:
@@ -706,11 +761,16 @@ def main() -> None:
                 for method in methods:
                     if method in all_cp_runs:
                         launch, note = all_cp_runs[method]
+                        expected_out = (
+                            expected_llama3_out
+                            if method == "llama3_allgather_attention"
+                            else expected_all_cp_out
+                        )
                         runs.append(
                             MethodRun(
                                 method,
                                 launch,
-                                expected_all_cp_out,
+                                expected_out,
                                 None,
                                 note,
                             )
@@ -833,7 +893,7 @@ def main() -> None:
                         mode = "causal" if is_causal else "noncausal"
                         rank_times = ",".join(f"{value:.4f}" for value in timing.rank_times_ms)
                         print(
-                            f"method={run.name:<20} mode={mode:<9} "
+                            f"method={run.name:<27} mode={mode:<9} "
                             f"SM={config.num_comp_sm}:{config.num_comm_sm:<2} "
                             f"max_ms={timing.max_ms:.4f} agg_TFLOPS={agg_tflops:.1f} "
                             f"avg_gpu_TFLOPS={agg_tflops / world_size:.1f} "

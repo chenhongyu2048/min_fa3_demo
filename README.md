@@ -249,13 +249,13 @@ torchrun --standalone --nproc_per_node=8 \
 GPU_COUNTS="2 4 8" ./benchmark_ring_1_2_4_8.sh
 ```
 
-`ring_test/benchmark_hybrid_forward.py` compares all-CP all-gather attention,
-FA3+NCCL ring attention, all-CP fused mega-ring, and hierarchical hybrid
-mega-ring. The first three split every global sequence evenly over all ranks;
-the hybrid method follows `--ring-sizes` and `--ring-starts`. It measures the
-complete Python op with CUDA events, reports maximum elapsed time across ranks,
-and prints aggregate and average-per-GPU TFLOPS. `--check` adds output reference
-validation after timing.
+`ring_test/benchmark_hybrid_forward.py` compares per-sequence and whole-packed
+Llama3-style all-CP all-gather attention, FA3+NCCL ring attention, all-CP fused
+mega-ring, and hierarchical hybrid mega-ring. The all-CP methods use all
+physical ranks; the hybrid method follows `--ring-sizes` and `--ring-starts`.
+It measures the complete Python op with CUDA events, reports maximum elapsed
+time across ranks, and prints aggregate and average-per-GPU TFLOPS. `--check`
+adds output reference validation after timing.
 
 Distributed ring benchmark:
 

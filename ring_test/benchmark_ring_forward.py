@@ -1,6 +1,6 @@
 """Torchrun entry point for multi-rank forward attention benchmarks.
 
-The script compares an all-gather baseline and Python-side ring attention using
+The script compares two all-gather baselines and Python-side ring attention using
 PyTorch/FA2/FA3 block kernels with the local min_fa3 varlen, min_fa3
 single-step ring, and fused min_fa3 mega-ring paths. Timing is end-to-end per
 method call and reports the maximum elapsed time across ranks.
@@ -25,7 +25,12 @@ if str(DEMO_DIR) not in sys.path:
 
 import min_fa3_op
 
-from allgather_attention import AllGatherAttention, select_allgather_backend
+from allgather_attention import (
+    AllGatherAttention,
+    Llama3AllGatherAttention,
+    repartition_sequence_shards_to_llama3,
+    select_allgather_backend,
+)
 from ring_common import (
     flash_varlen_block_attention,
     gather_rank_tensor,
@@ -53,6 +58,7 @@ except ImportError:
 
 METHOD_ORDER = [
     "allgather_attention",
+    "llama3_allgather_attention",
     # "pytorch",
     # "fa2",
     "fa3",
@@ -509,6 +515,27 @@ def build_method_runs(
                 args.allgather_backend,
             )
             runs.append(MethodRun(method, runner.forward, runner.note))
+        elif method == "llama3_allgather_attention":
+            global_seqlens = [case.seqlen * local_world_size] * case.batch_size
+            llama3_q = repartition_sequence_shards_to_llama3(
+                dist.group.WORLD, q, global_seqlens, case.is_causal
+            )
+            llama3_k = repartition_sequence_shards_to_llama3(
+                dist.group.WORLD, k, global_seqlens, case.is_causal
+            )
+            llama3_v = repartition_sequence_shards_to_llama3(
+                dist.group.WORLD, v, global_seqlens, case.is_causal
+            )
+            runner = Llama3AllGatherAttention(
+                dist.group.WORLD,
+                llama3_q,
+                llama3_k,
+                llama3_v,
+                global_seqlens,
+                case.is_causal,
+                args.allgather_backend,
+            )
+            runs.append(MethodRun(method, runner.forward, runner.note))
         elif method == "pytorch":
             def fn(method=method):
                 # Full Python-side ring: P2P K/V exchange, one PyTorch block
@@ -880,6 +907,7 @@ def run_case(
     )
 
     ref = None
+    llama3_ref = None
     if args.check:
         # The reference gathers all rank-local K/V blocks. Noncausal uses the
         # ordinary full-rank sequence; causal uses the default zigzag layout.
@@ -905,6 +933,11 @@ def run_case(
                 local_rank,
                 False,
             )
+        if "llama3_allgather_attention" in methods:
+            global_seqlens = [case.seqlen * local_world_size] * case.batch_size
+            llama3_ref = repartition_sequence_shards_to_llama3(
+                dist.group.WORLD, ref, global_seqlens, case.is_causal
+            )
 
     results: dict[str, Result] = {}
     for run in runs:
@@ -918,7 +951,8 @@ def run_case(
             avg_gpu_tflops = tflops / local_world_size
             check = "skip"
             if args.check and run.checkable and ref is not None:
-                check = check_output(run.name, run.timing_fn, ref, args.atol, args.rtol)
+                expected = llama3_ref if run.name == "llama3_allgather_attention" else ref
+                check = check_output(run.name, run.timing_fn, expected, args.atol, args.rtol)
             elif args.check and not run.checkable:
                 check = "timing-only"
             results[run.name] = Result(time_ms, tflops, check, run.note, timing.rank_times_ms, avg_gpu_tflops)
@@ -975,6 +1009,19 @@ def validate_args(
         raise SystemExit(f"--num-iters must be positive, got {args.num_iters}")
     if args.warmup_iters < 0:
         raise SystemExit(f"--warmup-iters must be non-negative, got {args.warmup_iters}")
+    if "llama3_allgather_attention" in methods:
+        invalid = [
+            (case.batch_size, case.seqlen, case.is_causal)
+            for case in make_cases(args)
+            if (case.batch_size * case.seqlen) % 2
+            or (case.is_causal and case.seqlen % 2)
+        ]
+        if invalid:
+            raise SystemExit(
+                "llama3_allgather_attention requires B * local_seqlen to be even, "
+                "and causal source shards require even local_seqlen; "
+                f"invalid cases: {invalid}"
+            )
     if any(method in methods for method in ("min_varlen_ring", "min_varlen_mega_ring")):
         if args.kvhead * args.headdim != 1024:
             raise SystemExit(
@@ -1008,14 +1055,15 @@ def print_results(case: Case, results: dict[str, Result], methods: list[str]) ->
         avg_gpu_tflops_s = "N/A" if result.avg_gpu_tflops is None else f"{result.avg_gpu_tflops:.1f}"
         rows.append((method, time_s, tflops_s, avg_gpu_tflops_s, result.check, result.note))
 
+    method_width = max((24, *(len(row[0]) for row in rows)))
     time_width = max((64, *(len(row[1]) for row in rows)))
     print(
-        f"{'Method':<24} {'Time ms':<{time_width}} {'Agg TFLOPS':>12} "
+        f"{'Method':<{method_width}} {'Time ms':<{time_width}} {'Agg TFLOPS':>12} "
         f"{'Avg/GPU':>10} {'Check':>14}  Note"
     )
     for method, time_s, tflops_s, avg_gpu_tflops_s, check, note in rows:
         print(
-            f"{method:<24} {time_s:<{time_width}} {tflops_s:>12} "
+            f"{method:<{method_width}} {time_s:<{time_width}} {tflops_s:>12} "
             f"{avg_gpu_tflops_s:>10} {check:>14}  {note}"
         )
 

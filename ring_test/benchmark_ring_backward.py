@@ -1,9 +1,9 @@
 """Torchrun benchmark for causal all-CP varlen backward.
 
-The script compares an all-gather baseline, a complete Python/NCCL zigzag ring
-built from the local min_fa3 varlen backward, and the fused mega-ring backward
-kernel. Forward preparation, allocations, and fused remote-workspace resets
-are outside the CUDA-event timing interval.
+The script compares two all-gather baselines, a complete Python/NCCL zigzag
+ring built from the local min_fa3 varlen backward, and the fused mega-ring
+backward kernel. Forward preparation, allocations, and fused remote-workspace
+resets are outside the CUDA-event timing interval.
 """
 
 from __future__ import annotations
@@ -25,11 +25,21 @@ if str(DEMO_DIR) not in sys.path:
 
 import min_fa3_op
 
-from allgather_attention import AllGatherAttention, select_allgather_backend
+from allgather_attention import (
+    AllGatherAttention,
+    Llama3AllGatherAttention,
+    repartition_sequence_shards_to_llama3,
+    select_allgather_backend,
+)
 from ring_common import RingComm, raise_if_any_rank_failed
 
 
-METHOD_ORDER = ["allgather_attention", "min_varlen_python_ring", "min_varlen_mega_ring"]
+METHOD_ORDER = [
+    "allgather_attention",
+    "llama3_allgather_attention",
+    "min_varlen_python_ring",
+    "min_varlen_mega_ring",
+]
 
 
 @dataclass(frozen=True)
@@ -430,6 +440,7 @@ def build_method_runs(
     sm_config: SmConfig,
     seed: int,
     allgather_backend: str,
+    methods: list[str],
 ) -> dict[str, MethodRun]:
     q, local_k, local_v, dout = make_inputs(case, local_rank, seed)
     cu, cu_host = make_cu_seqlens(case, q.device)
@@ -461,6 +472,37 @@ def build_method_runs(
         lambda: allgather_attention.backward(dout),
         allgather_attention.note,
     )
+    llama3_run = None
+    if "llama3_allgather_attention" in methods:
+        global_seqlens = [case.seqlen * local_world_size] * case.batch_size
+        llama3_q = repartition_sequence_shards_to_llama3(
+            dist.group.WORLD, q, global_seqlens, True
+        )
+        llama3_k = repartition_sequence_shards_to_llama3(
+            dist.group.WORLD, local_k, global_seqlens, True
+        )
+        llama3_v = repartition_sequence_shards_to_llama3(
+            dist.group.WORLD, local_v, global_seqlens, True
+        )
+        llama3_dout = repartition_sequence_shards_to_llama3(
+            dist.group.WORLD, dout, global_seqlens, True
+        )
+        llama3_attention = Llama3AllGatherAttention(
+            dist.group.WORLD,
+            llama3_q,
+            llama3_k,
+            llama3_v,
+            global_seqlens,
+            True,
+            allgather_backend,
+            enable_backward=True,
+        )
+        llama3_run = MethodRun(
+            "llama3_allgather_attention",
+            llama3_attention.forward,
+            lambda: llama3_attention.backward(llama3_dout),
+            llama3_attention.note,
+        )
     remote_k, remote_v = make_mega_parallel_tensors(local_k, local_v, local_rank, local_world_size)
     torch.cuda.synchronize()
     cuda_barrier()
@@ -532,7 +574,7 @@ def build_method_runs(
             num_comm_sm=sm_config.num_comm_sm,
         )
 
-    return {
+    runs = {
         "allgather_attention": allgather_run,
         "min_varlen_python_ring": MethodRun(
             "min_varlen_python_ring",
@@ -547,6 +589,9 @@ def build_method_runs(
             "fused; remote workspace reset excluded",
         ),
     }
+    if llama3_run is not None:
+        runs["llama3_allgather_attention"] = llama3_run
+    return runs
 
 
 def prepare_method(run: MethodRun) -> None:
@@ -643,14 +688,24 @@ def run_case(
         sm_config,
         args.seed,
         args.allgather_backend,
+        methods,
     )
     reference = None
+    llama3_reference = None
     if args.check:
         reference_run = runs["min_varlen_python_ring"]
         prepare_method(reference_run)
         reference = reference_run.timing_fn()
         torch.cuda.synchronize()
         cuda_barrier()
+        if "llama3_allgather_attention" in methods:
+            global_seqlens = [case.seqlen * local_world_size] * case.batch_size
+            llama3_reference = tuple(
+                repartition_sequence_shards_to_llama3(
+                    dist.group.WORLD, gradient, global_seqlens, True
+                )
+                for gradient in reference
+            )
 
     results: dict[str, Result] = {}
     for method in methods:
@@ -662,7 +717,12 @@ def run_case(
             if args.check and method == "min_varlen_python_ring":
                 check = "reference"
             elif args.check and reference is not None:
-                check = check_gradients(method, run, reference, args.atol, args.rtol)
+                expected = (
+                    llama3_reference
+                    if method == "llama3_allgather_attention"
+                    else reference
+                )
+                check = check_gradients(method, run, expected, args.atol, args.rtol)
             results[method] = Result(
                 timing.max_time_ms,
                 aggregate_tflops,
@@ -706,14 +766,15 @@ def print_results(case: Case, methods: list[str], results: dict[str, Result]) ->
             speedup_s = f"{baseline.time_ms / result.time_ms:.3f}x"
         rows.append((method, time_s, aggregate_s, per_gpu_s, speedup_s, result.check, result.note))
 
+    method_width = max((25, *(len(row[0]) for row in rows)))
     time_width = max((64, *(len(row[1]) for row in rows)))
     print(
-        f"{'Method':<25} {'Time ms':<{time_width}} {'Agg TFLOPS':>11} "
+        f"{'Method':<{method_width}} {'Time ms':<{time_width}} {'Agg TFLOPS':>11} "
         f"{'Avg/GPU':>9} {'vs Python':>10} {'Check':>10}  Note"
     )
     for method, time_s, aggregate_s, per_gpu_s, speedup_s, check, note in rows:
         print(
-            f"{method:<25} {time_s:<{time_width}} {aggregate_s:>11} "
+            f"{method:<{method_width}} {time_s:<{time_width}} {aggregate_s:>11} "
             f"{per_gpu_s:>9} {speedup_s:>10} {check:>10}  {note}"
         )
 
