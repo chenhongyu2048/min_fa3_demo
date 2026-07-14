@@ -1,0 +1,473 @@
+
+================================================================================
+[forward_all_cp] GPUs=8, visible=0,1,2,3,4,5,6,7
+================================================================================
+CUDA_VISIBLE_DEVICES=0\,1\,2\,3\,4\,5\,6\,7 torchrun --standalone --nproc_per_node=8 ring_test/benchmark_ring_forward.py --b 16\,8\,4\,2\,1 --seqlen 1024\,2048\,4096\,8192\,16384 --qhead 32 --kvhead 8 --headdim 128 --mode causal --methods all --sm-configs 128:4\,124:8\,120:12\,116:16 --warmup-iters 10 --num-iters 40 --no-check
+FA2 flash_attn_varlen_func is not available, skipping FA2 benchmarks
+FA3 flash_attn_varlen_func is not available, skipping FA3 benchmarks
+FA2 flash_attn_varlen_func is not available, skipping FA2 benchmarks
+FA3 flash_attn_varlen_func is not available, skipping FA3 benchmarks
+FA2 flash_attn_varlen_func is not available, skipping FA2 benchmarks
+FA3 flash_attn_varlen_func is not available, skipping FA3 benchmarks
+FA2 flash_attn_varlen_func is not available, skipping FA2 benchmarks
+FA3 flash_attn_varlen_func is not available, skipping FA3 benchmarks
+FA2 flash_attn_varlen_func is not available, skipping FA2 benchmarks
+FA3 flash_attn_varlen_func is not available, skipping FA3 benchmarks
+FA2 flash_attn_varlen_func is not available, skipping FA2 benchmarks
+FA3 flash_attn_varlen_func is not available, skipping FA3 benchmarks
+FA2 flash_attn_varlen_func is not available, skipping FA2 benchmarks
+FA3 flash_attn_varlen_func is not available, skipping FA3 benchmarks
+FA2 flash_attn_varlen_func is not available, skipping FA2 benchmarks
+FA3 flash_attn_varlen_func is not available, skipping FA3 benchmarks
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3', 'min_varlen', 'min_varlen_ring', 'min_varlen_mega_ring'], B=16,8,4,2,1, seqlen=1024,2048,4096,8192,16384, qhead=32, kvhead=8, D=128, mode=causal, sm_configs=128:4,124:8,120:12,116:16, warmup=10, iters=40, check=False
+Agg TFLOPS sums visible attention work across ranks; Avg/GPU is that value divided by world_size.
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+Running B=16, local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=7.498, t1=7.651, t2=7.589, t3=7.561, t4=7.769, t5=7.385, t6=7.526, t7=7.430 | max_across_ranks=8.042                1093.9      136.7           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=3.471, t1=3.495, t2=3.482, t3=3.492, t4=3.466, t5=3.473, t6=3.465, t7=3.503 | max_across_ranks=3.507                2508.3      313.5           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=9.762, t1=9.877, t2=9.971, t3=10.010, t4=10.015, t5=9.933, t6=9.846, t7=9.626 | max_across_ranks=10.082              872.6      109.1           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=0.323, t1=0.787, t2=1.237, t3=1.713, t4=2.204, t5=2.696, t6=3.203, t7=3.906 | max_across_ranks=3.906                2252.2      281.5           skip  timing-only local step loop
+min_varlen_ring            t0=2.093, t1=4.125, t2=6.097, t3=8.114, t4=10.089, t5=12.090, t6=14.033, t7=14.366 | max_across_ranks=14.366            612.4       76.5           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=23.247, t1=22.118, t2=20.816, t3=19.522, t4=18.177, t5=16.849, t6=15.239, t7=13.881 | max_across_ranks=23.247        378.4       47.3           skip  zigzag causal
+
+Running B=8, local_S=2048, causal=True
+
+B=8, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=6.393, t1=6.541, t2=6.445, t3=6.484, t4=6.735, t5=6.428, t6=6.397, t7=6.480 | max_across_ranks=6.834                2574.4      321.8           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=4.904, t1=4.965, t2=4.923, t3=4.974, t4=4.897, t5=4.925, t6=4.928, t7=4.975 | max_across_ranks=4.984                3529.7      441.2           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=9.753, t1=9.876, t2=9.930, t3=9.957, t4=9.995, t5=9.966, t6=9.934, t7=9.666 | max_across_ranks=10.123               1737.9      217.2           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=0.490, t1=1.322, t2=2.135, t3=2.988, t4=3.808, t5=4.640, t6=5.686, t7=7.045 | max_across_ranks=7.045                2497.2      312.2           skip  timing-only local step loop
+min_varlen_ring            t0=2.096, t1=4.158, t2=6.126, t3=8.171, t4=10.141, t5=12.173, t6=14.126, t7=14.801 | max_across_ranks=14.801           1188.7      148.6           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=23.613, t1=22.549, t2=21.088, t3=19.832, t4=18.486, t5=16.758, t6=15.283, t7=13.741 | max_across_ranks=23.613        745.1       93.1           skip  zigzag causal
+
+Running B=4, local_S=4096, causal=True
+
+B=4, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=8.901, t1=8.964, t2=8.951, t3=9.003, t4=8.865, t5=8.915, t6=8.884, t7=9.040 | max_across_ranks=9.071                3879.1      484.9           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=8.138, t1=8.075, t2=8.178, t3=8.151, t4=8.108, t5=8.042, t6=8.025, t7=8.120 | max_across_ranks=8.400                4188.6      523.6           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=11.858, t1=11.937, t2=11.791, t3=11.769, t4=11.543, t5=11.484, t6=11.341, t7=11.218 | max_across_ranks=12.042       2922.0      365.3           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=0.854, t1=2.426, t2=3.951, t3=5.546, t4=7.007, t5=8.650, t6=10.628, t7=13.646 | max_across_ranks=13.646             2578.4      322.3           skip  timing-only local step loop
+min_varlen_ring            t0=2.108, t1=4.200, t2=6.202, t3=8.312, t4=10.302, t5=12.393, t6=14.389, t7=16.314 | max_across_ranks=16.314           2156.8      269.6           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=24.028, t1=23.082, t2=21.463, t3=20.212, t4=18.701, t5=17.180, t6=15.581, t7=14.077 | max_across_ranks=24.030       1464.2      183.0           skip  zigzag causal
+
+Running B=2, local_S=8192, causal=True
+
+B=2, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=14.890, t1=14.897, t2=14.878, t3=15.029, t4=15.022, t5=14.748, t6=14.833, t7=15.110 | max_across_ranks=15.381       4575.1      571.9           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=14.901, t1=14.787, t2=14.799, t3=15.143, t4=14.619, t5=14.726, t6=14.828, t7=14.782 | max_across_ranks=15.290       4602.2      575.3           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=18.293, t1=18.679, t2=18.525, t3=18.391, t4=17.939, t5=18.054, t6=17.809, t7=17.570 | max_across_ranks=18.891       3725.0      465.6           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=1.556, t1=4.563, t2=7.478, t3=10.515, t4=13.277, t5=16.543, t6=20.189, t7=25.402 | max_across_ranks=25.402          2770.2      346.3           skip  timing-only local step loop
+min_varlen_ring            t0=2.158, t1=5.282, t2=8.341, t3=11.560, t4=14.507, t5=17.975, t6=21.982, t7=27.220 | max_across_ranks=27.220          2585.2      323.1           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=25.134, t1=24.143, t2=22.509, t3=21.476, t4=19.791, t5=18.335, t6=16.744, t7=15.215 | max_across_ranks=25.134       2799.8      350.0           skip  zigzag causal
+
+Running B=1, local_S=16384, causal=True
+
+B=1, local_S=16384, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=28.653, t1=28.852, t2=29.011, t3=28.886, t4=28.678, t5=28.559, t6=28.236, t7=28.917 | max_across_ranks=29.392       4788.3      598.5           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=28.858, t1=28.786, t2=28.830, t3=28.797, t4=28.607, t5=28.355, t6=28.316, t7=28.792 | max_across_ranks=29.302       4803.0      600.4           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=32.266, t1=32.133, t2=31.607, t3=31.950, t4=32.047, t5=32.214, t6=32.390, t7=32.496 | max_across_ranks=32.636       4312.4      539.0           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=2.973, t1=8.881, t2=14.654, t3=20.647, t4=26.395, t5=33.054, t6=40.064, t7=49.907 | max_across_ranks=49.907         2820.0      352.5           skip  timing-only local step loop
+min_varlen_ring            t0=3.050, t1=9.218, t2=15.184, t3=21.524, t4=27.544, t5=34.420, t6=41.764, t7=52.474 | max_across_ranks=52.474         2682.1      335.3           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=29.923, t1=29.320, t2=29.338, t3=29.169, t4=28.538, t5=28.803, t6=28.624, t7=29.046 | max_across_ranks=30.633       4594.4      574.3           skip  zigzag causal
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+Running B=16, local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                        Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=7.570, t1=7.892, t2=7.626, t3=7.612, t4=7.378, t5=7.918, t6=7.601, t7=7.402 | max_across_ranks=7.928            1109.7      138.7           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=3.461, t1=3.491, t2=3.479, t3=3.489, t4=3.463, t5=3.473, t6=3.476, t7=3.502 | max_across_ranks=3.505            2509.8      313.7           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=9.883, t1=9.995, t2=10.071, t3=10.101, t4=10.098, t5=10.088, t6=9.984, t7=9.665 | max_across_ranks=10.196        862.8      107.9           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=0.327, t1=0.808, t2=1.282, t3=1.791, t4=2.225, t5=2.760, t6=3.255, t7=4.078 | max_across_ranks=4.078            2157.0      269.6           skip  timing-only local step loop
+min_varlen_ring            t0=1.128, t1=2.196, t2=3.199, t3=4.262, t4=5.262, t5=6.302, t6=7.328, t7=7.798 | max_across_ranks=7.798            1128.1      141.0           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=12.229, t1=11.679, t2=11.023, t3=10.364, t4=9.686, t5=8.954, t6=8.163, t7=7.549 | max_across_ranks=12.229        719.3       89.9           skip  zigzag causal
+
+Running B=8, local_S=2048, causal=True
+
+B=8, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                        Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=6.404, t1=6.577, t2=6.471, t3=6.508, t4=6.431, t5=6.556, t6=6.422, t7=6.505 | max_across_ranks=6.596            2667.1      333.4           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=4.906, t1=4.971, t2=4.933, t3=4.959, t4=4.904, t5=4.938, t6=4.935, t7=4.982 | max_across_ranks=4.987            3528.1      441.0           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=9.711, t1=9.839, t2=9.920, t3=9.963, t4=9.947, t5=9.943, t6=9.861, t7=9.648 | max_across_ranks=10.120           1738.5      217.3           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=0.504, t1=1.362, t2=2.201, t3=3.097, t4=3.901, t5=4.783, t6=5.798, t7=7.425 | max_across_ranks=7.425            2369.4      296.2           skip  timing-only local step loop
+min_varlen_ring            t0=1.131, t1=2.218, t2=3.231, t3=4.322, t4=5.332, t5=6.402, t6=7.466, t7=8.646 | max_across_ranks=8.646            2034.8      254.3           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=12.450, t1=11.913, t2=11.182, t3=10.528, t4=9.770, t5=9.021, t6=8.174, t7=7.491 | max_across_ranks=12.451       1413.0      176.6           skip  zigzag causal
+
+Running B=4, local_S=4096, causal=True
+
+B=4, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=8.893, t1=9.026, t2=9.023, t3=9.008, t4=8.909, t5=8.942, t6=8.946, t7=9.038 | max_across_ranks=9.075                3877.1      484.6           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=8.083, t1=8.125, t2=8.249, t3=8.177, t4=8.056, t5=8.038, t6=8.021, t7=8.176 | max_across_ranks=8.415                4181.4      522.7           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=11.912, t1=11.986, t2=11.795, t3=11.719, t4=11.572, t5=11.520, t6=11.437, t7=11.314 | max_across_ranks=12.095       2909.1      363.6           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=0.875, t1=2.494, t2=4.053, t3=5.738, t4=7.233, t5=8.915, t6=11.119, t7=14.286 | max_across_ranks=14.286             2462.9      307.9           skip  timing-only local step loop
+min_varlen_ring            t0=1.139, t1=2.879, t2=4.543, t3=6.355, t4=7.949, t5=9.800, t6=12.006, t7=15.112 | max_across_ranks=15.112             2328.3      291.0           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=12.967, t1=12.388, t2=11.677, t3=11.086, t4=10.317, t5=9.619, t6=8.762, t7=8.206 | max_across_ranks=12.967          2713.6      339.2           skip  zigzag causal
+
+Running B=2, local_S=8192, causal=True
+
+B=2, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=15.006, t1=15.319, t2=14.965, t3=15.204, t4=15.016, t5=14.855, t6=14.759, t7=15.163 | max_across_ranks=15.511       4536.9      567.1           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=14.889, t1=14.925, t2=14.892, t3=14.956, t4=14.541, t5=14.897, t6=14.637, t7=14.806 | max_across_ranks=15.260       4611.4      576.4           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=18.555, t1=18.483, t2=18.512, t3=18.298, t4=17.948, t5=17.992, t6=17.790, t7=17.447 | max_across_ranks=18.864       3730.4      466.3           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=1.593, t1=4.683, t2=7.650, t3=10.871, t4=13.690, t5=17.208, t6=20.970, t7=26.230 | max_across_ranks=26.230          2682.8      335.3           skip  timing-only local step loop
+min_varlen_ring            t0=1.681, t1=4.945, t2=8.045, t3=11.455, t4=14.452, t5=18.084, t6=22.319, t7=27.834 | max_across_ranks=27.834          2528.2      316.0           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=14.704, t1=14.877, t2=15.110, t3=15.319, t4=15.429, t5=15.742, t6=15.660, t7=15.841 | max_across_ranks=16.204       4342.9      542.9           skip  zigzag causal
+
+Running B=1, local_S=16384, causal=True
+
+B=1, local_S=16384, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=28.860, t1=28.800, t2=28.778, t3=28.899, t4=28.531, t5=28.577, t6=28.516, t7=28.761 | max_across_ranks=29.493       4771.9      596.5           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=28.857, t1=28.977, t2=28.773, t3=28.896, t4=28.610, t5=28.827, t6=28.424, t7=28.560 | max_across_ranks=29.400       4787.0      598.4           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=31.562, t1=31.717, t2=31.590, t3=30.663, t4=30.827, t5=30.903, t6=31.262, t7=31.543 | max_across_ranks=31.843       4419.7      552.5           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=3.038, t1=9.108, t2=14.991, t3=21.383, t4=27.427, t5=34.259, t6=41.771, t7=51.574 | max_across_ranks=51.574         2728.9      341.1           skip  timing-only local step loop
+min_varlen_ring            t0=3.116, t1=9.478, t2=15.536, t3=22.255, t4=28.527, t5=36.146, t6=43.683, t7=54.188 | max_across_ranks=54.188         2597.2      324.7           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=29.292, t1=29.055, t2=29.261, t3=29.237, t4=28.570, t5=28.849, t6=28.705, t7=28.867 | max_across_ranks=30.593       4600.4      575.0           skip  zigzag causal
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+Running B=16, local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                    Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=7.567, t1=7.895, t2=7.601, t3=7.588, t4=7.372, t5=7.921, t6=7.587, t7=7.412 | max_across_ranks=7.929        1109.5      138.7           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=3.461, t1=3.494, t2=3.486, t3=3.490, t4=3.466, t5=3.477, t6=3.481, t7=3.497 | max_across_ranks=3.506        2509.2      313.6           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=9.659, t1=9.774, t2=9.840, t3=9.928, t4=9.968, t5=9.992, t6=9.901, t7=9.608 | max_across_ranks=10.052        875.1      109.4           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=0.339, t1=0.833, t2=1.317, t3=1.815, t4=2.339, t5=2.833, t6=3.373, t7=4.203 | max_across_ranks=4.203        2093.1      261.6           skip  timing-only local step loop
+min_varlen_ring            t0=0.802, t1=1.551, t2=2.233, t3=2.971, t4=3.664, t5=4.383, t6=5.076, t7=5.662 | max_across_ranks=5.662        1553.7      194.2           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=8.459, t1=8.104, t2=7.667, t3=7.236, t4=6.786, t5=6.293, t6=5.760, t7=5.426 | max_across_ranks=8.459        1040.0      130.0           skip  zigzag causal
+
+Running B=8, local_S=2048, causal=True
+
+B=8, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                    Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=6.411, t1=6.584, t2=6.462, t3=6.494, t4=6.439, t5=6.565, t6=6.423, t7=6.492 | max_across_ranks=6.599        2666.2      333.3           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=4.910, t1=4.973, t2=4.946, t3=4.969, t4=4.905, t5=4.946, t6=4.952, t7=4.987 | max_across_ranks=4.993        3523.8      440.5           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=9.746, t1=9.832, t2=9.874, t3=9.923, t4=9.913, t5=9.931, t6=9.823, t7=9.579 | max_across_ranks=10.060       1748.8      218.6           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=0.517, t1=1.395, t2=2.267, t3=3.156, t4=4.007, t5=4.915, t6=5.994, t7=7.491 | max_across_ranks=7.491        2348.7      293.6           skip  timing-only local step loop
+min_varlen_ring            t0=0.806, t1=1.796, t2=2.754, t3=3.771, t4=4.697, t5=5.696, t6=6.823, t7=8.575 | max_across_ranks=8.575        2051.6      256.5           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=8.781, t1=8.338, t2=7.859, t3=7.474, t4=6.956, t5=6.486, t6=5.932, t7=5.557 | max_across_ranks=8.781        2003.5      250.4           skip  zigzag causal
+
+Running B=4, local_S=4096, causal=True
+
+B=4, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=8.942, t1=9.065, t2=9.032, t3=9.026, t4=8.950, t5=8.964, t6=8.993, t7=9.077 | max_across_ranks=9.114                3860.4      482.5           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=8.219, t1=8.178, t2=8.232, t3=8.274, t4=8.184, t5=8.141, t6=8.076, t7=8.132 | max_across_ranks=8.414                4181.7      522.7           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=11.931, t1=12.039, t2=11.851, t3=11.893, t4=11.737, t5=11.660, t6=11.500, t7=11.356 | max_across_ranks=12.153       2895.3      361.9           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=0.895, t1=2.548, t2=4.154, t3=5.863, t4=7.388, t5=9.148, t6=11.426, t7=14.342 | max_across_ranks=14.342             2453.3      306.7           skip  timing-only local step loop
+min_varlen_ring            t0=0.991, t1=2.779, t2=4.493, t3=6.346, t4=7.966, t5=9.895, t6=12.147, t7=15.234 | max_across_ranks=15.234             2309.6      288.7           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=9.456, t1=9.227, t2=8.672, t3=8.345, t4=8.422, t5=8.745, t6=9.022, t7=9.013 | max_across_ranks=9.468                3716.4      464.5           skip  zigzag causal
+
+Running B=2, local_S=8192, causal=True
+
+B=2, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=14.960, t1=15.341, t2=14.958, t3=15.137, t4=14.995, t5=14.863, t6=14.906, t7=15.216 | max_across_ranks=15.554       4524.3      565.5           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=14.893, t1=14.973, t2=14.782, t3=14.940, t4=14.702, t5=14.896, t6=14.777, t7=14.898 | max_across_ranks=15.300       4599.4      574.9           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=18.535, t1=18.533, t2=18.492, t3=18.290, t4=17.795, t5=17.955, t6=17.733, t7=17.444 | max_across_ranks=18.867       3729.7      466.2           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=1.629, t1=4.784, t2=7.832, t3=11.107, t4=14.009, t5=17.602, t6=21.434, t7=26.840 | max_across_ranks=26.840          2621.8      327.7           skip  timing-only local step loop
+min_varlen_ring            t0=1.717, t1=5.057, t2=8.243, t3=11.706, t4=14.794, t5=18.488, t6=22.987, t7=28.415 | max_across_ranks=28.415          2476.5      309.6           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=14.832, t1=14.965, t2=14.988, t3=15.208, t4=15.299, t5=15.798, t6=15.653, t7=15.896 | max_across_ranks=16.175       4350.6      543.8           skip  zigzag causal
+
+Running B=1, local_S=16384, causal=True
+
+B=1, local_S=16384, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=29.078, t1=28.599, t2=28.834, t3=28.990, t4=28.666, t5=28.784, t6=28.516, t7=28.846 | max_across_ranks=29.566       4760.2      595.0           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=28.736, t1=28.583, t2=28.687, t3=29.032, t4=28.485, t5=28.547, t6=28.530, t7=28.570 | max_across_ranks=29.465       4776.4      597.0           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=31.745, t1=31.994, t2=31.840, t3=31.981, t4=31.928, t5=31.998, t6=31.964, t7=32.017 | max_across_ranks=32.314       4355.3      544.4           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=3.101, t1=9.302, t2=15.268, t3=21.846, t4=28.152, t5=35.232, t6=42.534, t7=52.636 | max_across_ranks=52.636         2673.8      334.2           skip  timing-only local step loop
+min_varlen_ring            t0=3.179, t1=9.685, t2=15.905, t3=22.791, t4=29.199, t5=36.837, t6=44.954, t7=55.141 | max_across_ranks=55.141         2552.4      319.0           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=29.142, t1=29.007, t2=29.136, t3=29.222, t4=28.670, t5=29.214, t6=28.734, t7=28.778 | max_across_ranks=30.720       4581.4      572.7           skip  zigzag causal
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+Running B=16, local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                        Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=7.566, t1=7.904, t2=7.603, t3=7.820, t4=7.356, t5=7.916, t6=7.632, t7=7.405 | max_across_ranks=7.956            1105.7      138.2           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=3.468, t1=3.495, t2=3.483, t3=3.494, t4=3.466, t5=3.479, t6=3.486, t7=3.505 | max_across_ranks=3.512            2505.1      313.1           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=9.814, t1=9.963, t2=10.042, t3=10.114, t4=10.100, t5=10.066, t6=9.983, t7=9.720 | max_across_ranks=10.197        862.7      107.8           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=0.347, t1=0.856, t2=1.356, t3=1.901, t4=2.369, t5=2.921, t6=3.437, t7=4.307 | max_across_ranks=4.307            2042.3      255.3           skip  timing-only local step loop
+min_varlen_ring            t0=0.640, t1=1.259, t2=1.860, t3=2.482, t4=3.079, t5=3.697, t6=4.284, t7=5.138 | max_across_ranks=5.138            1712.3      214.0           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=6.649, t1=6.330, t2=5.962, t3=5.682, t4=5.350, t5=5.036, t6=4.624, t7=4.490 | max_across_ranks=6.649            1323.0      165.4           skip  zigzag causal
+
+Running B=8, local_S=2048, causal=True
+
+B=8, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                       Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=6.401, t1=6.588, t2=6.471, t3=6.558, t4=6.446, t5=6.604, t6=6.440, t7=6.503 | max_across_ranks=6.637           2650.9      331.4           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=4.905, t1=4.976, t2=4.947, t3=4.960, t4=4.906, t5=4.945, t6=4.947, t7=4.983 | max_across_ranks=4.990           3525.8      440.7           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=9.707, t1=9.827, t2=9.932, t3=10.016, t4=10.048, t5=10.058, t6=9.885, t7=9.625 | max_across_ranks=10.156       1732.4      216.5           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=0.534, t1=1.432, t2=2.323, t3=3.237, t4=4.104, t5=5.040, t6=6.110, t7=7.605 | max_across_ranks=7.605           2313.5      289.2           skip  timing-only local step loop
+min_varlen_ring            t0=0.665, t1=1.671, t2=2.655, t3=3.710, t4=4.665, t5=5.681, t6=6.853, t7=8.659 | max_across_ranks=8.659           2031.9      254.0           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=6.831, t1=6.531, t2=6.136, t3=5.840, t4=5.500, t5=5.374, t6=5.492, t7=5.582 | max_across_ranks=6.831           2575.3      321.9           skip  zigzag causal
+
+Running B=4, local_S=4096, causal=True
+
+B=4, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=8.954, t1=9.053, t2=8.996, t3=9.043, t4=8.920, t5=9.004, t6=8.996, t7=9.050 | max_across_ranks=9.099                3867.1      483.4           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=8.233, t1=8.167, t2=8.176, t3=8.257, t4=8.126, t5=8.063, t6=8.092, t7=8.236 | max_across_ranks=8.469                4154.4      519.3           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=11.972, t1=12.025, t2=11.947, t3=11.901, t4=11.715, t5=11.662, t6=11.578, t7=11.375 | max_across_ranks=12.211       2881.5      360.2           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=0.918, t1=2.607, t2=4.259, t3=5.997, t4=7.600, t5=9.356, t6=11.688, t7=14.794 | max_across_ranks=14.794             2378.4      297.3           skip  timing-only local step loop
+min_varlen_ring            t0=1.019, t1=2.844, t2=4.628, t3=6.486, t4=8.173, t5=10.119, t6=12.461, t7=15.690 | max_across_ranks=15.690            2242.5      280.3           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=8.188, t1=8.361, t2=8.370, t3=8.407, t4=8.481, t5=8.787, t6=9.084, t7=9.047 | max_across_ranks=9.173                3835.7      479.5           skip  zigzag causal
+
+Running B=2, local_S=8192, causal=True
+
+B=2, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=14.943, t1=15.275, t2=14.992, t3=15.220, t4=14.816, t5=14.909, t6=15.022, t7=15.232 | max_across_ranks=15.582       4516.2      564.5           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=14.987, t1=14.703, t2=14.989, t3=14.851, t4=14.741, t5=14.833, t6=14.752, t7=14.869 | max_across_ranks=15.307       4597.2      574.6           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=18.679, t1=18.321, t2=18.300, t3=18.169, t4=18.088, t5=18.003, t6=17.642, t7=17.528 | max_across_ranks=18.955       3712.4      464.0           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=1.669, t1=4.897, t2=8.032, t3=11.369, t4=14.415, t5=17.910, t6=22.079, t7=27.287 | max_across_ranks=27.287          2578.9      322.4           skip  timing-only local step loop
+min_varlen_ring            t0=1.758, t1=5.171, t2=8.466, t3=11.964, t4=15.174, t5=19.014, t6=23.524, t7=28.930 | max_across_ranks=28.930          2432.4      304.1           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=14.725, t1=15.043, t2=15.107, t3=15.346, t4=15.189, t5=15.844, t6=15.633, t7=15.782 | max_across_ranks=16.220       4338.3      542.3           skip  zigzag causal
+
+Running B=1, local_S=16384, causal=True
+
+B=1, local_S=16384, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU          Check  Note
+allgather_attention        t0=28.942, t1=28.628, t2=28.777, t3=28.883, t4=28.385, t5=28.655, t6=28.439, t7=29.002 | max_across_ranks=29.562       4760.8      595.1           skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=28.830, t1=28.540, t2=28.783, t3=28.948, t4=28.223, t5=28.674, t6=28.460, t7=28.652 | max_across_ranks=29.414       4784.7      598.1           skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+fa3                        t0=30.691, t1=30.735, t2=30.534, t3=30.846, t4=30.900, t5=31.148, t6=31.169, t7=31.169 | max_across_ranks=31.293       4497.4      562.2           skip  fallback: min_fa3_varlen block
+min_varlen                 t0=3.173, t1=9.520, t2=15.697, t3=22.368, t4=28.731, t5=36.004, t6=43.686, t7=53.594 | max_across_ranks=53.594         2626.0      328.3           skip  timing-only local step loop
+min_varlen_ring            t0=3.252, t1=9.916, t2=16.399, t3=23.330, t4=30.104, t5=37.603, t6=45.686, t7=56.462 | max_across_ranks=56.462         2492.6      311.6           skip  ordinary causal ring timing-only
+min_varlen_mega_ring       t0=29.244, t1=29.086, t2=29.072, t3=29.535, t4=28.669, t5=29.261, t6=28.722, t7=28.748 | max_across_ranks=30.602       4599.0      574.9           skip  zigzag causal
+
+================================================================================
+[forward_hybrid] GPUs=8, visible=0,1,2,3,4,5,6,7
+================================================================================
+CUDA_VISIBLE_DEVICES=0\,1\,2\,3\,4\,5\,6\,7 torchrun --standalone --nproc_per_node=8 ring_test/benchmark_hybrid_forward.py --global-seqlens 98304\,8192\,4096\,4096\,2048\,2048\,2048\,2048\,2048\,2048\,2048\,2048 --ring-sizes 8\,8\,4\,4\,1\,1\,1\,1\,1\,1\,1\,1 --ring-starts 0\,0\,0\,4\,0\,1\,2\,3\,4\,5\,6\,7 --qhead 32 --kvhead 8 --headdim 128 --mode causal --methods all --sm-configs 128:4\,124:8\,120:12\,116:16 --warmup-iters 10 --num-iters 40 --no-check
+world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'mega_ring_all_cp', 'mega_ring_hybrid'], global_seqlens=[98304, 8192, 4096, 4096, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], ring_sizes=[8, 8, 4, 4, 1, 1, 1, 1, 1, 1, 1, 1], ring_starts=[0, 0, 0, 4, 0, 1, 2, 3, 4, 5, 6, 7], QH=32, KVH=8, D=128, FA backend=local min_fa3 fallback
+method=allgather_attention         mode=causal    SM=128:4  max_ms=16.7542 agg_TFLOPS=4790.8 avg_gpu_TFLOPS=598.8 check=skip rank_ms=[16.3455,16.4538,16.4182,16.3853,16.1891,16.3852,16.3835,16.3590] note=all-CP all-gather; local min_fa3 fallback
+method=llama3_allgather_attention  mode=causal    SM=128:4  max_ms=28.2611 agg_TFLOPS=2840.1 avg_gpu_TFLOPS=355.0 check=skip rank_ms=[3.0076,4.4119,5.9648,7.7845,27.7084,27.8376,27.7490,28.0125] note=whole-packed zigzag all-gather; local min_fa3 fallback; causal
+method=fa3_ring                    mode=causal    SM=128:4  max_ms=20.1693 agg_TFLOPS=3979.6 avg_gpu_TFLOPS=497.4 check=skip rank_ms=[19.7984,19.6159,19.9920,19.7806,19.4453,19.2463,18.6702,18.5886] note=all-CP NCCL ring; local min_fa3 fallback
+method=mega_ring_all_cp            mode=causal    SM=128:4  max_ms=25.4726 agg_TFLOPS=3151.0 avg_gpu_TFLOPS=393.9 check=skip rank_ms=[25.4670,24.4148,23.1332,21.9678,20.3543,19.0806,17.5220,16.1809] note=all-CP fused mega-ring
+method=mega_ring_hybrid            mode=causal    SM=128:4  max_ms=21.6524 agg_TFLOPS=3707.0 avg_gpu_TFLOPS=463.4 check=skip rank_ms=[21.6524,20.6120,19.6292,18.6223,17.4494,16.3017,15.1453,15.3740] note=hierarchical hybrid fused mega-ring
+method=allgather_attention         mode=causal    SM=124:8  max_ms=17.4124 agg_TFLOPS=4609.7 avg_gpu_TFLOPS=576.2 check=skip rank_ms=[17.0348,16.9961,16.9793,17.0315,16.9623,16.8894,16.7127,17.1509] note=all-CP all-gather; local min_fa3 fallback
+method=llama3_allgather_attention  mode=causal    SM=124:8  max_ms=28.1348 agg_TFLOPS=2852.9 avg_gpu_TFLOPS=356.6 check=skip rank_ms=[2.9791,4.3821,5.9262,7.7583,27.7367,27.9749,27.5412,28.0089] note=whole-packed zigzag all-gather; local min_fa3 fallback; causal
+method=fa3_ring                    mode=causal    SM=124:8  max_ms=20.4017 agg_TFLOPS=3934.2 avg_gpu_TFLOPS=491.8 check=skip rank_ms=[19.8275,20.0628,20.0546,20.0710,19.4250,19.3031,19.3207,19.0592] note=all-CP NCCL ring; local min_fa3 fallback
+method=mega_ring_all_cp            mode=causal    SM=124:8  max_ms=17.5583 agg_TFLOPS=4571.4 avg_gpu_TFLOPS=571.4 check=skip rank_ms=[17.1716,17.1852,17.0554,17.2026,17.1502,17.3540,17.1339,17.3050] note=all-CP fused mega-ring
+method=mega_ring_hybrid            mode=causal    SM=124:8  max_ms=17.2500 agg_TFLOPS=4653.1 avg_gpu_TFLOPS=581.6 check=skip rank_ms=[16.9424,16.9109,16.8509,16.8990,16.9187,17.0910,16.7290,16.9339] note=hierarchical hybrid fused mega-ring
+method=allgather_attention         mode=causal    SM=120:12 max_ms=17.2879 agg_TFLOPS=4642.9 avg_gpu_TFLOPS=580.4 check=skip rank_ms=[16.9436,17.0258,16.8131,16.9279,16.8319,16.9931,16.6411,16.9851] note=all-CP all-gather; local min_fa3 fallback
+method=llama3_allgather_attention  mode=causal    SM=120:12 max_ms=28.2565 agg_TFLOPS=2840.6 avg_gpu_TFLOPS=355.1 check=skip rank_ms=[2.9768,4.3843,5.9451,7.7656,27.6333,27.9831,27.6288,28.1165] note=whole-packed zigzag all-gather; local min_fa3 fallback; causal
+method=fa3_ring                    mode=causal    SM=120:12 max_ms=20.3142 agg_TFLOPS=3951.2 avg_gpu_TFLOPS=493.9 check=skip rank_ms=[19.8773,20.0442,20.0900,20.0603,19.3628,19.3803,19.4109,19.2897] note=all-CP NCCL ring; local min_fa3 fallback
+method=mega_ring_all_cp            mode=causal    SM=120:12 max_ms=17.6688 agg_TFLOPS=4542.8 avg_gpu_TFLOPS=567.8 check=skip rank_ms=[17.1039,17.0240,17.1391,17.1712,17.1036,17.3455,17.0476,17.3343] note=all-CP fused mega-ring
+method=mega_ring_hybrid            mode=causal    SM=120:12 max_ms=17.2103 agg_TFLOPS=4663.8 avg_gpu_TFLOPS=583.0 check=skip rank_ms=[16.9886,16.8548,16.8608,16.9908,16.7728,17.0151,16.7973,16.9691] note=hierarchical hybrid fused mega-ring
+method=allgather_attention         mode=causal    SM=116:16 max_ms=17.2254 agg_TFLOPS=4659.7 avg_gpu_TFLOPS=582.5 check=skip rank_ms=[16.7929,16.8659,16.9265,17.0195,16.8506,17.0051,16.7493,17.0291] note=all-CP all-gather; local min_fa3 fallback
+method=llama3_allgather_attention  mode=causal    SM=116:16 max_ms=28.3071 agg_TFLOPS=2835.5 avg_gpu_TFLOPS=354.4 check=skip rank_ms=[2.9739,4.3844,5.9495,7.7718,27.6825,28.0954,27.8270,28.0923] note=whole-packed zigzag all-gather; local min_fa3 fallback; causal
+method=fa3_ring                    mode=causal    SM=116:16 max_ms=20.4364 agg_TFLOPS=3927.6 avg_gpu_TFLOPS=490.9 check=skip rank_ms=[20.3166,20.1205,19.8168,19.9285,19.5629,19.3018,19.1472,19.2318] note=all-CP NCCL ring; local min_fa3 fallback
+method=mega_ring_all_cp            mode=causal    SM=116:16 max_ms=17.5928 agg_TFLOPS=4562.4 avg_gpu_TFLOPS=570.3 check=skip rank_ms=[17.1672,17.0965,17.1393,17.2803,17.0415,17.3255,17.1335,17.1999] note=all-CP fused mega-ring
+method=mega_ring_hybrid            mode=causal    SM=116:16 max_ms=17.2403 agg_TFLOPS=4655.7 avg_gpu_TFLOPS=582.0 check=skip rank_ms=[17.0188,16.8857,17.0164,16.9522,16.7853,16.9588,16.8278,16.8104] note=hierarchical hybrid fused mega-ring
+
+================================================================================
+[backward] GPUs=8, visible=0,1,2,3,4,5,6,7
+================================================================================
+CUDA_VISIBLE_DEVICES=0\,1\,2\,3\,4\,5\,6\,7 torchrun --standalone --nproc_per_node=8 ring_test/benchmark_ring_backward.py --b 16\,8\,4\,2\,1 --seqlen 1024\,2048\,4096\,8192\,16384 --qhead 32 --kvhead 8 --headdim 128 --methods all --sm-configs 128:4\,124:8\,120:12\,116:16 --warmup-iters 10 --num-iters 40 --no-check
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'min_varlen_python_ring', 'min_varlen_mega_ring'], B=16,8,4,2,1, seqlen=1024,2048,4096,8192,16384, QH=32, KVH=8, D=128, sm_configs=128:4,124:8,120:12,116:16, warmup=10, iters=40, check=False
+Timing excludes forward preparation, allocations, and fused remote-workspace reset.
+Agg TFLOPS uses 10 FLOPs per visible score for causal backward.
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+Running B=16, local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=15.033, t1=15.037, t2=15.038, t3=15.039, t4=15.034, t5=15.031, t6=15.023, t7=15.023 | max_across_ranks=15.052      1460.9     182.6     1.664x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=8.841, t1=8.842, t2=8.834, t3=8.835, t4=8.820, t5=8.814, t6=8.816, t7=8.825 | max_across_ranks=8.851               2484.6     310.6     2.830x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=25.040, t1=25.046, t2=24.888, t3=24.901, t4=24.900, t5=24.905, t6=24.848, t7=25.004 | max_across_ranks=25.046       878.0     109.7     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=32.500, t1=32.543, t2=31.878, t3=30.802, t4=30.042, t5=28.949, t6=27.994, t7=26.925 | max_across_ranks=32.543       675.7      84.5     0.770x       skip  fused; remote workspace reset excluded
+
+Running B=8, local_S=2048, causal=True
+
+B=8, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=18.018, t1=18.022, t2=18.017, t3=18.025, t4=18.028, t5=18.028, t6=18.024, t7=18.009 | max_across_ranks=18.046      2437.1     304.6     1.460x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=13.667, t1=13.661, t2=13.661, t3=13.667, t4=13.669, t5=13.667, t6=13.670, t7=13.664 | max_across_ranks=13.698      3210.8     401.3     1.923x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=26.327, t1=26.328, t2=26.276, t3=26.313, t4=26.231, t5=26.212, t6=26.205, t7=26.290 | max_across_ranks=26.338      1669.8     208.7     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=31.880, t1=31.886, t2=31.052, t3=30.031, t4=29.501, t5=28.682, t6=27.632, t7=26.433 | max_across_ranks=31.886      1379.3     172.4     0.826x       skip  fused; remote workspace reset excluded
+
+Running B=4, local_S=4096, causal=True
+
+B=4, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=27.189, t1=27.185, t2=27.184, t3=27.175, t4=27.175, t5=27.175, t6=27.176, t7=27.182 | max_across_ranks=27.210      3232.6     404.1     1.381x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=23.451, t1=23.453, t2=23.452, t3=23.450, t4=23.445, t5=23.438, t6=23.429, t7=23.438 | max_across_ranks=23.474      3747.1     468.4     1.601x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=37.551, t1=37.579, t2=37.577, t3=37.279, t4=37.171, t5=37.200, t6=37.330, t7=37.449 | max_across_ranks=37.583      2340.4     292.6     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=32.017, t1=32.032, t2=31.313, t3=30.451, t4=29.693, t5=28.759, t6=27.816, t7=26.600 | max_across_ranks=32.033      2746.0     343.2     1.173x       skip  fused; remote workspace reset excluded
+
+Running B=2, local_S=8192, causal=True
+
+B=2, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=45.753, t1=45.756, t2=45.752, t3=45.743, t4=45.741, t5=45.734, t6=45.736, t7=45.749 | max_across_ranks=45.778      3842.9     480.4     1.178x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=43.217, t1=43.220, t2=43.215, t3=43.211, t4=43.202, t5=43.196, t6=43.199, t7=43.205 | max_across_ranks=43.240      4068.5     508.6     1.247x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=53.807, t1=53.820, t2=53.832, t3=53.801, t4=53.839, t5=53.799, t6=53.792, t7=53.756 | max_across_ranks=53.940      3261.4     407.7     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=41.410, t1=41.675, t2=41.709, t3=41.643, t4=41.557, t5=41.110, t6=41.022, t7=40.820 | max_across_ranks=41.810      4207.7     526.0     1.290x       skip  fused; remote workspace reset excluded
+
+Running B=1, local_S=16384, causal=True
+
+B=1, local_S=16384, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=83.550, t1=83.556, t2=83.565, t3=83.559, t4=83.560, t5=83.551, t6=83.546, t7=83.543 | max_across_ranks=83.586      4209.4     526.2     1.079x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=83.323, t1=83.326, t2=83.322, t3=83.321, t4=83.329, t5=83.317, t6=83.317, t7=83.315 | max_across_ranks=83.352      4221.2     527.6     1.082x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=89.820, t1=89.886, t2=89.981, t3=90.027, t4=90.035, t5=90.051, t6=89.987, t7=89.948 | max_across_ranks=90.176      3901.8     487.7     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=77.968, t1=79.557, t2=79.577, t3=79.471, t4=79.480, t5=78.450, t6=78.542, t7=77.990 | max_across_ranks=79.730      4413.0     551.6     1.131x       skip  fused; remote workspace reset excluded
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+Running B=16, local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=15.090, t1=15.082, t2=15.071, t3=15.063, t4=15.067, t5=15.063, t6=15.067, t7=15.077 | max_across_ranks=15.094      1456.9     182.1     1.657x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=8.869, t1=8.879, t2=8.871, t3=8.858, t4=8.846, t5=8.834, t6=8.841, t7=8.852 | max_across_ranks=8.881               2476.2     309.5     2.815x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=24.999, t1=25.001, t2=24.853, t3=24.865, t4=24.885, t5=24.877, t6=24.813, t7=24.965 | max_across_ranks=25.002       879.5     109.9     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=18.036, t1=18.339, t2=18.312, t3=18.091, t4=17.832, t5=17.518, t6=17.127, t7=16.586 | max_across_ranks=18.393      1195.5     149.4     1.359x       skip  fused; remote workspace reset excluded
+
+Running B=8, local_S=2048, causal=True
+
+B=8, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=18.062, t1=18.056, t2=18.065, t3=18.060, t4=18.063, t5=18.056, t6=18.058, t7=18.058 | max_across_ranks=18.086      2431.7     304.0     1.456x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=13.718, t1=13.720, t2=13.721, t3=13.711, t4=13.705, t5=13.701, t6=13.704, t7=13.711 | max_across_ranks=13.742      3200.4     400.0     1.916x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=26.314, t1=26.315, t2=26.286, t3=26.302, t4=26.230, t5=26.205, t6=26.183, t7=26.279 | max_across_ranks=26.324      1670.7     208.8     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=17.725, t1=17.919, t2=17.940, t3=17.786, t4=17.531, t5=17.118, t6=16.547, t7=16.030 | max_across_ranks=18.020      2440.6     305.1     1.461x       skip  fused; remote workspace reset excluded
+
+Running B=4, local_S=4096, causal=True
+
+B=4, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=27.224, t1=27.227, t2=27.233, t3=27.228, t4=27.226, t5=27.219, t6=27.218, t7=27.222 | max_across_ranks=27.255      3227.3     403.4     1.379x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=23.487, t1=23.489, t2=23.493, t3=23.496, t4=23.498, t5=23.491, t6=23.486, t7=23.486 | max_across_ranks=23.517      3740.3     467.5     1.598x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=37.539, t1=37.568, t2=37.561, t3=37.323, t4=37.215, t5=37.252, t6=37.344, t7=37.464 | max_across_ranks=37.573      2341.1     292.6     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=23.197, t1=22.994, t2=22.917, t3=23.020, t4=23.078, t5=23.051, t6=23.121, t7=23.185 | max_across_ranks=23.342      3768.4     471.0     1.610x       skip  fused; remote workspace reset excluded
+
+Running B=2, local_S=8192, causal=True
+
+B=2, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=46.097, t1=46.101, t2=46.109, t3=46.113, t4=46.109, t5=46.105, t6=46.100, t7=46.099 | max_across_ranks=46.137      3813.0     476.6     1.172x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=43.159, t1=43.159, t2=43.158, t3=43.154, t4=43.147, t5=43.142, t6=43.143, t7=43.151 | max_across_ranks=43.182      4074.0     509.2     1.253x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=53.960, t1=53.987, t2=53.967, t3=53.939, t4=53.943, t5=53.918, t6=53.924, t7=53.923 | max_across_ranks=54.089      3252.4     406.6     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=42.125, t1=41.777, t2=41.751, t3=41.758, t4=41.846, t5=41.743, t6=41.816, t7=42.043 | max_across_ranks=42.293      4159.6     520.0     1.279x       skip  fused; remote workspace reset excluded
+
+Running B=1, local_S=16384, causal=True
+
+B=1, local_S=16384, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=83.565, t1=83.565, t2=83.563, t3=83.570, t4=83.566, t5=83.562, t6=83.562, t7=83.567 | max_across_ranks=83.596      4208.9     526.1     1.085x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=83.623, t1=83.628, t2=83.628, t3=83.620, t4=83.619, t5=83.618, t6=83.617, t7=83.621 | max_across_ranks=83.650      4206.1     525.8     1.084x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=90.443, t1=90.472, t2=90.563, t3=90.578, t4=90.488, t5=90.381, t6=90.378, t7=90.462 | max_across_ranks=90.700      3879.2     484.9     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=80.306, t1=80.407, t2=80.487, t3=79.690, t4=79.508, t5=79.934, t6=79.998, t7=80.314 | max_across_ranks=80.844      4352.1     544.0     1.122x       skip  fused; remote workspace reset excluded
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+Running B=16, local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=15.093, t1=15.089, t2=15.075, t3=15.064, t4=15.065, t5=15.063, t6=15.067, t7=15.080 | max_across_ranks=15.096      1456.7     182.1     1.657x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=8.879, t1=8.888, t2=8.881, t3=8.866, t4=8.849, t5=8.838, t6=8.845, t7=8.858 | max_across_ranks=8.890               2473.5     309.2     2.813x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=25.004, t1=25.007, t2=24.853, t3=24.871, t4=24.890, t5=24.874, t6=24.832, t7=24.968 | max_across_ranks=25.009       879.3     109.9     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=13.312, t1=13.989, t2=14.078, t3=14.029, t4=13.866, t5=13.607, t6=13.282, t7=12.877 | max_across_ranks=14.240      1544.3     193.0     1.756x       skip  fused; remote workspace reset excluded
+
+Running B=8, local_S=2048, causal=True
+
+B=8, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=18.060, t1=18.062, t2=18.065, t3=18.068, t4=18.064, t5=18.060, t6=18.058, t7=18.058 | max_across_ranks=18.088      2431.4     303.9     1.454x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=13.725, t1=13.724, t2=13.725, t3=13.721, t4=13.715, t5=13.711, t6=13.715, t7=13.718 | max_across_ranks=13.750      3198.6     399.8     1.913x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=26.293, t1=26.294, t2=26.266, t3=26.278, t4=26.190, t5=26.185, t6=26.165, t7=26.259 | max_across_ranks=26.303      1672.1     209.0     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=13.625, t1=13.597, t2=13.659, t3=13.551, t4=13.407, t5=13.398, t6=13.481, t7=13.569 | max_across_ranks=13.803      3186.3     398.3     1.906x       skip  fused; remote workspace reset excluded
+
+Running B=4, local_S=4096, causal=True
+
+B=4, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=27.178, t1=27.183, t2=27.183, t3=27.186, t4=27.181, t5=27.175, t6=27.172, t7=27.175 | max_across_ranks=27.208      3232.9     404.1     1.382x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=23.512, t1=23.515, t2=23.522, t3=23.524, t4=23.523, t5=23.513, t6=23.509, t7=23.508 | max_across_ranks=23.545      3735.8     467.0     1.597x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=37.568, t1=37.582, t2=37.572, t3=37.348, t4=37.198, t5=37.250, t6=37.364, t7=37.497 | max_across_ranks=37.594      2339.8     292.5     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=23.394, t1=23.178, t2=23.134, t3=23.104, t4=23.148, t5=23.069, t6=23.151, t7=23.419 | max_across_ranks=23.549      3735.3     466.9     1.596x       skip  fused; remote workspace reset excluded
+
+Running B=2, local_S=8192, causal=True
+
+B=2, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=45.775, t1=45.784, t2=45.788, t3=45.785, t4=45.782, t5=45.775, t6=45.769, t7=45.774 | max_across_ranks=45.812      3840.1     480.0     1.179x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=43.231, t1=43.234, t2=43.235, t3=43.230, t4=43.225, t5=43.220, t6=43.216, t7=43.224 | max_across_ranks=43.256      4067.0     508.4     1.249x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=53.925, t1=53.943, t2=53.914, t3=53.851, t4=53.819, t5=53.832, t6=53.855, t7=53.892 | max_across_ranks=54.033      3255.8     407.0     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=42.626, t1=42.504, t2=42.582, t3=42.592, t4=42.584, t5=42.318, t6=42.357, t7=42.575 | max_across_ranks=42.875      4103.1     512.9     1.260x       skip  fused; remote workspace reset excluded
+
+Running B=1, local_S=16384, causal=True
+
+B=1, local_S=16384, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=83.645, t1=83.646, t2=83.649, t3=83.647, t4=83.647, t5=83.642, t6=83.642, t7=83.646 | max_across_ranks=83.677      4204.8     525.6     1.084x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=83.580, t1=83.582, t2=83.586, t3=83.588, t4=83.577, t5=83.569, t6=83.569, t7=83.574 | max_across_ranks=83.608      4208.2     526.0     1.085x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=90.235, t1=90.392, t2=90.521, t3=90.623, t4=90.597, t5=90.516, t6=90.355, t7=90.377 | max_across_ranks=90.708      3878.9     484.9     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=81.698, t1=81.569, t2=81.896, t3=81.920, t4=81.720, t5=81.511, t6=81.535, t7=81.652 | max_across_ranks=82.348      4272.7     534.1     1.102x       skip  fused; remote workspace reset excluded
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+Running B=16, local_S=1024, causal=True
+
+B=16, local_S=1024, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=15.094, t1=15.088, t2=15.076, t3=15.069, t4=15.070, t5=15.066, t6=15.073, t7=15.083 | max_across_ranks=15.102      1456.2     182.0     1.655x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=8.875, t1=8.887, t2=8.877, t3=8.865, t4=8.851, t5=8.835, t6=8.837, t7=8.856 | max_across_ranks=8.888               2474.2     309.3     2.813x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=24.995, t1=24.998, t2=24.840, t3=24.855, t4=24.874, t5=24.860, t6=24.808, t7=24.960 | max_across_ranks=25.000       879.6     110.0     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=11.281, t1=11.368, t2=11.501, t3=11.738, t4=11.697, t5=11.688, t6=11.491, t7=11.207 | max_across_ranks=11.952      1839.9     230.0     2.092x       skip  fused; remote workspace reset excluded
+
+Running B=8, local_S=2048, causal=True
+
+B=8, local_S=2048, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=18.095, t1=18.096, t2=18.101, t3=18.102, t4=18.103, t5=18.091, t6=18.084, t7=18.092 | max_across_ranks=18.122      2426.9     303.4     1.453x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=13.759, t1=13.757, t2=13.755, t3=13.745, t4=13.744, t5=13.740, t6=13.744, t7=13.751 | max_across_ranks=13.781      3191.3     398.9     1.911x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=26.321, t1=26.323, t2=26.297, t3=26.306, t4=26.219, t5=26.208, t6=26.195, t7=26.284 | max_across_ranks=26.330      1670.3     208.8     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=13.683, t1=13.256, t2=13.242, t3=13.402, t4=13.492, t5=13.692, t6=13.731, t7=13.724 | max_across_ranks=13.816      3183.3     397.9     1.906x       skip  fused; remote workspace reset excluded
+
+Running B=4, local_S=4096, causal=True
+
+B=4, local_S=4096, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=27.181, t1=27.176, t2=27.178, t3=27.170, t4=27.171, t5=27.170, t6=27.169, t7=27.177 | max_across_ranks=27.204      3233.3     404.2     1.383x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=23.526, t1=23.518, t2=23.527, t3=23.519, t4=23.518, t5=23.514, t6=23.512, t7=23.519 | max_across_ranks=23.549      3735.3     466.9     1.597x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=37.575, t1=37.606, t2=37.608, t3=37.294, t4=37.183, t5=37.241, t6=37.350, t7=37.475 | max_across_ranks=37.611      2338.7     292.3     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=23.813, t1=23.703, t2=23.545, t3=23.608, t4=23.597, t5=23.546, t6=23.668, t7=23.689 | max_across_ranks=23.916      3678.0     459.7     1.573x       skip  fused; remote workspace reset excluded
+
+Running B=2, local_S=8192, causal=True
+
+B=2, local_S=8192, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=45.988, t1=45.986, t2=45.984, t3=45.986, t4=45.990, t5=45.983, t6=45.981, t7=45.984 | max_across_ranks=46.016      3823.0     477.9     1.176x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=43.147, t1=43.147, t2=43.142, t3=43.140, t4=43.135, t5=43.130, t6=43.129, t7=43.137 | max_across_ranks=43.167      4075.4     509.4     1.253x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=53.993, t1=54.003, t2=54.000, t3=53.948, t4=53.925, t5=53.915, t6=53.943, t7=53.948 | max_across_ranks=54.101      3251.7     406.5     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=43.513, t1=43.358, t2=43.419, t3=43.313, t4=43.262, t5=43.389, t6=43.401, t7=43.517 | max_across_ranks=43.749      4021.1     502.6     1.237x       skip  fused; remote workspace reset excluded
+
+Running B=1, local_S=16384, causal=True
+
+B=1, local_S=16384, QH=32, KVH=8, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS   Avg/GPU  vs Python      Check  Note
+allgather_attention        t0=83.574, t1=83.579, t2=83.579, t3=83.574, t4=83.577, t5=83.572, t6=83.573, t7=83.574 | max_across_ranks=83.605      4208.4     526.1     1.081x       skip  all-gather; local min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=83.390, t1=83.391, t2=83.392, t3=83.384, t4=83.386, t5=83.377, t6=83.380, t7=83.382 | max_across_ranks=83.415      4218.0     527.3     1.084x       skip  whole-packed zigzag all-gather; local min_fa3 fallback; causal
+min_varlen_python_ring     t0=89.971, t1=90.105, t2=90.232, t3=90.321, t4=90.330, t5=90.226, t6=90.064, t7=90.060 | max_across_ranks=90.391      3892.4     486.6     1.000x       skip  min_fa3 block kernels + NCCL P2P
+min_varlen_mega_ring       t0=82.775, t1=83.354, t2=83.656, t3=83.683, t4=83.545, t5=83.382, t6=83.402, t7=82.797 | max_across_ranks=83.868      4195.2     524.4     1.078x       skip  fused; remote workspace reset excluded
