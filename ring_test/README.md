@@ -186,6 +186,67 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_hybrid_forward.py \
   --warmup-iters 5 --num-iters 20
 ```
 
+### Dataset-shaped hybrid workload
+
+`benchmark_hybrid_dataset_forward.py` samples an Arxiv or Github length
+distribution, packs one global batch to 128K tokens by default, and assigns
+each sequence to an aligned G8/G4/G2/G1 subgroup. Compute and local tokens are
+hard placement constraints; normalized token balance is the main objective,
+while compute variance and estimated ring token-hops are soft costs. It then
+calls `benchmark_hybrid_forward.main(...)` in the same process with the
+generated ring metadata.
+
+If the final sampled sequence is truncated by the remaining batch budget and
+its truncated length exceeds `--truncated-padding-threshold` (32K by default),
+the frontend pads it upward to `256 * world_size` alignment, capped at 128K.
+This preserves causal full-ring alignment for large packing residuals. The
+physical padded tokens participate in the benchmark, so `actual_tokens` can
+exceed `target_tokens` by less than the selected alignment. The shell wrapper
+exposes the threshold as `TRUNCATED_PADDING_THRESHOLD`.
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  ring_test/benchmark_hybrid_dataset_forward.py \
+  --dataset arxiv --target-tokens 131072 --seed 0 \
+  --qhead 32 --kvhead 8 --headdim 128 \
+  --mode causal --methods all --no-check
+
+DATASETS="arxiv github" GPU_COUNTS="2 4 8" \
+  ./benchmark_hybrid_dataset.sh
+```
+
+The requested compute and token tolerances default to 5% and 10%. The planner
+searches compute caps up to 20% and token caps up to 50%, stopping at the first
+token cap that has a feasible placement. The relevant controls are:
+
+```text
+--balance-tolerance 0.05
+--token-balance-tolerance 0.10
+--max-compute-balance-tolerance 0.20
+--max-token-balance-tolerance 0.50
+--communication-weight 0.05
+--local-search-passes 4
+```
+
+The shell wrapper exposes the same settings as `BALANCE_TOLERANCE`,
+`TOKEN_BALANCE_TOLERANCE`, `MAX_COMPUTE_BALANCE_TOLERANCE`,
+`MAX_TOKEN_BALANCE_TOLERANCE`, `COMMUNICATION_WEIGHT`, and
+`LOCAL_SEARCH_PASSES`. `--print-workload` reports the requested, topology, and
+final caps; estimated per-rank communication; cap-relaxation flags; emergency
+fallback; and the number of accepted local-repair moves. A topology-limited
+workload can exceed the configured imbalance tolerance when a sequence cannot
+use a larger legal ring. Emergency fallback is used only when no placement is
+feasible within either configured maximum cap.
+
+`--methods` defaults to `all`. Dataset mode runs every compatible method for
+each causal/noncausal mode and prints a skip reason for an incompatible method.
+In particular, short causal sequences cannot run `mega_ring_all_cp` because
+its rank-local half length must be 128-aligned. Explicitly requesting an
+incompatible method remains an error. Use `--print-workload --world-size 8`
+to inspect generated lengths and ring assignments without CUDA. Keep
+`--no-check` for the full 128K workload because the current correctness
+reference materializes quadratic attention scores.
+
 ## 1/2/4/8-GPU causal sweep
 
 `benchmark_ring_1_2_4_8.sh` runs the all-CP forward, hybrid forward, and

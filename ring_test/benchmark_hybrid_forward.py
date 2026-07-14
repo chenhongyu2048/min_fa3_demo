@@ -7,7 +7,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 import torch
 import torch.distributed as dist
@@ -51,6 +51,13 @@ METHOD_ORDER = [
     "mega_ring_hybrid",
 ]
 
+ALL_CP_METHODS = {
+    "allgather_attention",
+    "llama3_allgather_attention",
+    "fa3_ring",
+    "mega_ring_all_cp",
+}
+
 
 @dataclass(frozen=True)
 class SmConfig:
@@ -72,6 +79,16 @@ class MethodRun:
     expected_out: torch.Tensor | None
     expected_lse: torch.Tensor | None
     note: str
+
+
+@dataclass(frozen=True)
+class Result:
+    time_ms: float
+    aggregate_tflops: float
+    avg_gpu_tflops: float
+    check: str
+    note: str
+    rank_times_ms: list[float] | None
 
 
 def parse_methods(spec: str) -> list[str]:
@@ -135,7 +152,6 @@ def validate_metadata(
     ring_starts: list[int],
     world_size: int,
     mode: str,
-    methods: list[str],
 ) -> None:
     if not (len(global_lengths) == len(ring_sizes) == len(ring_starts)):
         raise SystemExit("global lengths, ring sizes, and ring starts must have the same length")
@@ -156,41 +172,63 @@ def validate_metadata(
             raise SystemExit(f"causal local half length is not 128-aligned at batch {idx}")
         previous_size = ring_size
 
-    all_cp_methods = {
-        "allgather_attention",
-        "llama3_allgather_attention",
-        "fa3_ring",
-        "mega_ring_all_cp",
-    }
-    if all_cp_methods.intersection(methods):
-        for idx, global_len in enumerate(global_lengths):
-            if global_len % world_size:
-                raise SystemExit(
-                    "all-CP baselines require every global length to be divisible by world_size: "
-                    f"batch={idx}, global_len={global_len}, world_size={world_size}"
-                )
-            local_len = global_len // world_size
-            if mode in ("causal", "both") and local_len % 2:
-                raise SystemExit(
-                    f"causal all-CP baseline requires even local length at batch {idx}, got {local_len}"
-                )
-            if (
-                "mega_ring_all_cp" in methods
-                and mode in ("causal", "both")
-                and (local_len // 2) % 128
-            ):
-                raise SystemExit(
-                    "causal all-CP mega-ring requires local_len / 2 to be 128-aligned: "
-                    f"batch={idx}, local_len={local_len}"
-                )
-    if (
-        "llama3_allgather_attention" in methods
-        and sum(global_lengths) % (2 * world_size)
-    ):
-        raise SystemExit(
+
+
+def method_incompatibility(
+    method: str,
+    global_lengths: list[int],
+    world_size: int,
+    is_causal: bool,
+) -> str | None:
+    if method not in ALL_CP_METHODS:
+        return None
+    for idx, global_len in enumerate(global_lengths):
+        if global_len % world_size:
+            return (
+                "all-CP methods require every global length to be divisible by world_size: "
+                f"batch={idx}, global_len={global_len}, world_size={world_size}"
+            )
+        local_len = global_len // world_size
+        if is_causal and local_len % 2:
+            return (
+                "causal all-CP methods require even local lengths: "
+                f"batch={idx}, local_len={local_len}"
+            )
+        if method == "mega_ring_all_cp" and is_causal and (local_len // 2) % 128:
+            return (
+                "causal all-CP mega-ring requires local_len / 2 to be 128-aligned: "
+                f"batch={idx}, local_len={local_len}"
+            )
+    if method == "llama3_allgather_attention" and sum(global_lengths) % (2 * world_size):
+        return (
             "llama3_allgather_attention requires total global tokens divisible by "
             f"2 * world_size, got total={sum(global_lengths)}, world_size={world_size}"
         )
+    return None
+
+
+def compatible_methods_for_mode(
+    methods: list[str],
+    global_lengths: list[int],
+    world_size: int,
+    is_causal: bool,
+    *,
+    skip_incompatible: bool,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    compatible: list[str] = []
+    skipped: list[tuple[str, str]] = []
+    for method in methods:
+        reason = method_incompatibility(method, global_lengths, world_size, is_causal)
+        if reason is None:
+            compatible.append(method)
+        elif skip_incompatible:
+            skipped.append((method, reason))
+        else:
+            raise SystemExit(f"method '{method}' is incompatible: {reason}")
+    if not compatible:
+        mode = "causal" if is_causal else "noncausal"
+        raise SystemExit(f"no compatible methods remain for {mode} mode")
+    return compatible, skipped
 
 
 def fa3_or_min_block_attention(
@@ -491,6 +529,60 @@ def aggregate_tflops(
     return float(flops) / (time_ms * 1e-3) / 1e12
 
 
+def print_results(
+    global_lengths: list[int],
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    is_causal: bool,
+    methods: list[str],
+    results: dict[str, Result],
+) -> None:
+    """Print one hybrid benchmark result table on rank 0."""
+    mode = "causal" if is_causal else "noncausal"
+    print(
+        f"\nB={len(global_lengths)}, global_tokens={sum(global_lengths)}, "
+        f"QH={q_heads}, KVH={kv_heads}, D={head_dim}, mode={mode}"
+    )
+    rows: list[tuple[str, str, str, str, str, str]] = []
+    for method in methods:
+        result = results.get(method)
+        if result is None:
+            continue
+        if result.rank_times_ms is None:
+            time_s = f"max_across_ranks={result.time_ms:.3f}"
+        else:
+            rank_times_s = ", ".join(
+                f"t{rank}={time_ms:.3f}"
+                for rank, time_ms in enumerate(result.rank_times_ms)
+            )
+            time_s = (
+                f"{rank_times_s} | max_across_ranks={result.time_ms:.3f}"
+            )
+        rows.append(
+            (
+                method,
+                time_s,
+                f"{result.aggregate_tflops:.1f}",
+                f"{result.avg_gpu_tflops:.1f}",
+                result.check,
+                result.note,
+            )
+        )
+
+    method_width = max((24, *(len(row[0]) for row in rows)))
+    time_width = max((64, *(len(row[1]) for row in rows)))
+    print(
+        f"{'Method':<{method_width}} {'Time ms':<{time_width}} "
+        f"{'Agg TFLOPS':>12} {'Avg/GPU':>10} {'Check':>10}  Note"
+    )
+    for method, time_s, aggregate_s, per_gpu_s, check, note in rows:
+        print(
+            f"{method:<{method_width}} {time_s:<{time_width}} "
+            f"{aggregate_s:>12} {per_gpu_s:>10} {check:>10}  {note}"
+        )
+
+
 def raise_if_any_rank_failed(local_error: str | None) -> None:
     failed = torch.tensor([local_error is not None], device="cuda", dtype=torch.int32)
     dist.all_reduce(failed)
@@ -501,7 +593,7 @@ def raise_if_any_rank_failed(local_error: str | None) -> None:
     raise AssertionError("another rank failed hierarchical output validation")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark hierarchical hybrid forward with all-CP baselines")
     parser.add_argument("--global-seqlens", required=True)
     parser.add_argument("--ring-sizes", required=True)
@@ -522,13 +614,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--atol", type=float, default=2e-1)
     parser.add_argument("--rtol", type=float, default=2e-1)
     parser.add_argument("--seed", type=int, default=0)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    skip_incompatible_methods: bool = False,
+) -> None:
     global flash_attn_varlen_func3
 
-    args = parse_args()
+    args = parse_args(argv)
     methods = parse_methods(args.methods)
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         raise SystemExit("SM90 Hopper CUDA device is required")
@@ -544,7 +640,7 @@ def main() -> None:
         global_lengths = parse_int_list(args.global_seqlens, "--global-seqlens")
         ring_sizes = parse_int_list(args.ring_sizes, "--ring-sizes")
         ring_starts = parse_int_list(args.ring_starts, "--ring-starts")
-        validate_metadata(global_lengths, ring_sizes, ring_starts, world_size, args.mode, methods)
+        validate_metadata(global_lengths, ring_sizes, ring_starts, world_size, args.mode)
         sm_configs = parse_sm_configs(args.sm_configs)
         sm_count = torch.cuda.get_device_properties(rank).multi_processor_count
         for config in sm_configs:
@@ -563,33 +659,88 @@ def main() -> None:
         if not fa_available.item():
             flash_attn_varlen_func3 = None
         backend_note = "external FA3" if flash_attn_varlen_func3 is not None else "local min_fa3 fallback"
-        llama3_backend = (
-            select_allgather_backend(dist.group.WORLD)
-            if "llama3_allgather_attention" in methods
-            else None
-        )
-
         modes = {
             "noncausal": [False],
             "causal": [True],
             "both": [False, True],
         }[args.mode]
+        methods_by_mode: dict[bool, list[str]] = {}
+        skipped_by_mode: dict[bool, list[tuple[str, str]]] = {}
+        for is_causal in modes:
+            active_methods, skipped_methods = compatible_methods_for_mode(
+                methods,
+                global_lengths,
+                world_size,
+                is_causal,
+                skip_incompatible=skip_incompatible_methods,
+            )
+            methods_by_mode[is_causal] = active_methods
+            skipped_by_mode[is_causal] = skipped_methods
+
+        llama3_backend = (
+            select_allgather_backend(dist.group.WORLD)
+            if any(
+                "llama3_allgather_attention" in active_methods
+                for active_methods in methods_by_mode.values()
+            )
+            else None
+        )
 
         if rank == 0:
+            sm_configs_s = ",".join(
+                f"{config.num_comp_sm}:{config.num_comm_sm}"
+                for config in sm_configs
+            )
             print(
-                f"world_size={world_size}, methods={methods}, global_seqlens={global_lengths}, "
-                f"ring_sizes={ring_sizes}, ring_starts={ring_starts}, "
+                f"Config: world_size={world_size}, methods={methods}, "
                 f"QH={args.qhead}, KVH={args.kvhead}, D={args.headdim}, "
-                f"FA backend={backend_note}",
+                f"mode={args.mode}, sm_configs={sm_configs_s}, "
+                f"warmup={args.warmup_iters}, iters={args.num_iters}, "
+                f"check={args.check}"
+            )
+            print(
+                f"Workload: B={len(global_lengths)}, "
+                f"global_tokens={sum(global_lengths)}, "
+                f"global_seqlens={global_lengths}"
+            )
+            print(
+                f"Hybrid rings: sizes={ring_sizes}, starts={ring_starts}"
+            )
+            print(
+                f"FA backend: {backend_note}",
                 flush=True,
             )
+            print(
+                "Agg TFLOPS sums visible attention work across ranks; "
+                "Avg/GPU is that value divided by world_size."
+            )
+            if args.check:
+                print(
+                    "Checks compare each method with the matching full-rank "
+                    "reference output."
+                )
+            for is_causal in modes:
+                mode = "causal" if is_causal else "noncausal"
+                skipped_methods = skipped_by_mode[is_causal]
+                if skipped_methods:
+                    print(f"Skipped methods ({mode}):")
+                    for method, reason in skipped_methods:
+                        print(f"  {method}: {reason}")
 
         for is_causal in modes:
+            active_methods = methods_by_mode[is_causal]
+            if rank == 0:
+                print(
+                    f"\nRunning B={len(global_lengths)}, "
+                    f"global_tokens={sum(global_lengths)}, "
+                    f"causal={is_causal}",
+                    flush=True,
+                )
             all_cp_runs: dict[str, tuple[Callable[[], object], str]] = {}
             expected_all_cp_out = None
             expected_all_cp_lse = None
             expected_llama3_out = None
-            if any(method != "mega_ring_hybrid" for method in methods):
+            if any(method != "mega_ring_hybrid" for method in active_methods):
                 all_cp_lengths = [length // world_size for length in global_lengths]
                 all_cp_total = sum(all_cp_lengths)
                 all_cp_cu, all_cp_cu_host = make_cu_seqlens(all_cp_lengths, device)
@@ -609,7 +760,7 @@ def main() -> None:
                 )
                 all_cp_ring_starts_host = torch.zeros(len(global_lengths), dtype=torch.int32)
 
-                if "allgather_attention" in methods:
+                if "allgather_attention" in active_methods:
                     allgather_runner = VarlenAllGatherAttention(
                         all_cp_q,
                         all_cp_k,
@@ -623,7 +774,7 @@ def main() -> None:
                         allgather_runner.forward,
                         f"all-CP all-gather; {backend_note}",
                     )
-                if "llama3_allgather_attention" in methods:
+                if "llama3_allgather_attention" in active_methods:
                     llama3_q = repartition_sequence_shards_to_llama3(
                         dist.group.WORLD, all_cp_q, global_lengths, is_causal
                     )
@@ -646,7 +797,7 @@ def main() -> None:
                         llama3_runner.forward,
                         llama3_runner.note,
                     )
-                if "fa3_ring" in methods:
+                if "fa3_ring" in active_methods:
                     all_cp_runs["fa3_ring"] = (
                         lambda: fa3_ring_forward(
                             all_cp_q,
@@ -659,7 +810,7 @@ def main() -> None:
                         ),
                         f"all-CP NCCL ring; {backend_note}",
                     )
-                if "mega_ring_all_cp" in methods:
+                if "mega_ring_all_cp" in active_methods:
                     all_cp_remote_k, all_cp_remote_v = make_mega_parallel_tensors(
                         all_cp_k, all_cp_v, rank, world_size, all_cp_total
                     )
@@ -679,7 +830,7 @@ def main() -> None:
                         rank,
                         is_causal,
                     )
-                    if "llama3_allgather_attention" in methods:
+                    if "llama3_allgather_attention" in active_methods:
                         expected_llama3_out = repartition_sequence_shards_to_llama3(
                             dist.group.WORLD,
                             expected_all_cp_out,
@@ -688,7 +839,7 @@ def main() -> None:
                         )
 
             hybrid_run_data = None
-            if "mega_ring_hybrid" in methods:
+            if "mega_ring_hybrid" in active_methods:
                 hybrid_rank_lengths = [
                     local_lengths_for_rank(global_lengths, ring_sizes, ring_starts, source_rank)
                     for source_rank in range(world_size)
@@ -757,8 +908,14 @@ def main() -> None:
 
             cuda_barrier()
             for config in sm_configs:
+                if rank == 0:
+                    print(
+                        f"\nSM config: num_comp_sm={config.num_comp_sm}, "
+                        f"num_comm_sm={config.num_comm_sm}",
+                        flush=True,
+                    )
                 runs: list[MethodRun] = []
-                for method in methods:
+                for method in active_methods:
                     if method in all_cp_runs:
                         launch, note = all_cp_runs[method]
                         expected_out = (
@@ -856,6 +1013,7 @@ def main() -> None:
                     else:
                         raise RuntimeError(f"unhandled method {method}")
 
+                results: dict[str, Result] = {}
                 for run in runs:
                     timing = measure_distributed_ms(
                         run.launch, args.warmup_iters, args.num_iters, rank
@@ -890,16 +1048,24 @@ def main() -> None:
                     cuda_barrier()
 
                     if rank == 0:
-                        mode = "causal" if is_causal else "noncausal"
-                        rank_times = ",".join(f"{value:.4f}" for value in timing.rank_times_ms)
-                        print(
-                            f"method={run.name:<27} mode={mode:<9} "
-                            f"SM={config.num_comp_sm}:{config.num_comm_sm:<2} "
-                            f"max_ms={timing.max_ms:.4f} agg_TFLOPS={agg_tflops:.1f} "
-                            f"avg_gpu_TFLOPS={agg_tflops / world_size:.1f} "
-                            f"check={check_status} rank_ms=[{rank_times}] note={run.note}",
-                            flush=True,
+                        results[run.name] = Result(
+                            timing.max_ms,
+                            agg_tflops,
+                            agg_tflops / world_size,
+                            check_status,
+                            run.note,
+                            timing.rank_times_ms,
                         )
+                if rank == 0:
+                    print_results(
+                        global_lengths,
+                        args.qhead,
+                        args.kvhead,
+                        args.headdim,
+                        is_causal,
+                        active_methods,
+                        results,
+                    )
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

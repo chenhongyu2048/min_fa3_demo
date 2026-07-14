@@ -249,6 +249,34 @@ torchrun --standalone --nproc_per_node=8 \
 GPU_COUNTS="2 4 8" ./benchmark_ring_1_2_4_8.sh
 ```
 
+Dataset-shaped hierarchical hybrid benchmark:
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  ring_test/benchmark_hybrid_dataset_forward.py \
+  --dataset arxiv --target-tokens 131072 --seed 0 \
+  --qhead 32 --kvhead 8 --headdim 128 \
+  --mode causal --methods all --no-check
+
+DATASETS="arxiv github" GPU_COUNTS=8 ./benchmark_hybrid_dataset.sh
+```
+
+The dataset frontend generates global lengths and token/compute-constrained
+G8/G4/G2/G1 metadata, then calls `benchmark_hybrid_forward.main(...)` in the
+same process. The planner searches the strictest feasible token cap, permits
+compute relaxation only up to its configured cap unless topology or emergency
+fallback requires more, and uses estimated ring token-hops as a tunable soft
+cost. Use `--communication-weight` to change that tradeoff and
+`--print-workload --world-size 8` to inspect the final caps and per-rank loads.
+When the final sampled sequence is truncated to fit the target and its length
+exceeds `--truncated-padding-threshold` (32K by default), it is padded upward to
+an alignment of `256 * world_size`, capped at 128K. The physical padded tokens
+participate in attention, so `actual_tokens` can be slightly above the target.
+With the default `--methods all`, methods that cannot represent a generated
+length in a particular mode are reported as skipped; an explicitly requested
+incompatible method remains an error. Full 128K runs should use `--no-check`
+because the correctness reference has quadratic memory use.
+
 `ring_test/benchmark_hybrid_forward.py` compares per-sequence and whole-packed
 Llama3-style all-CP all-gather attention, FA3+NCCL ring attention, all-CP fused
 mega-ring, and hierarchical hybrid mega-ring. The all-CP methods use all
