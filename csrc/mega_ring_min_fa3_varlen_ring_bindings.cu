@@ -386,6 +386,8 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     TORCH_CHECK(rank_kv_capacity_i64 > 0 && rank_kv_capacity_i64 <= std::numeric_limits<int>::max(),
                 "rank_kv_capacity must be positive and fit in int32. Got ", rank_kv_capacity_i64);
     int const rank_kv_capacity = static_cast<int>(rank_kv_capacity_i64);
+    TORCH_CHECK(rank_kv_capacity % 128 == 0,
+                "mega ring requires rank_kv_capacity to be 128-row aligned. Got ", rank_kv_capacity);
     TORCH_CHECK(local_total_k <= rank_kv_capacity,
                 "local_total_k exceeds rank_kv_capacity. Got ", local_total_k, " vs ", rank_kv_capacity);
     TORCH_CHECK(
@@ -394,8 +396,8 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
         k.size(0),
         ", kv_heads=",
         k.size(1));
-    // MEGA_RING: the current remote-load vector path copies a full KV row whose
-    // flattened KVH * D width is fixed to 1024 bf16 values.
+    // MEGA_RING_TILE_COPY: every physical 16-row TMA subtile spans the full
+    // flattened KVH * D width, which is fixed to 1024 bf16 values.
     TORCH_CHECK(k.size(1) * k.size(2) == 1024,
                 "Mega ring communication path currently requires kv_heads * head_dim == 1024. Got kv_heads=",
                 k.size(1), ", head_dim=", k.size(2));
@@ -409,6 +411,9 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
         int const q_len = cu_seqlens_q_host_ptr[batch_idx + 1] - cu_seqlens_q_host_ptr[batch_idx];
         int const k_len = cu_seqlens_k_host_ptr[batch_idx + 1] - cu_seqlens_k_host_ptr[batch_idx];
         TORCH_CHECK(q_len >= 0 && k_len >= 0, "cu_seqlens must be nondecreasing at batch=", batch_idx);
+        TORCH_CHECK(q_len % 128 == 0 && k_len % 128 == 0,
+                    "mega ring requires every local q/k length to be 128-row aligned at batch=",
+                    batch_idx, ". q_len=", q_len, ", k_len=", k_len);
         int const global_len = global_seqlens_host_ptr[batch_idx];
         int const ring_size = ring_sizes_host_ptr[batch_idx];
         int const ring_start = ring_starts_host_ptr[batch_idx];
@@ -489,10 +494,13 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
             total_work_tiles += is_causal
                 ? int64_t(ring_local_rank) * full_tiles + int64_t(ring_size - 1 - ring_local_rank) * half_tiles
                 : int64_t(ring_size - 1) * full_tiles;
+            int const kv_block_n = is_causal ? 128 : 176;
+            int64_t const full_kv_tiles = (int64_t(level.full_rows) + kv_block_n - 1) / kv_block_n;
+            int64_t const half_kv_tiles = (int64_t(level.half_rows) + kv_block_n - 1) / kv_block_n;
             total_comm_tasks += is_causal
-                ? 2 * (int64_t(ring_local_rank) * level.half_rows
-                       + int64_t(ring_size - 1 - ring_local_rank) * level.full_rows)
-                : 2 * int64_t(ring_size - 1) * level.full_rows;
+                ? 2 * (int64_t(ring_local_rank) * half_kv_tiles
+                       + int64_t(ring_size - 1 - ring_local_rank) * full_kv_tiles)
+                : 2 * int64_t(ring_size - 1) * full_kv_tiles;
             reduction_tiles += full_tiles;
         }
     }

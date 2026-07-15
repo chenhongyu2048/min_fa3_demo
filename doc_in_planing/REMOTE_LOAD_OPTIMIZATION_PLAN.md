@@ -2,8 +2,12 @@
 
 ## Status
 
-This document records a future optimization plan only. No CUDA, Python, build,
-or Slurm behavior is changed by this document.
+Superseded by the implemented mega-ring tile-copy path. The final implementation
+uses 128/176-row logical communication tasks decomposed into fixed 16-row 2D
+TMA subtiles, assumes 128-row-aligned target ranges, and has no unaligned-tail
+fallback. The sections below are retained as the earlier design draft and do
+not describe the final chunk size or readiness accounting; see `README.md` for
+the current contract.
 
 The plan applies to the pure mega-ring forward and FA3 backward paths. Hybrid
 context-parallel forward keeps the existing row-granular fallback in the first
@@ -284,4 +288,3 @@ After the eight-row implementation is validated, benchmark these separately:
 3. Direct peer-to-compute TMA. Keep this deferred unless profiling shows that
    staging HBM traffic dominates; it risks multiplying NVLink traffic through
    repeated K/V consumption by Q blocks and GQA heads.
-

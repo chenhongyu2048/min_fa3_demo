@@ -472,9 +472,11 @@ py::tuple backward_varlen_mega_ring(
                     "causal mega-ring backward requires q_len == k_len == 2 * half_len and 128-aligned halves");
         int const full_work = (k_len + 127) / 128 * q.size(1);
         int const half_work = (half_len + 127) / 128 * q.size(1);
+        int const full_kv_tiles = (k_len + 127) / 128;
+        int const half_kv_tiles = (half_len + 127) / 128;
         for (int step = 0; step < world_size; ++step) {
             expected[step] += step > 0 && step <= rank ? half_work : full_work;
-            kv_expected[step] += step == 0 ? 0 : 2 * (step <= rank ? half_len : k_len);
+            kv_expected[step] += step == 0 ? 0 : 2 * (step <= rank ? half_kv_tiles : full_kv_tiles);
         }
     }
 

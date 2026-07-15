@@ -4,6 +4,11 @@
 
 本文记录 `world_size=8` 下层级 hybrid mega-ring forward 的实现方案与当前实现约束。
 
+其中 row-granular communication 与 readiness 的段落保留为初版设计记录；
+当前实现已统一改为 128/176-row logical task，并通过固定 16-row 2D TMA
+subtile 传输。目标 row range 与 rank arena capacity 均要求 128-row 对齐，
+不再提供单行或非对齐 tail fallback。当前约束以 `README.md` 为准。
+
 目标是在现有一次 fused mega-ring attention/communication launch 中同时支持：
 
 - size 1：单 GPU 完整序列

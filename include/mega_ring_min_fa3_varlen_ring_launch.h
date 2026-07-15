@@ -94,13 +94,26 @@ struct MegaRingKernelConfig {
     using AttnKernel = flash::enable_sm90<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
 
     static constexpr int kVecLength = 1024;
+    // MEGA_RING_TILE_COPY: communication is scheduled in attention-sized KV
+    // tiles, while each physical TMA transaction moves a 16-row subtile.  All
+    // mega-ring row ranges and arena offsets are at least 128-row aligned.
+    enum : int {
+        kRowsPerTask = Config::kBlockN,
+        kRowsPerTransfer = 16,
+    };
+    static_assert(kRowsPerTask % kRowsPerTransfer == 0);
+    static_assert(128 % kRowsPerTransfer == 0);
     static_assert(AttnKernel::MaxThreadsPerBlock % cutlass::NumThreadsPerWarp == 0);
     static constexpr int kNumWarpsPerBlock = AttnKernel::MaxThreadsPerBlock / cutlass::NumThreadsPerWarp;
     static constexpr int kNumCommChunks = kNumWarpsPerBlock / 2;
     static_assert(kNumCommChunks > 0);
-    using shared_vec = sv_bf<kVecLength>;
-    using staging_gl = gl<bf16, 1, 1, -1, kVecLength, shared_vec>;
+    using shared_tile = st_bf<kRowsPerTransfer, kVecLength>;
+    using staging_gl = gl<bf16, 1, 1, -1, kVecLength, shared_tile>;
     using remote_pgl = pgl<staging_gl, NumDevices, false>;
+    static constexpr int kCommSmemSize =
+        int(sizeof(shared_tile)) * kNumCommChunks + 1024;
+    static_assert(kCommSmemSize <= MAX_SHARED_MEMORY,
+                  "mega-ring forward communication staging exceeds Hopper shared memory");
     static constexpr bool kIsCausal = IsCausal;
 
     // MEGA_RING: kernel params carry full concatenated local K/V storage and a
@@ -158,7 +171,8 @@ void run_mega_ring_remote_load(
     }
 
     tma_swizzle_allocator allocator(reinterpret_cast<int*>(smem_buf));
-    typename RingConfig::shared_vec (&vec)[RingConfig::kNumCommChunks] = allocator.allocate<typename RingConfig::shared_vec, RingConfig::kNumCommChunks>();
+    typename RingConfig::shared_tile (&tile)[RingConfig::kNumCommChunks] =
+        allocator.allocate<typename RingConfig::shared_tile, RingConfig::kNumCommChunks>();
     __shared__ MegaRingRemoteLoadBarriers<RingConfig> barriers;
 
     static_assert(sizeof(MegaRingRemoteLoadBarriers<RingConfig>) % 128 == 0);
@@ -180,7 +194,8 @@ void run_mega_ring_remote_load(
         int const ring_local_rank = params.ring_rank - ring_base;
         for (int step = 1; step < level.ring_size; ++step) {
             bool const use_half = RingConfig::kIsCausal && step <= ring_local_rank;
-            total_tasks += 2 * (use_half ? level.half_rows : level.full_rows);
+            int const rows = use_half ? level.half_rows : level.full_rows;
+            total_tasks += 2 * ((rows + RingConfig::kRowsPerTask - 1) / RingConfig::kRowsPerTask);
         }
     }
     int const warp_id = warp::groupid();
@@ -215,7 +230,8 @@ void run_mega_ring_remote_load(
             for (int step = 1; step < level.ring_size; ++step) {
                 bool const use_half = RingConfig::kIsCausal && step <= ring_local_rank;
                 int const rows = use_half ? level.half_rows : level.full_rows;
-                int const section_tasks = 2 * rows;
+                int const tiles = (rows + RingConfig::kRowsPerTask - 1) / RingConfig::kRowsPerTask;
+                int const section_tasks = 2 * tiles;
                 if (rem < section_tasks) {
                     decoded_level_idx = level_idx;
                     decoded_step = step;
@@ -228,8 +244,17 @@ void run_mega_ring_remote_load(
             }
         }
         auto const& level = params.hierarchy.levels[decoded_level_idx];
-        bool const is_v = rem >= rows_this_section;
-        int const logical_row = is_v ? rem - rows_this_section : rem;
+        int const tiles_this_section =
+            (rows_this_section + RingConfig::kRowsPerTask - 1) / RingConfig::kRowsPerTask;
+        bool const is_v = rem >= tiles_this_section;
+        int const tile_idx = is_v ? rem - tiles_this_section : rem;
+        int const logical_row = tile_idx * RingConfig::kRowsPerTask;
+        int const rows_remaining = rows_this_section - logical_row;
+        // Host validation makes every section 128-row aligned.  Together with
+        // the assertions above, the last logical task is therefore still an
+        // integral number of 16-row transfers; there is no short-tail path.
+        int const valid_rows = rows_remaining < RingConfig::kRowsPerTask
+            ? rows_remaining : RingConfig::kRowsPerTask;
         int const row_idx = kv_use_half
             ? half_row_to_full_row(level.half_row_begin + logical_row)
             : level.row_begin + logical_row;
@@ -239,7 +264,7 @@ void run_mega_ring_remote_load(
             + (ring_local_rank - decoded_step + level.ring_size) % level.ring_size;
         int const row_with_rank = load_kv_rank * params.rank_kv_capacity + row_idx;
         int const ready_idx = level.kv_ready_base + decoded_step - 1;
-        return cute::make_tuple(is_v, row_with_rank, load_kv_rank, ready_idx);
+        return cute::make_tuple(is_v, row_with_rank, load_kv_rank, ready_idx, valid_rows);
     };
 
     if (warp_id < RingConfig::kNumCommChunks && laneid() == 0) {
@@ -247,17 +272,22 @@ void run_mega_ring_remote_load(
         for (int task_id = RingConfig::kNumCommChunks * comm_bid + chunk_id;
              task_id < total_tasks;
              task_id += RingConfig::kNumCommChunks * params.num_comm_sm) {
-            auto [is_v, row_with_rank, source_rank, ready_idx] = decode_task(task_id);
+            auto [is_v, row_with_rank, source_rank, ready_idx, valid_rows] = decode_task(task_id);
             (void)ready_idx;
-
-            wait(barriers.finished[chunk_id], get_phasebit<1>(phasebits, 0));
-            update_phasebit<1>(phasebits, 0);
-
-            tma::expect_bytes(barriers.arrived[chunk_id], sizeof(typename RingConfig::shared_vec));
-            if (!is_v) {
-                tma::load_async(vec[chunk_id], params.remote_k[source_rank], {row_with_rank, 0}, barriers.arrived[chunk_id]);
-            } else {
-                tma::load_async(vec[chunk_id], params.remote_v[source_rank], {row_with_rank, 0}, barriers.arrived[chunk_id]);
+            int const num_transfers = valid_rows / RingConfig::kRowsPerTransfer;
+            for (int transfer_idx = 0; transfer_idx < num_transfers; ++transfer_idx) {
+                int const transfer_row =
+                    row_with_rank + transfer_idx * RingConfig::kRowsPerTransfer;
+                wait(barriers.finished[chunk_id], get_phasebit<1>(phasebits, 0));
+                update_phasebit<1>(phasebits, 0);
+                tma::expect_bytes(barriers.arrived[chunk_id], sizeof(typename RingConfig::shared_tile));
+                if (!is_v) {
+                    tma::load_async(tile[chunk_id], params.remote_k[source_rank],
+                                    {transfer_row / RingConfig::kRowsPerTransfer, 0}, barriers.arrived[chunk_id]);
+                } else {
+                    tma::load_async(tile[chunk_id], params.remote_v[source_rank],
+                                    {transfer_row / RingConfig::kRowsPerTransfer, 0}, barriers.arrived[chunk_id]);
+                }
             }
         }
     } else if (warp_id < 2 * RingConfig::kNumCommChunks && laneid() == 0) {
@@ -265,25 +295,29 @@ void run_mega_ring_remote_load(
         for (int task_id = RingConfig::kNumCommChunks * comm_bid + chunk_id;
              task_id < total_tasks;
              task_id += RingConfig::kNumCommChunks * params.num_comm_sm) {
-            auto [is_v, row_with_rank, source_rank, ready_idx] = decode_task(task_id);
+            auto [is_v, row_with_rank, source_rank, ready_idx, valid_rows] = decode_task(task_id);
             (void)source_rank;
-
-            wait(barriers.arrived[chunk_id], get_phasebit<0>(phasebits, 0));
-            update_phasebit<0>(phasebits, 0);
-
-            if (!is_v) {
-                tma::store_async(params.local_k, vec[chunk_id], {row_with_rank, 0});
-            } else {
-                tma::store_async(params.local_v, vec[chunk_id], {row_with_rank, 0});
+            int const num_transfers = valid_rows / RingConfig::kRowsPerTransfer;
+            for (int transfer_idx = 0; transfer_idx < num_transfers; ++transfer_idx) {
+                int const transfer_row =
+                    row_with_rank + transfer_idx * RingConfig::kRowsPerTransfer;
+                wait(barriers.arrived[chunk_id], get_phasebit<0>(phasebits, 0));
+                update_phasebit<0>(phasebits, 0);
+                if (!is_v) {
+                    tma::store_async(params.local_k, tile[chunk_id],
+                                     {transfer_row / RingConfig::kRowsPerTransfer, 0});
+                } else {
+                    tma::store_async(params.local_v, tile[chunk_id],
+                                     {transfer_row / RingConfig::kRowsPerTransfer, 0});
+                }
+                tma::store_async_read_wait(); // wait for the store to finish reading from shared memory
+                arrive(barriers.finished[chunk_id]);
+                // The readiness counter is consumed from global memory, so
+                // wait for the TMA store itself, not just its shared read.
+                tma::store_async_wait();
             }
-            tma::store_async_read_wait(); // wait for the store to finish reading from shared memory
-            arrive(barriers.finished[chunk_id]);
-            // MEGA_RING: the readiness counter is consumed from global memory,
-            // so wait for the TMA store itself, not just its shared-memory read.
-            tma::store_async_wait();
 
-            // Each completed K/V row contributes to its exact (G, step)
-            // section; causal half sections signal only front-half rows.
+            // One count represents a complete logical K or V tile.
             min_fa3_varlen_demo::mega_ring::signal_release(params.kv_ready_counts + ready_idx, 1);
         }
     }
@@ -461,7 +495,8 @@ void run_mega_ring_min_fa3_varlen_ring_sm90(
     auto kernel = mega_ring_flash_attn_varlen_kernel<RingConfig>;
     dim3 grid_dims(uint32_t(params.num_comp_sm + params.num_comm_sm), 1, 1);
     dim3 block_dims = AttnKernel::get_block_shape();
-    int smem_size = AttnKernel::SharedStorageSize;
+    int smem_size = AttnKernel::SharedStorageSize > RingConfig::kCommSmemSize
+        ? AttnKernel::SharedStorageSize : RingConfig::kCommSmemSize;
 
     if (smem_size >= 48 * 1024) {
         CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));

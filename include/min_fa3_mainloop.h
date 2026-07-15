@@ -888,16 +888,18 @@ struct CollectiveMainloopFwdSm90 {
         bool should_load_KV = !Use_TMA_KV || ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync()); // True for the elected thread
 
         if constexpr (EnableMegaRing) {
-            // MEGA_RING: communication CTAs increment this counter after each
-            // K/V row is resident in the local concatenated KV buffer. One
+            // MEGA_RING_TILE_COPY: communication CTAs increment this counter
+            // after each logical K/V tile is resident in the local concatenated
+            // KV buffer. One
             // producer thread polls; the barrier releases the rest of the
             // producer threads before they touch Q/K/V pipeline state.
             if (mega_ring_is_cp_batch && mega_ring_step > 0 && thread_idx == 0) {
+                enum : int { kReadyBlockN = CUTE_STATIC_V(get<1>(TileShape_MNK{})) };
                 auto const& level = params.mega_ring_hierarchy.levels[mega_ring_level_idx];
-                int kv_ready_target = level.full_rows * 2;
+                int kv_ready_target = ((level.full_rows + kReadyBlockN - 1) / kReadyBlockN) * 2;
                 if constexpr (Is_causal) {
                     if (mega_ring_kv_use_half) {
-                        kv_ready_target = level.half_rows * 2;
+                        kv_ready_target = ((level.half_rows + kReadyBlockN - 1) / kReadyBlockN) * 2;
                     }
                 }
                 min_fa3_varlen_demo::mega_ring::wait_until_at_least(

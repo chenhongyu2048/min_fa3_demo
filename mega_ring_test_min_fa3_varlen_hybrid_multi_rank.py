@@ -421,6 +421,8 @@ def validate_metadata_args(args: argparse.Namespace, world_size: int) -> None:
         if global_len <= 0 or global_len % ring_size:
             raise SystemExit(f"invalid global length at batch {idx}")
         local_len = global_len // ring_size
+        if local_len % 128:
+            raise SystemExit(f"local length is not 128-aligned at batch {idx}")
         if args.mode in ("causal", "both") and ring_size > 1 and (
             local_len % 2 or (local_len // 2) % 128
         ):

@@ -186,7 +186,13 @@ def run_case(
     total_tokens = batch_size * seqlen
     cu_seqlens_q, cu_seqlens_q_host = make_cu_seqlens(batch_size, seqlen, torch.device("cuda"))
     cu_seqlens_k, cu_seqlens_k_host = make_cu_seqlens(batch_size, seqlen, torch.device("cuda"))
-    half_cu_seqlens, half_cu_seqlens_host = (make_cu_seqlens(batch_size, seqlen // 2, torch.device("cuda")) if is_causal else (None, None))
+    global_seqlens_host = torch.full(
+        (batch_size,), seqlen * local_world_size, dtype=torch.int32
+    )
+    ring_sizes_host = torch.full(
+        (batch_size,), local_world_size, dtype=torch.int32
+    )
+    ring_starts_host = torch.zeros((batch_size,), dtype=torch.int32)
 
     q, local_k, local_v = make_rank_local_qkv(
         total_tokens,
@@ -235,12 +241,13 @@ def run_case(
         is_causal,
         cu_seqlens_q_host=cu_seqlens_q_host,
         cu_seqlens_k_host=cu_seqlens_k_host,
-        half_cu_seqlens=half_cu_seqlens,
-        half_cu_seqlens_host=half_cu_seqlens_host,
         remote_k=remote_k,
         remote_v=remote_v,
         num_comp_sm=num_comp_sm,
         num_comm_sm=num_comm_sm,
+        global_seqlens_host=global_seqlens_host,
+        ring_sizes_host=ring_sizes_host,
+        ring_starts_host=ring_starts_host,
     )
     torch.cuda.synchronize()
     dist.barrier()

@@ -41,16 +41,32 @@ using namespace kittens;
 template <typename AttnKernel, int NumDevices>
 struct MegaRingBwdCommConfig {
     static constexpr int kVecLength = 1024;
+    enum : int {
+        kRowsPerTask = kBlockN,
+        kRowsPerTransfer = 16,
+    };
+    static_assert(kRowsPerTask % kRowsPerTransfer == 0);
     static constexpr int kNumWarps = AttnKernel::MaxThreadsPerBlock / cutlass::NumThreadsPerWarp;
-    static constexpr int kNumChunks = kNumWarps / 2;
-    static_assert(kNumChunks > 0);
+    static constexpr int kNumKChunks = kNumWarps / 2;
+    // FP32 subtiles are twice as large as BF16 subtiles.  Three paired
+    // producer/consumer warp lanes keep the D staging footprint below 227 KiB.
+    static constexpr int kNumDChunks = kNumWarps / 2 < 3 ? kNumWarps / 2 : 3;
+    static_assert(kNumKChunks > 0 && kNumDChunks > 0);
 
-    using KShared = sv_bf<kVecLength>;
-    using KGlobal = gl<bf16, 1, 1, -1, kVecLength, KShared>;
+    using KTile = st_bf<kRowsPerTransfer, kVecLength>;
+    using KGlobal = gl<bf16, 1, 1, -1, kVecLength, KTile>;
     using KRemote = pgl<KGlobal, NumDevices, false>;
-    using DShared = sv_fl<kVecLength>;
-    using DGlobal = gl<float, 1, 1, -1, kVecLength, DShared>;
+    using DTile = st_fl<kRowsPerTransfer, kVecLength>;
+    using DGlobal = gl<float, 1, 1, -1, kVecLength, DTile>;
     using DRemote = pgl<DGlobal, NumDevices, false>;
+    static constexpr int kKCommSmemSize =
+        int(sizeof(KTile)) * kNumKChunks + 1024;
+    static constexpr int kDCommSmemSize =
+        int(sizeof(DTile)) * kNumDChunks + 1024;
+    static constexpr int kCommSmemSize =
+        kKCommSmemSize > kDCommSmemSize ? kKCommSmemSize : kDCommSmemSize;
+    static_assert(kCommSmemSize <= MAX_SHARED_MEMORY,
+                  "mega-ring backward communication staging exceeds Hopper shared memory");
 };
 
 template <typename AttnKernel, int NumDevices>
@@ -82,17 +98,20 @@ struct alignas(128) MegaRingBwdKernelParams {
     int* remote_completion[8];
 };
 
-template <typename Comm>
+template <int NumChunks>
 struct alignas(128) MegaRingBwdTmaBarriers {
-    semaphore arrived[Comm::kNumChunks];
-    semaphore finished[Comm::kNumChunks];
+    semaphore arrived[NumChunks];
+    semaphore finished[NumChunks];
 };
 
 template <typename Comm>
 constexpr void check_mega_ring_bwd_tma_layout() {
-    static_assert(sizeof(typename Comm::KShared) == Comm::kVecLength * sizeof(bf16));
-    static_assert(sizeof(typename Comm::DShared) == Comm::kVecLength * sizeof(float));
-    static_assert(sizeof(MegaRingBwdTmaBarriers<Comm>) % 128 == 0);
+    static_assert(sizeof(typename Comm::KTile) ==
+                  Comm::kRowsPerTransfer * Comm::kVecLength * sizeof(bf16));
+    static_assert(sizeof(typename Comm::DTile) ==
+                  Comm::kRowsPerTransfer * Comm::kVecLength * sizeof(float));
+    static_assert(sizeof(MegaRingBwdTmaBarriers<Comm::kNumKChunks>) % 128 == 0);
+    static_assert(sizeof(MegaRingBwdTmaBarriers<Comm::kNumDChunks>) % 128 == 0);
 }
 
 template <typename AttnKernel, int NumDevices>
@@ -104,20 +123,22 @@ CUTLASS_DEVICE void run_mega_ring_bwd_kv_load(
     if (params.ring_world_size <= 1) { return; }
 
     tma_swizzle_allocator allocator(reinterpret_cast<int*>(smem_buf));
-    typename Comm::KShared (&vec)[Comm::kNumChunks] =
-        allocator.allocate<typename Comm::KShared, Comm::kNumChunks>();
-    __shared__ MegaRingBwdTmaBarriers<Comm> barriers;
+    typename Comm::KTile (&tile)[Comm::kNumKChunks] =
+        allocator.allocate<typename Comm::KTile, Comm::kNumKChunks>();
+    __shared__ MegaRingBwdTmaBarriers<Comm::kNumKChunks> barriers;
     if (threadIdx.x == 0) {
         #pragma unroll
-        for (int i = 0; i < Comm::kNumChunks; ++i) {
+        for (int i = 0; i < Comm::kNumKChunks; ++i) {
             init_semaphore(barriers.arrived[i], 0, 1);
             init_semaphore(barriers.finished[i], 0, 1);
         }
     }
     __syncthreads();
 
-    int const half_tasks = params.ring_rank * params.half_rows_per_rank * 2;
-    int const full_tasks_per_step = params.rows_per_rank * 2;
+    int const half_tiles_per_step = params.half_rows_per_rank / Comm::kRowsPerTask;
+    int const full_tiles_per_step = params.rows_per_rank / Comm::kRowsPerTask;
+    int const half_tasks = params.ring_rank * half_tiles_per_step * 2;
+    int const full_tasks_per_step = full_tiles_per_step * 2;
     int const total_tasks = half_tasks
         + (params.ring_world_size - 1 - params.ring_rank) * full_tasks_per_step;
     int const warp_id = warp::groupid();
@@ -134,55 +155,75 @@ CUTLASS_DEVICE void run_mega_ring_bwd_kv_load(
     };
 
     auto decode_task = [&] (int task_id) {
-        int step, task_in_step, rows_this_step;
+        int step, task_in_step;
+        int tiles_this_step;
         bool use_half;
         if (task_id < half_tasks) {
-            int const step_idx = task_id / (params.half_rows_per_rank * 2);
+            int const step_idx = task_id / (half_tiles_per_step * 2);
             step = step_idx + 1;
-            task_in_step = task_id - step_idx * params.half_rows_per_rank * 2;
-            rows_this_step = params.half_rows_per_rank;
+            task_in_step = task_id - step_idx * half_tiles_per_step * 2;
+            tiles_this_step = half_tiles_per_step;
             use_half = true;
         } else {
             int const remaining = task_id - half_tasks;
             int const step_idx = remaining / full_tasks_per_step;
             step = params.ring_rank + 1 + step_idx;
             task_in_step = remaining - step_idx * full_tasks_per_step;
-            rows_this_step = params.rows_per_rank;
+            tiles_this_step = full_tiles_per_step;
             use_half = false;
         }
-        bool const is_v = task_in_step >= rows_this_step;
-        int const logical_row = is_v ? task_in_step - rows_this_step : task_in_step;
+        bool const is_v = task_in_step >= tiles_this_step;
+        int const tile_idx = is_v ? task_in_step - tiles_this_step : task_in_step;
+        int const logical_row = tile_idx * Comm::kRowsPerTask;
         int const row = use_half ? half_row_to_full_row(logical_row) : logical_row;
         int owner = params.ring_rank - step;
         if (owner < 0) { owner += params.ring_world_size; }
         return cute::make_tuple(step, is_v, owner * params.rows_per_rank + row, owner);
     };
 
-    if (warp_id < Comm::kNumChunks && laneid() == 0) {
+    if (warp_id < Comm::kNumKChunks && laneid() == 0) {
         int const chunk = warp_id;
-        for (int task_id = Comm::kNumChunks * comm_bid + chunk;
+        for (int task_id = Comm::kNumKChunks * comm_bid + chunk;
              task_id < total_tasks;
-             task_id += Comm::kNumChunks * params.num_comm_sm) {
+             task_id += Comm::kNumKChunks * params.num_comm_sm) {
             auto [step, is_v, row, owner] = decode_task(task_id);
-            wait(barriers.finished[chunk], get_phasebit<1>(phasebits, 0));
-            update_phasebit<1>(phasebits, 0);
-            tma::expect_bytes(barriers.arrived[chunk], sizeof(typename Comm::KShared));
-            if (is_v) { tma::load_async(vec[chunk], params.remote_v[owner], {row, 0}, barriers.arrived[chunk]); }
-            else { tma::load_async(vec[chunk], params.remote_k[owner], {row, 0}, barriers.arrived[chunk]); }
+            int const num_transfers = Comm::kRowsPerTask / Comm::kRowsPerTransfer;
+            for (int transfer_idx = 0; transfer_idx < num_transfers; ++transfer_idx) {
+                int const transfer_row = row + transfer_idx * Comm::kRowsPerTransfer;
+                wait(barriers.finished[chunk], get_phasebit<1>(phasebits, 0));
+                update_phasebit<1>(phasebits, 0);
+                tma::expect_bytes(barriers.arrived[chunk], sizeof(typename Comm::KTile));
+                if (is_v) {
+                    tma::load_async(tile[chunk], params.remote_v[owner],
+                                    {transfer_row / Comm::kRowsPerTransfer, 0}, barriers.arrived[chunk]);
+                } else {
+                    tma::load_async(tile[chunk], params.remote_k[owner],
+                                    {transfer_row / Comm::kRowsPerTransfer, 0}, barriers.arrived[chunk]);
+                }
+            }
         }
-    } else if (warp_id < 2 * Comm::kNumChunks && laneid() == 0) {
-        int const chunk = warp_id - Comm::kNumChunks;
-        for (int task_id = Comm::kNumChunks * comm_bid + chunk;
+    } else if (warp_id < 2 * Comm::kNumKChunks && laneid() == 0) {
+        int const chunk = warp_id - Comm::kNumKChunks;
+        for (int task_id = Comm::kNumKChunks * comm_bid + chunk;
              task_id < total_tasks;
-             task_id += Comm::kNumChunks * params.num_comm_sm) {
+             task_id += Comm::kNumKChunks * params.num_comm_sm) {
             auto [step, is_v, row, owner] = decode_task(task_id);
-            wait(barriers.arrived[chunk], get_phasebit<0>(phasebits, 0));
-            update_phasebit<0>(phasebits, 0);
-            if (is_v) { tma::store_async(params.local_v, vec[chunk], {row, 0}); }
-            else { tma::store_async(params.local_k, vec[chunk], {row, 0}); }
-            tma::store_async_read_wait();
-            arrive(barriers.finished[chunk]);
-            tma::store_async_wait();
+            int const num_transfers = Comm::kRowsPerTask / Comm::kRowsPerTransfer;
+            for (int transfer_idx = 0; transfer_idx < num_transfers; ++transfer_idx) {
+                int const transfer_row = row + transfer_idx * Comm::kRowsPerTransfer;
+                wait(barriers.arrived[chunk], get_phasebit<0>(phasebits, 0));
+                update_phasebit<0>(phasebits, 0);
+                if (is_v) {
+                    tma::store_async(params.local_v, tile[chunk],
+                                     {transfer_row / Comm::kRowsPerTransfer, 0});
+                } else {
+                    tma::store_async(params.local_k, tile[chunk],
+                                     {transfer_row / Comm::kRowsPerTransfer, 0});
+                }
+                tma::store_async_read_wait();
+                arrive(barriers.finished[chunk]);
+                tma::store_async_wait();
+            }
             min_fa3_varlen_demo::mega_ring::signal_release(params.kv_ready + step, 1);
         }
     }
@@ -195,12 +236,12 @@ CUTLASS_DEVICE void run_mega_ring_bwd_dkv_store(
         char* smem_buf) {
     using Comm = MegaRingBwdCommConfig<AttnKernel, NumDevices>;
     tma_swizzle_allocator allocator(reinterpret_cast<int*>(smem_buf));
-    typename Comm::DShared (&vec)[Comm::kNumChunks] =
-        allocator.allocate<typename Comm::DShared, Comm::kNumChunks>();
-    __shared__ MegaRingBwdTmaBarriers<Comm> barriers;
+    typename Comm::DTile (&tile)[Comm::kNumDChunks] =
+        allocator.allocate<typename Comm::DTile, Comm::kNumDChunks>();
+    __shared__ MegaRingBwdTmaBarriers<Comm::kNumDChunks> barriers;
     if (threadIdx.x == 0) {
         #pragma unroll
-        for (int i = 0; i < Comm::kNumChunks; ++i) {
+        for (int i = 0; i < Comm::kNumDChunks; ++i) {
             init_semaphore(barriers.arrived[i], 0, 1);
             init_semaphore(barriers.finished[i], 0, 1);
         }
@@ -210,41 +251,66 @@ CUTLASS_DEVICE void run_mega_ring_bwd_dkv_store(
     int const warp_id = warp::groupid();
     uint32_t phasebits = 0xFFFF0000;
     for (int step = 0; step < params.ring_world_size; ++step) {
-        if (warp_id < 2 * Comm::kNumChunks && laneid() == 0) {
+        if (warp_id < 2 * Comm::kNumDChunks && laneid() == 0) {
             min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
                 params.local_ready + step, params.expected_ready[step]);
         }
 
         int owner = params.ring_rank - step;
         if (owner < 0) { owner += params.ring_world_size; }
-        int const tasks_per_step = params.dkv_rows_per_step * 2;
-        if (warp_id < Comm::kNumChunks && laneid() == 0) {
+        int const tiles_per_step = params.dkv_rows_per_step / Comm::kRowsPerTask;
+        int const tasks_per_step = tiles_per_step * 2;
+        if (warp_id < Comm::kNumDChunks && laneid() == 0) {
             int const chunk = warp_id;
-            for (int task = Comm::kNumChunks * comm_bid + chunk;
+            for (int task = Comm::kNumDChunks * comm_bid + chunk;
                  task < tasks_per_step;
-                 task += Comm::kNumChunks * params.num_comm_sm) {
-                bool const is_v = task >= params.dkv_rows_per_step;
-                int const row = is_v ? task - params.dkv_rows_per_step : task;
+                 task += Comm::kNumDChunks * params.num_comm_sm) {
+                bool const is_v = task >= tiles_per_step;
+                int const tile_idx = is_v ? task - tiles_per_step : task;
+                int const row = tile_idx * Comm::kRowsPerTask;
                 int const local_row = step * params.dkv_rows_per_step + row;
-                wait(barriers.finished[chunk], get_phasebit<1>(phasebits, 0));
-                update_phasebit<1>(phasebits, 0);
-                tma::expect_bytes(barriers.arrived[chunk], sizeof(typename Comm::DShared));
-                if (is_v) { tma::load_async(vec[chunk], params.local_dv_steps, {local_row, 0}, barriers.arrived[chunk]); }
-                else { tma::load_async(vec[chunk], params.local_dk_steps, {local_row, 0}, barriers.arrived[chunk]); }
+                int const num_transfers = Comm::kRowsPerTask / Comm::kRowsPerTransfer;
+                for (int transfer_idx = 0; transfer_idx < num_transfers; ++transfer_idx) {
+                    int const transfer_row =
+                        local_row + transfer_idx * Comm::kRowsPerTransfer;
+                    wait(barriers.finished[chunk], get_phasebit<1>(phasebits, 0));
+                    update_phasebit<1>(phasebits, 0);
+                    tma::expect_bytes(barriers.arrived[chunk], sizeof(typename Comm::DTile));
+                    if (is_v) {
+                        tma::load_async(tile[chunk], params.local_dv_steps,
+                                        {transfer_row / Comm::kRowsPerTransfer, 0}, barriers.arrived[chunk]);
+                    } else {
+                        tma::load_async(tile[chunk], params.local_dk_steps,
+                                        {transfer_row / Comm::kRowsPerTransfer, 0}, barriers.arrived[chunk]);
+                    }
+                }
             }
-        } else if (warp_id < 2 * Comm::kNumChunks && laneid() == 0) {
-            int const chunk = warp_id - Comm::kNumChunks;
-            for (int task = Comm::kNumChunks * comm_bid + chunk;
+        } else if (warp_id < 2 * Comm::kNumDChunks && laneid() == 0) {
+            int const chunk = warp_id - Comm::kNumDChunks;
+            for (int task = Comm::kNumDChunks * comm_bid + chunk;
                  task < tasks_per_step;
-                 task += Comm::kNumChunks * params.num_comm_sm) {
-                bool const is_v = task >= params.dkv_rows_per_step;
-                int const row = is_v ? task - params.dkv_rows_per_step : task;
-                wait(barriers.arrived[chunk], get_phasebit<0>(phasebits, 0));
-                update_phasebit<0>(phasebits, 0);
-                if (is_v) { tma::store_add_async(params.remote_dv_accum[owner], vec[chunk], {row, 0}); }
-                else { tma::store_add_async(params.remote_dk_accum[owner], vec[chunk], {row, 0}); }
-                tma::store_async_read_wait();
-                arrive(barriers.finished[chunk]);
+                 task += Comm::kNumDChunks * params.num_comm_sm) {
+                bool const is_v = task >= tiles_per_step;
+                int const tile_idx = is_v ? task - tiles_per_step : task;
+                int const row = tile_idx * Comm::kRowsPerTask;
+                int const local_row = step * params.dkv_rows_per_step + row;
+                int const num_transfers = Comm::kRowsPerTask / Comm::kRowsPerTransfer;
+                for (int transfer_idx = 0; transfer_idx < num_transfers; ++transfer_idx) {
+                    int const transfer_row =
+                        local_row + transfer_idx * Comm::kRowsPerTransfer;
+                    int const remote_row = row + transfer_row - local_row;
+                    wait(barriers.arrived[chunk], get_phasebit<0>(phasebits, 0));
+                    update_phasebit<0>(phasebits, 0);
+                    if (is_v) {
+                        tma::store_add_async(params.remote_dv_accum[owner], tile[chunk],
+                                             {remote_row / Comm::kRowsPerTransfer, 0});
+                    } else {
+                        tma::store_add_async(params.remote_dk_accum[owner], tile[chunk],
+                                             {remote_row / Comm::kRowsPerTransfer, 0});
+                    }
+                    tma::store_async_read_wait();
+                    arrive(barriers.finished[chunk]);
+                }
             }
             tma::store_async_wait();
         }
@@ -494,8 +560,9 @@ void run_flash_bwd(
                     "mega-ring backward K/V TMA row must contain KVH * D == ", Comm::kVecLength);
         TORCH_CHECK(params.dkv_step_stride % Comm::kVecLength == 0,
                     "mega-ring backward dKV accumulator must be divisible by the TMA row width");
-        int const comm_smem_size = int(sizeof(typename Comm::DShared)) * Comm::kNumChunks + 1024;
-        smem_size = smem_size > comm_smem_size ? smem_size : comm_smem_size;
+        TORCH_CHECK(dkv_rows_per_step % Comm::kRowsPerTask == 0,
+                    "mega-ring backward padded dKV rows must be divisible by ", Comm::kRowsPerTask);
+        smem_size = smem_size > Comm::kCommSmemSize ? smem_size : Comm::kCommSmemSize;
         if (smem_size >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
@@ -595,7 +662,21 @@ void run_flash_bwd(
     if (smem_size_postprocess >= 48 * 1024) {
         CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
     }
-    CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKernel>(grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_params, false /*launch_with_pdl*/));
+    if constexpr (MegaRing) {
+        // Keep this launch in the mega-ring instantiation.  The regular and
+        // mega-ring translation units instantiate the same weak CUTLASS launch
+        // helper for dQ, which can otherwise resolve to an invalid launch after
+        // they are linked into the same extension.
+        cutlass::device_kernel<PostprocessKernel><<<
+            grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock,
+            smem_size_postprocess, stream>>>(postprocess_params);
+        CHECK_CUDA_KERNEL_LAUNCH();
+    } else {
+        CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKernel>(
+            grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock,
+            smem_size_postprocess, stream, postprocess_params,
+            false /*launch_with_pdl*/));
+    }
 
     if constexpr (GQA || MegaRing) {
         using TileShape_NK = cute::Shape<Int<kBlockN>, Int<kHeadDim>>;

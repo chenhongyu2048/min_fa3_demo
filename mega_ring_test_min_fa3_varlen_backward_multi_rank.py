@@ -11,6 +11,7 @@ from mega_ring_test_min_fa3_varlen_ring_multi_rank import (
     assert_close_named,
     gather_rank_blocks,
     make_cu_seqlens,
+    expected_loaded_row_mask,
     parse_seqlen_spec,
     raise_if_any_rank_failed,
     reference_mega_ring_varlen,
@@ -247,6 +248,11 @@ def run_case(
     cu_q, cu_q_host = make_cu_seqlens(args.b, seqlen, device)
     cu_k, cu_k_host = cu_q, cu_q_host
     half_cu, half_cu_host = make_cu_seqlens(args.b, seqlen // 2, device)
+    global_seqlens_host = torch.full(
+        (args.b,), seqlen * world_size, dtype=torch.int32
+    )
+    ring_sizes_host = torch.full((args.b,), world_size, dtype=torch.int32)
+    ring_starts_host = torch.zeros((args.b,), dtype=torch.int32)
     q, local_k, local_v = make_centered_rank_local_qkv(
         total_tokens, total_tokens, args.qhead, args.kvhead, args.headdim, rank
     )
@@ -280,12 +286,13 @@ def run_case(
         True,
         cu_seqlens_q_host=cu_q_host,
         cu_seqlens_k_host=cu_k_host,
-        half_cu_seqlens=half_cu,
-        half_cu_seqlens_host=half_cu_host,
         remote_k=remote_k,
         remote_v=remote_v,
         num_comp_sm=args.num_comp_sm,
         num_comm_sm=args.num_comm_sm,
+        global_seqlens_host=global_seqlens_host,
+        ring_sizes_host=ring_sizes_host,
+        ring_starts_host=ring_starts_host,
         return_lse=True,
     )
     dout_generator = torch.Generator(device="cuda")
@@ -363,12 +370,19 @@ def run_case(
     dist.all_reduce(dv_ref_by_owner)
     dk_ref = dk_ref_by_owner[rank]
     dv_ref = dv_ref_by_owner[rank]
+    loaded_rows = expected_loaded_row_mask(
+        args.b, seqlen, True, rank, world_size, k.device
+    )
+    expected_loaded_k = torch.zeros_like(expected_k)
+    expected_loaded_v = torch.zeros_like(expected_v)
+    expected_loaded_k[loaded_rows] = expected_k[loaded_rows]
+    expected_loaded_v[loaded_rows] = expected_v[loaded_rows]
 
     local_error = None
     try:
         assert_close_named("forward output", out.float(), out_ref.float(), atol=0.2, rtol=0.2)
-        assert_close_named("backward-loaded K", k.float(), expected_k.float(), atol=0.0, rtol=0.0)
-        assert_close_named("backward-loaded V", v.float(), expected_v.float(), atol=0.0, rtol=0.0)
+        assert_close_named("backward-loaded K", k.float(), expected_loaded_k.float(), atol=0.0, rtol=0.0)
+        assert_close_named("backward-loaded V", v.float(), expected_loaded_v.float(), atol=0.0, rtol=0.0)
         assert_close_named("dQ vs stepwise min_fa3", dq.float(), dq_stepwise, atol=0.3, rtol=0.3)
         assert_close_named("dK vs stepwise min_fa3", dk.float(), dk_stepwise, atol=0.3, rtol=0.3)
         assert_close_named("dV vs stepwise min_fa3", dv.float(), dv_stepwise, atol=0.3, rtol=0.3)

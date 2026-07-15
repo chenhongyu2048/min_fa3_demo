@@ -186,12 +186,14 @@ Hierarchical mega-ring forward notes:
 - This path supports one node with 2, 4, or 8 SM90 GPUs. A ring size cannot exceed the physical world size.
 - The 8-GPU path uses one fused persistent launch for G8/G4/G2/G1 sequences; the 2-GPU path similarly fuses G2/G1.
 - Batches are ordered by non-increasing ring size and explicitly pass global lengths, ring sizes, and aligned ring starts.
-- K/V use a shared rank-major capacity arena; the current row-granular communication path requires `KVH * D = 1024`.
-- Causal G8/G4/G2 uses the zigzag `[front half | back half]` layout and requires each local half to be 128-aligned.
+- K/V use a shared rank-major capacity arena. Communication scheduling and readiness are tracked per logical KV tile: 128 rows for causal forward/backward and 176 rows for noncausal forward. Each logical task is physically transferred through 16-row 2D TMA subtiles spanning `KVH * D = 1024` values.
+- Every local Q/K sequence length and the per-rank K/V arena capacity must be 128-row aligned. Causal G8/G4/G2 additionally requires each local half to be 128-row aligned. There is no single-row or unaligned-tail communication fallback.
+- A full 128/176-row logical tile is not staged in shared memory at once: communication CTAs reuse a small number of 16-row slots so the fused launch stays below Hopper's shared-memory limit.
+- Causal G8/G4/G2 uses the zigzag `[front half | back half]` layout.
 - The caller must synchronize owner-local K/V initialization across ranks before entering the op.
 - Ranks with no local sequence still enter the fused kernel and exit with an empty scheduler work stream.
 - Mega-ring backward is currently causal and non-deterministic only. Its VMM-backed FP32 dK/dV accumulators and owner completion counter must be zeroed on every rank and globally synchronized before calling `backward_varlen_mega_ring`.
-- Mega-ring backward communication uses row-granular TMA pipelines for remote K/V load/store and FP32 dK/dV load/remote reduce-add. K/V rows contain `KVH * D = 1024` bf16 values; dKV communication rows are contiguous groups of 1024 floats in the existing padded accumulator layout.
+- Mega-ring backward keeps the existing execution paths: K/V ingress is `remote gmem -> local smem -> local gmem`, while dK/dV egress is `local gmem -> local smem -> remote gmem reduce-add`. Both use 128-row logical tasks decomposed into 16-row 2D TMA subtiles; the padded FP32 dKV accumulator row count must therefore be 128-row aligned.
 
 Parameterized test examples:
 
