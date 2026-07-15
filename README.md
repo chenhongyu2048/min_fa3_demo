@@ -263,17 +263,18 @@ torchrun --standalone --nproc_per_node=8 \
 DATASETS="arxiv github" GPU_COUNTS=8 ./benchmark_hybrid_dataset.sh
 ```
 
-The dataset frontend generates global lengths and token/compute-constrained
-G8/G4/G2/G1 metadata, then calls `benchmark_hybrid_forward.main(...)` in the
-same process. The planner searches the strictest feasible token cap, permits
-compute relaxation only up to its configured cap unless topology or emergency
-fallback requires more, and uses estimated ring token-hops as a tunable soft
-cost. Use `--communication-weight` to change that tradeoff and
-`--print-workload --world-size 8` to inspect the final caps and per-rank loads.
-When the final sampled sequence is truncated to fit the target and its length
-exceeds `--truncated-padding-threshold` (32K by default), it is padded upward to
-an alignment of `256 * world_size`, capped at 128K. The physical padded tokens
-participate in attention, so `actual_tokens` can be slightly above the target.
+The dataset frontend calls the standalone `balancer` package to generate
+global lengths and token/compute-constrained G8/G4/G2/G1 metadata, then calls
+`benchmark_hybrid_forward.main(...)` in the same process. The planner searches
+the strictest feasible token cap, permits compute relaxation only up to its
+configured cap unless topology or emergency fallback requires more, and uses
+estimated ring token-hops as a tunable soft cost. Use `--communication-weight`
+to change that tradeoff and `--print-workload --world-size 8` to inspect the
+final caps and per-rank loads. Every sampled length is padded upward: lengths
+below 4K use `256 * 2` alignment, lengths from 4K to 8K use `256 * 4`, and
+lengths from 8K upward use `256 * 8`. The physical padded tokens participate
+in attention, so `actual_tokens` can exceed the target by fewer than 2048
+tokens.
 With the default `--methods all`, methods that cannot represent a generated
 length in a particular mode are reported as skipped; an explicitly requested
 incompatible method remains an error. Full 128K runs should use `--no-check`

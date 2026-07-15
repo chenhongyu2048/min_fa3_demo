@@ -188,21 +188,21 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_hybrid_forward.py \
 
 ### Dataset-shaped hybrid workload
 
-`benchmark_hybrid_dataset_forward.py` samples an Arxiv or Github length
-distribution, packs one global batch to 128K tokens by default, and assigns
-each sequence to an aligned G8/G4/G2/G1 subgroup. Compute and local tokens are
-hard placement constraints; normalized token balance is the main objective,
-while compute variance and estimated ring token-hops are soft costs. It then
-calls `benchmark_hybrid_forward.main(...)` in the same process with the
-generated ring metadata.
+`benchmark_hybrid_dataset_forward.py` uses the standalone `balancer` package
+to sample an Arxiv or Github length distribution, pack one global batch to
+128K tokens by default, and assign each sequence to a G8/G4/G2/G1 subgroup.
+Compute and local tokens are hard placement constraints; normalized token
+balance is the main objective, while compute variance and estimated ring
+token-hops are soft costs. The frontend then calls
+`benchmark_hybrid_forward.main(...)` in the same process with the generated
+ring metadata.
 
-If the final sampled sequence is truncated by the remaining batch budget and
-its truncated length exceeds `--truncated-padding-threshold` (32K by default),
-the frontend pads it upward to `256 * world_size` alignment, capped at 128K.
-This preserves causal full-ring alignment for large packing residuals. The
-physical padded tokens participate in the benchmark, so `actual_tokens` can
-exceed `target_tokens` by less than the selected alignment. The shell wrapper
-exposes the threshold as `TRUNCATED_PADDING_THRESHOLD`.
+Every sampled length, including the final packing residual, is padded upward.
+Lengths below 4K use `256 * 2` alignment, lengths from 4K to 8K use
+`256 * 4`, and lengths from 8K upward use `256 * 8` (including lengths at or
+above 16K). This makes each causal sequence eligible for at least its target
+G2/G4/G8 ring. The physical padded tokens participate in the benchmark, so
+`actual_tokens` can exceed `target_tokens` by fewer than 2048 tokens.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \

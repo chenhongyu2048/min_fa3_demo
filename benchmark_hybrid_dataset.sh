@@ -17,7 +17,6 @@ MAX_COMPUTE_BALANCE_TOLERANCE=${MAX_COMPUTE_BALANCE_TOLERANCE:-0.20}
 MAX_TOKEN_BALANCE_TOLERANCE=${MAX_TOKEN_BALANCE_TOLERANCE:-0.50}
 COMMUNICATION_WEIGHT=${COMMUNICATION_WEIGHT:-0.05}
 LOCAL_SEARCH_PASSES=${LOCAL_SEARCH_PASSES:-4}
-TRUNCATED_PADDING_THRESHOLD=${TRUNCATED_PADDING_THRESHOLD:-32768}
 SEED=${SEED:-0}
 METHODS=${METHODS:-all}
 MODE=${MODE:-causal}
@@ -122,7 +121,6 @@ run_benchmark() {
         --max-token-balance-tolerance "$MAX_TOKEN_BALANCE_TOLERANCE"
         --communication-weight "$COMMUNICATION_WEIGHT"
         --local-search-passes "$LOCAL_SEARCH_PASSES"
-        --truncated-padding-threshold "$TRUNCATED_PADDING_THRESHOLD"
         --seed "$SEED"
         --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM"
         --mode "$MODE" --methods "$METHODS" --sm-configs "$SM_CONFIGS"
@@ -156,7 +154,7 @@ fi
 
 echo "Log: $LOG_FILE"
 echo "Datasets: ${DATASET_LIST[*]}"
-echo "Config: target_tokens=$TARGET_TOKENS, compute_tolerance=$BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, max_compute_tolerance=$MAX_COMPUTE_BALANCE_TOLERANCE, max_token_tolerance=$MAX_TOKEN_BALANCE_TOLERANCE, communication_weight=$COMMUNICATION_WEIGHT, local_search_passes=$LOCAL_SEARCH_PASSES, truncated_padding_threshold=$TRUNCATED_PADDING_THRESHOLD, seed=$SEED, mode=$MODE, methods=$METHODS"
+echo "Config: target_tokens=$TARGET_TOKENS, compute_tolerance=$BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, max_compute_tolerance=$MAX_COMPUTE_BALANCE_TOLERANCE, max_token_tolerance=$MAX_TOKEN_BALANCE_TOLERANCE, communication_weight=$COMMUNICATION_WEIGHT, local_search_passes=$LOCAL_SEARCH_PASSES, seed=$SEED, mode=$MODE, methods=$METHODS"
 
 for world_size in "${GPU_COUNT_LIST[@]}"; do
     select_devices "$world_size"
