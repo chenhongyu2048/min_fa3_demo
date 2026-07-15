@@ -37,6 +37,10 @@ struct TileSchedulerArguments {
     int const mega_ring_rank = 0;
     int const* const mega_ring_ring_sizes = nullptr;
     min_fa3_varlen_demo::MegaRingHierarchyDesc const mega_ring_hierarchy{};
+    int const* const mega_ring_kv_ready_counts = nullptr;
+    int* const mega_ring_tile_states = nullptr;
+    int* const mega_ring_scan_cursor = nullptr;
+    int* const mega_ring_completed_tiles = nullptr;
 };
 
 template<int kBlockM, int kBlockN, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
@@ -55,6 +59,7 @@ protected:
 public:
     // MEGA_RING: default scheduler does not expose ring-step metadata.
     static constexpr bool EnableMegaRing = false;
+    static constexpr bool EnableChunkedSegments = false;
     static constexpr bool EnableQueuedInitialWork = false;
     // MEGA_RING: expose the existing scheduler barrier participant count to
     // the copied mega-ring scheduler variant.
@@ -85,6 +90,10 @@ public:
         int const mega_ring_rank;
         int const* const mega_ring_ring_sizes;
         min_fa3_varlen_demo::MegaRingHierarchyDesc const mega_ring_hierarchy;
+        int const* const mega_ring_kv_ready_counts;
+        int* const mega_ring_tile_states;
+        int* const mega_ring_scan_cursor;
+        int* const mega_ring_completed_tiles;
     };
 
     static Params
@@ -114,7 +123,11 @@ public:
                 args.mega_ring_world_size,
                 args.mega_ring_rank,
                 args.mega_ring_ring_sizes,
-                args.mega_ring_hierarchy};
+                args.mega_ring_hierarchy,
+                args.mega_ring_kv_ready_counts,
+                args.mega_ring_tile_states,
+                args.mega_ring_scan_cursor,
+                args.mega_ring_completed_tiles};
     }
 
     static dim3

@@ -339,12 +339,11 @@ public:
                  work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info) : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
 
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
-                int mega_ring_step = 0;
+                int mega_ring_segment_meta = 0;
                 if constexpr (TileScheduler::EnableMegaRing) {
-                    // MEGA_RING: persistent scheduler decodes the ring step
-                    // from the global tile id and carries it beside the
-                    // original varlen tile coordinate.
-                    mega_ring_step = work_tile_info.ring_step;
+                    // MEGA_RING_SEGMENTS: keep the packed claim intact across
+                    // the kernel and decode it only in short mainloop scopes.
+                    mega_ring_segment_meta = work_tile_info.segment_meta;
                 }
                 SeqlenInfo_t seqlen_info{
                     get<2>(block_coord) /*bidb*/,
@@ -371,7 +370,8 @@ public:
                 // pipeline_vt won't be used if we don't need to transpose V.
                 mainloop.template load<TileScheduler::EnableMegaRing>(
                     params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
-                    shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx, mega_ring_step);
+                    shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx,
+                    mega_ring_segment_meta);
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
@@ -393,9 +393,9 @@ public:
             for (auto work_tile_info = get_initial_scheduler_work</*IsProducerWarp=*/false>(scheduler, params.scheduler, start_from_work_queue);
                  work_tile_info.is_valid(params.scheduler);
                  // get_next_work will be called before the epilogue
-                 ) {
+                ) {
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
-                int mega_ring_step = 0;
+                int mega_ring_segment_meta = 0;
                 int mega_ring_reduction_tile_idx = 0;
                 int mega_ring_q_row_offset = 0;
                 int mega_ring_seqlen_o = -1;
@@ -403,16 +403,13 @@ public:
                     // MEGA_RING: reduction_tile_idx identifies the same output
                     // tile across ring steps. For causal zigzag half-Q steps it
                     // is already mapped back into the full-Q back-half stream.
-                    mega_ring_step = work_tile_info.ring_step;
+                    mega_ring_segment_meta = work_tile_info.segment_meta;
                     mega_ring_reduction_tile_idx = work_tile_info.reduction_tile_idx;
                 }
                 int const bidb = get<2>(block_coord);
                 bool mega_ring_is_cp_batch = true;
-                int mega_ring_local_rank = params.mainloop.mega_ring_rank;
                 if constexpr (TileScheduler::EnableMegaRing) {
                     int const ring_size = params.mainloop.mega_ring_ring_sizes[bidb];
-                    int const ring_base = (params.mainloop.mega_ring_rank / ring_size) * ring_size;
-                    mega_ring_local_rank = params.mainloop.mega_ring_rank - ring_base;
                     mega_ring_is_cp_batch = ring_size > 1;
                 }
                 SeqlenInfo_t seqlen_info{
@@ -425,10 +422,17 @@ public:
                     params.mainloop.seqlens_rotary
                 };
                 if constexpr (TileScheduler::EnableMegaRing && Is_causal) {
-                    if (mega_ring_is_cp_batch && mega_ring_step > mega_ring_local_rank) {
-                        int const half_len = params.mainloop.mega_ring_half_cu_seqlens[bidb + 1] - params.mainloop.mega_ring_half_cu_seqlens[bidb];
-                        mega_ring_q_row_offset = half_len;
-                        mega_ring_seqlen_o = half_len;
+                    if constexpr (!TileScheduler::EnableChunkedSegments) {
+                        int const ring_size = params.mainloop.mega_ring_ring_sizes[bidb];
+                        int const ring_base = (params.mainloop.mega_ring_rank / ring_size) * ring_size;
+                        int const ring_local_rank = params.mainloop.mega_ring_rank - ring_base;
+                        int const ring_step = min_fa3_varlen_demo::mega_ring::segment_begin_step(
+                            mega_ring_segment_meta);
+                        if (mega_ring_is_cp_batch && ring_step > ring_local_rank) {
+                            int const half_len = params.mainloop.mega_ring_half_cu_seqlens[bidb + 1] - params.mainloop.mega_ring_half_cu_seqlens[bidb];
+                            mega_ring_q_row_offset = half_len;
+                            mega_ring_seqlen_o = half_len;
+                        }
                     }
                 }
                 // if constexpr (AppendKV) {
@@ -463,7 +467,8 @@ public:
                 // if constexpr (!LargeHeadDimV) {
                 tile_valid = mainloop.template mma<TileScheduler::EnableMegaRing>(
                     params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
-                    tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage, mega_ring_step);
+                    tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info,
+                    block_coord, shared_storage, mega_ring_segment_meta);
                 // } else {  // mma_pv might not compile if !LargeHeadDimV
                 //     if (warp_group_idx == 1) {
                 //         tile_valid = mainloop.mma(
@@ -475,8 +480,14 @@ public:
                 //             tOrO, softmax, threadIdx.x - MmaThreadOffset, seqlen_info, block_coord, shared_storage);
                 //     }
                 // }
-                // Do this here before the epilogue so that the next tile is ready to go.
-                work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info);
+                // Keep the copied scheduler/epilogue overlap for the ordinary
+                // paths.  A chunked mega-ring tile must publish its updated
+                // progress and clear the busy bit before asking for more work:
+                // the producer scheduler may otherwise be waiting for this
+                // very tile, while the consumer is waiting for the producer.
+                if constexpr (!TileScheduler::EnableChunkedSegments) {
+                    work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info);
+                }
                 // if constexpr (Split && Varlen) {
                 //     if (!work_tile_info.is_valid(params.scheduler)) {  // Last tile
                 //         cutlass::arch::launch_dependent_grids();
@@ -484,10 +495,13 @@ public:
                 // }
                 if (tile_valid) {
                     // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
-                    if constexpr (TileScheduler::EnableMegaRing) {
+                    if constexpr (TileScheduler::EnableMegaRing && !TileScheduler::EnableChunkedSegments) {
                         // MEGA_RING: output/LSE are merged in-place. Serialize only the same Q tile across ring steps; different Q
                         // tiles still run independently. One consumer thread polls the per-tile completed-step counter; the barrier
                         // releases the rest of the epilogue threads only after the previous step is ready.
+                        int const mega_ring_step =
+                            min_fa3_varlen_demo::mega_ring::segment_begin_step(
+                                mega_ring_segment_meta);
                         if (mega_ring_is_cp_batch && mega_ring_step > 0) {
                             if (threadIdx.x == MmaThreadOffset) {
                                 min_fa3_varlen_demo::mega_ring::wait_until_at_least(
@@ -500,7 +514,7 @@ public:
                     epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma_pv,
                                    threadIdx.x - MmaThreadOffset, block_coord,
                                    mega_ring_q_row_offset, mega_ring_seqlen_o);
-                    if constexpr (TileScheduler::EnableMegaRing) {
+                    if constexpr (TileScheduler::EnableMegaRing && !TileScheduler::EnableChunkedSegments) {
                         // MEGA_RING: publish step completion only after every epilogue thread has finished its part of the in-place O/LSE merge.
                         if (mega_ring_is_cp_batch) {
                             flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
@@ -514,18 +528,23 @@ public:
                 } else {
                     // Write 0 to gO and -inf to gLSE.
                     if constexpr (TileScheduler::EnableMegaRing) {
+                        int const mega_ring_step =
+                            min_fa3_varlen_demo::mega_ring::segment_begin_step(
+                                mega_ring_segment_meta);
                         if (!mega_ring_is_cp_batch) {
                             if (mega_ring_step == 0) {
                                 epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord, mega_ring_q_row_offset, mega_ring_seqlen_o);
                             }
                         } else {
-                            if (mega_ring_step > 0) {
-                                if (threadIdx.x == MmaThreadOffset) {
-                                    min_fa3_varlen_demo::mega_ring::wait_until_at_least(
-                                        params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
-                                        mega_ring_step);
+                            if constexpr (!TileScheduler::EnableChunkedSegments) {
+                                if (mega_ring_step > 0) {
+                                    if (threadIdx.x == MmaThreadOffset) {
+                                        min_fa3_varlen_demo::mega_ring::wait_until_at_least(
+                                            params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
+                                            mega_ring_step);
+                                    }
+                                    flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
                                 }
-                                flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
                             }
                             // MEGA_RING: a later ring step can be empty under
                             // causal masking (future rank). Only step 0 owns
@@ -534,20 +553,48 @@ public:
                             if (mega_ring_step == 0) {
                                 epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord, mega_ring_q_row_offset, mega_ring_seqlen_o);
                             }
-                            // MEGA_RING: for step 0, make sure zero/-inf
-                            // initialization is complete before signaling. For
-                            // later empty steps, keep the same step-completion
-                            // ordering before releasing the next ring step.
-                            flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-                            if (threadIdx.x == MmaThreadOffset) {
-                                min_fa3_varlen_demo::mega_ring::signal_release(
-                                    params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
-                                    1);
+                            if constexpr (!TileScheduler::EnableChunkedSegments) {
+                                // For step 0, make sure zero/-inf initialization
+                                // is complete before signaling. Later empty
+                                // steps keep the same completion ordering.
+                                flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                                if (threadIdx.x == MmaThreadOffset) {
+                                    min_fa3_varlen_demo::mega_ring::signal_release(
+                                        params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
+                                        1);
+                                }
                             }
                         }
                     } else {
                         epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
                     }
+                }
+                if constexpr (TileScheduler::EnableChunkedSegments) {
+                    // MEGA_RING_SEGMENTS: decode completion metadata only after
+                    // the O/LSE merge (or neutral initialization) is visible.
+                    // Step 0 advances its tile state but never contributes to
+                    // the remote-completion counter.
+                    if (mega_ring_is_cp_batch) {
+                        flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                        if (threadIdx.x == MmaThreadOffset) {
+                            int const begin_step =
+                                min_fa3_varlen_demo::mega_ring::segment_begin_step(
+                                    mega_ring_segment_meta);
+                            int const end_step =
+                                min_fa3_varlen_demo::mega_ring::segment_end_step(
+                                    mega_ring_segment_meta);
+                            min_fa3_varlen_demo::mega_ring::store_release(
+                                params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
+                                end_step + 1);
+                            if (begin_step > 0
+                                && min_fa3_varlen_demo::mega_ring::segment_is_terminal(
+                                    mega_ring_segment_meta)) {
+                                min_fa3_varlen_demo::mega_ring::signal_release(
+                                    params.scheduler.mega_ring_completed_tiles, 1);
+                            }
+                        }
+                    }
+                    work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info);
                 }
             }
             epilogue.store_tail();

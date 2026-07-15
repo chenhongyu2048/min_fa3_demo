@@ -35,6 +35,7 @@ public:
     using SharedStorage = int;
     // MEGA_RING: default fixed-layout scheduler does not expose ring-step metadata.
     static constexpr bool EnableMegaRing = false;
+    static constexpr bool EnableChunkedSegments = false;
     static constexpr bool EnableQueuedInitialWork = false;
 
     struct Params {
@@ -98,6 +99,7 @@ public:
     using SharedStorage = int;
     // MEGA_RING: default fixed-layout scheduler does not expose ring-step metadata.
     static constexpr bool EnableMegaRing = false;
+    static constexpr bool EnableChunkedSegments = false;
     static constexpr bool EnableQueuedInitialWork = false;
 
 protected:

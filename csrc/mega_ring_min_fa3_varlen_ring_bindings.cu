@@ -220,6 +220,8 @@ RingVarlenParams make_mega_ring_varlen_params(const torch::Tensor& q,
                                               int* half_cu_seqlens,
                                               torch::Tensor& kv_ready_counts,
                                               torch::Tensor& step_ready,
+                                              torch::Tensor& scan_cursor,
+                                              torch::Tensor& completed_tiles,
                                               void* q_descriptor_ptr,
                                               void* o_descriptor_ptr,
                                               void* lse_descriptor_ptr) {
@@ -250,6 +252,8 @@ RingVarlenParams make_mega_ring_varlen_params(const torch::Tensor& q,
     params.mega_ring_half_cu_seqlens = half_cu_seqlens;
     params.mega_ring_kv_ready_counts = kv_ready_counts.data_ptr<int>();
     params.mega_ring_step_ready = step_ready.data_ptr<int>();
+    params.mega_ring_scan_cursor = scan_cursor.data_ptr<int>();
+    params.mega_ring_completed_tiles = completed_tiles.data_ptr<int>();
     params.q_ptr = q_descriptor_ptr;
     params.o_ptr = o_descriptor_ptr;
     params.softmax_lse_ptr = lse_descriptor_ptr;
@@ -460,8 +464,10 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     constexpr int kKvReadyBases[4] = {0, 7, 10, 11};
     int batch_cursor = 0;
     int64_t reduction_tiles = 0;
+    int64_t remote_tiles = 0;
     int64_t total_comm_tasks = 0;
-    int64_t total_work_tiles = compute_tiles_per_step(cu_seqlens_q_host_ptr, batch_size, q.size(1));
+    int64_t const base_work_tiles = compute_tiles_per_step(cu_seqlens_q_host_ptr, batch_size, q.size(1));
+    int64_t total_work_tiles = base_work_tiles;
     for (int level_idx = 0; level_idx < 4; ++level_idx) {
         int const ring_size = kRingSizes[level_idx];
         int const batch_begin = batch_cursor;
@@ -494,6 +500,11 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
             total_work_tiles += is_causal
                 ? int64_t(ring_local_rank) * full_tiles + int64_t(ring_size - 1 - ring_local_rank) * half_tiles
                 : int64_t(ring_size - 1) * full_tiles;
+            if (is_causal) {
+                // Back-half Q tiles consume every remote source. Front-half Q
+                // tiles consume the lower-rank half-KV segments when rank > 0.
+                remote_tiles += half_tiles * (ring_local_rank > 0 ? 2 : 1);
+            }
             int const kv_block_n = is_causal ? 128 : 176;
             int64_t const full_kv_tiles = (int64_t(level.full_rows) + kv_block_n - 1) / kv_block_n;
             int64_t const half_kv_tiles = (int64_t(level.half_rows) + kv_block_n - 1) / kv_block_n;
@@ -505,12 +516,17 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
         }
     }
     TORCH_CHECK(batch_cursor == batch_size, "failed to partition all batches into hierarchical ring levels");
-    TORCH_CHECK(total_work_tiles <= std::numeric_limits<int>::max() && reduction_tiles <= std::numeric_limits<int>::max(),
+    TORCH_CHECK(base_work_tiles <= std::numeric_limits<int>::max()
+                    && total_work_tiles <= std::numeric_limits<int>::max()
+                    && reduction_tiles <= std::numeric_limits<int>::max()
+                    && remote_tiles <= std::numeric_limits<int>::max(),
                 "mega-ring total work and reduction tile counts must fit in int32");
     TORCH_CHECK(total_comm_tasks <= std::numeric_limits<int>::max(),
                 "mega-ring communication task count must fit in int32");
+    hierarchy.base_work_tiles = static_cast<int>(base_work_tiles);
     hierarchy.total_work_tiles = static_cast<int>(total_work_tiles);
     hierarchy.reduction_tiles = static_cast<int>(reduction_tiles);
+    hierarchy.remote_tiles = static_cast<int>(remote_tiles);
     TORCH_CHECK(num_comm_sm > 0 || reduction_tiles == 0,
                 "num_comm_sm must be positive when this rank has G8/G4/G2 replay work");
 
@@ -530,6 +546,8 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
 
     auto kv_ready_counts = torch::zeros({11}, q.options().dtype(torch::kInt32));
     auto step_ready = torch::zeros({std::max<int64_t>(reduction_tiles, 1)}, q.options().dtype(torch::kInt32));
+    auto scan_cursor = torch::zeros({1}, q.options().dtype(torch::kInt32));
+    auto completed_tiles = torch::zeros({1}, q.options().dtype(torch::kInt32));
 
     torch::Tensor q_descriptor = q;
     torch::Tensor out_descriptor = out;
@@ -563,6 +581,8 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
         is_causal ? static_cast<int*>(half_cu_seqlens.data_ptr()) : nullptr,
         kv_ready_counts,
         step_ready,
+        scan_cursor,
+        completed_tiles,
         q_descriptor.data_ptr(),
         out_descriptor.data_ptr(),
         lse_descriptor.data_ptr());

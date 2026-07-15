@@ -4,6 +4,7 @@
 #pragma once
 
 #include "min_fa3_varlen_scheduler.h"
+#include "mega_ring_semaphore.cuh"
 
 namespace flash {
 
@@ -27,6 +28,7 @@ public:
     // policy; we reuse it here as the compile-time causal/zigzag gate to avoid
     // adding another template boolean.
     static constexpr bool EnableZigzag = LPT;
+    static constexpr bool EnableChunkedSegments = EnableZigzag;
     // MEGA_RING: one int4 for the original varlen work tile and one int4 for
     // ring metadata shared between producer and consumer warpgroups.
     using SharedStorage = cute::array<typename Base::SharedStorage, 2>;
@@ -34,20 +36,19 @@ public:
 
     struct WorkTileInfo {
         int tile_idx, block, bidh, bidb;
-        // MEGA_RING: ring_step selects the KV rank for this replay of the
-        // original varlen tile; global_tile_idx is the expanded scheduler id
-        // used later to recover the same Q tile across ring steps.
-        int ring_step;
-        int global_tile_idx;
-        int step_tile_idx;
+        // MEGA_RING_SEGMENTS: causal remote work claims a contiguous ready
+        // range packed as {begin[3:0], end[7:4], terminal[8]}. Non-causal
+        // mode keeps begin == end and terminal clear.
+        int segment_meta;
         int reduction_tile_idx;
 
         CUTLASS_DEVICE
         bool
         is_valid(Params const& params) const {
-            // MEGA_RING: the expanded stream is valid only while the ring step
-            // is in range and the underlying varlen tile decoded to a batch.
-            return ring_step < params.mega_ring_world_size && bidb < params.num_batch;
+            // MEGA_RING: work is valid only while the segment begin is in
+            // range and the underlying varlen tile decoded to a batch.
+            return min_fa3_varlen_demo::mega_ring::segment_begin_step(segment_meta)
+                < params.mega_ring_world_size && bidb < params.num_batch;
         }
 
         CUTLASS_DEVICE
@@ -89,6 +90,37 @@ private:
     int virtual_batch_ring_size(Params const& params, int bidb) const {
         int const actual_batch = get_actual_batch(params, bidb);
         return actual_batch < params.num_batch ? params.mega_ring_ring_sizes[actual_batch] : 0;
+    }
+
+    CUTLASS_DEVICE
+    int level_idx_for_reduction_tile(Params const& params, int reduction_tile_idx) const {
+        #pragma unroll
+        for (int level_idx = 0; level_idx < 3; ++level_idx) {
+            auto const& level = params.mega_ring_hierarchy.levels[level_idx];
+            if (reduction_tile_idx >= level.reduction_base
+                && reduction_tile_idx < level.reduction_base + level.full_tiles) {
+                return level_idx;
+            }
+        }
+        return 3;
+    }
+
+    CUTLASS_DEVICE
+    int ready_segment_end(Params const& params, int level_idx, int begin_step, int last_step) const {
+        auto const& level = params.mega_ring_hierarchy.levels[level_idx];
+        int const ring_base = (params.mega_ring_rank / level.ring_size) * level.ring_size;
+        int const ring_local_rank = params.mega_ring_rank - ring_base;
+        int ready_end = begin_step - 1;
+        for (int step = begin_step; step <= last_step; ++step) {
+            bool const kv_use_half = step <= ring_local_rank;
+            int const rows = kv_use_half ? level.half_rows : level.full_rows;
+            int const target = 2 * cute::ceil_div(rows, kBlockN);
+            int const count = min_fa3_varlen_demo::mega_ring::load_acquire(
+                params.mega_ring_kv_ready_counts + level.kv_ready_base + step - 1);
+            if (count < target) { break; }
+            ready_end = step;
+        }
+        return ready_end;
     }
 
     template<bool HalfMBlocks=false>
@@ -168,12 +200,112 @@ private:
     CUTLASS_DEVICE
     WorkTileInfo
     decode_mega_ring_tile(Params const& params,
-                          int next_tile_idx, // expanded global tile id
+                          int next_tile_idx, // base tile id or dynamic-work ticket
                           int current_ring_step,
                           typename Base::WorkTileInfo const& current_base_work) const {
+        if constexpr (EnableChunkedSegments) {
+            if (next_tile_idx < params.mega_ring_hierarchy.base_work_tiles) {
+                typename Base::WorkTileInfo decode_start = current_ring_step == 0
+                    && next_tile_idx >= current_base_work.tile_idx
+                    && current_base_work.bidb < params.num_batch
+                        ? current_base_work
+                        : typename Base::WorkTileInfo{0, 0, 0, 0};
+                typename Base::WorkTileInfo base_work =
+                    Base::template tile_idx_to_work_tile_impl<false>(params, next_tile_idx, decode_start);
+                int reduction_tile_idx = 0;
+                int const target_ring_size = base_work.bidb < params.num_batch
+                    ? virtual_batch_ring_size(params, base_work.bidb) : 0;
+                if (target_ring_size > 1 && base_work.bidb < params.num_batch) {
+                    int target_level_idx = 3;
+                    #pragma unroll
+                    for (int level_idx = 0; level_idx < 3; ++level_idx) {
+                        if (params.mega_ring_hierarchy.levels[level_idx].ring_size == target_ring_size) {
+                            target_level_idx = level_idx;
+                        }
+                    }
+                    reduction_tile_idx = params.mega_ring_hierarchy.levels[target_level_idx].reduction_base
+                        + level_full_tile_idx_from_work(params, base_work, target_ring_size, false);
+                }
+                return {base_work.tile_idx, base_work.block, base_work.bidh, base_work.bidb,
+                        min_fa3_varlen_demo::mega_ring::pack_segment_meta(0, 0, false),
+                        reduction_tile_idx};
+            }
+
+            int found_reduction_idx = -1;
+            int found_segment_meta = min_fa3_varlen_demo::mega_ring::pack_segment_meta(
+                params.mega_ring_world_size, params.mega_ring_world_size, false);
+            typename Base::WorkTileInfo found_work{0, 0, 0, params.num_batch};
+            int const lane = threadIdx.x % cutlass::NumThreadsPerWarp;
+            if (lane == 0) {
+                constexpr int kScanBatch = 8;
+                while (found_reduction_idx < 0) {
+                    if (min_fa3_varlen_demo::mega_ring::load_acquire(
+                            params.mega_ring_completed_tiles)
+                        >= params.mega_ring_hierarchy.remote_tiles) {
+                        break;
+                    }
+                    int const scan_begin = atomicAdd(params.mega_ring_scan_cursor, kScanBatch);
+                    #pragma unroll
+                    for (int scan_offset = 0; scan_offset < kScanBatch; ++scan_offset) {
+                        int const reduction_idx =
+                            (scan_begin + scan_offset) % params.mega_ring_hierarchy.reduction_tiles;
+                        int const state = min_fa3_varlen_demo::mega_ring::load_acquire(
+                            params.mega_ring_tile_states + reduction_idx);
+                        if (state <= 0 || (state & min_fa3_varlen_demo::mega_ring::kTileStateBusy)) {
+                            continue;
+                        }
+                        int const level_idx = level_idx_for_reduction_tile(params, reduction_idx);
+                        if (level_idx >= 3) { continue; }
+                        auto const& level = params.mega_ring_hierarchy.levels[level_idx];
+                        int const step_tile_idx = reduction_idx - level.reduction_base;
+                        typename Base::WorkTileInfo base_work =
+                            tile_idx_to_level_work_linear<false>(params, step_tile_idx, level.ring_size);
+                        if (base_work.bidb >= params.num_batch) { continue; }
+                        int const ring_base = (params.mega_ring_rank / level.ring_size) * level.ring_size;
+                        int const ring_local_rank = params.mega_ring_rank - ring_base;
+                        int const num_m_blocks = params.num_m_blocks_ptr[base_work.bidb];
+                        bool const q_is_back = base_work.block >= num_m_blocks / 2;
+                        int const last_step = q_is_back ? level.ring_size - 1 : ring_local_rank;
+                        int const begin_step = state;
+                        if (begin_step > last_step) { continue; }
+                        int const end_step = ready_segment_end(
+                            params, level_idx, begin_step, last_step);
+                        if (end_step < begin_step) { continue; }
+                        int const locked_state = state | min_fa3_varlen_demo::mega_ring::kTileStateBusy;
+                        if (min_fa3_varlen_demo::mega_ring::compare_exchange_acquire(
+                                params.mega_ring_tile_states + reduction_idx, state, locked_state) != state) {
+                            continue;
+                        }
+                        found_reduction_idx = reduction_idx;
+                        found_segment_meta = min_fa3_varlen_demo::mega_ring::pack_segment_meta(
+                            begin_step, end_step, end_step == last_step);
+                        found_work = base_work;
+                        break;
+                    }
+                    if (found_reduction_idx < 0) { __nanosleep(64); }
+                }
+            }
+            found_reduction_idx = __shfl_sync(0xffffffff, found_reduction_idx, 0);
+            found_segment_meta = __shfl_sync(0xffffffff, found_segment_meta, 0);
+            found_work.tile_idx = __shfl_sync(0xffffffff, found_work.tile_idx, 0);
+            found_work.block = __shfl_sync(0xffffffff, found_work.block, 0);
+            found_work.bidh = __shfl_sync(0xffffffff, found_work.bidh, 0);
+            found_work.bidb = __shfl_sync(0xffffffff, found_work.bidb, 0);
+            if (found_reduction_idx < 0) {
+                return {0, 0, 0, params.num_batch,
+                        min_fa3_varlen_demo::mega_ring::pack_segment_meta(
+                            params.mega_ring_world_size, params.mega_ring_world_size, false),
+                        0};
+            }
+            return {found_work.tile_idx, found_work.block, found_work.bidh, found_work.bidb,
+                    found_segment_meta, found_reduction_idx};
+        }
+
         if (next_tile_idx >= params.mega_ring_hierarchy.total_work_tiles) {
-            return {next_tile_idx, 0, 0, params.num_batch, params.mega_ring_world_size,
-                    next_tile_idx, 0, 0};
+            return {next_tile_idx, 0, 0, params.num_batch,
+                    min_fa3_varlen_demo::mega_ring::pack_segment_meta(
+                        params.mega_ring_world_size, params.mega_ring_world_size, false),
+                    0};
         }
         int tiles_all = 0;
         #pragma unroll
@@ -244,19 +376,22 @@ private:
                 + level_full_tile_idx_from_work(params, base_work, target_ring_size, q_use_half);
         }
         return {base_work.tile_idx, base_work.block, base_work.bidh, base_work.bidb,
-                ring_step, next_tile_idx, step_tile_idx, reduction_tile_idx};
+                min_fa3_varlen_demo::mega_ring::pack_segment_meta(
+                    ring_step, ring_step, false),
+                reduction_tile_idx};
     }
 
 public:
     CUTLASS_DEVICE
     void
-    publish_work_to_smem(WorkTileInfo const& work_info, int global_tile_idx) const {
+    publish_work_to_smem(WorkTileInfo const& work_info) const {
         if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
             typename Base::SharedStorage* smem = mega_ring_work_info_smem();
             smem[0] = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
-            // MEGA_RING: the second int4 slot carries ring_step and the
-            // original global tile id for the matching consumer warpgroup.
-            smem[1] = make_int4(work_info.ring_step, global_tile_idx, work_info.step_tile_idx, work_info.reduction_tile_idx);
+            // MEGA_RING_SEGMENTS: preserve the existing second int4 allocation
+            // while carrying only packed segment metadata and tile-state id.
+            smem[1] = make_int4(work_info.segment_meta,
+                                work_info.reduction_tile_idx, 0, 0);
         }
         flash::named_barrier_arrive(Base::kNumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);   // TileCountSmemFull
     }
@@ -268,10 +403,10 @@ public:
         if constexpr (IsProducerWarp) {
             int const next_tile_idx = Base::virtual_block_idx(params);
             WorkTileInfo work_info = decode_mega_ring_tile(params, next_tile_idx, -1, {0, 0, 0, 0});
-            publish_work_to_smem(work_info, next_tile_idx);
+            publish_work_to_smem(work_info);
             return work_info;
         } else {
-            return get_next_work<false>(params, {0, 0, 0, 0, 0, 0, 0, 0});
+            return get_next_work<false>(params, {0, 0, 0, 0, 0, 0});
         }
     }
 
@@ -286,10 +421,10 @@ public:
             }
             next_tile_idx = __shfl_sync(0xffffffff, next_tile_idx, 0 /*lane*/);
             WorkTileInfo work_info = decode_mega_ring_tile(params, next_tile_idx, -1, {0, 0, 0, 0});
-            publish_work_to_smem(work_info, next_tile_idx);
+            publish_work_to_smem(work_info);
             return work_info;
         } else {
-            return get_next_work<false>(params, {0, 0, 0, 0, 0, 0, 0, 0});
+            return get_next_work<false>(params, {0, 0, 0, 0, 0, 0});
         }
     }
 
@@ -297,8 +432,8 @@ public:
     void
     prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {
         if (threadIdx.x % NumProducerThreads == 0) {
-            // MEGA_RING: tile_count_semaphore walks the expanded stream
-            // [world_size][tiles_per_step], not just the base varlen stream.
+            // MEGA_RING_SEGMENTS: after the base prepared stream, the counter
+            // supplies tickets that enter the dynamic reduction-tile scan.
             current_work.tile_idx = atomicAdd(params.tile_count_semaphore, 1) + Base::virtual_grid_dim_x(params);
         }
     }
@@ -316,21 +451,23 @@ public:
                                                           current_work.block,
                                                           current_work.bidh,
                                                           current_work.bidb};
-            WorkTileInfo work_info = decode_mega_ring_tile(params, new_tile_idx, current_work.ring_step, current_base_work);
+            WorkTileInfo work_info = decode_mega_ring_tile(
+                params, new_tile_idx,
+                min_fa3_varlen_demo::mega_ring::segment_begin_step(current_work.segment_meta),
+                current_base_work);
             flash::named_barrier_sync(Base::kNumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);  // TileCountSmemEmpty
-            publish_work_to_smem(work_info, new_tile_idx);
+            publish_work_to_smem(work_info);
             return work_info;
         } else {
             flash::named_barrier_sync(Base::kNumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);  // TileCountSmemFull
             typename Base::SharedStorage* smem = const_cast<MegaRingVarlenDynamicPersistentTileScheduler*>(this)->mega_ring_work_info_smem();
             int4 work_info = smem[0];
-            // MEGA_RING: the consumer needs both the original varlen tile and
-            // the expanded global tile id; the latter determines ring-step
-            // ordering for in-place O/LSE reduction.
+            // MEGA_RING_SEGMENTS: consumer WGs receive the same claimed
+            // segment range and tile-state index as the producer WG.
             int4 mega_info = smem[1];
             flash::named_barrier_arrive(Base::kNumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);  // TileCountSmemEmpty
             return WorkTileInfo{work_info.x, work_info.y, work_info.z, work_info.w,
-                                mega_info.x, mega_info.y, mega_info.z, mega_info.w};
+                                mega_info.x, mega_info.y};
         }
     }
 };

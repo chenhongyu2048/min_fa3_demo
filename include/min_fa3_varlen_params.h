@@ -28,8 +28,12 @@ struct MegaRingLevelDesc {
 
 struct MegaRingHierarchyDesc {
     MegaRingLevelDesc levels[4]{};
+    // MEGA_RING_SEGMENTS: step 0 keeps the original prepared varlen stream.
+    // Causal remote work is scheduled dynamically over reduction_tiles.
+    int base_work_tiles = 0;
     int total_work_tiles = 0;
     int reduction_tiles = 0;
+    int remote_tiles = 0;
 };
 
 struct Qkv_params {
@@ -130,8 +134,12 @@ struct Ring_fwd_params : public Flash_fwd_params {
     MegaRingHierarchyDesc mega_ring_hierarchy{};
     int* __restrict__ mega_ring_half_cu_seqlens = nullptr;
     int* __restrict__ mega_ring_kv_ready_counts = nullptr;
-    // MEGA_RING: per-Q-tile completed-step counters for in-place O/LSE reduction ordering.
+    // MEGA_RING_SEGMENTS: causal mode encodes next_step in the low bits and a
+    // transient scheduler lock in the high bit. Non-causal mode keeps the old
+    // completed-step counter behavior.
     int* __restrict__ mega_ring_step_ready = nullptr;
+    int* __restrict__ mega_ring_scan_cursor = nullptr;
+    int* __restrict__ mega_ring_completed_tiles = nullptr;
     // Communication CTAs prefetch remote K/V into these buffers while compute CTAs
     // continue reading the current K/V from k_ptr / v_ptr.
     void* __restrict__ local_k_staging_ptr = nullptr;

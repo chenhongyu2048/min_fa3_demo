@@ -624,7 +624,7 @@ struct CollectiveMainloopFwdSm90 {
          SeqlenInfo_t const& seqlen_info,
          cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
          int &work_idx,
-         int mega_ring_step = 0
+         int mega_ring_segment_meta = 0
          ) {
 
         // some of these are captured in lambda so can't use structured binding
@@ -636,11 +636,15 @@ struct CollectiveMainloopFwdSm90 {
         int mega_ring_local_rank = 0;
         int mega_ring_level_idx = 3;
         bool mega_ring_is_cp_batch = false;
+        bool mega_ring_remote_chunk = false;
         if constexpr (EnableMegaRing) {
             mega_ring_size = params.mega_ring_ring_sizes[bidb];
             int const ring_base = (params.mega_ring_rank / mega_ring_size) * mega_ring_size;
             mega_ring_local_rank = params.mega_ring_rank - ring_base;
             mega_ring_is_cp_batch = mega_ring_size > 1;
+            mega_ring_remote_chunk = Is_causal && mega_ring_is_cp_batch
+                && min_fa3_varlen_demo::mega_ring::segment_begin_step(
+                    mega_ring_segment_meta) > 0;
             #pragma unroll
             for (int level_idx = 0; level_idx < 4; ++level_idx) {
                 if (params.mega_ring_hierarchy.levels[level_idx].ring_size == mega_ring_size) {
@@ -660,28 +664,48 @@ struct CollectiveMainloopFwdSm90 {
         int mega_ring_q_row_offset = 0;
         int mega_ring_seqlen_q = seqlen_info.seqlen_q;
         int mega_ring_seqlen_k = seqlen_info.seqlen_k;
-        bool mega_ring_kv_use_half = false;
+        int mega_ring_chunk_n_blocks = 0;
         if constexpr (EnableMegaRing) {
-            int const ring_base = (params.mega_ring_rank / mega_ring_size) * mega_ring_size;
+            int const mega_ring_step =
+                min_fa3_varlen_demo::mega_ring::segment_begin_step(
+                    mega_ring_segment_meta);
+            int const ring_base = params.mega_ring_rank - mega_ring_local_rank;
             mega_ring_kv_rank = ring_base
-                + (mega_ring_local_rank - mega_ring_step + mega_ring_size) % mega_ring_size;
+                + ((mega_ring_local_rank - mega_ring_step + mega_ring_size)
+                    & (mega_ring_size - 1));
             if (!mega_ring_is_cp_batch) {
                 if (mega_ring_step > 0) {
                     n_block_max = 0;
                 }
             } else if constexpr (Is_causal) {
+                static_assert(kBlockN == 128,
+                              "causal mega-ring block mapping requires kBlockN == 128");
                 int const half_len = params.mega_ring_half_cu_seqlens[bidb + 1] - params.mega_ring_half_cu_seqlens[bidb];
                 int const block_m = get<0>(TileShape_MNK{});
                 int const block_n = get<1>(TileShape_MNK{});
-                bool const q_use_half = mega_ring_step > mega_ring_local_rank;
+                bool const q_use_half = !mega_ring_remote_chunk && mega_ring_step > mega_ring_local_rank;
                 bool const kv_use_half = mega_ring_step >= 1 && mega_ring_step <= mega_ring_local_rank;
                 bool const is_diag = mega_ring_step == 0;
-                mega_ring_kv_use_half = kv_use_half;
                 mega_ring_q_row_offset = q_use_half ? half_len : 0;
                 mega_ring_seqlen_q = q_use_half ? half_len : 2 * half_len;
                 mega_ring_seqlen_k = kv_use_half ? half_len : 2 * half_len;
                 n_block_min = 0;
-                if (is_diag) {
+                if (mega_ring_remote_chunk) {
+                    int const mega_ring_segment_end =
+                        min_fa3_varlen_demo::mega_ring::segment_end_step(
+                            mega_ring_segment_meta);
+                    int const half_blocks = half_len / block_n;
+                    int const half_end = mega_ring_segment_end < mega_ring_local_rank
+                        ? mega_ring_segment_end : mega_ring_local_rank;
+                    int const num_half_segments = half_end >= mega_ring_step
+                        ? half_end - mega_ring_step + 1 : 0;
+                    int const num_segments = mega_ring_segment_end - mega_ring_step + 1;
+                    int const num_full_segments = num_segments - num_half_segments;
+                    mega_ring_chunk_n_blocks = half_blocks
+                        * (num_half_segments + 2 * num_full_segments);
+                    mega_ring_seqlen_k = mega_ring_chunk_n_blocks * block_n;
+                    n_block_max = mega_ring_chunk_n_blocks;
+                } else if (is_diag) {
                     int const n_block_causal = cute::ceil_div((m_block + 1) * block_m, block_n);
                     int const n_block_full = cute::ceil_div(2 * half_len, block_n);
                     n_block_max = n_block_causal < n_block_full ? n_block_causal : n_block_full;
@@ -741,7 +765,8 @@ struct CollectiveMainloopFwdSm90 {
         Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(shape_V)(_, _, bidh_kv, _);
         int const mega_ring_kv_offset = [&] {
             if constexpr (EnableMegaRing) {
-                return mega_ring_kv_rank * params.mega_ring_rank_kv_capacity;
+                return mega_ring_remote_chunk ? 0
+                    : mega_ring_kv_rank * params.mega_ring_rank_kv_capacity;
             } else {
                 return 0;
             }
@@ -749,8 +774,9 @@ struct CollectiveMainloopFwdSm90 {
 
         Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q + mega_ring_q_row_offset, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
         // if (cute::thread0()) { printf("Varlen = %d, params.leftpad_k = %p, leftpad_k = %d\n", Varlen, params.leftpad_k, leftpad_k); }
-        Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k + mega_ring_kv_offset, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)
-        Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k + mega_ring_kv_offset, _0{}), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));  // (K, N, _, _)
+        int const mega_ring_kv_batch_offset = mega_ring_remote_chunk ? 0 : seqlen_info.offset_k;
+        Tensor gK_TMA = local_tile(domain_offset(make_coord(mega_ring_kv_batch_offset + mega_ring_kv_offset, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)
+        Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, mega_ring_kv_batch_offset + mega_ring_kv_offset, _0{}), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));  // (K, N, _, _)
 
         auto block_tma_Q = params.tma_load_Q.get_slice(_0{});
         Tensor tQgQ = group_modes<0, 3>(block_tma_Q.partition_S(gQ));  // (TMA)
@@ -788,6 +814,54 @@ struct CollectiveMainloopFwdSm90 {
             params.page_size_divmod, params.blockN_per_page_size_divmod,
             bidb_kv, bidh_kv, thread_idx, mega_ring_seqlen_k, seqlen_info.leftpad_k, bidb_kv_idx
         );
+
+        auto mega_ring_virtual_n_block = [&](int virtual_n_block) {
+            if (!mega_ring_remote_chunk) { return virtual_n_block; }
+            int const mega_ring_step =
+                min_fa3_varlen_demo::mega_ring::segment_begin_step(
+                    mega_ring_segment_meta);
+            int const mega_ring_segment_end =
+                min_fa3_varlen_demo::mega_ring::segment_end_step(
+                    mega_ring_segment_meta);
+            int const half_len = params.mega_ring_half_cu_seqlens[bidb + 1]
+                - params.mega_ring_half_cu_seqlens[bidb];
+            int const block_n = get<1>(TileShape_MNK{});
+            int const half_blocks = half_len / block_n;
+            int const half_end = mega_ring_segment_end < mega_ring_local_rank
+                ? mega_ring_segment_end : mega_ring_local_rank;
+            int const num_half_segments = half_end >= mega_ring_step
+                ? half_end - mega_ring_step + 1 : 0;
+            int const half_region_blocks = num_half_segments * half_blocks;
+            int const execution_ordinal =
+                mega_ring_chunk_n_blocks - 1 - virtual_n_block;
+            int step;
+            int local_block;
+            if (execution_ordinal < half_region_blocks) {
+                int const region_ordinal = execution_ordinal;
+                int const half_unit = region_ordinal / half_blocks;
+                int const remainder = region_ordinal - half_unit * half_blocks;
+                step = mega_ring_step + half_unit;
+                local_block = half_blocks - 1 - remainder;
+            } else {
+                int const region_ordinal = execution_ordinal - half_region_blocks;
+                int const half_unit = region_ordinal / half_blocks;
+                int const remainder = region_ordinal - half_unit * half_blocks;
+                int const segment_offset = half_unit >> 1;
+                int const block_in_full_segment =
+                    (half_unit & 1) * half_blocks + remainder;
+                step = mega_ring_step + num_half_segments + segment_offset;
+                local_block = 2 * half_blocks - 1 - block_in_full_segment;
+            }
+            int const ring_base = params.mega_ring_rank - mega_ring_local_rank;
+            int const source_local_rank =
+                (mega_ring_local_rank - step + mega_ring_size) & (mega_ring_size - 1);
+            int const source_rank = ring_base + source_local_rank;
+            int const rank_capacity_blocks =
+                params.mega_ring_rank_kv_capacity / block_n;
+            int const batch_offset_blocks = seqlen_info.offset_k / block_n;
+            return source_rank * rank_capacity_blocks
+                + batch_offset_blocks + local_block;
+        };
 
         // Set up for transposing V, only used if Transpose_V
         S2RTiledCopyVt s2r_tiled_copy_vt;
@@ -893,18 +967,26 @@ struct CollectiveMainloopFwdSm90 {
             // KV buffer. One
             // producer thread polls; the barrier releases the rest of the
             // producer threads before they touch Q/K/V pipeline state.
-            if (mega_ring_is_cp_batch && mega_ring_step > 0 && thread_idx == 0) {
+            if (mega_ring_remote_chunk && thread_idx == 0) {
+                int const mega_ring_step =
+                    min_fa3_varlen_demo::mega_ring::segment_begin_step(
+                        mega_ring_segment_meta);
+                int const mega_ring_segment_end =
+                    min_fa3_varlen_demo::mega_ring::segment_end_step(
+                        mega_ring_segment_meta);
                 enum : int { kReadyBlockN = CUTE_STATIC_V(get<1>(TileShape_MNK{})) };
                 auto const& level = params.mega_ring_hierarchy.levels[mega_ring_level_idx];
-                int kv_ready_target = ((level.full_rows + kReadyBlockN - 1) / kReadyBlockN) * 2;
-                if constexpr (Is_causal) {
-                    if (mega_ring_kv_use_half) {
-                        kv_ready_target = ((level.half_rows + kReadyBlockN - 1) / kReadyBlockN) * 2;
+                for (int step = mega_ring_step; step <= mega_ring_segment_end; ++step) {
+                    int kv_ready_target = ((level.full_rows + kReadyBlockN - 1) / kReadyBlockN) * 2;
+                    if constexpr (Is_causal) {
+                        if (step <= mega_ring_local_rank) {
+                            kv_ready_target = ((level.half_rows + kReadyBlockN - 1) / kReadyBlockN) * 2;
+                        }
                     }
+                    min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
+                        params.mega_ring_kv_ready_counts + level.kv_ready_base + step - 1,
+                        kv_ready_target);
                 }
-                min_fa3_varlen_demo::mega_ring::wait_until_at_least(
-                    params.mega_ring_kv_ready_counts + level.kv_ready_base + mega_ring_step - 1,
-                    kv_ready_target);
             }
             flash::named_barrier_sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::MegaRingKVReady));
         }
@@ -913,7 +995,8 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (PagedKVNonTMA) { // FALSE
                 paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
             } else {
-                paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block);
+                paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(
+                    mega_ring_virtual_n_block(n_block));
             }
             if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
             // if (thread_idx == 0) { printf("Producer: main load, before load_K, index = %d\n", smem_pipe_write.index());}
@@ -977,7 +1060,7 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (PagedKVNonTMA) { // FALSE
                     paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
                 } else {
-                    paged_kv_manager.load_page_table_TMA(n_block);
+                    paged_kv_manager.load_page_table_TMA(mega_ring_virtual_n_block(n_block));
                 }
                 if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
                 load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
@@ -1075,7 +1158,7 @@ struct CollectiveMainloopFwdSm90 {
         SeqlenInfo_t const& seqlen_info,
         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage,
-        int mega_ring_step = 0
+        int mega_ring_segment_meta = 0
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -1090,11 +1173,15 @@ struct CollectiveMainloopFwdSm90 {
         int mega_ring_size = 1;
         int mega_ring_local_rank = 0;
         bool mega_ring_is_cp_batch = false;
+        bool mega_ring_remote_chunk = false;
         if constexpr (EnableMegaRing) {
             mega_ring_size = params.mega_ring_ring_sizes[bidb];
             int const ring_base = (params.mega_ring_rank / mega_ring_size) * mega_ring_size;
             mega_ring_local_rank = params.mega_ring_rank - ring_base;
             mega_ring_is_cp_batch = mega_ring_size > 1;
+            mega_ring_remote_chunk = Is_causal && mega_ring_is_cp_batch
+                && min_fa3_varlen_demo::mega_ring::segment_begin_step(
+                    mega_ring_segment_meta) > 0;
         }
         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
@@ -1106,20 +1193,40 @@ struct CollectiveMainloopFwdSm90 {
         int mega_ring_seqlen_k = seqlen_info.seqlen_k;
         bool mega_ring_use_causal_mask = true;
         if constexpr (EnableMegaRing) {
+            int const mega_ring_step =
+                min_fa3_varlen_demo::mega_ring::segment_begin_step(
+                    mega_ring_segment_meta);
             if (!mega_ring_is_cp_batch) {
                 if (mega_ring_step > 0) {
                     n_block_max = 0;
                 }
             } else if constexpr (Is_causal) {
+                static_assert(kBlockN == 128,
+                              "causal mega-ring block mapping requires kBlockN == 128");
                 int const half_len = params.mega_ring_half_cu_seqlens[bidb + 1] - params.mega_ring_half_cu_seqlens[bidb];
-                bool const q_use_half = mega_ring_step > mega_ring_local_rank;
+                bool const q_use_half = !mega_ring_remote_chunk && mega_ring_step > mega_ring_local_rank;
                 bool const kv_use_half = mega_ring_step >= 1 && mega_ring_step <= mega_ring_local_rank;
                 bool const is_diag = mega_ring_step == 0;
                 mega_ring_seqlen_q = q_use_half ? half_len : 2 * half_len;
                 mega_ring_seqlen_k = kv_use_half ? half_len : 2 * half_len;
-                mega_ring_use_causal_mask = is_diag;
+                mega_ring_use_causal_mask = is_diag && !mega_ring_remote_chunk;
                 n_block_min = 0;
-                if (is_diag) {
+                if (mega_ring_remote_chunk) {
+                    int const mega_ring_segment_end =
+                        min_fa3_varlen_demo::mega_ring::segment_end_step(
+                            mega_ring_segment_meta);
+                    int const half_blocks = half_len / kBlockN;
+                    int const half_end = mega_ring_segment_end < mega_ring_local_rank
+                        ? mega_ring_segment_end : mega_ring_local_rank;
+                    int const num_half_segments = half_end >= mega_ring_step
+                        ? half_end - mega_ring_step + 1 : 0;
+                    int const num_segments = mega_ring_segment_end - mega_ring_step + 1;
+                    int const num_full_segments = num_segments - num_half_segments;
+                    int const chunk_n_blocks = half_blocks
+                        * (num_half_segments + 2 * num_full_segments);
+                    mega_ring_seqlen_k = chunk_n_blocks * kBlockN;
+                    n_block_max = chunk_n_blocks;
+                } else if (is_diag) {
                     int const n_block_causal = cute::ceil_div((m_block + 1) * kBlockM, kBlockN);
                     int const n_block_full = cute::ceil_div(2 * half_len, kBlockN);
                     n_block_max = n_block_causal < n_block_full ? n_block_causal : n_block_full;

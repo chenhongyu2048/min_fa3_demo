@@ -9,6 +9,59 @@
 
 namespace min_fa3_varlen_demo::mega_ring {
 
+enum : int {
+    kTileStateBusy = 1 << 30,
+    // MEGA_RING_SEGMENTS: one long-lived int carries the claimed causal
+    // segment. Ring sizes are limited to 2/4/8, so four bits also cover the
+    // invalid world_size sentinel (8).
+    kSegmentBeginMask = 0x0f,
+    kSegmentEndShift = 4,
+    kSegmentEndMask = 0x0f << kSegmentEndShift,
+    kSegmentTerminalBit = 1 << 8,
+};
+
+CUTLASS_HOST_DEVICE
+constexpr int pack_segment_meta(int begin_step, int end_step, bool terminal_chunk) {
+    return (begin_step & kSegmentBeginMask)
+        | ((end_step & kSegmentBeginMask) << kSegmentEndShift)
+        | (terminal_chunk ? kSegmentTerminalBit : 0);
+}
+
+CUTLASS_HOST_DEVICE
+constexpr int segment_begin_step(int segment_meta) {
+    return segment_meta & kSegmentBeginMask;
+}
+
+CUTLASS_HOST_DEVICE
+constexpr int segment_end_step(int segment_meta) {
+    return (segment_meta & kSegmentEndMask) >> kSegmentEndShift;
+}
+
+CUTLASS_HOST_DEVICE
+constexpr bool segment_is_terminal(int segment_meta) {
+    return (segment_meta & kSegmentTerminalBit) != 0;
+}
+
+CUTLASS_DEVICE
+int load_acquire(int const* address) {
+    int value;
+    asm volatile("{ld.acquire.gpu.global.s32 %0, [%1];}" : "=r"(value) : "l"(address) : "memory");
+    return value;
+}
+
+CUTLASS_DEVICE
+void store_release(int* address, int value) {
+    asm volatile("{st.release.gpu.global.s32 [%0], %1;}" :: "l"(address), "r"(value) : "memory");
+}
+
+CUTLASS_DEVICE
+int compare_exchange_acquire(int* address, int compare, int value) {
+    int old;
+    asm volatile("{atom.acquire.gpu.global.cas.b32 %0, [%1], %2, %3;}"
+                 : "=r"(old) : "l"(address), "r"(compare), "r"(value) : "memory");
+    return old;
+}
+
 // MEGA_RING: wait on a monotonically increasing device-local global counter.
 // This is used for K/V readiness and per-Q-tile ring-step ordering where the
 // consumer CTA can poll the count directly.
