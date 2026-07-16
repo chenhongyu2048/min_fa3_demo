@@ -12,6 +12,7 @@
 #include "hopper_compat/seqlen.h"
 #include "min_fa3_named_barrier.h"
 #include "mega_ring_semaphore.cuh"
+#include "min_fa3_mega_ring_hierarchy.h"
 #include "hopper_compat/utils.h"
 
 namespace flash {
@@ -172,9 +173,11 @@ struct CollectiveEpilogueBwd {
           TiledMma tiled_mma,
           int thread_idx,
           cute::tuple<int32_t, int32_t, int32_t> const& block_coord,
+          int ring_level = 0,
           int ring_step = 0
           ) {
 
+        (void)ring_level;
         auto [n_block, bidh, bidb] = block_coord;
         Tensor sdK = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.epilogue.smem_dk.data()), SmemLayoutdKV{}));
         Tensor sdV = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.epilogue.smem_dv.data()), SmemLayoutdKV{}));
@@ -284,8 +287,10 @@ struct CollectiveEpilogueBwd {
          Params const& params,
          int thread_idx,
          cute::tuple<int32_t, int32_t, int32_t> const& block_coord,
+         int ring_level = 0,
          int ring_step = 0
          ) {
+        (void)ring_level;
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
         auto [n_block, bidh, bidb] = block_coord;
         flash::SeqlenInfo<Varlen, kBlockN> seqlen_info{bidb, size<0>(params.shape_dK), params.cu_seqlens, params.seqused};
@@ -429,6 +434,7 @@ struct CollectiveEpilogueBwdGQA {
           TiledMma tiled_mma,
           int thread_idx,
           cute::tuple<int32_t, int32_t, int32_t> const& block_coord,
+          int ring_level = 0,
           int ring_step = 0
           ) {
 
@@ -525,8 +531,10 @@ struct CollectiveEpilogueBwdGQA {
             Barrier::arrive_inc(lock_ptr, thread_idx, n_block * num_batch * num_head_kv);
         }
         if (params.ring_local_ready != nullptr && thread_idx == 0) {
+            int const section = min_fa3_varlen_demo::mega_ring_dkv_section(
+                ring_level, ring_step);
             min_fa3_varlen_demo::mega_ring::signal_release(
-                params.ring_local_ready + ring_step, 1);
+                params.ring_local_ready + section, 1);
         }
         // // Tell warp 0 that smem_k and smem_v are ready
         // flash::named_barrier_arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
@@ -542,12 +550,15 @@ struct CollectiveEpilogueBwdGQA {
          Params const& params,
          int thread_idx,
          cute::tuple<int32_t, int32_t, int32_t> const& block_coord,
+         int ring_level = 0,
          int ring_step = 0
          ) {
         // Don't need to do anything since dKaccum and dVaccum are already zero-initialized
         if (params.ring_local_ready != nullptr && thread_idx == 0) {
+            int const section = min_fa3_varlen_demo::mega_ring_dkv_section(
+                ring_level, ring_step);
             min_fa3_varlen_demo::mega_ring::signal_release(
-                params.ring_local_ready + ring_step, 1);
+                params.ring_local_ready + section, 1);
         }
     }
 

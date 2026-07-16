@@ -22,6 +22,7 @@
 #include "hopper_compat/utils.h"
 #include "backward/min_fa3_bwd_copy_sm90_bulk_reduce.h"
 #include "mega_ring_semaphore.cuh"
+#include "min_fa3_mega_ring_hierarchy.h"
 
 namespace flash {
 
@@ -338,11 +339,13 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
-        // MEGA_RING_BWD: full concatenated KV storage and zigzag metadata.
+        // MEGA_RING_BWD: rank-major KV arena and hierarchical zigzag metadata.
         int const ring_rank = 0;
         int const ring_world_size = 1;
-        int const local_total_k = 0;
+        int const rank_kv_capacity = 0;
         int const* const half_cu_seqlens = nullptr;
+        int const* const ring_sizes = nullptr;
+        min_fa3_varlen_demo::MegaRingHierarchyDesc const mega_ring_hierarchy{};
         int const* const kv_ready_counts = nullptr;
         int const* const kv_expected_ready = nullptr;
     };
@@ -377,8 +380,10 @@ struct CollectiveMainloopBwdSm90 {
         int const* const seqused_k = nullptr;
         int const ring_rank;
         int const ring_world_size;
-        int const local_total_k;
+        int const rank_kv_capacity;
         int const* const half_cu_seqlens;
+        int const* const ring_sizes;
+        min_fa3_varlen_demo::MegaRingHierarchyDesc const mega_ring_hierarchy;
         int const* const kv_ready_counts;
         int const* const kv_expected_ready;
     };
@@ -438,28 +443,35 @@ struct CollectiveMainloopBwdSm90 {
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
-                args.ring_rank, args.ring_world_size, args.local_total_k,
-                args.half_cu_seqlens, args.kv_ready_counts, args.kv_expected_ready};
+                args.ring_rank, args.ring_world_size, args.rank_kv_capacity,
+                args.half_cu_seqlens, args.ring_sizes, args.mega_ring_hierarchy,
+                args.kv_ready_counts, args.kv_expected_ready};
     }
 
     CUTLASS_DEVICE
-    static int ring_kv_rank(Params const& params, int ring_step) {
-        int rank = params.ring_rank - ring_step;
-        return rank < 0 ? rank + params.ring_world_size : rank;
+    static int ring_kv_rank(Params const& params, int bidb, int ring_step) {
+        int const ring_size = params.ring_sizes[bidb];
+        int const ring_base = (params.ring_rank / ring_size) * ring_size;
+        int const ring_local_rank = params.ring_rank - ring_base;
+        return ring_base + (ring_local_rank - ring_step + ring_size) % ring_size;
     }
 
     CUTLASS_DEVICE
-    static SeqlenInfo_t get_seqlen_info(Params const& params, int bidb, int ring_step) {
+    static SeqlenInfo_t get_seqlen_info(
+            Params const& params, int bidb, int ring_level, int ring_step) {
         SeqlenInfo_t info{
-            bidb, get<0>(params.shape_Q), params.local_total_k > 0 ? params.local_total_k : size<0>(params.shape_K),
+            bidb, get<0>(params.shape_Q), params.rank_kv_capacity,
             params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k};
         if constexpr (MegaRing) {
-            info.offset_k += ring_kv_rank(params, ring_step) * params.local_total_k;
-            if (ring_step > 0 && ring_step <= params.ring_rank) {
+            (void)ring_level;
+            int const ring_size = params.ring_sizes[bidb];
+            int const ring_local_rank = params.ring_rank % ring_size;
+            info.offset_k += ring_kv_rank(params, bidb, ring_step) * params.rank_kv_capacity;
+            if (ring_step > 0 && ring_step <= ring_local_rank) {
                 info.seqlen_k = params.half_cu_seqlens
                     ? params.half_cu_seqlens[bidb + 1] - params.half_cu_seqlens[bidb]
                     : info.seqlen_k / 2;
-            } else if (ring_step > params.ring_rank) {
+            } else if (ring_step > ring_local_rank) {
                 int const half_q = params.half_cu_seqlens
                     ? params.half_cu_seqlens[bidb + 1] - params.half_cu_seqlens[bidb]
                     : info.seqlen_q / 2;
@@ -509,19 +521,22 @@ struct CollectiveMainloopBwdSm90 {
          SharedStorage &shared_storage,
          SchedulerPrefetch const& scheduler_prefetch,
          cute::tuple<int32_t, int32_t, int32_t> block_coord,
+         int ring_level = 0,
          int ring_step = 0
          ) {
 
         auto [n_block, bidh, bidb] = block_coord;
         if constexpr (MegaRing) {
-            if (cute::elect_one_sync()) {
+            if (ring_step > 0 && cute::elect_one_sync()) {
+                int const ready_idx = params.mega_ring_hierarchy.levels[ring_level].kv_ready_base
+                    + ring_step - 1;
                 min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
-                    params.kv_ready_counts + ring_step,
-                    params.kv_expected_ready[ring_step]);
+                    params.kv_ready_counts + ready_idx,
+                    params.kv_expected_ready[ready_idx]);
             }
             __syncwarp();
         }
-        SeqlenInfo_t seqlen_info = get_seqlen_info(params, bidb, ring_step);
+        SeqlenInfo_t seqlen_info = get_seqlen_info(params, bidb, ring_level, ring_step);
         auto [m_block_min, m_block_max] = get_m_block_min_max(
             params, seqlen_info, n_block, bidb, ring_step);
         if constexpr (IsPersistent) {
@@ -685,12 +700,13 @@ struct CollectiveMainloopBwdSm90 {
     store_dq(Params const& params,
              SharedStorage &shared_storage,
              cute::tuple<int32_t, int32_t, int32_t> block_coord,
+             int ring_level = 0,
              int ring_step = 0
              ) {
         if constexpr (!dQacc_use_TMA) { return; }
 
         auto [n_block, bidh, bidb] = block_coord;
-        SeqlenInfo_t seqlen_info = get_seqlen_info(params, bidb, ring_step);
+        SeqlenInfo_t seqlen_info = get_seqlen_info(params, bidb, ring_level, ring_step);
         auto [m_block_min, m_block_max] = get_m_block_min_max(
             params, seqlen_info, n_block, bidb, ring_step);
         // It's possible to have m_block_max <= m_block_min. Exit early
@@ -783,13 +799,14 @@ struct CollectiveMainloopBwdSm90 {
         int &work_idx,
         cute::tuple<int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage,
+        int ring_level = 0,
         int ring_step = 0
         ) {
         static_assert(is_rmem<FrgTensordKV>::value, "dK and dV tensor must be rmem resident.");
 
         int n_block = get<0>(block_coord);
         int bidb = get<2>(block_coord);
-        SeqlenInfo_t seqlen_info = get_seqlen_info(params, bidb, ring_step);
+        SeqlenInfo_t seqlen_info = get_seqlen_info(params, bidb, ring_level, ring_step);
         auto [m_block_min, m_block_max] = get_m_block_min_max(
             params, seqlen_info, n_block, bidb, ring_step);
         // It's possible to have m_block_max <= m_block_min. Exit early

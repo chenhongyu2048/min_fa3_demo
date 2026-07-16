@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
+import sys
+import types
 import unittest
+from unittest import mock
 
 import balancer
 from balancer.sampler import _align_sequence_length
-from ring_test import benchmark_hybrid_dataset_forward
+from ring_test import (
+    benchmark_hybrid_dataset_backward,
+    benchmark_hybrid_dataset_forward,
+)
 
 
 class DatasetSamplerTest(unittest.TestCase):
@@ -161,6 +168,71 @@ class DatasetBenchmarkFrontendTest(unittest.TestCase):
         self.assertIn("actual_tokens=5120", rendered)
         self.assertIn("global_seqlens=5120", rendered)
         self.assertIn("ring_sizes=4", rendered)
+
+    def test_backward_print_workload_uses_balancer_without_cuda(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            benchmark_hybrid_dataset_backward.main(
+                [
+                    "--dataset",
+                    "arxiv",
+                    "--target-tokens",
+                    "4097",
+                    "--seed",
+                    "0",
+                    "--world-size",
+                    "8",
+                    "--print-workload",
+                ]
+            )
+        rendered = output.getvalue()
+        self.assertIn("mode=causal", rendered)
+        self.assertIn("actual_tokens=5120", rendered)
+        self.assertIn("global_seqlens=5120", rendered)
+        self.assertIn("ring_sizes=4", rendered)
+
+    def test_backward_frontend_forwards_explicit_topology(self) -> None:
+        forwarded: list[str] = []
+        options: dict[str, object] = {}
+
+        def fake_main(argv, **kwargs) -> None:
+            forwarded.extend(argv)
+            options.update(kwargs)
+
+        fake_benchmark = types.SimpleNamespace(
+            main=fake_main
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"LOCAL_RANK": "0", "LOCAL_WORLD_SIZE": "8"},
+        ), mock.patch.dict(
+            sys.modules,
+            {"benchmark_hybrid_backward": fake_benchmark},
+        ), contextlib.redirect_stdout(io.StringIO()):
+            benchmark_hybrid_dataset_backward.main(
+                [
+                    "--dataset",
+                    "arxiv",
+                    "--target-tokens",
+                    "4097",
+                    "--seed",
+                    "0",
+                    "--sm-configs",
+                    "100:16",
+                    "--no-check",
+                ]
+            )
+
+        def value_after(flag: str) -> str:
+            return forwarded[forwarded.index(flag) + 1]
+
+        self.assertEqual(value_after("--global-seqlens"), "5120")
+        self.assertEqual(value_after("--ring-sizes"), "4")
+        self.assertEqual(value_after("--ring-starts"), "0")
+        self.assertEqual(value_after("--sm-configs"), "100:16")
+        self.assertEqual(value_after("--methods"), "all")
+        self.assertIn("--no-check", forwarded)
+        self.assertTrue(options["skip_incompatible_methods"])
 
 
 if __name__ == "__main__":

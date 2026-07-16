@@ -247,7 +247,7 @@ def run_case(
     device = torch.device("cuda")
     cu_q, cu_q_host = make_cu_seqlens(args.b, seqlen, device)
     cu_k, cu_k_host = cu_q, cu_q_host
-    half_cu, half_cu_host = make_cu_seqlens(args.b, seqlen // 2, device)
+    half_cu, _ = make_cu_seqlens(args.b, seqlen // 2, device)
     global_seqlens_host = torch.full(
         (args.b,), seqlen * world_size, dtype=torch.int32
     )
@@ -275,26 +275,34 @@ def run_case(
     torch.cuda.synchronize()
     dist.barrier()
 
-    out, lse = min_fa3_op.forward_varlen_mega_ring(
-        q,
-        k,
-        v,
-        cu_q,
-        cu_k,
-        seqlen,
-        seqlen,
-        True,
-        cu_seqlens_q_host=cu_q_host,
-        cu_seqlens_k_host=cu_k_host,
-        remote_k=remote_k,
-        remote_v=remote_v,
-        num_comp_sm=args.num_comp_sm,
-        num_comm_sm=args.num_comm_sm,
-        global_seqlens_host=global_seqlens_host,
-        ring_sizes_host=ring_sizes_host,
-        ring_starts_host=ring_starts_host,
-        return_lse=True,
-    )
+    if world_size == 1:
+        out, lse = min_fa3_op.forward_varlen(
+            q, k, v, cu_q, cu_k, seqlen, seqlen, True,
+            cu_seqlens_q_host=cu_q_host,
+            cu_seqlens_k_host=cu_k_host,
+            return_lse=True,
+        )
+    else:
+        out, lse = min_fa3_op.forward_varlen_mega_ring(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            seqlen,
+            seqlen,
+            True,
+            cu_seqlens_q_host=cu_q_host,
+            cu_seqlens_k_host=cu_k_host,
+            remote_k=remote_k,
+            remote_v=remote_v,
+            num_comp_sm=args.num_comp_sm,
+            num_comm_sm=args.num_comm_sm,
+            global_seqlens_host=global_seqlens_host,
+            ring_sizes_host=ring_sizes_host,
+            ring_starts_host=ring_starts_host,
+            return_lse=True,
+        )
     dout_generator = torch.Generator(device="cuda")
     dout_generator.manual_seed(20261711 + rank)
     dout = (
@@ -335,8 +343,6 @@ def run_case(
         seqlen,
         cu_seqlens_q_host=cu_q_host,
         cu_seqlens_k_host=cu_k_host,
-        half_cu_seqlens=half_cu,
-        half_cu_seqlens_host=half_cu_host,
         remote_k=remote_k,
         remote_v=remote_v,
         remote_dk_accum=remote_dk,
@@ -344,6 +350,9 @@ def run_case(
         remote_dkv_completion=remote_completion,
         num_comp_sm=args.num_comp_sm,
         num_comm_sm=args.num_comm_sm,
+        global_seqlens_host=global_seqlens_host,
+        ring_sizes_host=ring_sizes_host,
+        ring_starts_host=ring_starts_host,
     )
 
     q_ref = q.detach().clone().requires_grad_(True)

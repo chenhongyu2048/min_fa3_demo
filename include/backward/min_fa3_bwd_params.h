@@ -7,6 +7,8 @@
 #include <cuda.h>
 #include <cstdint>
 
+#include "min_fa3_mega_ring_hierarchy.h"
+
 namespace kittens::py {
 struct TKParallelTensor;
 }
@@ -102,14 +104,19 @@ struct Flash_bwd_params : public Flash_fwd_params {
     int num_comp_sm;
     int num_comm_sm;
     int local_total_k;
+    int rank_kv_capacity;
+    int padded_rank_capacity;
     int64_t dkv_step_stride;
     int* __restrict__ half_cu_seqlens;
+    int* __restrict__ ring_sizes;
+    min_fa3_varlen_demo::MegaRingHierarchyDesc mega_ring_hierarchy;
     int* __restrict__ ring_local_ready;
     int* __restrict__ ring_expected_ready;
     int* __restrict__ ring_kv_ready;
     int* __restrict__ ring_kv_expected_ready;
     int* __restrict__ ring_dkv_comm_done;
     int* __restrict__ ring_completion;
+    int ring_expected_completion;
     float* __restrict__ remote_dk_accum[8];
     float* __restrict__ remote_dv_accum[8];
     int* __restrict__ remote_dkv_completion[8];

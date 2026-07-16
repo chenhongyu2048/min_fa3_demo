@@ -31,7 +31,8 @@ from allgather_attention import (
     repartition_sequence_shards_to_llama3,
     select_allgather_backend,
 )
-from ring_common import RingComm, raise_if_any_rank_failed
+from hybrid_backward_baselines import VarlenFa3RingBackward
+from ring_common import raise_if_any_rank_failed
 
 
 METHOD_ORDER = [
@@ -216,206 +217,6 @@ def make_inputs(
     return q, k, v, dout
 
 
-def pack_half(tensor: torch.Tensor, case: Case, *, front: bool) -> torch.Tensor:
-    half = case.seqlen // 2
-    pieces = []
-    for batch_idx in range(case.batch_size):
-        start = batch_idx * case.seqlen
-        middle = start + half
-        end = start + case.seqlen
-        pieces.append(tensor[start:middle] if front else tensor[middle:end])
-    return torch.cat(pieces, dim=0).contiguous()
-
-
-def pack_half_lse(lse: torch.Tensor, case: Case, *, front: bool) -> torch.Tensor:
-    half = case.seqlen // 2
-    pieces = []
-    for batch_idx in range(case.batch_size):
-        start = batch_idx * case.seqlen
-        middle = start + half
-        end = start + case.seqlen
-        pieces.append(lse[:, start:middle] if front else lse[:, middle:end])
-    return torch.cat(pieces, dim=1).contiguous()
-
-
-def add_packed_half(
-    destination: torch.Tensor,
-    packed: torch.Tensor,
-    case: Case,
-    *,
-    front: bool,
-) -> None:
-    half = case.seqlen // 2
-    packed_offset = 0
-    for batch_idx in range(case.batch_size):
-        start = batch_idx * case.seqlen
-        middle = start + half
-        end = start + case.seqlen
-        dst_start, dst_end = (start, middle) if front else (middle, end)
-        destination[dst_start:dst_end] += packed[packed_offset : packed_offset + half]
-        packed_offset += half
-
-
-class PythonRingBackward:
-    """Complete zigzag ring backward using min_fa3 block kernels and NCCL P2P."""
-
-    def __init__(
-        self,
-        case: Case,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        dout: torch.Tensor,
-        out: torch.Tensor,
-        lse: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-    ) -> None:
-        self.case = case
-        self.q = q
-        self.k = k
-        self.v = v
-        self.dout = dout
-        self.out = out
-        self.lse = lse
-        self.cu = cu_seqlens
-        self.half_cu = cu_seqlens // 2
-        self.half_seqlen = case.seqlen // 2
-        self.half_tokens = case.batch_size * self.half_seqlen
-
-        self.q_back = pack_half(q, case, front=False)
-        self.dout_back = pack_half(dout, case, front=False)
-        self.out_back = pack_half(out, case, front=False)
-        self.lse_back = pack_half_lse(lse, case, front=False)
-
-        self.dq_scratch = torch.empty_like(q)
-        self.dk_scratch = torch.empty_like(k)
-        self.dv_scratch = torch.empty_like(v)
-        self.dq_accum = torch.empty_like(q, dtype=torch.float32)
-        self.k_ring = [torch.empty_like(k), torch.empty_like(k)]
-        self.v_ring = [torch.empty_like(v), torch.empty_like(v)]
-        self.dk_ring = [torch.empty_like(k, dtype=torch.float32) for _ in range(2)]
-        self.dv_ring = [torch.empty_like(v, dtype=torch.float32) for _ in range(2)]
-
-    def block_backward(
-        self,
-        dout: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        out: torch.Tensor,
-        lse: torch.Tensor,
-        *,
-        causal: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        half_q = q.size(0) == self.half_tokens
-        half_k = k.size(0) == self.half_tokens
-        return min_fa3_op.backward_varlen(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            lse,
-            self.half_cu if half_q else self.cu,
-            self.half_cu if half_k else self.cu,
-            self.half_seqlen if half_q else self.case.seqlen,
-            self.half_seqlen if half_k else self.case.seqlen,
-            causal,
-            deterministic=False,
-            dq=self.dq_scratch[: q.size(0)],
-            dk=self.dk_scratch[: k.size(0)],
-            dv=self.dv_scratch[: v.size(0)],
-        )
-
-    def __call__(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        kv_comm = RingComm(dist.group.WORLD)
-        dkv_comm = RingComm(dist.group.WORLD)
-        cur_k, cur_v = self.k, self.v
-        cur_dk, cur_dv = self.dk_ring[0], self.dv_ring[0]
-        next_dk = next_dv = None
-
-        for step in range(kv_comm.world_size):
-            if step + 1 < kv_comm.world_size:
-                buffer_idx = step % 2
-                next_k, next_v = kv_comm.send_recv_kv(
-                    cur_k,
-                    cur_v,
-                    self.k_ring[buffer_idx],
-                    self.v_ring[buffer_idx],
-                )
-            else:
-                next_k = next_v = None
-
-            if step == 0:
-                dq_block, dk_block, dv_block = self.block_backward(
-                    self.dout,
-                    self.q,
-                    cur_k,
-                    cur_v,
-                    self.out,
-                    self.lse,
-                    causal=True,
-                )
-                self.dq_accum.copy_(dq_block)
-                cur_dk.copy_(dk_block)
-                cur_dv.copy_(dv_block)
-            else:
-                if step <= kv_comm.rank:
-                    k_front = pack_half(cur_k, self.case, front=True)
-                    v_front = pack_half(cur_v, self.case, front=True)
-                    dq_block, dk_block, dv_block = self.block_backward(
-                        self.dout,
-                        self.q,
-                        k_front,
-                        v_front,
-                        self.out,
-                        self.lse,
-                        causal=False,
-                    )
-                    self.dq_accum += dq_block
-                else:
-                    dq_block, dk_block, dv_block = self.block_backward(
-                        self.dout_back,
-                        self.q_back,
-                        cur_k,
-                        cur_v,
-                        self.out_back,
-                        self.lse_back,
-                        causal=False,
-                    )
-                    add_packed_half(self.dq_accum, dq_block, self.case, front=False)
-
-                dkv_comm.wait()
-                if next_dk is None or next_dv is None:
-                    raise RuntimeError("dKV ring did not produce a receive buffer")
-                cur_dk, cur_dv = next_dk, next_dv
-                if step <= kv_comm.rank:
-                    add_packed_half(cur_dk, dk_block, self.case, front=True)
-                    add_packed_half(cur_dv, dv_block, self.case, front=True)
-                else:
-                    cur_dk += dk_block
-                    cur_dv += dv_block
-
-            if step + 1 < kv_comm.world_size:
-                kv_comm.wait()
-                if next_k is None or next_v is None:
-                    raise RuntimeError("KV ring did not produce a receive buffer")
-                cur_k, cur_v = next_k, next_v
-
-            recv_idx = (step + 1) % 2
-            next_dk, next_dv = dkv_comm.send_recv_kv(
-                cur_dk,
-                cur_dv,
-                self.dk_ring[recv_idx],
-                self.dv_ring[recv_idx],
-            )
-
-        dkv_comm.wait()
-        if next_dk is None or next_dv is None:
-            raise RuntimeError("dKV ring did not return the owner gradients")
-        return self.dq_accum.to(self.q.dtype), next_dk.to(self.k.dtype), next_dv.to(self.v.dtype)
-
-
 def make_mega_parallel_tensors(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -444,10 +245,6 @@ def build_method_runs(
 ) -> dict[str, MethodRun]:
     q, local_k, local_v, dout = make_inputs(case, local_rank, seed)
     cu, cu_host = make_cu_seqlens(case, q.device)
-    half_cu, half_cu_host = make_cu_seqlens(
-        Case(case.batch_size, case.seqlen // 2, case.q_heads, case.kv_heads, case.head_dim),
-        q.device,
-    )
     global_seqlens_host = torch.full(
         (case.batch_size,), case.seqlen * local_world_size, dtype=torch.int32
     )
@@ -530,7 +327,15 @@ def build_method_runs(
     torch.cuda.synchronize()
     cuda_barrier()
 
-    python_ring = PythonRingBackward(case, q, local_k, local_v, dout, out, lse, cu)
+    python_ring = VarlenFa3RingBackward(
+        dist.group.WORLD,
+        q,
+        local_k,
+        local_v,
+        dout,
+        [case.seqlen] * case.batch_size,
+        "min_fa3",
+    )
     total_tokens = case.batch_size * case.seqlen
     total_k_padded = ((total_tokens + case.batch_size * 128 + 127) // 128) * 128
     accum_numel = case.kv_heads * total_k_padded * case.head_dim
@@ -563,8 +368,6 @@ def build_method_runs(
             case.seqlen,
             cu_seqlens_q_host=cu_host,
             cu_seqlens_k_host=cu_host,
-            half_cu_seqlens=half_cu,
-            half_cu_seqlens_host=half_cu_host,
             remote_k=remote_k,
             remote_v=remote_v,
             remote_dk_accum=remote_dk,
@@ -572,14 +375,17 @@ def build_method_runs(
             remote_dkv_completion=remote_completion,
             num_comp_sm=sm_config.num_comp_sm,
             num_comm_sm=sm_config.num_comm_sm,
+            global_seqlens_host=global_seqlens_host,
+            ring_sizes_host=ring_sizes_host,
+            ring_starts_host=ring_starts_host,
         )
 
     runs = {
         "allgather_attention": allgather_run,
         "min_varlen_python_ring": MethodRun(
             "min_varlen_python_ring",
-            lambda: None,
-            python_ring,
+            python_ring.forward,
+            python_ring.backward,
             "min_fa3 block kernels + NCCL P2P",
         ),
         "min_varlen_mega_ring": MethodRun(

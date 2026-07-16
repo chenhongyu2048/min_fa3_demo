@@ -10,31 +10,9 @@
 #include <cstdint>
 #include <optional>
 
+#include "min_fa3_mega_ring_hierarchy.h"
+
 namespace min_fa3_varlen_demo {
-
-struct MegaRingLevelDesc {
-    int ring_size = 1;
-    int batch_begin = 0;
-    int batch_end = 0;
-    int row_begin = 0;
-    int full_rows = 0;
-    int half_row_begin = 0;
-    int half_rows = 0;
-    int full_tiles = 0;
-    int half_tiles = 0;
-    int reduction_base = 0;
-    int kv_ready_base = 0;
-};
-
-struct MegaRingHierarchyDesc {
-    MegaRingLevelDesc levels[4]{};
-    // MEGA_RING_SEGMENTS: step 0 keeps the original prepared varlen stream.
-    // Causal remote work is scheduled dynamically over reduction_tiles.
-    int base_work_tiles = 0;
-    int total_work_tiles = 0;
-    int reduction_tiles = 0;
-    int remote_tiles = 0;
-};
 
 struct Qkv_params {
     using index_t = int64_t;

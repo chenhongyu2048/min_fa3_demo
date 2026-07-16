@@ -1,9 +1,9 @@
-# Multi-rank ring attention forward test
+# Multi-rank ring attention tests and benchmarks
 
-This directory contains a torchrun entry point for forward-only multi-rank
-ring attention over the existing varlen demo layout.
+This directory contains torchrun entry points for multi-rank forward and
+backward ring attention over the existing varlen demo layout.
 
-The standard PyTorch / FA2 / FA3 methods run a real Python-side ring:
+The `fa3` method runs a real Python-side ring:
 
 - each rank starts from its local `[B * S, H, D]` K/V block
 - K/V are passed around the ring with `batch_isend_irecv`
@@ -40,20 +40,19 @@ The two local Q halves are non-adjacent in that global sequence, so the
 baseline runs two bottom-right-aligned causal varlen calls. For rank `r`, local
 half length `H`, and world size `W`, the front call uses `Sk=(r+1)*H` and the
 back call uses `Sk=(2*W-r)*H`. Their total KV work is identical on every rank,
-which preserves zigzag load balancing. This path is all-CP only and is not
-used by `benchmark_hybrid_forward.py`.
+which preserves zigzag load balancing. This is the causal
+`allgather_attention` layout in both `benchmark_ring_forward.py` and
+`benchmark_hybrid_forward.py`.
 
 If the FA3 Python package import fails, the `fa3` method falls back to the
 local `min_fa3_op.forward_varlen(..., return_lse=True)` block backend while
 keeping the same Python-side ring and online LSE merge. Result tables mark this
-case with `fallback: min_fa3_varlen block`. FA2 remains optional and is skipped
-when unavailable.
+case with `fallback: min_fa3_varlen block`.
 
 The minimal FA3 methods follow the current local demo APIs:
 
-- `min_varlen` is a timing-only local step loop. The current binding returns
-  only `out`, so it does not expose enough state for a strict Python-side
-  cross-step ring merge.
+- `min_varlen` is a timing-only local step loop. It neither exchanges remote
+  K/V nor performs the online O/LSE merge required for a complete ring.
 - `min_varlen_ring` launches the existing single-step ring kernel for multiple
   steps. The kernel does its own remote load and per-launch reduction. The timed
   path passes running `out` and `lse` buffers through each launch, so correctness
@@ -65,7 +64,7 @@ The minimal FA3 methods follow the current local demo APIs:
 Example:
 
 ```bash
-cd /home/LOCAL/shixuan/hongyu/min_fa3_demo
+# Run from the min_fa3_demo repository root.
 make
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
   --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 \
@@ -83,7 +82,7 @@ For a faster smoke run:
 ```bash
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
   --b 1 --seqlen 128 --qhead 8 --kvhead 8 --mode noncausal \
-  --methods pytorch,min_varlen_mega_ring --num-comp-sm 1 --num-comm-sm 1 \
+  --methods fa3,min_varlen_mega_ring --num-comp-sm 1 --num-comm-sm 1 \
   --warmup-iters 1 --num-iters 3
 ```
 
@@ -121,7 +120,10 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
 - `min_varlen_mega_ring` is the fused persistent compute/communication kernel.
 
 The fused backward communication CTAs use TMA for remote K/V load, local K/V
-store, local FP32 dK/dV load, and remote FP32 reduce-add. Row tasks are spread
+store, local FP32 dK/dV load, and remote FP32 reduce-add. K/V ingress uses
+128-row logical tasks split into fixed 16-row by 1024-BF16 TMA subtiles. dKV
+egress decodes each level range by KV head and 128-token padded block; every dK
+or dV task is one fixed `16 x 1024` FP32 TMA transaction. Tasks are spread
 across all communication CTAs instead of assigning one CTA to an entire ring
 step.
 
@@ -151,6 +153,127 @@ Use `--no-check` for timing-only sweeps. Local sequence lengths must be
 divisible by 256, and the current fused backward requires causal mode,
 `D=128`, `qhead % kvhead == 0`, and `kvhead * D == 1024`.
 
+### Hierarchical hybrid backward
+
+`benchmark_hybrid_backward.py` compares the same causal global workload with:
+
+- `allgather_attention`: per-sequence zigzag all-gather plus batched varlen backward
+- `llama3_allgather_attention`: whole-packed two-block all-gather backward
+- `fa3_ring`: NCCL zigzag K/V and FP32 dKV ring using external FA3 block backward
+- `mega_ring_hybrid`: fused G8/G4/G2/G1 hierarchical backward
+
+The block methods consistently fall back to local min-FA3 when external FA3 is
+not available on every rank. Results include maximum end-to-end wall time,
+per-rank median times, aggregate/average-per-GPU causal backward TFLOP/s, and
+the hybrid compute/communication SM split. Forward preparation is outside every
+method's timed interval. The fused owner-accumulator reset and distributed
+barrier are also outside its timed interval.
+
+`--b` and `--seqlen` are comma-separated integer lists with equal length. Each
+`(b[i], seqlen[i])` pair is one case; `seqlen[i]` is the local sequence length
+on a member rank. The `--ring-sizes`/`--ring-starts` pattern is repeated until
+the case has `b[i]` batches, then sorted by non-increasing ring size. The global
+length for each generated batch is `seqlen[i] * ring_size`.
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  ring_test/benchmark_hybrid_backward.py \
+  --b 1,4 --seqlen 256,256 \
+  --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
+  --qhead 16 --kvhead 8 --headdim 128 \
+  --methods all \
+  --num-comp-sm 100 --num-comm-sm 16 \
+  --warmup-iters 5 --num-iters 20
+```
+
+The same entry point accepts one planner-generated explicit topology and an SM
+configuration sweep:
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  ring_test/benchmark_hybrid_backward.py \
+  --global-seqlens 2048,1024,512,256 \
+  --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
+  --qhead 16 --kvhead 8 --headdim 128 \
+  --methods all \
+  --sm-configs 128:4,124:8,120:12,116:16 \
+  --warmup-iters 5 --num-iters 20 --check
+```
+
+`--check` builds subgroup-aware FP32 autograd references for the all-CP and
+hybrid layouts, validates hybrid forward O/LSE preparation, and checks every
+method's dQ/dK/dV. Llama3 reference gradients are repartitioned into its
+whole-packed local layout before comparison. Default tolerances are
+`dq_atol=1.0`, `dkv_atol=0.5`, and `rtol=0.2`.
+
+The fused backward API receives compact local Q/O/dO and returns compact local
+dQ/dK/dV. K/V remain in a rank-major
+`[world_size * rank_kv_capacity, KVH, 128]` IPC arena. Each VMM-backed FP32
+owner accumulator contains:
+
+```text
+KVH * round_up(rank_kv_capacity + B * 128, 128) * 128
+```
+
+The public topology tensors are CPU int32 contiguous `[B]` tensors named
+`global_seqlens_host`, `ring_sizes_host`, and `ring_starts_host`. Causal half
+prefix sums are generated by the C++ binding. Accumulators and the one-element
+int32 completion tensor must be zeroed and globally synchronized before every
+call.
+
+Correctness and binding-validation entry points are:
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  mega_ring_test_min_fa3_varlen_backward_hybrid_multi_rank.py \
+  --global-seqlens 2048,1024,512,256 \
+  --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
+  --qhead 16 --kvhead 8 --repeat 2 \
+  --num-comp-sm 100 --num-comm-sm 16
+
+torchrun --standalone --nproc_per_node=8 \
+  mega_ring_test_min_fa3_varlen_backward_validation_multi_rank.py
+```
+
+The full scheduler/readiness/completion contract is recorded in
+`../docs/HIERARCHICAL_HYBRID_MEGA_RING_BACKWARD_DESIGN.md`.
+
+### Dataset-shaped hybrid backward
+
+`benchmark_hybrid_dataset_backward.py` uses the same `balancer` workload as the
+forward dataset frontend. It samples Arxiv or Github lengths, packs the target
+token budget, prints the same placement/cap/load report, and calls
+`benchmark_hybrid_backward.main(...)` in the same process with explicit ring
+metadata. Backward is causal-only and currently benchmarks the hierarchical
+fused kernel together with the per-sequence all-gather, Llama3 all-gather, and
+FA3/NCCL ring baselines.
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  ring_test/benchmark_hybrid_dataset_backward.py \
+  --dataset arxiv --target-tokens 131072 --seed 0 \
+  --qhead 32 --kvhead 8 --headdim 128 \
+  --methods all \
+  --sm-configs 128:4,124:8,120:12,116:16 \
+  --warmup-iters 10 --num-iters 40 --no-check
+
+DATASETS="arxiv github" GPU_COUNTS="2 4 8" \
+  ./benchmark_hybrid_dataset_backward.sh
+```
+
+Planner-only inspection does not import or initialize CUDA:
+
+```bash
+python ring_test/benchmark_hybrid_dataset_backward.py \
+  --dataset github --target-tokens 131072 \
+  --world-size 8 --print-workload
+```
+
+Use `--check` only for small token budgets because the dense backward reference
+has quadratic score memory. The shell wrapper shares the forward wrapper's
+`DATASETS`, `GPU_COUNTS`, balancing controls, `SM_CONFIGS`, logging, `CHECK`,
+and `DRY_RUN` environment variables.
+
 ## Hybrid mega-ring benchmark
 
 `benchmark_hybrid_forward.py` compares the same global varlen batch with five
@@ -165,9 +288,9 @@ methods:
 The first three methods are baselines. Every global sequence is divided evenly
 over all physical ranks. `mega_ring_hybrid` instead uses `--ring-sizes` and
 `--ring-starts`; rank-local length is `global_len / ring_size` for members of
-that batch's ring and zero for other ranks. External FA3 is used by the first
-two baselines when available, otherwise they fall back to the local min-FA3
-varlen block.
+that batch's ring and zero for other ranks. External FA3 is used by all three
+block baselines when available; each consistently falls back to the local
+min-FA3 varlen block when it is unavailable.
 
 All-CP baseline lengths must be divisible by the physical world size. The total
 global token count for `llama3_allgather_attention` must also be divisible by
@@ -249,10 +372,11 @@ reference materializes quadratic attention scores.
 
 ## 1/2/4/8-GPU causal sweep
 
-`benchmark_ring_1_2_4_8.sh` runs the all-CP forward, hybrid forward, and
-backward varlen benchmarks on 1, 2, 4, and 8 GPUs. It fixes QH/KVH at 32/8,
-head dim at 128, warmup iterations at 10, and measured iterations at 40. Run
-it inside a single-node allocation exposing eight SM90 GPUs:
+`benchmark_ring_1_2_4_8.sh` runs the all-CP forward and backward varlen
+benchmarks on 1, 2, 4, and 8 GPUs. Hierarchical hybrid forward runs on 2, 4,
+and 8 GPUs; the script explicitly skips it for world size 1. It fixes QH/KVH
+at 32/8, head dim at 128, warmup iterations at 10, and measured iterations at
+40. Run it inside a single-node allocation exposing eight SM90 GPUs:
 
 ```bash
 ./benchmark_ring_1_2_4_8.sh
@@ -262,8 +386,8 @@ The all-CP forward and backward defaults pair batch sizes `16,8,4,2,1` with
 local sequence lengths `1K,2K,4K,8K,16K`. This keeps each setting at 16K local
 tokens per rank. The corresponding global token totals are 16K, 32K, 64K, and
 128K for 1, 2, 4, and 8 GPUs. The hybrid workload keeps one fixed global batch
-and balances its local-only sequences across all tested world sizes. All runs
-are appended to one timestamped
+and balances its local-only sequences across the supported 2/4/8-GPU hybrid
+runs. All runs are appended to one timestamped
 `benchmark_logs/<timestamp>/benchmark_ring_1_2_4_8.log` file, with a separator,
 run label, GPU count, and full command before each result section.
 
@@ -285,31 +409,12 @@ LOG_DIR=benchmark_logs/selected \
 Set `DRY_RUN=1` to print the complete commands without launching `torchrun`,
 or `CHECK=1` to enable the benchmark entry points' correctness checks.
 
-# Result Example
+## Result columns
 
-```
-Config: world_size=2, methods=['pytorch', 'fa2', 'fa3', 'min_varlen', 'min_varlen_ring', 'min_varlen_mega_ring'], B=16, seqlen=4096, qhead=32, kvhead=8, D=128, mode=both, num_comp_sm=74, num_comm_sm=4, warmup=20, iters=30, check=True
-Checks compare each rank output against a full-rank PyTorch reference.
-
-Running local_S=4096, causal=False
-
-B=16, local_S=4096, QH=32, KVH=8, D=128, mode=noncausal
-Method                        Time ms       TFLOPS          Check  Note
-pytorch                       114.027        154.3             ok  
-fa2                           100.139        175.7             ok  
-fa3                            69.020        254.9             ok  
-min_varlen                     68.260        257.7    timing-only  timing-only local step loop
-min_varlen_ring                69.536        253.0             ok
-min_varlen_mega_ring           69.726        252.3             ok  
-
-Running local_S=4096, causal=True
-
-B=16, local_S=4096, QH=32, KVH=8, D=128, mode=causal
-Method                        Time ms       TFLOPS          Check  Note
-pytorch                        89.154         98.7             ok  
-fa2                            77.318        113.8             ok  
-fa3                            52.941        166.2             ok  
-min_varlen                     51.464        170.9    timing-only  timing-only local step loop
-min_varlen_ring                52.665        167.0             ok
-min_varlen_mega_ring           51.806        169.8             ok
-```
+`benchmark_ring_forward.py` prints one row per selected method. `Time ms`
+contains each rank's median and the maximum across ranks. `Agg TFLOPS` sums the
+visible attention work across ranks, and `Avg/GPU` divides that value by the
+physical world size. `Check` records reference validation or marks a
+timing-only method; `Note` records the selected block backend and other method
+details. The exact method rows follow `--methods` and the current CLI method
+list rather than a hard-coded result snapshot.

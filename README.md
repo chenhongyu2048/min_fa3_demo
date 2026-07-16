@@ -181,9 +181,31 @@ torchrun --standalone --nproc_per_node=8 \
   --mode both --check-arena --repeat 20
 ```
 
-Hierarchical mega-ring forward notes:
+Hierarchical mega-ring backward tests:
 
-- This path supports one node with 2, 4, or 8 SM90 GPUs. A ring size cannot exceed the physical world size.
+```bash
+# Explicit all-CP metadata on two GPUs.
+torchrun --standalone --nproc_per_node=2 \
+  mega_ring_test_min_fa3_varlen_backward_multi_rank.py \
+  --b 1 --seqlen 256 --qhead 16 --kvhead 8 \
+  --num-comp-sm 64 --num-comm-sm 8
+
+# Overlapping G8/G4/G2/G1 subrings, including repeated backward execution.
+torchrun --standalone --nproc_per_node=8 \
+  mega_ring_test_min_fa3_varlen_backward_hybrid_multi_rank.py \
+  --global-seqlens 2048,1024,512,256 \
+  --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
+  --qhead 16 --kvhead 8 --repeat 2 \
+  --num-comp-sm 100 --num-comm-sm 16
+
+# C++ binding validation failures; every case is guarded against kernel launch.
+torchrun --standalone --nproc_per_node=8 \
+  mega_ring_test_min_fa3_varlen_backward_validation_multi_rank.py
+```
+
+Hierarchical mega-ring notes:
+
+- Forward supports one node with 2, 4, or 8 SM90 GPUs. Backward supports physical world size 1, 2, 4, or 8; world size 1 permits only G1. A logical ring cannot exceed the physical world size.
 - The 8-GPU path uses one fused persistent launch for G8/G4/G2/G1 sequences; the 2-GPU path similarly fuses G2/G1.
 - Batches are ordered by non-increasing ring size and explicitly pass global lengths, ring sizes, and aligned ring starts.
 - K/V use a shared rank-major capacity arena. Communication scheduling and readiness are tracked per logical KV tile: 128 rows for causal forward/backward and 176 rows for noncausal forward. Each logical task is physically transferred through 16-row 2D TMA subtiles spanning `KVH * D = 1024` values.
@@ -192,8 +214,12 @@ Hierarchical mega-ring forward notes:
 - Causal G8/G4/G2 uses the zigzag `[front half | back half]` layout.
 - The caller must synchronize owner-local K/V initialization across ranks before entering the op.
 - Ranks with no local sequence still enter the fused kernel and exit with an empty scheduler work stream.
-- Mega-ring backward is currently causal and non-deterministic only. Its VMM-backed FP32 dK/dV accumulators and owner completion counter must be zeroed on every rank and globally synchronized before calling `backward_varlen_mega_ring`.
-- Mega-ring backward keeps the existing execution paths: K/V ingress is `remote gmem -> local smem -> local gmem`, while dK/dV egress is `local gmem -> local smem -> remote gmem reduce-add`. Both use 128-row logical tasks decomposed into 16-row 2D TMA subtiles; the padded FP32 dKV accumulator row count must therefore be 128-row aligned.
+- Mega-ring backward is causal and non-deterministic only. Its public topology inputs are the CPU int32 contiguous `[B]` tensors `global_seqlens_host`, `ring_sizes_host`, and `ring_starts_host`; causal half prefix sums are generated inside the binding.
+- All-CP backward uses `ring_size=world_size, ring_start=0`. The public `half_cu_seqlens` and `half_cu_seqlens_host` arguments no longer exist.
+- K/V are `[world_size * rank_kv_capacity, KVH, 128]` rank-major IPC arenas. `rank_kv_capacity` is positive and 128-row aligned. Each FP32 owner accumulator contains `KVH * padded_rank_capacity * 128` elements, where `padded_rank_capacity = round_up(rank_kv_capacity + B * 128, 128)`.
+- The VMM-backed FP32 dK/dV owner accumulators and one-element int32 completion counter must be zeroed on every rank, followed by CUDA synchronization and a distributed barrier, before every `backward_varlen_mega_ring` call.
+- Backward K/V ingress is `remote gmem -> local smem -> local gmem`. dK/dV egress decodes work by KV head and 128-token padded block, then uses one fixed `16 x 1024` FP32 TMA transaction for each remote reduce-add task. Padding stays zero and there is no unaligned tail path.
+- The full scheduler, readiness, owner-completion, and zero-rank contracts are documented in `docs/HIERARCHICAL_HYBRID_MEGA_RING_BACKWARD_DESIGN.md`.
 
 Parameterized test examples:
 
@@ -251,7 +277,7 @@ torchrun --standalone --nproc_per_node=8 \
 GPU_COUNTS="2 4 8" ./benchmark_ring_1_2_4_8.sh
 ```
 
-Dataset-shaped hierarchical hybrid benchmark:
+Dataset-shaped hierarchical hybrid forward and backward benchmarks:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
@@ -261,11 +287,22 @@ torchrun --standalone --nproc_per_node=8 \
   --mode causal --methods all --no-check
 
 DATASETS="arxiv github" GPU_COUNTS=8 ./benchmark_hybrid_dataset.sh
+
+torchrun --standalone --nproc_per_node=8 \
+  ring_test/benchmark_hybrid_dataset_backward.py \
+  --dataset arxiv --target-tokens 131072 --seed 0 \
+  --qhead 32 --kvhead 8 --headdim 128 \
+  --methods all --sm-configs 128:4,124:8,120:12,116:16 --no-check
+
+DATASETS="arxiv github" GPU_COUNTS=8 \
+  ./benchmark_hybrid_dataset_backward.sh
 ```
 
-The dataset frontend calls the standalone `balancer` package to generate
-global lengths and token/compute-constrained G8/G4/G2/G1 metadata, then calls
-`benchmark_hybrid_forward.main(...)` in the same process. The planner searches
+The dataset frontends call the standalone `balancer` package to generate global
+lengths and token/compute-constrained G8/G4/G2/G1 metadata. The forward frontend
+calls `benchmark_hybrid_forward.main(...)`; the causal backward frontend calls
+`benchmark_hybrid_backward.main(...)` with the same explicit topology. The
+planner searches
 the strictest feasible token cap, permits compute relaxation only up to its
 configured cap unless topology or emergency fallback requires more, and uses
 estimated ring token-hops as a tunable soft cost. Use `--communication-weight`
@@ -276,9 +313,11 @@ lengths from 8K upward use `256 * 8`. The physical padded tokens participate
 in attention, so `actual_tokens` can exceed the target by fewer than 2048
 tokens.
 With the default `--methods all`, methods that cannot represent a generated
-length in a particular mode are reported as skipped; an explicitly requested
-incompatible method remains an error. Full 128K runs should use `--no-check`
-because the correctness reference has quadratic memory use.
+length are reported as skipped; an explicitly requested incompatible method
+remains an error. Backward is causal-only and compares per-sequence all-gather,
+Llama3 whole-packed all-gather, FA3/NCCL zigzag ring, and hierarchical fused
+mega-ring. Full 128K forward and backward runs should use `--no-check` because
+their correctness references have quadratic memory use.
 
 `ring_test/benchmark_hybrid_forward.py` compares per-sequence and whole-packed
 Llama3-style all-CP all-gather attention, FA3+NCCL ring attention, all-CP fused
@@ -295,6 +334,35 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py --b
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py --b 16,16,16 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both --methods all --num-comp-sm 116 --num-comm-sm 16 --no-check
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_backward.py --b 4,4,4 --seqlen 256,512,1024 --qhead 32 --kvhead 8 --headdim 128 --methods all --num-comp-sm 64 --num-comm-sm 8 --check
 ```
+
+Hierarchical hybrid backward benchmark:
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  ring_test/benchmark_hybrid_backward.py \
+  --b 1,4 --seqlen 256,256 \
+  --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
+  --qhead 16 --kvhead 8 --headdim 128 \
+  --methods all \
+  --num-comp-sm 100 --num-comm-sm 16 \
+  --warmup-iters 5 --num-iters 20
+```
+
+`benchmark_hybrid_backward.py` treats `--b` and `--seqlen` as equal-length
+comma-separated integer lists. Each pair `(b[i], seqlen[i])` is one benchmark
+case, and `seqlen[i]` is the member-rank local length. The ring-size/start
+pattern is repeated to fill that case's batch and sorted by decreasing ring
+size; each generated global length is `seqlen[i] * ring_size`. Timing excludes
+forward preparation, owner-accumulator reset, and the distributed barrier,
+reports maximum wall time across ranks, and derives aggregate causal backward
+TFLOP/s. Alternatively,
+`--global-seqlens`, `--ring-sizes`, and `--ring-starts` pass one explicit
+topology, while `--sm-configs` sweeps several compute/communication allocations
+without rebuilding the workload. `--check` enables subgroup-aware FP32 autograd
+dQ/dK/dV validation for small workloads. `--methods all` runs
+`allgather_attention`, `llama3_allgather_attention`, `fa3_ring`, and
+`mega_ring_hybrid`; the three all-CP baselines are measured once, while only
+the fused hybrid method is repeated for every SM configuration.
 
 Distributed ring benchmark notes:
 
@@ -327,7 +395,8 @@ Default test submission:
 sbatch run.slurm
 ```
 
-Backward correctness, FA3 performance comparison, and causal ring backward:
+Backward correctness, FA3 performance comparison, all-CP ring backward, and
+eight-GPU hierarchical backward validation/benchmarking:
 
 ```bash
 sbatch run_backward.slurm
@@ -336,9 +405,12 @@ sbatch run_backward.slurm
 Current `run.slurm` notes:
 
 - The checked-in script currently requests `4` GPUs and `16` CPUs on one node.
-- Its active commands run the distributed `ring_test/benchmark_ring_forward.py` sweep with `torchrun --nproc_per_node=4`.
-- `run_backward.slurm` requests one GPU and includes a single-rank
-  `ring_test/benchmark_ring_backward.py` sweep after the local backward tests.
+- Its active commands run the distributed `ring_test/benchmark_ring_forward.py`
+  sweep followed by three `ring_test/benchmark_hybrid_forward.py` workloads, all
+  with `torchrun --nproc_per_node=4`.
+- `run_backward.slurm` requests `8` GPUs and `32` CPUs. After the local backward
+  checks and benchmarks it runs two-GPU all-CP backward, eight-GPU hierarchical
+  correctness, binding validation failures, and the hybrid backward benchmark.
 
 ## Python usage
 
@@ -408,8 +480,10 @@ Ring varlen usage:
 import torch
 import min_fa3_op
 
-cu_seqlens_q = torch.tensor([0, 128, 256], device="cuda", dtype=torch.int32)
-cu_seqlens_k = torch.tensor([0, 128, 256], device="cuda", dtype=torch.int32)
+cu_seqlens_q_host = torch.tensor([0, 128, 256], dtype=torch.int32)
+cu_seqlens_k_host = torch.tensor([0, 128, 256], dtype=torch.int32)
+cu_seqlens_q = cu_seqlens_q_host.to(device="cuda")
+cu_seqlens_k = cu_seqlens_k_host.to(device="cuda")
 
 q = torch.randn(256, 16, 128, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(256, 8, 128, device="cuda", dtype=torch.bfloat16)
@@ -460,5 +534,4 @@ Behavior:
 
 - The demo currently requires contiguous BSHD tensors.
 - The varlen demo currently requires contiguous flattened `[total_tokens, H, D]` tensors, CUDA `int32` `cu_seqlens`, and matching CPU `int32` host copies of `cu_seqlens`.
-- The output LSE is allocated internally and not exposed.
 - The demo fixes cluster size to `1` to keep the standalone launch path small while preserving the original SM90 forward mainloop and kernel structure.

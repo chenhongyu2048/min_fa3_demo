@@ -226,6 +226,7 @@ public:
                     mainloop.template load<TileScheduler::IsPersistent>(
                         params.mainloop, pipeline_q, pipeline_do, smem_pipe_write,
                         smem_pipe_write_do, shared_storage, scheduler_prefetch, block_coord,
+                        work_tile_info.ring_level,
                         work_tile_info.ring_step);
                 }
                 mainloop.load_tail(pipeline_q, pipeline_do, smem_pipe_write, smem_pipe_write_do);
@@ -237,6 +238,7 @@ public:
                     auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
                     cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
                     mainloop.store_dq(params.mainloop, shared_storage, block_coord,
+                                      work_tile_info.ring_level,
                                       work_tile_info.ring_step);
                 }
             }
@@ -266,14 +268,14 @@ public:
                 bool tile_valid = mainloop.mma(
                     params.mainloop, pipeline_q, pipeline_do, smem_pipe_read, smem_pipe_read_do,
                     tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx, block_coord,
-                    shared_storage, work_tile_info.ring_step);
+                    shared_storage, work_tile_info.ring_level, work_tile_info.ring_step);
                 if (tile_valid) {
                     epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
                                    threadIdx.x - NumCopyThreads, block_coord,
-                                   work_tile_info.ring_step);
+                                   work_tile_info.ring_level, work_tile_info.ring_step);
                 } else {
                     epilogue.store_zero(params.epilogue, threadIdx.x - NumCopyThreads, block_coord,
-                                        work_tile_info.ring_step);
+                                        work_tile_info.ring_level, work_tile_info.ring_step);
                 }
                 if constexpr (TileScheduler::IsPersistent) {
                     // Release K/V shared memory only after the epilogue has

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Dataset-shaped hierarchical hybrid forward benchmark.
+# Dataset-shaped hierarchical hybrid forward/backward benchmark.
 # Run inside a single-node allocation exposing 2, 4, or 8 SM90 GPUs.
 
 set -euo pipefail
@@ -10,6 +10,7 @@ cd "$SCRIPT_DIR"
 
 GPU_COUNTS=${GPU_COUNTS:-"8"}
 DATASETS=${DATASETS:-"arxiv github"}
+DIRECTION=${DIRECTION:-forward}
 TARGET_TOKENS=${TARGET_TOKENS:-131072}
 BALANCE_TOLERANCE=${BALANCE_TOLERANCE:-0.05}
 TOKEN_BALANCE_TOLERANCE=${TOKEN_BALANCE_TOLERANCE:-0.10}
@@ -30,7 +31,13 @@ CHECK=${CHECK:-0}
 DRY_RUN=${DRY_RUN:-0}
 TORCHRUN=${TORCHRUN:-torchrun}
 LOG_DIR=${LOG_DIR:-"benchmark_logs/$(date +%Y%m%d-%H%M%S)"}
-LOG_FILE=${LOG_FILE:-"$LOG_DIR/benchmark_hybrid_dataset.log"}
+if [[ -z ${LOG_FILE:-} ]]; then
+    if [[ "$DIRECTION" == forward ]]; then
+        LOG_FILE="$LOG_DIR/benchmark_hybrid_dataset.log"
+    else
+        LOG_FILE="$LOG_DIR/benchmark_hybrid_dataset_backward.log"
+    fi
+fi
 
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
@@ -50,10 +57,18 @@ case "$DRY_RUN" in
     *) die "DRY_RUN must be 0 or 1, got '$DRY_RUN'" ;;
 esac
 
+case "$DIRECTION" in
+    forward|backward) ;;
+    *) die "DIRECTION must be forward or backward, got '$DIRECTION'" ;;
+esac
+
 case "$MODE" in
     noncausal|causal|both) ;;
     *) die "MODE must be noncausal, causal, or both, got '$MODE'" ;;
 esac
+if [[ "$DIRECTION" == backward && "$MODE" != causal ]]; then
+    die "hybrid backward supports only MODE=causal"
+fi
 
 [[ "$TARGET_TOKENS" =~ ^[1-9][0-9]*$ ]] || \
     die "TARGET_TOKENS must be a positive integer, got '$TARGET_TOKENS'"
@@ -110,9 +125,15 @@ run_benchmark() {
     local dataset=$1
     local world_size=$2
     local visible_devices=$3
+    local entrypoint
+    if [[ "$DIRECTION" == forward ]]; then
+        entrypoint=ring_test/benchmark_hybrid_dataset_forward.py
+    else
+        entrypoint=ring_test/benchmark_hybrid_dataset_backward.py
+    fi
     local -a command=(
         "$TORCHRUN" --standalone --nproc_per_node="$world_size"
-        ring_test/benchmark_hybrid_dataset_forward.py
+        "$entrypoint"
         --dataset "$dataset"
         --target-tokens "$TARGET_TOKENS"
         --balance-tolerance "$BALANCE_TOLERANCE"
@@ -123,15 +144,20 @@ run_benchmark() {
         --local-search-passes "$LOCAL_SEARCH_PASSES"
         --seed "$SEED"
         --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM"
-        --mode "$MODE" --methods "$METHODS" --sm-configs "$SM_CONFIGS"
+        --sm-configs "$SM_CONFIGS"
         --warmup-iters "$WARMUP_ITERS" --num-iters "$NUM_ITERS"
         "${CHECK_ARGS[@]}"
     )
+    if [[ "$DIRECTION" == forward ]]; then
+        command+=(--mode "$MODE" --methods "$METHODS")
+    else
+        command+=(--methods "$METHODS")
+    fi
 
     if ((DRY_RUN)); then
         printf '\n================================================================================\n'
-        printf '[hybrid_dataset] dataset=%s GPUs=%s visible=%s\n' \
-            "$dataset" "$world_size" "$visible_devices"
+        printf '[hybrid_dataset_%s] dataset=%s GPUs=%s visible=%s\n' \
+            "$DIRECTION" "$dataset" "$world_size" "$visible_devices"
         printf '================================================================================\n'
         print_command "$visible_devices" "${command[@]}"
         return
@@ -139,22 +165,23 @@ run_benchmark() {
 
     {
         printf '\n================================================================================\n'
-        printf '[hybrid_dataset] dataset=%s GPUs=%s visible=%s\n' \
-            "$dataset" "$world_size" "$visible_devices"
+        printf '[hybrid_dataset_%s] dataset=%s GPUs=%s visible=%s\n' \
+            "$DIRECTION" "$dataset" "$world_size" "$visible_devices"
         printf '================================================================================\n'
         print_command "$visible_devices" "${command[@]}"
     } | tee -a "$LOG_FILE"
     CUDA_VISIBLE_DEVICES="$visible_devices" "${command[@]}" 2>&1 | tee -a "$LOG_FILE"
 }
 
-mkdir -p "$(dirname -- "$LOG_FILE")"
 if ((DRY_RUN == 0)); then
+    mkdir -p "$(dirname -- "$LOG_FILE")"
     : > "$LOG_FILE"
 fi
 
 echo "Log: $LOG_FILE"
 echo "Datasets: ${DATASET_LIST[*]}"
-echo "Config: target_tokens=$TARGET_TOKENS, compute_tolerance=$BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, max_compute_tolerance=$MAX_COMPUTE_BALANCE_TOLERANCE, max_token_tolerance=$MAX_TOKEN_BALANCE_TOLERANCE, communication_weight=$COMMUNICATION_WEIGHT, local_search_passes=$LOCAL_SEARCH_PASSES, seed=$SEED, mode=$MODE, methods=$METHODS"
+echo "Config: direction=$DIRECTION, target_tokens=$TARGET_TOKENS, compute_tolerance=$BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, max_compute_tolerance=$MAX_COMPUTE_BALANCE_TOLERANCE, max_token_tolerance=$MAX_TOKEN_BALANCE_TOLERANCE, communication_weight=$COMMUNICATION_WEIGHT, local_search_passes=$LOCAL_SEARCH_PASSES, seed=$SEED, mode=$MODE"
+echo "Methods: $METHODS"
 
 for world_size in "${GPU_COUNT_LIST[@]}"; do
     select_devices "$world_size"

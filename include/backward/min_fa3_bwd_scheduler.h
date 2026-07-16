@@ -11,6 +11,7 @@
 
 #include "hopper_compat/utils.h"
 #include "min_fa3_named_barrier.h"
+#include "min_fa3_mega_ring_hierarchy.h"
 
 namespace flash {
 
@@ -27,6 +28,8 @@ struct TileSchedulerArguments {
     int const ring_rank = 0;
     int const num_comp_sm = 0;
     int const* const half_cu_seqlens = nullptr;
+    int const* const ring_sizes = nullptr;
+    min_fa3_varlen_demo::MegaRingHierarchyDesc const mega_ring_hierarchy{};
 };
 
 template <bool Varlen, int kBlock = 128, bool Persistent = false>
@@ -66,6 +69,7 @@ public:
         int bidb = 0;
         int tile_idx = 0;
         int ring_step = 0;
+        int ring_level = 0;
 
         CUTLASS_DEVICE bool is_valid(Params const&) const { return bidb >= 0; }
 
@@ -187,6 +191,7 @@ public:
         int bidb;
         int tile_idx;
         int ring_step = 0;
+        int ring_level = 0;
 
         CUTLASS_DEVICE bool is_valid(Params const&) const { return bidb >= 0; }
 
@@ -305,15 +310,12 @@ public:
     }
 };
 
-// MEGA_RING_BWD: causal zigzag scheduler layered on the copied backward LPT
-// scheduler. The base scheduler remains responsible for the original
-// n-block/head/batch order; this class only expands it across ring steps and
-// filters the front-half KV steps.
+// MEGA_RING_BWD: exact-size hierarchical causal-zigzag scheduler trimmed from
+// the copied backward persistent scheduler. Each ticket is one
+// (level, ring_step, KV tile); no multi-segment work is fused here.
 template <bool Varlen, int kBlock,
           int NumMmaThreads = 2 * cutlass::NumThreadsPerWarpGroup>
 class MegaRingSingleTileBwdLPTScheduler {
-    using Base = SingleTileBwdLPTScheduler<Varlen, kBlock, false, true, NumMmaThreads>;
-
 public:
     static constexpr bool IsPersistent = true;
     static constexpr bool EnableMegaRing = true;
@@ -323,12 +325,16 @@ public:
     SharedStorage* const tile_idx_smem;
 
     struct Params {
-        typename Base::Params base;
         int total_blocks;
         int ring_world_size;
         int ring_rank;
         int num_comp_sm;
+        int num_head;
+        int* tile_count_semaphore;
+        int const* cu_seqlens;
         int const* half_cu_seqlens;
+        int const* ring_sizes;
+        min_fa3_varlen_demo::MegaRingHierarchyDesc mega_ring_hierarchy;
     };
 
     struct WorkTileInfo {
@@ -337,6 +343,7 @@ public:
         int bidb;
         int tile_idx;
         int ring_step;
+        int ring_level;
 
         CUTLASS_DEVICE bool is_valid(Params const&) const { return bidb >= 0; }
 
@@ -349,10 +356,14 @@ public:
     static Params to_underlying_arguments(TileSchedulerArguments const& args) {
         assert(args.ring_world_size >= 1);
         assert(args.num_comp_sm >= 1);
-        auto base = Base::to_underlying_arguments(args);
-        return {base, base.total_blocks * args.ring_world_size,
+        assert(args.tile_count_semaphore != nullptr);
+        assert(args.cu_seqlens != nullptr && args.half_cu_seqlens != nullptr);
+        assert(args.ring_sizes != nullptr);
+        return {args.mega_ring_hierarchy.total_work_tiles,
                 args.ring_world_size, args.ring_rank, args.num_comp_sm,
-                args.half_cu_seqlens};
+                args.num_head, args.tile_count_semaphore,
+                args.cu_seqlens, args.half_cu_seqlens, args.ring_sizes,
+                args.mega_ring_hierarchy};
     }
 
     static dim3 get_grid_shape(Params const& params, int) {
@@ -363,31 +374,73 @@ public:
         : tile_idx_smem(smem_scheduler) {}
 
     CUTLASS_DEVICE WorkTileInfo decode_work(Params const& params, int tile_idx) const {
-        if (tile_idx >= params.total_blocks) { return {0, 0, -1, tile_idx, params.ring_world_size}; }
-        int const tiles_per_step = params.base.total_blocks;
-        int const ring_step = tile_idx / tiles_per_step;
-        int const step_tile_idx = tile_idx - ring_step * tiles_per_step;
-        Base base_scheduler(nullptr);
-        auto base_work = base_scheduler.decode_work(params.base, step_tile_idx);
-        if (!base_work.is_valid(params.base)) {
-            return {0, 0, -1, tile_idx, ring_step};
+        if (tile_idx >= params.total_blocks) {
+            return {0, 0, -1, tile_idx, params.ring_world_size,
+                    min_fa3_varlen_demo::kMegaRingNumLevels};
         }
-        // For steps 1..rank, zigzag consumes only the front half of KV.
-        if (ring_step > 0 && ring_step <= params.ring_rank) {
-            int half_len = params.half_cu_seqlens
-                ? params.half_cu_seqlens[base_work.bidb + 1] - params.half_cu_seqlens[base_work.bidb]
-                : 0;
-            if (base_work.block * kBlock >= half_len) {
-                return {0, 0, -1, tile_idx, ring_step};
+
+        int rem = tile_idx;
+        int target_level = -1;
+        int ring_step = 0;
+        bool use_half = false;
+        if (rem < params.mega_ring_hierarchy.base_work_tiles) {
+            #pragma unroll
+            for (int level_idx = 0;
+                 level_idx < min_fa3_varlen_demo::kMegaRingNumLevels && target_level < 0;
+                 ++level_idx) {
+                int const tiles = params.mega_ring_hierarchy.levels[level_idx].full_tiles;
+                if (rem < tiles) {
+                    target_level = level_idx;
+                } else {
+                    rem -= tiles;
+                }
+            }
+        } else {
+            rem -= params.mega_ring_hierarchy.base_work_tiles;
+            #pragma unroll
+            for (int level_idx = 0; level_idx < 3 && target_level < 0; ++level_idx) {
+                auto const& level = params.mega_ring_hierarchy.levels[level_idx];
+                int const ring_local_rank = params.ring_rank % level.ring_size;
+                for (int step = 1; step < level.ring_size; ++step) {
+                    bool const step_uses_half = step <= ring_local_rank;
+                    int const tiles = step_uses_half ? level.half_tiles : level.full_tiles;
+                    if (rem < tiles) {
+                        target_level = level_idx;
+                        ring_step = step;
+                        use_half = step_uses_half;
+                        break;
+                    }
+                    rem -= tiles;
+                }
             }
         }
-        return {base_work.block, base_work.bidh, base_work.bidb, tile_idx, ring_step};
+        if (target_level < 0) {
+            return {0, 0, -1, tile_idx, params.ring_world_size,
+                    min_fa3_varlen_demo::kMegaRingNumLevels};
+        }
+
+        auto const& level = params.mega_ring_hierarchy.levels[target_level];
+        for (int bidb = level.batch_begin; bidb < level.batch_end; ++bidb) {
+            if (params.ring_sizes[bidb] != level.ring_size) { continue; }
+            int const rows = use_half
+                ? params.half_cu_seqlens[bidb + 1] - params.half_cu_seqlens[bidb]
+                : params.cu_seqlens[bidb + 1] - params.cu_seqlens[bidb];
+            int const num_blocks = cute::ceil_div(rows, kBlock);
+            int const batch_tiles = num_blocks * params.num_head;
+            if (rem < batch_tiles) {
+                int const bidh = rem / num_blocks;
+                int const block = rem - bidh * num_blocks;
+                return {block, bidh, bidb, tile_idx, ring_step, target_level};
+            }
+            rem -= batch_tiles;
+        }
+        return {0, 0, -1, tile_idx, ring_step, target_level};
     }
 
     CUTLASS_DEVICE int claim_dynamic_tile(Params const& params, int tile_idx) const {
         WorkTileInfo work = decode_work(params, tile_idx);
         while (tile_idx < params.total_blocks && !work.is_valid(params)) {
-            tile_idx = atomicAdd(params.base.tile_count_semaphore, 1) + params.num_comp_sm;
+            tile_idx = atomicAdd(params.tile_count_semaphore, 1) + params.num_comp_sm;
             work = decode_work(params, tile_idx);
         }
         return tile_idx;
@@ -419,7 +472,7 @@ public:
 
     CUTLASS_DEVICE void prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {
         if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
-            int tile_idx = atomicAdd(params.base.tile_count_semaphore, 1) + params.num_comp_sm;
+            int tile_idx = atomicAdd(params.tile_count_semaphore, 1) + params.num_comp_sm;
             current_work.tile_idx = claim_dynamic_tile(params, tile_idx);
         }
     }

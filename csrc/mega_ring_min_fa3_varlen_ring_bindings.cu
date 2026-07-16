@@ -460,16 +460,14 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     }
 
     min_fa3_varlen_demo::MegaRingHierarchyDesc hierarchy{};
-    constexpr int kRingSizes[4] = {8, 4, 2, 1};
-    constexpr int kKvReadyBases[4] = {0, 7, 10, 11};
     int batch_cursor = 0;
     int64_t reduction_tiles = 0;
     int64_t remote_tiles = 0;
     int64_t total_comm_tasks = 0;
     int64_t const base_work_tiles = compute_tiles_per_step(cu_seqlens_q_host_ptr, batch_size, q.size(1));
     int64_t total_work_tiles = base_work_tiles;
-    for (int level_idx = 0; level_idx < 4; ++level_idx) {
-        int const ring_size = kRingSizes[level_idx];
+    for (int level_idx = 0; level_idx < min_fa3_varlen_demo::kMegaRingNumLevels; ++level_idx) {
+        int const ring_size = min_fa3_varlen_demo::mega_ring_size_for_level(level_idx);
         int const batch_begin = batch_cursor;
         while (batch_cursor < batch_size && ring_sizes_host_ptr[batch_cursor] == ring_size) {
             ++batch_cursor;
@@ -493,7 +491,7 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
         level.full_tiles = static_cast<int>(full_tiles);
         level.half_tiles = static_cast<int>(half_tiles);
         level.reduction_base = static_cast<int>(reduction_tiles);
-        level.kv_ready_base = kKvReadyBases[level_idx];
+        level.kv_ready_base = min_fa3_varlen_demo::mega_ring_kv_ready_base(level_idx);
         if (ring_size > 1) {
             int const ring_base = (ring_rank / ring_size) * ring_size;
             int const ring_local_rank = ring_rank - ring_base;

@@ -102,8 +102,6 @@ def backward_varlen_mega_ring(
     *,
     cu_seqlens_q_host: torch.Tensor,
     cu_seqlens_k_host: torch.Tensor,
-    half_cu_seqlens: torch.Tensor,
-    half_cu_seqlens_host: torch.Tensor,
     remote_k: TKParallelTensor,
     remote_v: TKParallelTensor,
     remote_dk_accum: TKParallelTensor,
@@ -111,6 +109,9 @@ def backward_varlen_mega_ring(
     remote_dkv_completion: TKParallelTensor,
     num_comp_sm: int,
     num_comm_sm: int,
+    global_seqlens_host: torch.Tensor,
+    ring_sizes_host: torch.Tensor,
+    ring_starts_host: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _backward_varlen_mega_ring_cuda(
         dout,
@@ -123,8 +124,6 @@ def backward_varlen_mega_ring(
         cu_seqlens_k,
         cu_seqlens_q_host,
         cu_seqlens_k_host,
-        half_cu_seqlens,
-        half_cu_seqlens_host,
         int(max_seqlen_q),
         int(max_seqlen_k),
         remote_k,
@@ -134,6 +133,9 @@ def backward_varlen_mega_ring(
         remote_dkv_completion,
         int(num_comp_sm),
         int(num_comm_sm),
+        global_seqlens_host,
+        ring_sizes_host,
+        ring_starts_host,
     )
 
 # Resolve the local rank metadata used by the TK parallel IPC path.

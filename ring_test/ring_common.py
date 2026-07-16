@@ -256,7 +256,9 @@ def zigzag_ring_varlen_forward(
     cu_seqlens_host: torch.Tensor,
     max_seqlen: int,
     block_attention: ZigzagBlockAttention,
-) -> torch.Tensor:
+    *,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run load-balanced causal zigzag ring attention for one backend.
 
     Each rank-local sequence is interpreted as [front half | back half]. Step 0
@@ -339,7 +341,10 @@ def zigzag_ring_varlen_forward(
 
     if out is None:
         raise RuntimeError("zigzag ring attention produced no output blocks")
-    return out.to(q.dtype)
+    output = out.to(q.dtype)
+    if return_lse:
+        return output, lse.squeeze(-1).transpose(0, 1).contiguous()
+    return output
 
 
 def pytorch_varlen_block_attention(
