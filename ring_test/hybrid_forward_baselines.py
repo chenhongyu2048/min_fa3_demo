@@ -9,6 +9,7 @@ import torch.distributed as dist
 
 from allgather_attention import _external_forward, _local_forward
 from ring_common import ring_varlen_forward, zigzag_ring_varlen_forward
+from zepplin import ZepplinPlan, zepplin_note
 
 
 def make_cu_seqlens(
@@ -294,3 +295,85 @@ def fa3_ring_forward(
             causal_,
         ),
     )
+
+
+class ZepplinForward(_BlockBackend):
+    """Run rank-local G1 attention before the all-rank Gworld ring."""
+
+    def __init__(
+        self,
+        process_group: Optional[dist.ProcessGroup],
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        plan: ZepplinPlan,
+        backend: str,
+    ) -> None:
+        super().__init__(backend)
+        self.process_group = process_group
+        self.q = q
+        self.k = k
+        self.v = v
+        self.plan = plan
+        self.rank = dist.get_rank(process_group)
+        if dist.get_world_size(process_group) != plan.world_size:
+            raise ValueError("zepplin plan world size does not match process group")
+
+        self.short_lengths = plan.short_lengths_for_rank(self.rank)
+        self.long_lengths = plan.long_local_lengths()
+        self.short_total = sum(self.short_lengths)
+        expected_total = self.short_total + sum(self.long_lengths)
+        if q.size(0) != expected_total or k.size(0) != expected_total:
+            raise ValueError("Q/K do not match the zepplin rank-local packed layout")
+        if v.shape != k.shape:
+            raise ValueError("zepplin K/V shapes must match")
+
+        self.out = torch.empty_like(q)
+        if self.short_lengths:
+            self.short_cu, self.short_cu_host = make_cu_seqlens(
+                self.short_lengths, q.device
+            )
+        if self.long_lengths:
+            self.long_cu, self.long_cu_host = make_cu_seqlens(
+                self.long_lengths, q.device
+            )
+
+    @property
+    def note(self) -> str:
+        return zepplin_note(self.plan, self.backend_name)
+
+    def forward(self) -> torch.Tensor:
+        if self.short_lengths:
+            short_out, _ = self.forward_block(
+                self.q[: self.short_total],
+                self.k[: self.short_total],
+                self.v[: self.short_total],
+                self.short_cu,
+                self.short_cu,
+                self.short_cu_host,
+                self.short_cu_host,
+                max(self.short_lengths),
+                max(self.short_lengths),
+                self.plan.is_causal,
+            )
+            self.out[: self.short_total].copy_(short_out)
+
+        dist.barrier(group=self.process_group)
+
+        if self.long_lengths:
+            long_out = fa3_ring_forward(
+                self.process_group,
+                self.q[self.short_total :],
+                self.k[self.short_total :],
+                self.v[self.short_total :],
+                self.long_cu,
+                self.long_cu_host,
+                self.long_lengths,
+                self.plan.is_causal,
+                self.backend,
+            )
+            self.out[self.short_total :].copy_(long_out)
+        return self.out
+
+
+__all__ = ["VarlenAllGatherForward", "ZepplinForward", "fa3_ring_forward"]

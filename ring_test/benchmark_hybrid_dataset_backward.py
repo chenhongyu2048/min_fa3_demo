@@ -18,11 +18,13 @@ for path in (THIS_DIR, DEMO_DIR):
 
 import balancer
 from benchmark_hybrid_dataset_forward import (
+    _positive_int,
     _format_int_list,
     _requests_all,
     _world_size,
     print_workload,
 )
+from zepplin import DEFAULT_ZEPPLIN_THRESHOLD
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -69,6 +71,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--kvhead", type=int, default=8)
     parser.add_argument("--headdim", type=int, default=128)
     parser.add_argument("--methods", default="all")
+    parser.add_argument(
+        "--zepplin-threshold",
+        type=_positive_int,
+        default=DEFAULT_ZEPPLIN_THRESHOLD,
+    )
     parser.add_argument("--sm-configs", default="128:4,124:8,120:12,116:16")
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--num-iters", type=int, default=40)
@@ -77,6 +84,44 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dkv-atol", type=float, default=0.5)
     parser.add_argument("--rtol", type=float, default=0.2)
     return parser.parse_args(argv)
+
+
+def _benchmark_argv(
+    args: argparse.Namespace, workload: balancer.HybridWorkload
+) -> list[str]:
+    return [
+        "--global-seqlens",
+        _format_int_list(workload.global_lengths),
+        "--ring-sizes",
+        _format_int_list(workload.ring_sizes),
+        "--ring-starts",
+        _format_int_list(workload.ring_starts),
+        "--qhead",
+        str(args.qhead),
+        "--kvhead",
+        str(args.kvhead),
+        "--headdim",
+        str(args.headdim),
+        "--methods",
+        args.methods,
+        "--zepplin-threshold",
+        str(args.zepplin_threshold),
+        "--sm-configs",
+        args.sm_configs,
+        "--warmup-iters",
+        str(args.warmup_iters),
+        "--num-iters",
+        str(args.num_iters),
+        "--seed",
+        str(args.seed),
+        "--dq-atol",
+        str(args.dq_atol),
+        "--dkv-atol",
+        str(args.dkv_atol),
+        "--rtol",
+        str(args.rtol),
+        "--check" if args.check else "--no-check",
+    ]
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -112,37 +157,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.print_workload:
         return
 
-    forwarded_argv = [
-        "--global-seqlens",
-        _format_int_list(workload.global_lengths),
-        "--ring-sizes",
-        _format_int_list(workload.ring_sizes),
-        "--ring-starts",
-        _format_int_list(workload.ring_starts),
-        "--qhead",
-        str(args.qhead),
-        "--kvhead",
-        str(args.kvhead),
-        "--headdim",
-        str(args.headdim),
-        "--methods",
-        args.methods,
-        "--sm-configs",
-        args.sm_configs,
-        "--warmup-iters",
-        str(args.warmup_iters),
-        "--num-iters",
-        str(args.num_iters),
-        "--seed",
-        str(args.seed),
-        "--dq-atol",
-        str(args.dq_atol),
-        "--dkv-atol",
-        str(args.dkv_atol),
-        "--rtol",
-        str(args.rtol),
-        "--check" if args.check else "--no-check",
-    ]
+    forwarded_argv = _benchmark_argv(args, workload)
 
     import benchmark_hybrid_backward
 

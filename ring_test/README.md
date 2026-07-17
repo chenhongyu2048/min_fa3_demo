@@ -162,19 +162,22 @@ divisible by 256, and the current fused backward requires causal mode,
 
 - `allgather_attention`: per-sequence zigzag all-gather plus batched varlen backward
 - `llama3_allgather_attention`: whole-packed two-block all-gather backward
-- `fa3_ring`: NCCL zigzag K/V and FP32 dKV ring using external FA3 block backward
+- `fa3_ring`: NCCL zigzag K/V and FP32 dKV ring using FA3 block backward
+- `zepplin`: short-sequence G1 attention plus long-sequence all-rank FA3 ring
 - `mega_ring_all_cp`: fused backward with every sequence split across all ranks
 - `mega_ring_hybrid`: fused G8/G4/G2/G1 hierarchical backward
 
-The three block baselines prefer external FA3 consistently across all ranks
+The four block baselines prefer external FA3 consistently across all ranks
 and fall back to this repository's min-FA3 varlen forward/backward ops when it
 is unavailable. `mega_ring_all_cp` and `mega_ring_hybrid` sweep every requested
-SM configuration; the three block baselines run once. Results
+SM configuration; the four block baselines run once. Results
 include maximum end-to-end wall time, per-rank median times,
 aggregate/average-per-GPU causal backward TFLOP/s, and the fused
 compute/communication SM split. Forward preparation is outside every method's
 timed interval. The fused owner-accumulator reset and distributed barrier are
-also outside its timed interval.
+also outside its timed interval. Zeppelin's timed backward runs its all-rank
+ring backward first, then an all-rank phase barrier, then the rank-local G1
+backward. That internal phase barrier is included in its result.
 
 `--b` and `--seqlen` are comma-separated integer lists with equal length. Each
 `(b[i], seqlen[i])` pair is one case; `seqlen[i]` is the local sequence length
@@ -188,7 +191,7 @@ torchrun --standalone --nproc_per_node=8 \
   --b 1,4 --seqlen 256,256 \
   --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
   --qhead 16 --kvhead 8 --headdim 128 \
-  --methods all \
+  --methods all --zepplin-threshold 4096 \
   --num-comp-sm 100 --num-comm-sm 16 \
   --warmup-iters 5 --num-iters 20
 ```
@@ -253,19 +256,21 @@ token budget, prints the same placement/cap/load report, and calls
 `benchmark_hybrid_backward.main(...)` in the same process with explicit ring
 metadata. Backward is causal-only and benchmarks the all-CP and hierarchical
 fused kernels together with the per-sequence all-gather, Llama3 all-gather,
-and FA3/NCCL ring baselines.
+FA3/NCCL ring, and Zeppelin baselines. The dataset planner's hierarchical ring
+metadata is forwarded unchanged; Zeppelin independently rebuilds its G1/Gworld
+placement from the global sequence lengths.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
   ring_test/benchmark_hybrid_dataset_backward.py \
   --dataset arxiv --target-tokens 131072 --seed 0 \
   --qhead 32 --kvhead 8 --headdim 128 \
-  --methods all \
+  --methods all --zepplin-threshold 4096 \
   --sm-configs 128:4,124:8,120:12,116:16 \
   --warmup-iters 10 --num-iters 40 --no-check
 
-DATASETS="arxiv github" GPU_COUNTS="2 4 8" \
-  ./benchmark_hybrid_dataset_backward.sh
+DATASETS="arxiv github" GPU_COUNTS="2 4 8" DIRECTION=backward \
+  ZEPPLIN_THRESHOLD=4096 ./benchmark_hybrid_dataset.sh
 ```
 
 Planner-only inspection does not import or initialize CUDA:
@@ -279,16 +284,18 @@ python ring_test/benchmark_hybrid_dataset_backward.py \
 Use `--check` only for small token budgets because the dense backward reference
 has quadratic score memory. The shell wrapper shares the forward wrapper's
 `DATASETS`, `GPU_COUNTS`, balancing controls, `SM_CONFIGS`, logging, `CHECK`,
-and `DRY_RUN` environment variables.
+and `DRY_RUN` environment variables. `ZEPPLIN_THRESHOLD` controls the shared
+forward/backward threshold and defaults to `4096`.
 
 ## Hybrid mega-ring benchmark
 
-`benchmark_hybrid_forward.py` compares the same global varlen batch with five
+`benchmark_hybrid_forward.py` compares the same global varlen batch with six
 methods:
 
 - `allgather_attention`: all-CP K/V all-gather followed by batched varlen attention
 - `llama3_allgather_attention`: all-CP K/V all-gather with whole-packed zigzag partitioning
 - `fa3_ring`: all-CP Python ring using FA3 blocks plus NCCL P2P
+- `zepplin`: LPT-placed rank-local attention for short sequences and an all-rank ring for long sequences
 - `mega_ring_all_cp`: fused mega-ring with every sequence split across all ranks
 - `mega_ring_hybrid`: fused mega-ring using the requested per-batch ring hierarchy
 
@@ -297,19 +304,35 @@ the built demo extension. Their shared workload and reference helpers live in
 `ring_test/utils.py`; running them does not require the scripts under
 `scripts/test_mega_ring/` or an additional `PYTHONPATH`.
 
-The first three methods are baselines. Every global sequence is divided evenly
-over all physical ranks. `mega_ring_hybrid` instead uses `--ring-sizes` and
+The first three methods are all-CP baselines. Every global sequence is divided
+evenly over all physical ranks. `mega_ring_hybrid` instead uses `--ring-sizes` and
 `--ring-starts`; rank-local length is `global_len / ring_size` for members of
 that batch's ring and zero for other ranks. External FA3 is used by all three
-block baselines when available; each consistently falls back to the local
-min-FA3 varlen block when it is unavailable.
+all-CP block baselines and Zeppelin when available; all four consistently fall
+back to the local min-FA3 varlen block when it is unavailable.
+
+Zeppelin uses `--zepplin-threshold` (default `4096`) independently of the
+hierarchical metadata. A sequence with `global_length < threshold` is placed
+whole on one rank (G1); equality belongs to the long side, so length `4096`
+uses Gworld at the default threshold. Short sequences are assigned by
+deterministic longest-processing-time-first placement. Causal weight is
+`L * (L + 1) / 2`, noncausal weight is `L * L`; equal weights retain original
+batch-index order, and equal rank loads choose the smaller rank id. Long
+sequences add the same distributed load to every rank and do not affect the
+G1 choice.
+
+Each rank packs its owned short sequences first and every long sequence's
+local shard second; each part retains original batch order. Forward timing
+includes local varlen attention, one all-rank phase barrier, and the long
+`fa3_ring`. Ranks with no short work and workloads with no long work still
+participate in that barrier, while empty kernel launches are skipped.
 
 Forward selection requires the external FA3 varlen forward entry point on
 every rank. Backward selection requires both its forward and backward entry
-points; otherwise all three baselines use the current repository's matching
+points; otherwise all four block baselines use the current repository's matching
 min-FA3 operators for the entire run.
 
-For an `--sm-configs` list, the three block baselines run once using the first
+For an `--sm-configs` list, the four block baselines run once using the first
 configuration. `mega_ring_all_cp` and `mega_ring_hybrid` run once for every
 configuration in both hybrid forward and backward.
 
@@ -317,7 +340,10 @@ All-CP baseline lengths must be divisible by the physical world size. The total
 global token count for `llama3_allgather_attention` must also be divisible by
 `2 * world_size`. Causal all-CP mega-ring additionally requires each rank-local
 half length to be 128-aligned. Use `--methods` to select a subset or
-`--methods all` for all five.
+`--methods all` for all six. Zeppelin only requires sequences at or above its
+threshold to be divisible by `world_size`; causal long shards must also be
+even for the zigzag ring. Short G1 sequences have no all-CP divisibility
+constraint, and the threshold must be a positive integer.
 
 Example:
 
@@ -326,6 +352,7 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_hybrid_forward.py \
   --global-seqlens 8192,1024,1024 \
   --ring-sizes 2,1,1 --ring-starts 0,0,1 \
   --qhead 16 --kvhead 8 --headdim 128 --methods all \
+  --zepplin-threshold 4096 \
   --sm-configs 128:4,116:16 --mode both \
   --warmup-iters 5 --num-iters 20
 ```
@@ -353,9 +380,9 @@ torchrun --standalone --nproc_per_node=8 \
   ring_test/benchmark_hybrid_dataset_forward.py \
   --dataset arxiv --target-tokens 131072 --seed 0 \
   --qhead 32 --kvhead 8 --headdim 128 \
-  --mode causal --methods all --no-check
+  --mode causal --methods all --zepplin-threshold 4096 --no-check
 
-DATASETS="arxiv github" GPU_COUNTS="2 4 8" \
+DATASETS="arxiv github" GPU_COUNTS="2 4 8" ZEPPLIN_THRESHOLD=4096 \
   ./benchmark_hybrid_dataset.sh
 ```
 
@@ -375,7 +402,8 @@ token cap that has a feasible placement. The relevant controls are:
 The shell wrapper exposes the same settings as `BALANCE_TOLERANCE`,
 `TOKEN_BALANCE_TOLERANCE`, `MAX_COMPUTE_BALANCE_TOLERANCE`,
 `MAX_TOKEN_BALANCE_TOLERANCE`, `COMMUNICATION_WEIGHT`, and
-`LOCAL_SEARCH_PASSES`. `--print-workload` reports the requested, topology, and
+`LOCAL_SEARCH_PASSES`. `ZEPPLIN_THRESHOLD` defaults to `4096` and is forwarded
+to both dataset directions. `--print-workload` reports the requested, topology, and
 final caps; estimated per-rank communication; cap-relaxation flags; emergency
 fallback; and the number of accepted local-repair moves. A topology-limited
 workload can exceed the configured imbalance tolerance when a sequence cannot

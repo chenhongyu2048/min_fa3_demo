@@ -20,6 +20,7 @@ COMMUNICATION_WEIGHT=${COMMUNICATION_WEIGHT:-0.05}
 LOCAL_SEARCH_PASSES=${LOCAL_SEARCH_PASSES:-4}
 SEED=${SEED:-0}
 METHODS=${METHODS:-all}
+ZEPPLIN_THRESHOLD=${ZEPPLIN_THRESHOLD:-4096}
 MODE=${MODE:-causal}
 QHEAD=${QHEAD:-32}
 KVHEAD=${KVHEAD:-8}
@@ -72,6 +73,8 @@ fi
 
 [[ "$TARGET_TOKENS" =~ ^[1-9][0-9]*$ ]] || \
     die "TARGET_TOKENS must be a positive integer, got '$TARGET_TOKENS'"
+[[ "$ZEPPLIN_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || \
+    die "ZEPPLIN_THRESHOLD must be a positive integer, got '$ZEPPLIN_THRESHOLD'"
 
 gpu_counts_spec=${GPU_COUNTS//,/ }
 read -r -a GPU_COUNT_LIST <<< "$gpu_counts_spec"
@@ -144,6 +147,7 @@ run_benchmark() {
         --local-search-passes "$LOCAL_SEARCH_PASSES"
         --seed "$SEED"
         --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM"
+        --zepplin-threshold "$ZEPPLIN_THRESHOLD"
         --sm-configs "$SM_CONFIGS"
         --warmup-iters "$WARMUP_ITERS" --num-iters "$NUM_ITERS"
         "${CHECK_ARGS[@]}"
@@ -180,7 +184,7 @@ fi
 
 echo "Log: $LOG_FILE"
 echo "Datasets: ${DATASET_LIST[*]}"
-echo "Config: direction=$DIRECTION, target_tokens=$TARGET_TOKENS, compute_tolerance=$BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, max_compute_tolerance=$MAX_COMPUTE_BALANCE_TOLERANCE, max_token_tolerance=$MAX_TOKEN_BALANCE_TOLERANCE, communication_weight=$COMMUNICATION_WEIGHT, local_search_passes=$LOCAL_SEARCH_PASSES, seed=$SEED, mode=$MODE"
+echo "Config: direction=$DIRECTION, target_tokens=$TARGET_TOKENS, compute_tolerance=$BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, max_compute_tolerance=$MAX_COMPUTE_BALANCE_TOLERANCE, max_token_tolerance=$MAX_TOKEN_BALANCE_TOLERANCE, communication_weight=$COMMUNICATION_WEIGHT, local_search_passes=$LOCAL_SEARCH_PASSES, seed=$SEED, mode=$MODE, zepplin_threshold=$ZEPPLIN_THRESHOLD"
 echo "Methods: $METHODS"
 
 for world_size in "${GPU_COUNT_LIST[@]}"; do

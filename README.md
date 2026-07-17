@@ -270,7 +270,7 @@ torchrun --standalone --nproc_per_node=8 \
   --global-seqlens 8192,4096,2048,1024 \
   --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
   --qhead 32 --kvhead 8 --headdim 128 \
-  --methods all \
+  --methods all --zepplin-threshold 4096 \
   --sm-configs 128:4,124:8,120:12,116:16 \
   --mode both --warmup-iters 10 --num-iters 40 --no-check
 
@@ -284,18 +284,20 @@ torchrun --standalone --nproc_per_node=8 \
   ring_test/benchmark_hybrid_dataset_forward.py \
   --dataset arxiv --target-tokens 131072 --seed 0 \
   --qhead 32 --kvhead 8 --headdim 128 \
-  --mode causal --methods all --no-check
+  --mode causal --methods all --zepplin-threshold 4096 --no-check
 
-DATASETS="arxiv github" GPU_COUNTS=8 ./benchmark_hybrid_dataset.sh
+DATASETS="arxiv github" GPU_COUNTS=8 ZEPPLIN_THRESHOLD=4096 \
+  ./benchmark_hybrid_dataset.sh
 
 torchrun --standalone --nproc_per_node=8 \
   ring_test/benchmark_hybrid_dataset_backward.py \
   --dataset arxiv --target-tokens 131072 --seed 0 \
   --qhead 32 --kvhead 8 --headdim 128 \
-  --methods all --sm-configs 128:4,124:8,120:12,116:16 --no-check
+  --methods all --zepplin-threshold 4096 \
+  --sm-configs 128:4,124:8,120:12,116:16 --no-check
 
-DATASETS="arxiv github" GPU_COUNTS=8 \
-  ./benchmark_hybrid_dataset_backward.sh
+DATASETS="arxiv github" GPU_COUNTS=8 DIRECTION=backward \
+  ZEPPLIN_THRESHOLD=4096 ./benchmark_hybrid_dataset.sh
 ```
 
 The dataset frontends call the standalone `balancer` package to generate global
@@ -315,14 +317,19 @@ tokens.
 With the default `--methods all`, methods that cannot represent a generated
 length are reported as skipped; an explicitly requested incompatible method
 remains an error. Backward is causal-only and compares per-sequence all-gather,
-Llama3 whole-packed all-gather, FA3/NCCL zigzag ring, and hierarchical fused
-mega-ring. Full 128K forward and backward runs should use `--no-check` because
+Llama3 whole-packed all-gather, FA3/NCCL zigzag ring, Zeppelin, and hierarchical
+fused mega-ring. Zeppelin independently places lengths below
+`--zepplin-threshold` (default `4096`) whole on one rank by deterministic LPT
+and splits lengths at or above the threshold across all ranks. Full 128K
+forward and backward runs should use `--no-check` because
 their correctness references have quadratic memory use.
 
 `ring_test/benchmark_hybrid_forward.py` compares per-sequence and whole-packed
 Llama3-style all-CP all-gather attention, FA3+NCCL ring attention, all-CP fused
-mega-ring, and hierarchical hybrid mega-ring. The all-CP methods use all
-physical ranks; the hybrid method follows `--ring-sizes` and `--ring-starts`.
+mega-ring, Zeppelin, and hierarchical hybrid mega-ring. The all-CP methods use
+all physical ranks; the hybrid method follows `--ring-sizes` and
+`--ring-starts`. Zeppelin uses G1 for lengths strictly below its threshold and
+Gworld for equality and above.
 It measures the complete Python op with CUDA events, reports maximum elapsed
 time across ranks, and prints aggregate and average-per-GPU TFLOPS. `--check`
 adds output reference validation after timing.
@@ -343,7 +350,7 @@ torchrun --standalone --nproc_per_node=8 \
   --b 1,4 --seqlen 256,256 \
   --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
   --qhead 16 --kvhead 8 --headdim 128 \
-  --methods all \
+  --methods all --zepplin-threshold 4096 \
   --num-comp-sm 100 --num-comm-sm 16 \
   --warmup-iters 5 --num-iters 20
 ```
@@ -353,16 +360,17 @@ comma-separated integer lists. Each pair `(b[i], seqlen[i])` is one benchmark
 case, and `seqlen[i]` is the member-rank local length. The ring-size/start
 pattern is repeated to fill that case's batch and sorted by decreasing ring
 size; each generated global length is `seqlen[i] * ring_size`. Timing excludes
-forward preparation, owner-accumulator reset, and the distributed barrier,
+forward preparation, owner-accumulator reset, and the pre-launch distributed
+barrier; method-internal phase barriers such as Zeppelin's are included. It
 reports maximum wall time across ranks, and derives aggregate causal backward
 TFLOP/s. Alternatively,
 `--global-seqlens`, `--ring-sizes`, and `--ring-starts` pass one explicit
 topology, while `--sm-configs` sweeps several compute/communication allocations
 without rebuilding the workload. `--check` enables subgroup-aware FP32 autograd
-dQ/dK/dV validation for small workloads. `--methods all` runs
-`allgather_attention`, `llama3_allgather_attention`, `fa3_ring`, and
-`mega_ring_hybrid`; the three all-CP baselines are measured once, while only
-the fused hybrid method is repeated for every SM configuration.
+dQ/dK/dV validation for small workloads. `--methods all` includes
+`allgather_attention`, `llama3_allgather_attention`, `fa3_ring`, `zepplin`,
+`mega_ring_all_cp`, and `mega_ring_hybrid`; the four Python block baselines are
+measured once, while both fused methods are repeated for every SM configuration.
 
 Distributed ring benchmark notes:
 

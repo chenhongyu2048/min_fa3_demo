@@ -22,7 +22,11 @@ from allgather_attention import (
     repartition_sequence_shards_to_llama3,
     select_fa3_backend,
 )
-from hybrid_forward_baselines import VarlenAllGatherForward, fa3_ring_forward
+from hybrid_forward_baselines import (
+    VarlenAllGatherForward,
+    ZepplinForward,
+    fa3_ring_forward,
+)
 from ring_test.utils import (
     hierarchical_reference,
     init_distributed,
@@ -31,12 +35,19 @@ from ring_test.utils import (
     make_local_qkv,
     parse_int_list,
 )
+from zepplin import (
+    DEFAULT_ZEPPLIN_THRESHOLD,
+    ZepplinPlan,
+    make_zepplin_plan,
+    zepplin_incompatibility,
+)
 
 
 METHOD_ORDER = [
     "allgather_attention",
     "llama3_allgather_attention",
     "fa3_ring",
+    "zepplin",
     "mega_ring_all_cp",
     "mega_ring_hybrid",
 ]
@@ -156,7 +167,12 @@ def method_incompatibility(
     global_lengths: list[int],
     world_size: int,
     is_causal: bool,
+    zepplin_threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
 ) -> str | None:
+    if method == "zepplin":
+        return zepplin_incompatibility(
+            global_lengths, world_size, is_causal, zepplin_threshold
+        )
     if method not in ALL_CP_METHODS:
         return None
     for idx, global_len in enumerate(global_lengths):
@@ -191,11 +207,18 @@ def compatible_methods_for_mode(
     is_causal: bool,
     *,
     skip_incompatible: bool,
+    zepplin_threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
 ) -> tuple[list[str], list[tuple[str, str]]]:
     compatible: list[str] = []
     skipped: list[tuple[str, str]] = []
     for method in methods:
-        reason = method_incompatibility(method, global_lengths, world_size, is_causal)
+        reason = method_incompatibility(
+            method,
+            global_lengths,
+            world_size,
+            is_causal,
+            zepplin_threshold,
+        )
         if reason is None:
             compatible.append(method)
         elif skip_incompatible:
@@ -345,6 +368,13 @@ def raise_if_any_rank_failed(local_error: str | None) -> None:
     raise AssertionError("another rank failed hierarchical output validation")
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark hierarchical hybrid forward with all-CP baselines")
     parser.add_argument("--global-seqlens", required=True)
@@ -360,6 +390,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=f"Comma-separated methods from {METHOD_ORDER}, or all",
     )
     parser.add_argument("--sm-configs", default="128:4,124:8,120:12,116:16")
+    parser.add_argument(
+        "--zepplin-threshold",
+        type=positive_int,
+        default=DEFAULT_ZEPPLIN_THRESHOLD,
+    )
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--num-iters", type=int, default=40)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
@@ -390,7 +425,14 @@ def main(
         global_lengths = parse_int_list(args.global_seqlens, "--global-seqlens")
         ring_sizes = parse_int_list(args.ring_sizes, "--ring-sizes")
         ring_starts = parse_int_list(args.ring_starts, "--ring-starts")
-        validate_metadata(global_lengths, ring_sizes, ring_starts, world_size, args.mode)
+        if any(method != "zepplin" for method in methods):
+            validate_metadata(
+                global_lengths, ring_sizes, ring_starts, world_size, args.mode
+            )
+        elif not (len(global_lengths) == len(ring_sizes) == len(ring_starts)):
+            raise SystemExit(
+                "global lengths, ring sizes, and ring starts must have the same length"
+            )
         sm_configs = parse_sm_configs(args.sm_configs)
         sm_count = torch.cuda.get_device_properties(rank).multi_processor_count
         for config in sm_configs:
@@ -416,9 +458,20 @@ def main(
                 world_size,
                 is_causal,
                 skip_incompatible=skip_incompatible_methods,
+                zepplin_threshold=args.zepplin_threshold,
             )
             methods_by_mode[is_causal] = active_methods
             skipped_by_mode[is_causal] = skipped_methods
+
+        zepplin_plans: dict[bool, ZepplinPlan] = {}
+        for is_causal in modes:
+            if "zepplin" in methods_by_mode[is_causal]:
+                zepplin_plans[is_causal] = make_zepplin_plan(
+                    global_lengths,
+                    world_size,
+                    is_causal,
+                    args.zepplin_threshold,
+                )
 
         block_backend = (
             select_fa3_backend(dist.group.WORLD, require_backward=False)
@@ -429,6 +482,7 @@ def main(
                         "allgather_attention",
                         "llama3_allgather_attention",
                         "fa3_ring",
+                        "zepplin",
                     )
                 )
                 for active_methods in methods_by_mode.values()
@@ -451,6 +505,7 @@ def main(
                 f"Config: world_size={world_size}, methods={methods}, "
                 f"QH={args.qhead}, KVH={args.kvhead}, D={args.headdim}, "
                 f"mode={args.mode}, sm_configs={sm_configs_s}, "
+                f"zepplin_threshold={args.zepplin_threshold}, "
                 f"warmup={args.warmup_iters}, iters={args.num_iters}, "
                 f"check={args.check}"
             )
@@ -466,6 +521,14 @@ def main(
                 f"FA backend: {backend_note}",
                 flush=True,
             )
+            for is_causal, plan in zepplin_plans.items():
+                mode = "causal" if is_causal else "noncausal"
+                print(
+                    f"Zepplin placement ({mode}): threshold={plan.threshold}, "
+                    f"G1={len(plan.short_indices)}, "
+                    f"Gworld={len(plan.long_indices)}, "
+                    f"G1_rank_loads={list(plan.short_loads)}"
+                )
             print(
                 "Agg TFLOPS sums visible attention work across ranks; "
                 "Avg/GPU is that value divided by world_size."
@@ -496,7 +559,7 @@ def main(
             expected_all_cp_out = None
             expected_all_cp_lse = None
             expected_llama3_out = None
-            if any(method != "mega_ring_hybrid" for method in active_methods):
+            if any(method in ALL_CP_METHODS for method in active_methods):
                 all_cp_lengths = [length // world_size for length in global_lengths]
                 all_cp_total = sum(all_cp_lengths)
                 all_cp_cu, all_cp_cu_host = make_cu_seqlens(all_cp_lengths, device)
@@ -602,6 +665,69 @@ def main(
                             is_causal,
                         )
 
+            zepplin_run = None
+            if "zepplin" in active_methods:
+                if block_backend is None:
+                    raise RuntimeError("zepplin baseline requires a block backend")
+                zepplin_plan = zepplin_plans[is_causal]
+                zepplin_local_lengths = zepplin_plan.packed_lengths_for_rank(rank)
+                zepplin_local_total = sum(zepplin_local_lengths)
+                zepplin_q, zepplin_k, zepplin_v = make_local_qkv(
+                    zepplin_local_total,
+                    args.qhead,
+                    args.kvhead,
+                    args.headdim,
+                    rank,
+                    is_causal,
+                    device,
+                    base_seed=args.seed + 37,
+                )
+                zepplin_runner = ZepplinForward(
+                    dist.group.WORLD,
+                    zepplin_q,
+                    zepplin_k,
+                    zepplin_v,
+                    zepplin_plan,
+                    block_backend,
+                )
+                expected_zepplin_out = None
+                if args.check:
+                    zepplin_rank_lengths = [
+                        zepplin_plan.topology_lengths_for_rank(source_rank)
+                        for source_rank in range(world_size)
+                    ]
+                    zepplin_rank_capacity = max(
+                        sum(lengths) for lengths in zepplin_rank_lengths
+                    )
+                    gathered_zepplin_k = gather_padded_rank_tensor(
+                        zepplin_k, zepplin_rank_capacity
+                    )
+                    gathered_zepplin_v = gather_padded_rank_tensor(
+                        zepplin_v, zepplin_rank_capacity
+                    )
+                    _, zepplin_cu_host = make_cu_seqlens(
+                        zepplin_plan.topology_lengths_for_rank(rank), device
+                    )
+                    expected_zepplin_out, _ = hierarchical_reference(
+                        zepplin_q,
+                        gathered_zepplin_k,
+                        gathered_zepplin_v,
+                        zepplin_rank_lengths,
+                        zepplin_cu_host,
+                        zepplin_plan.packed_global_lengths,
+                        zepplin_plan.ring_sizes,
+                        zepplin_plan.ring_starts,
+                        rank,
+                        is_causal,
+                    )
+                zepplin_run = MethodRun(
+                    "zepplin",
+                    zepplin_runner.forward,
+                    expected_zepplin_out,
+                    None,
+                    zepplin_runner.note,
+                )
+
             hybrid_run_data = None
             if "mega_ring_hybrid" in active_methods:
                 hybrid_rank_lengths = [
@@ -687,7 +813,11 @@ def main(
                     )
                 runs: list[MethodRun] = []
                 for method in config_methods:
-                    if method in all_cp_runs:
+                    if method == "zepplin":
+                        if zepplin_run is None:
+                            raise RuntimeError("zepplin run was not prepared")
+                        runs.append(zepplin_run)
+                    elif method in all_cp_runs:
                         launch, note = all_cp_runs[method]
                         expected_out = (
                             expected_llama3_out
