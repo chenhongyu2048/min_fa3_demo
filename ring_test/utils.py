@@ -14,6 +14,16 @@ import torch.distributed as dist
 
 SENTINEL = -123.0
 BASE_SEED = 20260713
+MEGA_RING_ALL_CP_ALIGNMENT = 2048
+
+
+def align_mega_ring_all_cp_lengths(global_lengths: list[int]) -> list[int]:
+    """Round global lengths for the all-CP mega-ring's eight-rank alignment."""
+    alignment = MEGA_RING_ALL_CP_ALIGNMENT
+    return [
+        ((length + alignment - 1) // alignment) * alignment
+        for length in global_lengths
+    ]
 
 
 def parse_int_list(spec: str, name: str) -> list[int]:

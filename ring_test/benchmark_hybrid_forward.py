@@ -28,6 +28,8 @@ from hybrid_forward_baselines import (
     fa3_ring_forward,
 )
 from ring_test.utils import (
+    MEGA_RING_ALL_CP_ALIGNMENT,
+    align_mega_ring_all_cp_lengths,
     hierarchical_reference,
     init_distributed,
     local_lengths_for_rank,
@@ -59,6 +61,7 @@ ALL_CP_METHODS = {
     "fa3_ring",
     "mega_ring_all_cp",
 }
+BLOCK_ALL_CP_METHODS = ALL_CP_METHODS - {"mega_ring_all_cp"}
 
 
 @dataclass(frozen=True)
@@ -81,6 +84,7 @@ class MethodRun:
     expected_out: torch.Tensor | None
     expected_lse: torch.Tensor | None
     note: str
+    aligned_global_lengths: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -160,8 +164,6 @@ def validate_metadata(
             raise SystemExit(f"causal local half length is not 128-aligned at batch {idx}")
         previous_size = ring_size
 
-
-
 def method_incompatibility(
     method: str,
     global_lengths: list[int],
@@ -173,6 +175,10 @@ def method_incompatibility(
         return zepplin_incompatibility(
             global_lengths, world_size, is_causal, zepplin_threshold
         )
+    if method == "mega_ring_all_cp":
+        # This baseline benchmarks separately padded lengths, which are valid
+        # for causal all-CP mega-ring at every supported physical world size.
+        return None
     if method not in ALL_CP_METHODS:
         return None
     for idx, global_len in enumerate(global_lengths):
@@ -185,11 +191,6 @@ def method_incompatibility(
         if is_causal and local_len % 2:
             return (
                 "causal all-CP methods require even local lengths: "
-                f"batch={idx}, local_len={local_len}"
-            )
-        if method == "mega_ring_all_cp" and is_causal and (local_len // 2) % 128:
-            return (
-                "causal all-CP mega-ring requires local_len / 2 to be 128-aligned: "
                 f"batch={idx}, local_len={local_len}"
             )
     if method == "llama3_allgather_attention" and sum(global_lengths) % (2 * world_size):
@@ -291,14 +292,18 @@ def measure_distributed_ms(
     return TimingResult(local_avg, max_avg, rank_times)
 
 
-def aggregate_score_count(global_lengths: list[int], is_causal: bool) -> int:
+def aggregate_score_count(global_lengths: Sequence[int], is_causal: bool) -> int:
     if is_causal:
         return sum(length * (length + 1) // 2 for length in global_lengths)
     return sum(length * length for length in global_lengths)
 
 
 def aggregate_tflops(
-    global_lengths: list[int], q_heads: int, head_dim: int, is_causal: bool, time_ms: float
+    global_lengths: Sequence[int],
+    q_heads: int,
+    head_dim: int,
+    is_causal: bool,
+    time_ms: float,
 ) -> float:
     flops = 4 * aggregate_score_count(global_lengths, is_causal) * q_heads * head_dim
     return float(flops) / (time_ms * 1e-3) / 1e12
@@ -423,6 +428,7 @@ def main(
     rank, world_size = init_distributed()
     try:
         global_lengths = parse_int_list(args.global_seqlens, "--global-seqlens")
+        mega_ring_all_cp_global_lengths = align_mega_ring_all_cp_lengths(global_lengths)
         ring_sizes = parse_int_list(args.ring_sizes, "--ring-sizes")
         ring_starts = parse_int_list(args.ring_starts, "--ring-starts")
         if any(method != "zepplin" for method in methods):
@@ -514,6 +520,16 @@ def main(
                 f"global_tokens={sum(global_lengths)}, "
                 f"global_seqlens={global_lengths}"
             )
+            if any(
+                "mega_ring_all_cp" in active_methods
+                for active_methods in methods_by_mode.values()
+            ):
+                print(
+                    "Mega-ring all-CP workload: "
+                    f"alignment={MEGA_RING_ALL_CP_ALIGNMENT}, "
+                    f"global_tokens={sum(mega_ring_all_cp_global_lengths)}, "
+                    f"global_seqlens={mega_ring_all_cp_global_lengths}"
+                )
             print(
                 f"Hybrid rings: sizes={ring_sizes}, starts={ring_starts}"
             )
@@ -530,8 +546,8 @@ def main(
                     f"G1_rank_loads={list(plan.short_loads)}"
                 )
             print(
-                "Agg TFLOPS sums visible attention work across ranks; "
-                "Avg/GPU is that value divided by world_size."
+                "Agg TFLOPS uses the original workload lengths and sums visible "
+                "attention work across ranks; Avg/GPU divides it by world_size."
             )
             if args.check:
                 print(
@@ -557,9 +573,8 @@ def main(
                 )
             all_cp_runs: dict[str, tuple[Callable[[], object], str]] = {}
             expected_all_cp_out = None
-            expected_all_cp_lse = None
             expected_llama3_out = None
-            if any(method in ALL_CP_METHODS for method in active_methods):
+            if any(method in BLOCK_ALL_CP_METHODS for method in active_methods):
                 all_cp_lengths = [length // world_size for length in global_lengths]
                 all_cp_total = sum(all_cp_lengths)
                 all_cp_cu, all_cp_cu_host = make_cu_seqlens(all_cp_lengths, device)
@@ -573,12 +588,6 @@ def main(
                     device,
                     base_seed=args.seed,
                 )
-                all_cp_global_host = torch.tensor(global_lengths, dtype=torch.int32)
-                all_cp_ring_sizes_host = torch.full(
-                    (len(global_lengths),), world_size, dtype=torch.int32
-                )
-                all_cp_ring_starts_host = torch.zeros(len(global_lengths), dtype=torch.int32)
-
                 if "allgather_attention" in active_methods:
                     if block_backend is None:
                         raise RuntimeError("all-gather baseline requires a block backend")
@@ -637,15 +646,10 @@ def main(
                         ),
                         f"all-CP NCCL ring; {backend_note}",
                     )
-                if "mega_ring_all_cp" in active_methods:
-                    all_cp_remote_k, all_cp_remote_v = make_mega_parallel_tensors(
-                        all_cp_k, all_cp_v, rank, world_size, all_cp_total
-                    )
-
                 if args.check:
                     gathered_all_cp_k = gather_padded_rank_tensor(all_cp_k, all_cp_total)
                     gathered_all_cp_v = gather_padded_rank_tensor(all_cp_v, all_cp_total)
-                    expected_all_cp_out, expected_all_cp_lse = hierarchical_reference(
+                    expected_all_cp_out, _ = hierarchical_reference(
                         all_cp_q,
                         gathered_all_cp_k,
                         gathered_all_cp_v,
@@ -664,6 +668,80 @@ def main(
                             global_lengths,
                             is_causal,
                         )
+
+            mega_ring_all_cp_run_data = None
+            if "mega_ring_all_cp" in active_methods:
+                mega_ring_all_cp_lengths = [
+                    length // world_size
+                    for length in mega_ring_all_cp_global_lengths
+                ]
+                mega_ring_all_cp_total = sum(mega_ring_all_cp_lengths)
+                mega_ring_all_cp_cu, mega_ring_all_cp_cu_host = make_cu_seqlens(
+                    mega_ring_all_cp_lengths, device
+                )
+                mega_ring_all_cp_q, mega_ring_all_cp_k, mega_ring_all_cp_v = make_local_qkv(
+                    mega_ring_all_cp_total,
+                    args.qhead,
+                    args.kvhead,
+                    args.headdim,
+                    rank,
+                    is_causal,
+                    device,
+                    base_seed=args.seed,
+                )
+                mega_ring_all_cp_remote_k, mega_ring_all_cp_remote_v = make_mega_parallel_tensors(
+                    mega_ring_all_cp_k,
+                    mega_ring_all_cp_v,
+                    rank,
+                    world_size,
+                    mega_ring_all_cp_total,
+                )
+                mega_ring_all_cp_global_host = torch.tensor(
+                    mega_ring_all_cp_global_lengths, dtype=torch.int32
+                )
+                mega_ring_all_cp_ring_sizes_host = torch.full(
+                    (len(global_lengths),), world_size, dtype=torch.int32
+                )
+                mega_ring_all_cp_ring_starts_host = torch.zeros(
+                    len(global_lengths), dtype=torch.int32
+                )
+                expected_mega_ring_all_cp_out = None
+                expected_mega_ring_all_cp_lse = None
+                if args.check:
+                    gathered_mega_ring_all_cp_k = gather_padded_rank_tensor(
+                        mega_ring_all_cp_k, mega_ring_all_cp_total
+                    )
+                    gathered_mega_ring_all_cp_v = gather_padded_rank_tensor(
+                        mega_ring_all_cp_v, mega_ring_all_cp_total
+                    )
+                    (
+                        expected_mega_ring_all_cp_out,
+                        expected_mega_ring_all_cp_lse,
+                    ) = hierarchical_reference(
+                        mega_ring_all_cp_q,
+                        gathered_mega_ring_all_cp_k,
+                        gathered_mega_ring_all_cp_v,
+                        [mega_ring_all_cp_lengths for _ in range(world_size)],
+                        mega_ring_all_cp_cu_host,
+                        mega_ring_all_cp_global_lengths,
+                        [world_size] * len(global_lengths),
+                        [0] * len(global_lengths),
+                        rank,
+                        is_causal,
+                    )
+                mega_ring_all_cp_run_data = (
+                    mega_ring_all_cp_q,
+                    mega_ring_all_cp_cu,
+                    mega_ring_all_cp_cu_host,
+                    mega_ring_all_cp_remote_k,
+                    mega_ring_all_cp_remote_v,
+                    mega_ring_all_cp_global_host,
+                    mega_ring_all_cp_ring_sizes_host,
+                    mega_ring_all_cp_ring_starts_host,
+                    max(mega_ring_all_cp_lengths),
+                    expected_mega_ring_all_cp_out,
+                    expected_mega_ring_all_cp_lse,
+                )
 
             zepplin_run = None
             if "zepplin" in active_methods:
@@ -834,25 +912,41 @@ def main(
                             )
                         )
                     elif method == "mega_ring_all_cp":
+                        if mega_ring_all_cp_run_data is None:
+                            raise RuntimeError("mega-ring all-CP run was not prepared")
+                        (
+                            mega_ring_all_cp_q,
+                            mega_ring_all_cp_cu,
+                            mega_ring_all_cp_cu_host,
+                            mega_ring_all_cp_remote_k,
+                            mega_ring_all_cp_remote_v,
+                            mega_ring_all_cp_global_host,
+                            mega_ring_all_cp_ring_sizes_host,
+                            mega_ring_all_cp_ring_starts_host,
+                            mega_ring_all_cp_max_local_len,
+                            expected_mega_ring_all_cp_out,
+                            expected_mega_ring_all_cp_lse,
+                        ) = mega_ring_all_cp_run_data
+
                         def launch_all_cp_mega() -> tuple[torch.Tensor, torch.Tensor]:
                             return min_fa3_op.forward_varlen_mega_ring(
-                                all_cp_q,
-                                all_cp_remote_k.data_,
-                                all_cp_remote_v.data_,
-                                all_cp_cu,
-                                all_cp_cu,
-                                max(all_cp_lengths),
-                                max(all_cp_lengths),
+                                mega_ring_all_cp_q,
+                                mega_ring_all_cp_remote_k.data_,
+                                mega_ring_all_cp_remote_v.data_,
+                                mega_ring_all_cp_cu,
+                                mega_ring_all_cp_cu,
+                                mega_ring_all_cp_max_local_len,
+                                mega_ring_all_cp_max_local_len,
                                 is_causal,
-                                cu_seqlens_q_host=all_cp_cu_host,
-                                cu_seqlens_k_host=all_cp_cu_host,
-                                remote_k=all_cp_remote_k,
-                                remote_v=all_cp_remote_v,
+                                cu_seqlens_q_host=mega_ring_all_cp_cu_host,
+                                cu_seqlens_k_host=mega_ring_all_cp_cu_host,
+                                remote_k=mega_ring_all_cp_remote_k,
+                                remote_v=mega_ring_all_cp_remote_v,
                                 num_comp_sm=config.num_comp_sm,
                                 num_comm_sm=config.num_comm_sm,
-                                global_seqlens_host=all_cp_global_host,
-                                ring_sizes_host=all_cp_ring_sizes_host,
-                                ring_starts_host=all_cp_ring_starts_host,
+                                global_seqlens_host=mega_ring_all_cp_global_host,
+                                ring_sizes_host=mega_ring_all_cp_ring_sizes_host,
+                                ring_starts_host=mega_ring_all_cp_ring_starts_host,
                                 return_lse=True,
                             )
 
@@ -860,9 +954,10 @@ def main(
                             MethodRun(
                                 method,
                                 launch_all_cp_mega,
-                                expected_all_cp_out,
-                                expected_all_cp_lse,
+                                expected_mega_ring_all_cp_out,
+                                expected_mega_ring_all_cp_lse,
                                 "all-CP fused mega-ring",
+                                tuple(mega_ring_all_cp_global_lengths),
                             )
                         )
                     elif method == "mega_ring_hybrid":
@@ -920,7 +1015,11 @@ def main(
                         run.launch, args.warmup_iters, args.num_iters, rank
                     )
                     agg_tflops = aggregate_tflops(
-                        global_lengths, args.qhead, args.headdim, is_causal, timing.max_ms
+                        global_lengths,
+                        args.qhead,
+                        args.headdim,
+                        is_causal,
+                        timing.max_ms,
                     )
                     check_status = "skip"
                     if args.check:
@@ -949,12 +1048,26 @@ def main(
                     cuda_barrier()
 
                     if rank == 0:
+                        note = run.note
+                        if run.aligned_global_lengths is not None:
+                            aligned_agg_tflops = aggregate_tflops(
+                                run.aligned_global_lengths,
+                                args.qhead,
+                                args.headdim,
+                                is_causal,
+                                timing.max_ms,
+                            )
+                            note = (
+                                f"{note}; {MEGA_RING_ALL_CP_ALIGNMENT}-aligned "
+                                f"Agg TFLOPS={aligned_agg_tflops:.1f}, "
+                                f"Avg/GPU={aligned_agg_tflops / world_size:.1f}"
+                            )
                         results[run.name] = Result(
                             timing.max_ms,
                             agg_tflops,
                             agg_tflops / world_size,
                             check_status,
-                            run.note,
+                            note,
                             timing.rank_times_ms,
                         )
                 if rank == 0:

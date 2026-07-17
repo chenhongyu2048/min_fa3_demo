@@ -339,14 +339,18 @@ For an `--sm-configs` list, the four block baselines run once using the first
 configuration. `mega_ring_all_cp` and `mega_ring_hybrid` run once for every
 configuration in both hybrid forward and backward.
 
-All-CP baseline lengths must be divisible by the physical world size. The total
-global token count for `llama3_allgather_attention` must also be divisible by
-`2 * world_size`. Causal all-CP mega-ring additionally requires each rank-local
-half length to be 128-aligned. Use `--methods` to select a subset or
+The three block-based all-CP baseline lengths must be divisible by the physical
+world size. The total global token count for `llama3_allgather_attention` must
+also be divisible by `2 * world_size`. `mega_ring_all_cp` is benchmarked on a
+separate workload where every global sequence is rounded upward to a multiple
+of 2048, ensuring that each causal rank-local half is 128-aligned on eight GPUs.
+Its table TFLOPS use the original unaligned lengths; its Note reports aggregate
+and average-per-GPU TFLOPS using the physically executed aligned lengths and
+the same measured latency. Use `--methods` to select a subset or
 `--methods all` for all six. Zeppelin only requires sequences at or above its
-threshold to be divisible by `world_size`; causal long shards must also be
-even for the zigzag ring. Short G1 sequences have no all-CP divisibility
-constraint, and the threshold must be a positive integer.
+threshold to be divisible by `world_size`; causal long shards must also be even
+for the zigzag ring. Short G1 sequences have no all-CP divisibility constraint,
+and the threshold must be a positive integer.
 
 Example:
 
@@ -423,12 +427,12 @@ feasible within either configured maximum cap.
 
 `--methods` defaults to `all`. Dataset mode runs every compatible method for
 each causal/noncausal mode and prints a skip reason for an incompatible method.
-In particular, short causal sequences cannot run `mega_ring_all_cp` because
-its rank-local half length must be 128-aligned. Explicitly requesting an
-incompatible method remains an error. Use `--print-workload --world-size 8`
-to inspect generated lengths and ring assignments without CUDA. Keep
-`--no-check` for the full 128K workload because the current correctness
-reference materializes quadratic attention scores.
+The `mega_ring_all_cp` baseline is not skipped for an unaligned generated
+length because it uses its separate 2048-aligned workload in both directions.
+Explicitly requesting another incompatible method remains an error. Use
+`--print-workload --world-size 8` to inspect generated lengths and ring
+assignments without CUDA. Keep `--no-check` for the full 128K workload because
+the current correctness reference materializes quadratic attention scores.
 
 ## 1/2/4/8-GPU causal sweep
 

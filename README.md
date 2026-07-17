@@ -321,9 +321,13 @@ in attention, so `actual_tokens` can exceed the target by fewer than 2048
 tokens.
 With the default `--methods all`, methods that cannot represent a generated
 length are reported as skipped; an explicitly requested incompatible method
-remains an error. Backward is causal-only and compares per-sequence all-gather,
-Llama3 whole-packed all-gather, FA3/NCCL zigzag ring, Zeppelin, and hierarchical
-fused mega-ring. Zeppelin independently places lengths below
+remains an error. As an exception, `mega_ring_all_cp` rounds every generated
+global sequence upward to a multiple of 2048 in its own forward and backward
+benchmark workload. Its main TFLOPS columns use the original generated lengths,
+while its Note reports TFLOPS based on the aligned physical work.
+Backward is causal-only and compares per-sequence all-gather, Llama3 whole-packed
+all-gather, FA3/NCCL zigzag ring, Zeppelin, and hierarchical fused mega-ring.
+Zeppelin independently places lengths below
 `--zepplin-threshold` (default `4096`) whole on one rank by deterministic LPT
 and splits lengths at or above the threshold across all ranks. Full 128K
 forward and backward runs should use `--no-check` because
