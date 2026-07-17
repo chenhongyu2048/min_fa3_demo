@@ -335,9 +335,10 @@ mega-ring, Zeppelin, and hierarchical hybrid mega-ring. The all-CP methods use
 all physical ranks; the hybrid method follows `--ring-sizes` and
 `--ring-starts`. Zeppelin uses G1 for lengths strictly below its threshold and
 Gworld for equality and above.
-It measures the complete Python op with CUDA events, reports maximum elapsed
-time across ranks, and prints aggregate and average-per-GPU TFLOPS. `--check`
-adds output reference validation after timing.
+It measures the complete Python op with CUDA events, reports the average of
+the per-iteration maximum elapsed times across ranks, and prints aggregate and
+average-per-GPU TFLOPS. `--check` adds output reference validation after
+timing.
 
 Distributed ring benchmark:
 
@@ -367,8 +368,8 @@ pattern is repeated to fill that case's batch and sorted by decreasing ring
 size; each generated global length is `seqlen[i] * ring_size`. Timing excludes
 forward preparation, owner-accumulator reset, and the pre-launch distributed
 barrier; method-internal phase barriers such as Zeppelin's are included. It
-reports maximum wall time across ranks, and derives aggregate causal backward
-TFLOP/s. Alternatively,
+reports the average of the per-iteration maximum wall times across ranks, and
+derives aggregate causal backward TFLOP/s. Alternatively,
 `--global-seqlens`, `--ring-sizes`, and `--ring-starts` pass one explicit
 topology, while `--sm-configs` sweeps several compute/communication allocations
 without rebuilding the workload. `--check` enables subgroup-aware FP32 autograd

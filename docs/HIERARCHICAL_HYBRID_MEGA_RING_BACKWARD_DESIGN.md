@@ -353,9 +353,9 @@ torchrun --standalone --nproc_per_node=8 \
 The dataset frontend reuses the forward `balancer` placement and calls the
 programmatic backward benchmark with explicit global lengths, ring sizes, and
 ring starts. Forward preparation, owner accumulator reset, and the distributed
-barrier remain outside the timed region. The result reports per-rank medians,
-the median of per-sample max-rank wall times, and aggregate/average-per-GPU
-causal backward TFLOP/s.
+barrier remain outside the timed region. The result reports each rank's
+average time, the average of per-iteration max-rank wall times, and
+aggregate/average-per-GPU causal backward TFLOP/s.
 The same table includes per-sequence all-gather, Llama3 whole-packed
 all-gather, and external-FA3/NCCL zigzag ring baselines; external FA3 falls back
 consistently to local min-FA3 when unavailable. Dense `--check` validation is

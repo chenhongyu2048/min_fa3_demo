@@ -171,13 +171,14 @@ The four block baselines prefer external FA3 consistently across all ranks
 and fall back to this repository's min-FA3 varlen forward/backward ops when it
 is unavailable. `mega_ring_all_cp` and `mega_ring_hybrid` sweep every requested
 SM configuration; the four block baselines run once. Results
-include maximum end-to-end wall time, per-rank median times,
-aggregate/average-per-GPU causal backward TFLOP/s, and the fused
-compute/communication SM split. Forward preparation is outside every method's
-timed interval. The fused owner-accumulator reset and distributed barrier are
-also outside its timed interval. Zeppelin's timed backward runs one all-rank
-phase barrier first, followed by the all-rank ring backward and then the
-rank-local G1 backward. That internal phase barrier is included in its result;
+include the average of the per-iteration maximum end-to-end wall times and
+each rank's average time, aggregate/average-per-GPU causal backward TFLOP/s,
+and the fused compute/communication SM split. Forward preparation is outside
+every method's timed interval. The fused owner-accumulator reset and
+distributed barrier are also outside its timed interval. Zeppelin's timed
+backward runs one all-rank phase barrier first, followed by the all-rank ring
+backward and then the rank-local G1 backward. That internal phase barrier is
+included in its result;
 there is no barrier after either work phase.
 
 `--b` and `--seqlen` are comma-separated integer lists with equal length. Each
@@ -471,9 +472,10 @@ or `CHECK=1` to enable the benchmark entry points' correctness checks.
 ## Result columns
 
 `benchmark_ring_forward.py` prints one row per selected method. `Time ms`
-contains each rank's median and the maximum across ranks. `Agg TFLOPS` sums the
-visible attention work across ranks, and `Avg/GPU` divides that value by the
-physical world size. `Check` records reference validation or marks a
-timing-only method; `Note` records the selected block backend and other method
-details. The exact method rows follow `--methods` and the current CLI method
-list rather than a hard-coded result snapshot.
+contains each rank's average measured time and the average of the
+per-iteration maximum times across ranks. The latter is used to calculate
+`Agg TFLOPS`, which sums the visible attention work across ranks; `Avg/GPU`
+divides that value by the physical world size. `Check` records reference
+validation or marks a timing-only method; `Note` records the selected block
+backend and other method details. The exact method rows follow `--methods` and
+the current CLI method list rather than a hard-coded result snapshot.

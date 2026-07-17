@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import statistics
 import sys
 import time
 from dataclasses import dataclass
@@ -363,6 +362,7 @@ def measure_backward_ms(
     num_iters: int,
     rank: int,
 ) -> TimingResult:
+    """Average per-rank times and the per-iteration maximum across ranks."""
     for _ in range(warmup_iters):
         prepare()
         torch.cuda.synchronize()
@@ -385,13 +385,13 @@ def measure_backward_ms(
         local_samples.append(local_ms)
         max_samples.append(float(max_ms.item()))
 
-    local_median = statistics.median(local_samples)
-    max_median = statistics.median(max_samples)
-    local_time = torch.tensor([local_median], device="cuda", dtype=torch.float64)
+    local_avg = sum(local_samples) / len(local_samples)
+    max_avg = sum(max_samples) / len(max_samples)
+    local_time = torch.tensor([local_avg], device="cuda", dtype=torch.float64)
     gathered = [torch.empty_like(local_time) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, local_time)
     rank_times = [value.item() for value in gathered] if rank == 0 else None
-    return TimingResult(max_median, rank_times)
+    return TimingResult(max_avg, rank_times)
 
 
 def aggregate_backward_tflops(
@@ -524,7 +524,8 @@ def benchmark_topology(
         print(
             "Timing excludes forward preparation, owner-accumulator reset, and the "
             "pre-launch distributed barrier; method-internal phase barriers are included; "
-            "reported time is the median max-rank end-to-end backward op time.",
+            "reported time is the average of the per-iteration max-rank end-to-end "
+            "backward op times.",
             flush=True,
         )
 

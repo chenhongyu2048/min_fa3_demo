@@ -3,7 +3,8 @@
 The script compares two all-gather baselines and Python-side ring attention using
 PyTorch/FA2/FA3 block kernels with the local min_fa3 varlen, min_fa3
 single-step ring, and fused min_fa3 mega-ring paths. Timing is end-to-end per
-method call and reports the maximum elapsed time across ranks.
+method call and reports the average of the per-iteration maximum elapsed times
+across ranks.
 """
 
 from __future__ import annotations
