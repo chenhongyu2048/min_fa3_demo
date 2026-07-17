@@ -76,6 +76,9 @@ Use `--sm-configs comp:comm,comp:comm,...` to run multiple SM allocations in one
 invocation, for example `--sm-configs 128:4,124:8,116:16`.
 `--b` and `--seqlen` are comma-separated lists of equal length; each benchmark
 shape pairs `b[i]` with `seqlen[i]`.
+The forward and backward all-CP benchmarks run non-mega baselines only for the
+first SM configuration. `min_varlen_mega_ring` is the only method swept over
+the full configuration list.
 
 For a faster smoke run:
 
@@ -160,14 +163,18 @@ divisible by 256, and the current fused backward requires causal mode,
 - `allgather_attention`: per-sequence zigzag all-gather plus batched varlen backward
 - `llama3_allgather_attention`: whole-packed two-block all-gather backward
 - `fa3_ring`: NCCL zigzag K/V and FP32 dKV ring using external FA3 block backward
+- `mega_ring_all_cp`: fused backward with every sequence split across all ranks
 - `mega_ring_hybrid`: fused G8/G4/G2/G1 hierarchical backward
 
-The block methods consistently fall back to local min-FA3 when external FA3 is
-not available on every rank. Results include maximum end-to-end wall time,
-per-rank median times, aggregate/average-per-GPU causal backward TFLOP/s, and
-the hybrid compute/communication SM split. Forward preparation is outside every
-method's timed interval. The fused owner-accumulator reset and distributed
-barrier are also outside its timed interval.
+The three block baselines prefer external FA3 consistently across all ranks
+and fall back to this repository's min-FA3 varlen forward/backward ops when it
+is unavailable. `mega_ring_all_cp` and `mega_ring_hybrid` sweep every requested
+SM configuration; the three block baselines run once. Results
+include maximum end-to-end wall time, per-rank median times,
+aggregate/average-per-GPU causal backward TFLOP/s, and the fused
+compute/communication SM split. Forward preparation is outside every method's
+timed interval. The fused owner-accumulator reset and distributed barrier are
+also outside its timed interval.
 
 `--b` and `--seqlen` are comma-separated integer lists with equal length. Each
 `(b[i], seqlen[i])` pair is one case; `seqlen[i]` is the local sequence length
@@ -244,9 +251,9 @@ The full scheduler/readiness/completion contract is recorded in
 forward dataset frontend. It samples Arxiv or Github lengths, packs the target
 token budget, prints the same placement/cap/load report, and calls
 `benchmark_hybrid_backward.main(...)` in the same process with explicit ring
-metadata. Backward is causal-only and currently benchmarks the hierarchical
-fused kernel together with the per-sequence all-gather, Llama3 all-gather, and
-FA3/NCCL ring baselines.
+metadata. Backward is causal-only and benchmarks the all-CP and hierarchical
+fused kernels together with the per-sequence all-gather, Llama3 all-gather,
+and FA3/NCCL ring baselines.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
@@ -285,12 +292,26 @@ methods:
 - `mega_ring_all_cp`: fused mega-ring with every sequence split across all ranks
 - `mega_ring_hybrid`: fused mega-ring using the requested per-batch ring hierarchy
 
+The hybrid benchmark entry points are self-contained within `ring_test/` plus
+the built demo extension. Their shared workload and reference helpers live in
+`ring_test/utils.py`; running them does not require the scripts under
+`scripts/test_mega_ring/` or an additional `PYTHONPATH`.
+
 The first three methods are baselines. Every global sequence is divided evenly
 over all physical ranks. `mega_ring_hybrid` instead uses `--ring-sizes` and
 `--ring-starts`; rank-local length is `global_len / ring_size` for members of
 that batch's ring and zero for other ranks. External FA3 is used by all three
 block baselines when available; each consistently falls back to the local
 min-FA3 varlen block when it is unavailable.
+
+Forward selection requires the external FA3 varlen forward entry point on
+every rank. Backward selection requires both its forward and backward entry
+points; otherwise all three baselines use the current repository's matching
+min-FA3 operators for the entire run.
+
+For an `--sm-configs` list, the three block baselines run once using the first
+configuration. `mega_ring_all_cp` and `mega_ring_hybrid` run once for every
+configuration in both hybrid forward and backward.
 
 All-CP baseline lengths must be divisible by the physical world size. The total
 global token count for `llama3_allgather_attention` must also be divisible by

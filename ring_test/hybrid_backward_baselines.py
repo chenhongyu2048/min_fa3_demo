@@ -33,7 +33,11 @@ class _BlockBackend:
 
     @property
     def backend_name(self) -> str:
-        return "external FA3" if self.backend == "external_fa3" else "local min_fa3 fallback"
+        return (
+            "external FA3"
+            if self.backend == "external_fa3"
+            else "in-repo min_fa3 fallback"
+        )
 
     def forward_block(
         self,

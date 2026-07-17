@@ -29,7 +29,7 @@ from allgather_attention import (
     AllGatherAttention,
     Llama3AllGatherAttention,
     repartition_sequence_shards_to_llama3,
-    select_allgather_backend,
+    select_fa3_backend,
 )
 from ring_common import (
     flash_varlen_block_attention,
@@ -66,6 +66,7 @@ METHOD_ORDER = [
     "min_varlen_ring",
     "min_varlen_mega_ring",
 ]
+SM_SWEEP_METHODS = {"min_varlen_mega_ring"}
 
 
 @dataclass(frozen=True)
@@ -1094,7 +1095,9 @@ def main() -> None:
             flash_attn_varlen_func2 = None
         if not available_on_all_ranks(flash_attn_varlen_func3 is not None):
             flash_attn_varlen_func3 = None
-        args.allgather_backend = select_allgather_backend(dist.group.WORLD)
+        args.allgather_backend = select_fa3_backend(
+            dist.group.WORLD, require_backward=False
+        )
         validate_args(args, methods, local_world_size, sm_configs)
 
         if local_rank == 0:
@@ -1113,7 +1116,14 @@ def main() -> None:
                 print("Causal checks use the zigzag [front | back] reference by default.")
             print("Agg TFLOPS sums visible attention work across ranks; Avg/GPU is that value divided by world_size.")
 
-        for sm_config in sm_configs:
+        for config_index, sm_config in enumerate(sm_configs):
+            config_methods = [
+                method
+                for method in methods
+                if config_index == 0 or method in SM_SWEEP_METHODS
+            ]
+            if not config_methods:
+                continue
             args.num_comp_sm = sm_config.num_comp_sm
             args.num_comm_sm = sm_config.num_comm_sm
             if local_rank == 0:
@@ -1127,9 +1137,11 @@ def main() -> None:
                         f"\nRunning B={case.batch_size}, local_S={case.seqlen}, causal={case.is_causal}",
                         flush=True,
                     )
-                results = run_case(case, methods, local_rank, local_world_size, args)
+                results = run_case(
+                    case, config_methods, local_rank, local_world_size, args
+                )
                 if local_rank == 0:
-                    print_results(case, results, methods)
+                    print_results(case, results, config_methods)
                 cuda_barrier()
     finally:
         if dist.is_initialized():

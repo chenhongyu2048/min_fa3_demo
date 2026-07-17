@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,26 +20,17 @@ import min_fa3_op
 from allgather_attention import (
     Llama3AllGatherAttention,
     repartition_sequence_shards_to_llama3,
-    select_allgather_backend,
+    select_fa3_backend,
 )
-from mega_ring_test_min_fa3_varlen_hybrid_multi_rank import (
+from hybrid_forward_baselines import VarlenAllGatherForward, fa3_ring_forward
+from ring_test.utils import (
     hierarchical_reference,
+    init_distributed,
     local_lengths_for_rank,
     make_cu_seqlens,
     make_local_qkv,
     parse_int_list,
 )
-from ring_common import (
-    flash_varlen_block_attention,
-    min_fa3_varlen_block_attention,
-    ring_varlen_forward,
-    zigzag_ring_varlen_forward,
-)
-
-try:
-    from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func3
-except ImportError:
-    flash_attn_varlen_func3 = None
 
 
 METHOD_ORDER = [
@@ -50,6 +40,7 @@ METHOD_ORDER = [
     "mega_ring_all_cp",
     "mega_ring_hybrid",
 ]
+SM_SWEEP_METHODS = {"mega_ring_all_cp", "mega_ring_hybrid"}
 
 ALL_CP_METHODS = {
     "allgather_attention",
@@ -125,20 +116,6 @@ def parse_sm_configs(spec: str) -> list[SmConfig]:
     if not configs:
         raise SystemExit("--sm-configs must provide at least one COMP:COMM pair")
     return configs
-
-
-def init_distributed() -> tuple[int, int]:
-    if "LOCAL_RANK" not in os.environ or "LOCAL_WORLD_SIZE" not in os.environ:
-        raise SystemExit("Run this benchmark with torchrun")
-    rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["LOCAL_WORLD_SIZE"])
-    if world_size not in (2, 4, 8):
-        raise SystemExit(f"hierarchical mega ring requires 2, 4, or 8 ranks, got {world_size}")
-    torch.cuda.set_device(rank)
-    dist.init_process_group(backend="nccl", device_id=torch.device("cuda", rank))
-    if dist.get_world_size() != world_size:
-        raise SystemExit("This benchmark requires a single-node torchrun process group")
-    return rank, world_size
 
 
 def cuda_barrier() -> None:
@@ -229,231 +206,6 @@ def compatible_methods_for_mode(
         mode = "causal" if is_causal else "noncausal"
         raise SystemExit(f"no compatible methods remain for {mode} mode")
     return compatible, skipped
-
-
-def fa3_or_min_block_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    cu_seqlens_q_host: torch.Tensor,
-    cu_seqlens_k_host: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    is_causal: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if flash_attn_varlen_func3 is not None:
-        return flash_varlen_block_attention(
-            "fa3",
-            flash_attn_varlen_func3,
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            is_causal,
-        )
-    return min_fa3_varlen_block_attention(
-        min_fa3_op.forward_varlen,
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        cu_seqlens_q_host,
-        cu_seqlens_k_host,
-        max_seqlen_q,
-        max_seqlen_k,
-        is_causal,
-    )
-
-
-class VarlenAllGatherAttention:
-    """All-gather K/V and run one batched varlen attention per visible Q half."""
-
-    def __init__(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        local_lengths: list[int],
-        rank: int,
-        world_size: int,
-        is_causal: bool,
-    ) -> None:
-        self.q = q
-        self.k = k
-        self.v = v
-        self.local_lengths = local_lengths
-        self.rank = rank
-        self.world_size = world_size
-        self.is_causal = is_causal
-        self.local_total = sum(local_lengths)
-        self.global_lengths = [length * world_size for length in local_lengths]
-        self.gathered_k = torch.empty(
-            (world_size * self.local_total, k.size(1), k.size(2)), dtype=k.dtype, device=k.device
-        )
-        self.gathered_v = torch.empty_like(self.gathered_k)
-        self.ordered_k = torch.empty_like(self.gathered_k)
-        self.ordered_v = torch.empty_like(self.gathered_v)
-
-        global_order: list[int] = []
-        q_front_indices: list[int] = []
-        q_back_indices: list[int] = []
-        k_front_indices: list[int] = []
-        k_back_indices: list[int] = []
-        local_offset = 0
-        global_offset = 0
-        half_lengths: list[int] = []
-        front_k_lengths: list[int] = []
-        back_k_lengths: list[int] = []
-        for local_len in local_lengths:
-            if is_causal:
-                half_len = local_len // 2
-                half_lengths.append(half_len)
-                front_k_len = (rank + 1) * half_len
-                back_k_len = (2 * world_size - rank) * half_len
-                front_k_lengths.append(front_k_len)
-                back_k_lengths.append(back_k_len)
-                q_front_indices.extend(range(local_offset, local_offset + half_len))
-                q_back_indices.extend(range(local_offset + half_len, local_offset + local_len))
-                for source_rank in range(world_size):
-                    source = source_rank * self.local_total + local_offset
-                    global_order.extend(range(source, source + half_len))
-                for source_rank in reversed(range(world_size)):
-                    source = source_rank * self.local_total + local_offset + half_len
-                    global_order.extend(range(source, source + half_len))
-                k_front_indices.extend(range(global_offset, global_offset + front_k_len))
-                k_back_indices.extend(range(global_offset, global_offset + back_k_len))
-            else:
-                for source_rank in range(world_size):
-                    source = source_rank * self.local_total + local_offset
-                    global_order.extend(range(source, source + local_len))
-            local_offset += local_len
-            global_offset += local_len * world_size
-
-        self.global_order = torch.tensor(global_order, device=q.device, dtype=torch.int64)
-        self.local_cu, self.local_cu_host = make_cu_seqlens(local_lengths, q.device)
-        self.global_cu, self.global_cu_host = make_cu_seqlens(self.global_lengths, q.device)
-        self.max_local = max(local_lengths)
-        self.max_global = max(self.global_lengths)
-
-        if is_causal:
-            self.q_front_indices = torch.tensor(q_front_indices, device=q.device, dtype=torch.int64)
-            self.q_back_indices = torch.tensor(q_back_indices, device=q.device, dtype=torch.int64)
-            self.k_front_indices = torch.tensor(k_front_indices, device=q.device, dtype=torch.int64)
-            self.k_back_indices = torch.tensor(k_back_indices, device=q.device, dtype=torch.int64)
-            self.q_front = q.index_select(0, self.q_front_indices).contiguous()
-            self.q_back = q.index_select(0, self.q_back_indices).contiguous()
-            self.k_front = torch.empty(
-                (len(k_front_indices), k.size(1), k.size(2)), dtype=k.dtype, device=k.device
-            )
-            self.v_front = torch.empty_like(self.k_front)
-            self.k_back = torch.empty(
-                (len(k_back_indices), k.size(1), k.size(2)), dtype=k.dtype, device=k.device
-            )
-            self.v_back = torch.empty_like(self.k_back)
-            self.half_cu, self.half_cu_host = make_cu_seqlens(half_lengths, q.device)
-            self.front_k_cu, self.front_k_cu_host = make_cu_seqlens(front_k_lengths, q.device)
-            self.back_k_cu, self.back_k_cu_host = make_cu_seqlens(back_k_lengths, q.device)
-            self.out = torch.empty_like(q)
-
-    def forward(self) -> torch.Tensor:
-        dist.all_gather_into_tensor(self.gathered_k, self.k)
-        dist.all_gather_into_tensor(self.gathered_v, self.v)
-        torch.index_select(self.gathered_k, 0, self.global_order, out=self.ordered_k)
-        torch.index_select(self.gathered_v, 0, self.global_order, out=self.ordered_v)
-        if not self.is_causal:
-            out, _ = fa3_or_min_block_attention(
-                self.q,
-                self.ordered_k,
-                self.ordered_v,
-                self.local_cu,
-                self.global_cu,
-                self.local_cu_host,
-                self.global_cu_host,
-                self.max_local,
-                self.max_global,
-                False,
-            )
-            return out
-
-        torch.index_select(self.ordered_k, 0, self.k_front_indices, out=self.k_front)
-        torch.index_select(self.ordered_v, 0, self.k_front_indices, out=self.v_front)
-        torch.index_select(self.ordered_k, 0, self.k_back_indices, out=self.k_back)
-        torch.index_select(self.ordered_v, 0, self.k_back_indices, out=self.v_back)
-        out_front, _ = fa3_or_min_block_attention(
-            self.q_front,
-            self.k_front,
-            self.v_front,
-            self.half_cu,
-            self.front_k_cu,
-            self.half_cu_host,
-            self.front_k_cu_host,
-            max(self.local_lengths) // 2,
-            max(length * (self.rank + 1) // 2 for length in self.local_lengths),
-            True,
-        )
-        out_back, _ = fa3_or_min_block_attention(
-            self.q_back,
-            self.k_back,
-            self.v_back,
-            self.half_cu,
-            self.back_k_cu,
-            self.half_cu_host,
-            self.back_k_cu_host,
-            max(self.local_lengths) // 2,
-            max(length * (2 * self.world_size - self.rank) // 2 for length in self.local_lengths),
-            True,
-        )
-        self.out.index_copy_(0, self.q_front_indices, out_front)
-        self.out.index_copy_(0, self.q_back_indices, out_back)
-        return self.out
-
-
-def fa3_ring_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_host: torch.Tensor,
-    local_lengths: list[int],
-    is_causal: bool,
-) -> torch.Tensor:
-    max_local_len = max(local_lengths)
-    if is_causal:
-        return zigzag_ring_varlen_forward(
-            dist.group.WORLD,
-            q,
-            k,
-            v,
-            cu_seqlens,
-            cu_seqlens_host,
-            max_local_len,
-            fa3_or_min_block_attention,
-        )
-    return ring_varlen_forward(
-        dist.group.WORLD,
-        q,
-        k,
-        v,
-        False,
-        lambda q_, k_, v_, causal_: fa3_or_min_block_attention(
-            q_,
-            k_,
-            v_,
-            cu_seqlens,
-            cu_seqlens,
-            cu_seqlens_host,
-            cu_seqlens_host,
-            max_local_len,
-            max_local_len,
-            causal_,
-        ),
-    )
 
 
 def make_mega_parallel_tensors(
@@ -622,8 +374,6 @@ def main(
     *,
     skip_incompatible_methods: bool = False,
 ) -> None:
-    global flash_attn_varlen_func3
-
     args = parse_args(argv)
     methods = parse_methods(args.methods)
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
@@ -652,13 +402,6 @@ def main(
                 )
 
         device = torch.device("cuda", rank)
-        fa_available = torch.tensor(
-            [flash_attn_varlen_func3 is not None], device=device, dtype=torch.int32
-        )
-        dist.all_reduce(fa_available, op=dist.ReduceOp.MIN)
-        if not fa_available.item():
-            flash_attn_varlen_func3 = None
-        backend_note = "external FA3" if flash_attn_varlen_func3 is not None else "local min_fa3 fallback"
         modes = {
             "noncausal": [False],
             "causal": [True],
@@ -677,14 +420,27 @@ def main(
             methods_by_mode[is_causal] = active_methods
             skipped_by_mode[is_causal] = skipped_methods
 
-        llama3_backend = (
-            select_allgather_backend(dist.group.WORLD)
+        block_backend = (
+            select_fa3_backend(dist.group.WORLD, require_backward=False)
             if any(
-                "llama3_allgather_attention" in active_methods
+                any(
+                    method in active_methods
+                    for method in (
+                        "allgather_attention",
+                        "llama3_allgather_attention",
+                        "fa3_ring",
+                    )
+                )
                 for active_methods in methods_by_mode.values()
             )
             else None
         )
+        if block_backend == "external_fa3":
+            backend_note = "external FA3"
+        elif block_backend == "min_fa3":
+            backend_note = "in-repo min_fa3 fallback"
+        else:
+            backend_note = "not used"
 
         if rank == 0:
             sm_configs_s = ",".join(
@@ -761,20 +517,24 @@ def main(
                 all_cp_ring_starts_host = torch.zeros(len(global_lengths), dtype=torch.int32)
 
                 if "allgather_attention" in active_methods:
-                    allgather_runner = VarlenAllGatherAttention(
+                    if block_backend is None:
+                        raise RuntimeError("all-gather baseline requires a block backend")
+                    allgather_runner = VarlenAllGatherForward(
+                        dist.group.WORLD,
                         all_cp_q,
                         all_cp_k,
                         all_cp_v,
                         all_cp_lengths,
-                        rank,
-                        world_size,
                         is_causal,
+                        block_backend,
                     )
                     all_cp_runs["allgather_attention"] = (
                         allgather_runner.forward,
-                        f"all-CP all-gather; {backend_note}",
+                        allgather_runner.note,
                     )
                 if "llama3_allgather_attention" in active_methods:
+                    if block_backend is None:
+                        raise RuntimeError("Llama3 baseline requires a block backend")
                     llama3_q = repartition_sequence_shards_to_llama3(
                         dist.group.WORLD, all_cp_q, global_lengths, is_causal
                     )
@@ -791,15 +551,18 @@ def main(
                         llama3_v,
                         global_lengths,
                         is_causal,
-                        llama3_backend,
+                        block_backend,
                     )
                     all_cp_runs["llama3_allgather_attention"] = (
                         llama3_runner.forward,
                         llama3_runner.note,
                     )
                 if "fa3_ring" in active_methods:
+                    if block_backend is None:
+                        raise RuntimeError("FA3 ring baseline requires a block backend")
                     all_cp_runs["fa3_ring"] = (
                         lambda: fa3_ring_forward(
+                            dist.group.WORLD,
                             all_cp_q,
                             all_cp_k,
                             all_cp_v,
@@ -807,6 +570,7 @@ def main(
                             all_cp_cu_host,
                             all_cp_lengths,
                             is_causal,
+                            block_backend,
                         ),
                         f"all-CP NCCL ring; {backend_note}",
                     )
@@ -907,7 +671,14 @@ def main(
                 )
 
             cuda_barrier()
-            for config in sm_configs:
+            for config_index, config in enumerate(sm_configs):
+                config_methods = [
+                    method
+                    for method in active_methods
+                    if config_index == 0 or method in SM_SWEEP_METHODS
+                ]
+                if not config_methods:
+                    continue
                 if rank == 0:
                     print(
                         f"\nSM config: num_comp_sm={config.num_comp_sm}, "
@@ -915,7 +686,7 @@ def main(
                         flush=True,
                     )
                 runs: list[MethodRun] = []
-                for method in active_methods:
+                for method in config_methods:
                     if method in all_cp_runs:
                         launch, note = all_cp_runs[method]
                         expected_out = (
@@ -1063,7 +834,7 @@ def main(
                         args.kvhead,
                         args.headdim,
                         is_causal,
-                        active_methods,
+                        config_methods,
                         results,
                     )
     finally:

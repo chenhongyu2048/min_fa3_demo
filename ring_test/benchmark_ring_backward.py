@@ -29,7 +29,7 @@ from allgather_attention import (
     AllGatherAttention,
     Llama3AllGatherAttention,
     repartition_sequence_shards_to_llama3,
-    select_allgather_backend,
+    select_fa3_backend,
 )
 from hybrid_backward_baselines import VarlenFa3RingBackward
 from ring_common import raise_if_any_rank_failed
@@ -41,6 +41,7 @@ METHOD_ORDER = [
     "min_varlen_python_ring",
     "min_varlen_mega_ring",
 ]
+SM_SWEEP_METHODS = {"min_varlen_mega_ring"}
 
 
 @dataclass(frozen=True)
@@ -650,7 +651,9 @@ def main() -> None:
     try:
         if torch.cuda.get_device_capability() != (9, 0):
             raise SystemExit(f"This benchmark requires SM90, got {torch.cuda.get_device_capability()}")
-        args.allgather_backend = select_allgather_backend(dist.group.WORLD)
+        args.allgather_backend = select_fa3_backend(
+            dist.group.WORLD, require_backward=True
+        )
         validate_args(args, cases, sm_configs, local_world_size)
         if local_rank == 0:
             configs = ",".join(f"{cfg.num_comp_sm}:{cfg.num_comm_sm}" for cfg in sm_configs)
@@ -663,7 +666,14 @@ def main() -> None:
             print("Timing excludes forward preparation, allocations, and fused remote-workspace reset.")
             print("Agg TFLOPS uses 10 FLOPs per visible score for causal backward.")
 
-        for sm_config in sm_configs:
+        for config_index, sm_config in enumerate(sm_configs):
+            config_methods = [
+                method
+                for method in methods
+                if config_index == 0 or method in SM_SWEEP_METHODS
+            ]
+            if not config_methods:
+                continue
             if local_rank == 0:
                 print(
                     f"\nSM config: num_comp_sm={sm_config.num_comp_sm}, "
@@ -677,10 +687,15 @@ def main() -> None:
                         flush=True,
                     )
                 results = run_case(
-                    case, methods, local_rank, local_world_size, sm_config, args
+                    case,
+                    config_methods,
+                    local_rank,
+                    local_world_size,
+                    sm_config,
+                    args,
                 )
                 if local_rank == 0:
-                    print_results(case, methods, results)
+                    print_results(case, config_methods, results)
                 cuda_barrier()
                 torch.cuda.empty_cache()
     finally:

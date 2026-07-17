@@ -24,21 +24,37 @@ from ring_common import get_default_args
 
 try:
     from flash_attn_interface import (
-        _flash_attn_varlen_backward as _fa3_varlen_backward,
         _flash_attn_varlen_forward as _fa3_varlen_forward,
     )
 except ImportError:
     _fa3_varlen_forward = None
+
+try:
+    from flash_attn_interface import (
+        _flash_attn_varlen_backward as _fa3_varlen_backward,
+    )
+except ImportError:
     _fa3_varlen_backward = None
 
 
-EXTERNAL_FA3_AVAILABLE = _fa3_varlen_forward is not None and _fa3_varlen_backward is not None
+EXTERNAL_FA3_FORWARD_AVAILABLE = _fa3_varlen_forward is not None
+EXTERNAL_FA3_BACKWARD_AVAILABLE = _fa3_varlen_backward is not None
+EXTERNAL_FA3_AVAILABLE = (
+    EXTERNAL_FA3_FORWARD_AVAILABLE and EXTERNAL_FA3_BACKWARD_AVAILABLE
+)
 
 
-def select_allgather_backend(process_group: Optional[dist.ProcessGroup]) -> str:
-    """Select one backend consistently across every rank in the process group."""
+def select_fa3_backend(
+    process_group: Optional[dist.ProcessGroup],
+    *,
+    require_backward: bool,
+) -> str:
+    """Prefer external FA3 on every rank, otherwise use the in-repo FA3 op."""
+    local_available = EXTERNAL_FA3_FORWARD_AVAILABLE and (
+        not require_backward or EXTERNAL_FA3_BACKWARD_AVAILABLE
+    )
     available = torch.tensor(
-        [1 if EXTERNAL_FA3_AVAILABLE else 0],
+        [1 if local_available else 0],
         device=torch.device("cuda", torch.cuda.current_device()),
         dtype=torch.int32,
     )
@@ -46,11 +62,16 @@ def select_allgather_backend(process_group: Optional[dist.ProcessGroup]) -> str:
     return "external_fa3" if bool(available.item()) else "min_fa3"
 
 
+def select_allgather_backend(process_group: Optional[dist.ProcessGroup]) -> str:
+    """Compatibility wrapper for callers that may execute backward."""
+    return select_fa3_backend(process_group, require_backward=True)
+
+
 def backend_note(backend: str) -> str:
     if backend == "external_fa3":
         return "all-gather; external FA3; zigzag causal"
     if backend == "min_fa3":
-        return "all-gather; local min_fa3 fallback; zigzag causal"
+        return "all-gather; in-repo min_fa3 fallback; zigzag causal"
     raise ValueError(f"unknown all-gather attention backend: {backend}")
 
 
@@ -852,7 +873,11 @@ class Llama3AllGatherAttention:
 
     @property
     def note(self) -> str:
-        backend = "external FA3" if self.backend == "external_fa3" else "local min_fa3 fallback"
+        backend = (
+            "external FA3"
+            if self.backend == "external_fa3"
+            else "in-repo min_fa3 fallback"
+        )
         mode = "causal" if self.causal else "noncausal"
         return f"whole-packed zigzag all-gather; {backend}; {mode}"
 
@@ -976,11 +1001,14 @@ class Llama3AllGatherAttention:
 __all__ = [
     "AllGatherAttention",
     "EXTERNAL_FA3_AVAILABLE",
+    "EXTERNAL_FA3_BACKWARD_AVAILABLE",
+    "EXTERNAL_FA3_FORWARD_AVAILABLE",
     "Llama3AllGatherAttention",
     "backend_note",
     "llama3_rank_local_global_indices",
     "llama3_rank_major_to_global_order",
     "repartition_sequence_shards_to_llama3",
     "select_allgather_backend",
+    "select_fa3_backend",
     "sequence_shards_to_global_order",
 ]
