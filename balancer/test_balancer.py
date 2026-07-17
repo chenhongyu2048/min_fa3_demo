@@ -3,22 +3,71 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
+import json
 import os
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import balancer
-from balancer.sampler import _align_sequence_length
+from balancer.sampler import _align_sequence_length, _load_bucket_counts
+from dataset.build_length_bucket_stats import (
+    MAX_SEQUENCE_TOKENS,
+    bucket_counts,
+    build_statistics,
+)
 from ring_test import (
     benchmark_hybrid_dataset_backward,
     benchmark_hybrid_dataset_forward,
 )
 
 
+DEMO_DIR = Path(__file__).resolve().parent.parent
+DATASET_DIR = DEMO_DIR / "dataset"
+BUCKET_STATS_PATH = DATASET_DIR / "sequence_length_buckets.json"
+
+
+class DatasetBucketStatisticsTest(unittest.TestCase):
+    def test_bucket_boundaries_and_overflow_are_right_inclusive(self) -> None:
+        counts = bucket_counts([1, 256, 257, 512, 131072, 131073])
+        self.assertEqual(len(counts), MAX_SEQUENCE_TOKENS // 256)
+        self.assertEqual(counts[0], 2)
+        self.assertEqual(counts[1], 2)
+        self.assertEqual(counts[-1], 2)
+        self.assertEqual(sum(counts), 6)
+
+    def test_checked_in_statistics_match_sampled_lengths(self) -> None:
+        expected = build_statistics(DATASET_DIR)
+        actual = json.loads(BUCKET_STATS_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(actual, expected)
+        self.assertEqual(tuple(actual["datasets"]), ("arxiv", "github", "pile"))
+        for statistics in actual["datasets"].values():
+            self.assertEqual(statistics["sample_count"], 20_000)
+            self.assertEqual(sum(statistics["bucket_counts"]), 20_000)
+
+    def test_bucket_loader_rejects_inconsistent_sample_count(self) -> None:
+        payload = json.loads(BUCKET_STATS_PATH.read_text(encoding="utf-8"))
+        invalid = copy.deepcopy(payload)
+        invalid["datasets"]["arxiv"]["sample_count"] += 1
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "invalid.json"
+            path.write_text(json.dumps(invalid), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "sum to 20000"):
+                _load_bucket_counts(path)
+
+
 class DatasetSamplerTest(unittest.TestCase):
+    def test_bucket_upper_bounds_cover_256_token_intervals(self) -> None:
+        self.assertEqual(len(balancer.LENGTH_BUCKETS), 512)
+        self.assertEqual(balancer.LENGTH_BUCKETS[:4], (256, 512, 768, 1024))
+        self.assertEqual(balancer.LENGTH_BUCKETS[-1], 128 * 1024)
+        self.assertEqual(tuple(balancer.DATASET_WEIGHTS), ("arxiv", "github", "pile"))
+
     def test_alignment_boundaries_round_up(self) -> None:
         expected = {
             1: 512,
@@ -148,6 +197,27 @@ class HierarchicalLoadBalancerTest(unittest.TestCase):
 
 
 class DatasetBenchmarkFrontendTest(unittest.TestCase):
+    def test_pile_print_workload_uses_json_distribution(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            benchmark_hybrid_dataset_forward.main(
+                [
+                    "--dataset",
+                    "pile",
+                    "--target-tokens",
+                    "4097",
+                    "--seed",
+                    "0",
+                    "--world-size",
+                    "8",
+                    "--print-workload",
+                ]
+            )
+        rendered = output.getvalue()
+        self.assertIn("dataset=pile", rendered)
+        self.assertIn("actual_tokens=4608", rendered)
+        self.assertIn("global_seqlens=1536,1024,512,512,1024", rendered)
+
     def test_print_workload_uses_balancer_without_cuda(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):

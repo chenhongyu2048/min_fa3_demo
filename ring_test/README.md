@@ -252,8 +252,8 @@ The full scheduler/readiness/completion contract is recorded in
 ### Dataset-shaped hybrid backward
 
 `benchmark_hybrid_dataset_backward.py` uses the same `balancer` workload as the
-forward dataset frontend. It samples Arxiv or Github lengths, packs the target
-token budget, prints the same placement/cap/load report, and calls
+forward dataset frontend. It samples Arxiv, Github, or Pile-CC lengths, packs
+the target token budget, prints the same placement/cap/load report, and calls
 `benchmark_hybrid_backward.main(...)` in the same process with explicit ring
 metadata. Backward is causal-only and benchmarks the all-CP and hierarchical
 fused kernels together with the per-sequence all-gather, Llama3 all-gather,
@@ -270,7 +270,7 @@ torchrun --standalone --nproc_per_node=8 \
   --sm-configs 128:4,124:8,120:12,116:16 \
   --warmup-iters 10 --num-iters 40 --no-check
 
-DATASETS="arxiv github" GPU_COUNTS="2 4 8" DIRECTION=backward \
+DATASETS="arxiv github pile" GPU_COUNTS="2 4 8" DIRECTION=backward \
   ZEPPLIN_THRESHOLD=4096 ./benchmark_hybrid_dataset.sh
 ```
 
@@ -362,13 +362,21 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_hybrid_forward.py \
 ### Dataset-shaped hybrid workload
 
 `benchmark_hybrid_dataset_forward.py` uses the standalone `balancer` package
-to sample an Arxiv or Github length distribution, pack one global batch to
-128K tokens by default, and assign each sequence to a G8/G4/G2/G1 subgroup.
+to sample an Arxiv, Github, or Pile-CC length distribution, pack one global
+batch to 128K tokens by default, and assign each sequence to a G8/G4/G2/G1 subgroup.
 Compute and local tokens are hard placement constraints; normalized token
 balance is the main objective, while compute variance and estimated ring
 token-hops are soft costs. The frontend then calls
 `benchmark_hybrid_forward.main(...)` in the same process with the generated
 ring metadata.
+
+The three empirical distributions live in
+`../dataset/sequence_length_buckets.json`. Each one contains 512 counts for
+256-token `(lower, upper]` buckets up to 128K. Samples longer than 128K are
+merged into the final bucket, and a sampled bucket contributes its upper bound
+before the existing ring-aware alignment is applied. Regenerate the file from
+the sampled `*_doc_lengths.npy` arrays with
+`python dataset/build_length_bucket_stats.py` from the demo root.
 
 Every sampled length, including the final packing residual, is padded upward.
 Lengths below 4K use `256 * 2` alignment, lengths from 4K to 8K use
@@ -384,7 +392,7 @@ torchrun --standalone --nproc_per_node=8 \
   --qhead 32 --kvhead 8 --headdim 128 \
   --mode causal --methods all --zepplin-threshold 4096 --no-check
 
-DATASETS="arxiv github" GPU_COUNTS="2 4 8" ZEPPLIN_THRESHOLD=4096 \
+DATASETS="arxiv github pile" GPU_COUNTS="2 4 8" ZEPPLIN_THRESHOLD=4096 \
   ./benchmark_hybrid_dataset.sh
 ```
 

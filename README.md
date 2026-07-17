@@ -286,7 +286,7 @@ torchrun --standalone --nproc_per_node=8 \
   --qhead 32 --kvhead 8 --headdim 128 \
   --mode causal --methods all --zepplin-threshold 4096 --no-check
 
-DATASETS="arxiv github" GPU_COUNTS=8 ZEPPLIN_THRESHOLD=4096 \
+DATASETS="arxiv github pile" GPU_COUNTS=8 ZEPPLIN_THRESHOLD=4096 \
   ./benchmark_hybrid_dataset.sh
 
 torchrun --standalone --nproc_per_node=8 \
@@ -296,7 +296,7 @@ torchrun --standalone --nproc_per_node=8 \
   --methods all --zepplin-threshold 4096 \
   --sm-configs 128:4,124:8,120:12,116:16 --no-check
 
-DATASETS="arxiv github" GPU_COUNTS=8 DIRECTION=backward \
+DATASETS="arxiv github pile" GPU_COUNTS=8 DIRECTION=backward \
   ZEPPLIN_THRESHOLD=4096 ./benchmark_hybrid_dataset.sh
 ```
 
@@ -304,8 +304,13 @@ The dataset frontends call the standalone `balancer` package to generate global
 lengths and token/compute-constrained G8/G4/G2/G1 metadata. The forward frontend
 calls `benchmark_hybrid_forward.main(...)`; the causal backward frontend calls
 `benchmark_hybrid_backward.main(...)` with the same explicit topology. The
-planner searches
-the strictest feasible token cap, permits compute relaxation only up to its
+Arxiv, Github, and Pile-CC distributions are loaded from
+`dataset/sequence_length_buckets.json`. Each distribution contains 256-token
+`(lower, upper]` bucket counts derived from the sampled document lengths;
+samples above 128K are counted in the final bucket. Run
+`python dataset/build_length_bucket_stats.py` to regenerate the JSON from the
+three `*_doc_lengths.npy` files. The planner searches the strictest feasible
+token cap, permits compute relaxation only up to its
 configured cap unless topology or emergency fallback requires more, and uses
 estimated ring token-hops as a tunable soft cost. Use `--communication-weight`
 to change that tradeoff and `--print-workload --world-size 8` to inspect the
