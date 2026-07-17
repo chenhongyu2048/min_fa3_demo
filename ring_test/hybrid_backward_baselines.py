@@ -530,7 +530,7 @@ class VarlenFa3RingBackward(_BlockBackend):
 
 
 class ZepplinBackward(_BlockBackend):
-    """Prepare local-then-ring forward and time ring-then-local backward."""
+    """Synchronize, run the Gworld ring, then run rank-local G1 work."""
 
     def __init__(
         self,
@@ -593,6 +593,12 @@ class ZepplinBackward(_BlockBackend):
         return zepplin_note(self.plan, self.backend_name)
 
     def forward(self) -> torch.Tensor:
+        dist.barrier(group=self.process_group)
+
+        if self.ring_runner is not None:
+            long_out = self.ring_runner.forward()
+            self.out[self.short_total :].copy_(long_out)
+
         if self.short_lengths:
             self.short_out, self.short_lse = self.forward_block(
                 self.q[: self.short_total],
@@ -607,22 +613,16 @@ class ZepplinBackward(_BlockBackend):
                 True,
             )
             self.out[: self.short_total].copy_(self.short_out)
-
-        dist.barrier(group=self.process_group)
-
-        if self.ring_runner is not None:
-            long_out = self.ring_runner.forward()
-            self.out[self.short_total :].copy_(long_out)
         return self.out
 
     def backward(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dist.barrier(group=self.process_group)
+
         if self.ring_runner is not None:
             long_dq, long_dk, long_dv = self.ring_runner.backward()
             self.dq[self.short_total :].copy_(long_dq)
             self.dk[self.short_total :].copy_(long_dk)
             self.dv[self.short_total :].copy_(long_dv)
-
-        dist.barrier(group=self.process_group)
 
         if self.short_lengths:
             if self.short_out is None or self.short_lse is None:

@@ -175,9 +175,10 @@ include maximum end-to-end wall time, per-rank median times,
 aggregate/average-per-GPU causal backward TFLOP/s, and the fused
 compute/communication SM split. Forward preparation is outside every method's
 timed interval. The fused owner-accumulator reset and distributed barrier are
-also outside its timed interval. Zeppelin's timed backward runs its all-rank
-ring backward first, then an all-rank phase barrier, then the rank-local G1
-backward. That internal phase barrier is included in its result.
+also outside its timed interval. Zeppelin's timed backward runs one all-rank
+phase barrier first, followed by the all-rank ring backward and then the
+rank-local G1 backward. That internal phase barrier is included in its result;
+there is no barrier after either work phase.
 
 `--b` and `--seqlen` are comma-separated integer lists with equal length. Each
 `(b[i], seqlen[i])` pair is one case; `seqlen[i]` is the local sequence length
@@ -323,9 +324,10 @@ G1 choice.
 
 Each rank packs its owned short sequences first and every long sequence's
 local shard second; each part retains original batch order. Forward timing
-includes local varlen attention, one all-rank phase barrier, and the long
-`fa3_ring`. Ranks with no short work and workloads with no long work still
-participate in that barrier, while empty kernel launches are skipped.
+includes one all-rank phase barrier, the long `fa3_ring`, and then local varlen
+attention. There is no barrier after the ring or local phase. Ranks with no
+short work and workloads with no long work still participate in the initial
+barrier, while empty kernel launches are skipped.
 
 Forward selection requires the external FA3 varlen forward entry point on
 every rank. Backward selection requires both its forward and backward entry

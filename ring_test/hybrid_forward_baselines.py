@@ -298,7 +298,7 @@ def fa3_ring_forward(
 
 
 class ZepplinForward(_BlockBackend):
-    """Run rank-local G1 attention before the all-rank Gworld ring."""
+    """Synchronize, run the all-rank Gworld ring, then rank-local G1 attention."""
 
     def __init__(
         self,
@@ -343,21 +343,6 @@ class ZepplinForward(_BlockBackend):
         return zepplin_note(self.plan, self.backend_name)
 
     def forward(self) -> torch.Tensor:
-        if self.short_lengths:
-            short_out, _ = self.forward_block(
-                self.q[: self.short_total],
-                self.k[: self.short_total],
-                self.v[: self.short_total],
-                self.short_cu,
-                self.short_cu,
-                self.short_cu_host,
-                self.short_cu_host,
-                max(self.short_lengths),
-                max(self.short_lengths),
-                self.plan.is_causal,
-            )
-            self.out[: self.short_total].copy_(short_out)
-
         dist.barrier(group=self.process_group)
 
         if self.long_lengths:
@@ -373,6 +358,21 @@ class ZepplinForward(_BlockBackend):
                 self.backend,
             )
             self.out[self.short_total :].copy_(long_out)
+
+        if self.short_lengths:
+            short_out, _ = self.forward_block(
+                self.q[: self.short_total],
+                self.k[: self.short_total],
+                self.v[: self.short_total],
+                self.short_cu,
+                self.short_cu,
+                self.short_cu_host,
+                self.short_cu_host,
+                max(self.short_lengths),
+                max(self.short_lengths),
+                self.plan.is_causal,
+            )
+            self.out[: self.short_total].copy_(short_out)
         return self.out
 
 
