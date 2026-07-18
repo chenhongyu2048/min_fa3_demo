@@ -2,6 +2,7 @@
 
 from .load_balancer import (
     HybridWorkload,
+    LENGTH_BUCKET_LABELS,
     RING_SIZES,
     SequencePlacement,
     assign_hierarchical_rings,
@@ -22,6 +23,7 @@ from .sampler import (
 __all__ = [
     "DATASET_WEIGHTS",
     "HybridWorkload",
+    "LENGTH_BUCKET_LABELS",
     "LENGTH_BUCKETS",
     "MAX_SEQUENCE_TOKENS",
     "RING_SIZES",

@@ -32,6 +32,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be a non-negative integer")
+    return parsed
+
+
 def print_workload(
     workload: balancer.HybridWorkload,
     dataset: str,
@@ -92,53 +99,65 @@ def print_workload(
             f"{communication:>19.3e}"
         )
 
-    cap_rows = (
+    balance_rows = (
         (
             "Compute",
+            f"{min(workload.rank_compute):.3e}",
             f"{workload.average_compute:.3e}",
             f"{workload.peak_compute:.3e}",
-            f"{100.0 * workload.imbalance:.2f}%",
-            f"{workload.requested_cap:.3e}",
-            f"{workload.topology_lower_bound:.3e}",
-            f"{workload.final_cap:.3e}",
-            str(workload.topology_limited),
-            str(workload.compute_cap_relaxed),
+            f"{100.0 * workload.compute_deviation:.2f}%",
+            f"{100.0 * workload.compute_balance_tolerance:.2f}%",
+            str(
+                workload.compute_deviation
+                <= workload.compute_balance_tolerance + 1e-12
+            ),
         ),
         (
             "Tokens",
+            str(min(workload.rank_tokens)),
             f"{workload.average_tokens:.3f}",
             str(workload.peak_tokens),
-            f"{100.0 * workload.token_imbalance:.2f}%",
-            f"{workload.requested_token_cap:.3f}",
-            f"{workload.token_topology_lower_bound:.3f}",
-            f"{workload.final_token_cap:.3f}",
-            str(workload.token_topology_limited),
-            str(workload.token_cap_relaxed),
+            f"{100.0 * workload.token_deviation:.2f}%",
+            f"{100.0 * workload.token_balance_tolerance:.2f}%",
+            str(
+                workload.token_deviation
+                <= workload.token_balance_tolerance + 1e-12
+            ),
         ),
     )
-    print("\nBalance and caps")
+    print("\nBalance targets")
     print(
-        f"{'Metric':<8} {'Average':>14} {'Peak':>14} {'Imbalance':>10} "
-        f"{'Requested cap':>14} {'Topology LB':>14} {'Final cap':>14} "
-        f"{'Topology':>10} {'Relaxed':>9}"
+        f"{'Metric':<8} {'Minimum':>14} {'Average':>14} {'Maximum':>14} "
+        f"{'Max deviation':>14} {'Tolerance':>12} {'Met':>7}"
     )
-    for row in cap_rows:
-        metric, average, peak, imbalance, requested, topology, final, limited, relaxed = row
+    for row in balance_rows:
+        metric, minimum, average, maximum, deviation, tolerance, met = row
         print(
-            f"{metric:<8} {average:>14} {peak:>14} {imbalance:>10} "
-            f"{requested:>14} {topology:>14} {final:>14} "
-            f"{limited:>10} {relaxed:>9}"
+            f"{metric:<8} {minimum:>14} {average:>14} {maximum:>14} "
+            f"{deviation:>14} {tolerance:>12} {met:>7}"
         )
 
     print(
         "\nPlanner status: "
-        f"placement_relaxed={workload.placement_relaxed}, "
-        f"emergency_relaxed={workload.emergency_relaxed}, "
-        f"local_search_moves={workload.local_search_moves}"
+        f"feasible={workload.feasible}, "
+        f"violation={workload.load_violation:.6f}, "
+        f"relaxation_level={workload.relaxation_level}, "
+        f"relaxation={workload.relaxation_label!r}, "
+        f"repair_moves={workload.repair_moves}"
     )
+    print("Split protection")
+    print(f"{'Bucket':>10} {'Split count':>12} {'Split penalty':>15}")
+    for label, count, penalty in zip(
+        balancer.LENGTH_BUCKET_LABELS,
+        workload.split_counts,
+        workload.split_penalties,
+    ):
+        print(f"{label:>10} {count:>12} {penalty:>15}")
     print(
         "Communication: "
         f"amplification={workload.communication_amplification:.6f}, "
+        f"proxy_Q={workload.communication_cost:.3e}, "
+        f"active_rings={workload.active_ring_count}, "
         f"total_token_hops={sum(workload.rank_communication):.3e}"
     )
 
@@ -157,36 +176,41 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dataset", choices=tuple(balancer.DATASET_WEIGHTS), required=True)
     parser.add_argument("--target-tokens", type=int, default=balancer.MAX_SEQUENCE_TOKENS)
-    parser.add_argument("--balance-tolerance", type=float, default=0.05)
+    parser.add_argument(
+        "--compute-balance-tolerance",
+        type=float,
+        default=0.05,
+        help="Maximum absolute attention-compute deviation from the rank average",
+    )
     parser.add_argument(
         "--token-balance-tolerance",
         type=float,
         default=0.10,
-        help="Requested maximum token imbalance relative to average",
+        help="Maximum absolute token-load deviation from the rank average",
     )
     parser.add_argument(
-        "--max-compute-balance-tolerance",
+        "--beam-width",
+        type=_positive_int,
+        default=64,
+        help="Maximum BR-PBS states retained after each structural placement",
+    )
+    parser.add_argument(
+        "--finalist-count",
+        type=_positive_int,
+        default=8,
+        help="Number of complete Beam solutions passed to local repair",
+    )
+    parser.add_argument(
+        "--structure-threshold",
         type=float,
-        default=0.20,
-        help="Maximum compute imbalance explored by the planner",
+        default=0.5,
+        help="Minimum normalized sequence size included in structural search",
     )
     parser.add_argument(
-        "--max-token-balance-tolerance",
-        type=float,
-        default=0.50,
-        help="Maximum token imbalance explored before emergency fallback",
-    )
-    parser.add_argument(
-        "--communication-weight",
-        type=float,
-        default=0.05,
-        help="Weight of estimated ring communication in placement scoring",
-    )
-    parser.add_argument(
-        "--local-search-passes",
-        type=int,
-        default=4,
-        help="Number of deterministic local-repair passes; zero disables repair",
+        "--max-repair-iterations",
+        type=_nonnegative_int,
+        default=32,
+        help="Maximum number of strict lexicographic local-repair moves",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-cases", type=_positive_int, default=1)
@@ -282,12 +306,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             num_cases=args.num_cases,
             world_size=world_size,
             mode=args.mode,
-            balance_tolerance=args.balance_tolerance,
+            compute_balance_tolerance=args.compute_balance_tolerance,
             token_balance_tolerance=args.token_balance_tolerance,
-            max_compute_balance_tolerance=args.max_compute_balance_tolerance,
-            max_token_balance_tolerance=args.max_token_balance_tolerance,
-            communication_weight=args.communication_weight,
-            local_search_passes=args.local_search_passes,
+            beam_width=args.beam_width,
+            finalist_count=args.finalist_count,
+            structure_threshold=args.structure_threshold,
+            max_repair_iterations=args.max_repair_iterations,
         )
     except (RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc

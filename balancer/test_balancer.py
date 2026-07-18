@@ -15,6 +15,12 @@ from pathlib import Path
 from unittest import mock
 
 import balancer
+from balancer.load_balancer import (
+    _build_jobs,
+    _dominates,
+    _evaluate_solution,
+    _repair_neighbors,
+)
 from balancer.sampler import _align_sequence_length, _load_bucket_counts
 from dataset.build_length_bucket_stats import (
     MAX_SEQUENCE_TOKENS,
@@ -70,7 +76,8 @@ class DatasetSamplerTest(unittest.TestCase):
 
     def test_alignment_boundaries_round_up(self) -> None:
         expected = {
-            1: 512,
+            1: 256,
+            1025: 1280,
             4095: 4096,
             4097: 5120,
             8191: 8192,
@@ -85,7 +92,8 @@ class DatasetSamplerTest(unittest.TestCase):
 
     def test_alignment_enables_target_causal_ring(self) -> None:
         cases = (
-            (1025, 2),
+            (1025, 1),
+            (2049, 2),
             (4097, 4),
             (8193, 8),
             (16385, 8),
@@ -137,33 +145,29 @@ class DatasetSamplerTest(unittest.TestCase):
 
 
 class HierarchicalLoadBalancerTest(unittest.TestCase):
-    def test_causal_placements_and_rank_totals_are_consistent(self) -> None:
-        lengths = [512, 1536, 5120, 10240, 18432, 24576]
-        workload = balancer.assign_hierarchical_rings(
-            lengths,
-            world_size=8,
-            is_causal=True,
-            balance_tolerance=0.05,
-            local_search_passes=2,
-        )
-
-        expected_tokens = [0] * 8
-        expected_compute = [0.0] * 8
-        expected_communication = [0.0] * 8
+    def assert_workload_consistent(
+        self, workload: balancer.HybridWorkload, is_causal: bool
+    ) -> None:
+        expected_tokens = [0] * len(workload.rank_tokens)
+        expected_compute = [0.0] * len(workload.rank_compute)
+        expected_communication = [0.0] * len(workload.rank_communication)
+        active_rings: set[tuple[int, int]] = set()
+        communication_cost = 0.0
         for length, ring_size, ring_start in zip(
             workload.global_lengths,
             workload.ring_sizes,
             workload.ring_starts,
         ):
             self.assertIn(ring_size, balancer.RING_SIZES)
-            self.assertLessEqual(ring_size, 8)
             self.assertEqual(ring_start % ring_size, 0)
-            self.assertLessEqual(ring_start + ring_size, 8)
-            if ring_size > 1:
+            self.assertLessEqual(ring_start + ring_size, len(workload.rank_tokens))
+            if is_causal and ring_size > 1:
                 self.assertEqual(length % (256 * ring_size), 0)
+            if not is_causal:
+                self.assertEqual(length % ring_size, 0)
 
             token_increment = length // ring_size
-            compute_increment = balancer.attention_compute(length, True) / ring_size
+            compute_increment = balancer.attention_compute(length, is_causal) / ring_size
             communication_increment = balancer.ring_communication_per_rank(
                 length, ring_size
             )
@@ -171,14 +175,224 @@ class HierarchicalLoadBalancerTest(unittest.TestCase):
                 expected_tokens[rank] += token_increment
                 expected_compute[rank] += compute_increment
                 expected_communication[rank] += communication_increment
+            communication_cost += communication_increment
+            active_rings.add((ring_size, ring_start))
 
         self.assertEqual(workload.rank_tokens, expected_tokens)
         self.assertEqual(workload.rank_compute, expected_compute)
         self.assertEqual(workload.rank_communication, expected_communication)
+        self.assertEqual(workload.communication_cost, communication_cost)
+        self.assertEqual(workload.active_ring_count, len(active_rings))
+        expected_violation = max(
+            0.0,
+            workload.compute_deviation - workload.compute_balance_tolerance,
+            workload.token_deviation - workload.token_balance_tolerance,
+        )
+        self.assertAlmostEqual(workload.load_violation, expected_violation)
+        self.assertEqual(workload.feasible, expected_violation <= 1e-12)
+
+    def test_causal_placements_and_rank_totals_are_consistent(self) -> None:
+        lengths = [512, 1536, 5120, 10240, 18432, 24576]
+        workload = balancer.assign_hierarchical_rings(
+            lengths,
+            world_size=8,
+            is_causal=True,
+            compute_balance_tolerance=0.05,
+            max_repair_iterations=2,
+        )
+        self.assert_workload_consistent(workload, is_causal=True)
+
+    def test_noncausal_placements_and_rank_totals_are_consistent(self) -> None:
+        workload = balancer.assign_hierarchical_rings(
+            [256, 768, 2048, 5120, 8192],
+            world_size=4,
+            is_causal=False,
+            beam_width=32,
+            finalist_count=4,
+            max_repair_iterations=4,
+        )
+        self.assert_workload_consistent(workload, is_causal=False)
+
+    def test_buddy_tree_has_all_fifteen_candidates_for_g8_sequence(self) -> None:
+        length = 16 * 1024
+        compute = balancer.attention_compute(length, True)
+        jobs = _build_jobs(
+            [length],
+            world_size=8,
+            is_causal=True,
+            average_compute=compute / 8,
+            average_tokens=length / 8,
+            compute_tolerance=0.05,
+            token_tolerance=0.10,
+        )
+        self.assertEqual(jobs[0].legal_sizes, (1, 2, 4, 8))
+        self.assertEqual(len(jobs[0].candidates), 15)
+        self.assertEqual(jobs[0].minimum_ring_size, 8)
+
+    def test_pareto_dominance_requires_no_worse_metric(self) -> None:
+        self.assertTrue(_dominates((0.0, 1.0, 2), (0.0, 1.5, 2)))
+        self.assertFalse(_dominates((0.0, 2.0, 1), (0.0, 1.0, 2)))
+        self.assertFalse(_dominates((1.0, 2.0), (1.0, 2.0)))
+
+    def test_short_sequences_stay_local_when_a_feasible_plan_exists(self) -> None:
+        workload = balancer.assign_hierarchical_rings(
+            [512] * 8 + [4096, 4096],
+            world_size=8,
+            is_causal=True,
+        )
+        self.assertTrue(workload.feasible)
+        placements = list(zip(workload.global_lengths, workload.ring_sizes))
+        self.assertTrue(all(ring_size == 1 for length, ring_size in placements if length == 512))
+        self.assertEqual(workload.split_counts[0], 0)
+
+    def test_progressive_unlock_splits_longer_filler_before_shortest(self) -> None:
+        workload = balancer.assign_hierarchical_rings(
+            [512, 512, 2560, 20480, 18432, 12288, 28672, 26624],
+            world_size=8,
+            is_causal=True,
+        )
+        self.assertTrue(workload.feasible)
+        self.assertEqual(workload.relaxation_label, "unlock 2K-4K G2")
+        placements = list(zip(workload.global_lengths, workload.ring_sizes))
+        self.assertTrue(all(ring_size == 1 for length, ring_size in placements if length == 512))
+        self.assertIn((2560, 2), placements)
+        self.assertEqual(workload.split_counts[0], 0)
+
+    def test_infeasible_topology_returns_lowest_violation_plan(self) -> None:
+        workload = balancer.assign_hierarchical_rings(
+            [1280], world_size=8, is_causal=True
+        )
+        self.assertFalse(workload.feasible)
+        self.assertGreater(workload.load_violation, 0.0)
+        self.assertEqual(workload.ring_sizes, [1])
+        self.assert_workload_consistent(workload, is_causal=True)
+
+    def test_repair_neighborhood_contains_sibling_demotion(self) -> None:
+        lengths = [4096, 4096]
+        total_compute = sum(balancer.attention_compute(length, True) for length in lengths)
+        jobs = _build_jobs(
+            lengths,
+            world_size=4,
+            is_causal=True,
+            average_compute=total_compute / 4,
+            average_tokens=sum(lengths) / 4,
+            compute_tolerance=0.05,
+            token_tolerance=0.10,
+        )
+        placements = [
+            next(
+                candidate
+                for candidate in job.candidates
+                if candidate.ring_size == 4 and candidate.ring_start == 0
+            )
+            for job in jobs
+        ]
+        solution = _evaluate_solution(
+            placements,
+            jobs,
+            world_size=4,
+            average_compute=total_compute / 4,
+            average_tokens=sum(lengths) / 4,
+            compute_tolerance=0.05,
+            token_tolerance=0.10,
+        )
+        allowed = {job.original_index: job.candidates for job in jobs}
+        neighbors = list(_repair_neighbors(solution, jobs, allowed))
+        self.assertTrue(
+            any(
+                len(changes) == 2
+                and {placement.ring_size for _, placement in changes} == {2}
+                and {placement.ring_start for _, placement in changes} == {0, 2}
+                for changes in neighbors
+            )
+        )
+
+    def test_repair_neighborhood_contains_singleton_and_ring_moves(self) -> None:
+        def build_case(
+            lengths: list[int],
+            world_size: int,
+            placement_keys: list[tuple[int, int]],
+        ):
+            total_compute = sum(
+                balancer.attention_compute(length, True) for length in lengths
+            )
+            average_compute = total_compute / world_size
+            average_tokens = sum(lengths) / world_size
+            jobs = _build_jobs(
+                lengths,
+                world_size=world_size,
+                is_causal=True,
+                average_compute=average_compute,
+                average_tokens=average_tokens,
+                compute_tolerance=0.05,
+                token_tolerance=0.10,
+            )
+            placements = [
+                next(
+                    candidate
+                    for candidate in job.candidates
+                    if (candidate.ring_size, candidate.ring_start) == key
+                )
+                for job, key in zip(jobs, placement_keys)
+            ]
+            solution = _evaluate_solution(
+                placements,
+                jobs,
+                world_size,
+                average_compute,
+                average_tokens,
+                compute_tolerance=0.05,
+                token_tolerance=0.10,
+            )
+            allowed = {job.original_index: job.candidates for job in jobs}
+            return placements, list(_repair_neighbors(solution, jobs, allowed))
+
+        local_placements, local_neighbors = build_case(
+            [4096, 512], 2, [(1, 0), (1, 1)]
+        )
+        self.assertTrue(
+            any(
+                len(changes) == 1
+                and changes[0][1].ring_size == 1
+                and changes[0][1].ring_start
+                != local_placements[changes[0][0]].ring_start
+                for changes in local_neighbors
+            )
+        )
+        self.assertTrue(
+            any(
+                len(changes) == 2
+                and all(placement.ring_size == 1 for _, placement in changes)
+                for changes in local_neighbors
+            )
+        )
+
+        _, ring_neighbors = build_case(
+            [4096, 4096], 4, [(2, 0), (1, 0)]
+        )
+        first_job_targets = {
+            (placement.ring_size, placement.ring_start)
+            for changes in ring_neighbors
+            for index, placement in changes
+            if index == 0
+        }
+        self.assertIn((2, 2), first_job_targets)
+        self.assertIn((4, 0), first_job_targets)
+
+        _, demotion_neighbors = build_case(
+            [4096, 4096], 4, [(4, 0), (1, 0)]
+        )
+        self.assertTrue(
+            any(
+                index == 0 and placement.ring_size == 2
+                for changes in demotion_neighbors
+                for index, placement in changes
+            )
+        )
 
     def test_workload_generation_targets_expected_ring_tiers(self) -> None:
         cases = (
-            (1025, 1536, 2),
+            (1025, 1280, 1),
             (4097, 5120, 4),
             (8193, 10240, 8),
             (16385, 18432, 8),
@@ -191,7 +405,7 @@ class HierarchicalLoadBalancerTest(unittest.TestCase):
                     seed=0,
                     world_size=8,
                     mode="causal",
-                    balance_tolerance=0.05,
+                    compute_balance_tolerance=0.05,
                 )
                 self.assertEqual(workload.global_lengths, [aligned_length])
                 self.assertEqual(workload.ring_sizes, [ring_size])
@@ -203,7 +417,7 @@ class HierarchicalLoadBalancerTest(unittest.TestCase):
             seed=3,
             world_size=8,
             mode="causal",
-            balance_tolerance=0.05,
+            compute_balance_tolerance=0.05,
         )
         self.assertEqual(
             balancer.make_workload(**kwargs),
@@ -217,7 +431,7 @@ class HierarchicalLoadBalancerTest(unittest.TestCase):
             seed=7,
             world_size=8,
             mode="causal",
-            balance_tolerance=0.05,
+            compute_balance_tolerance=0.05,
         )
         workloads = balancer.make_workloads(**kwargs, num_cases=2)
         self.assertEqual(workloads[0], balancer.make_workload(**kwargs))
@@ -229,7 +443,7 @@ class HierarchicalLoadBalancerTest(unittest.TestCase):
                 [2048],
                 world_size=3,
                 is_causal=True,
-                balance_tolerance=0.05,
+                compute_balance_tolerance=0.05,
             )
 
 
@@ -252,8 +466,9 @@ class DatasetBenchmarkFrontendTest(unittest.TestCase):
             )
         rendered = output.getvalue()
         self.assertIn("dataset=pile", rendered)
-        self.assertIn("actual_tokens=4608", rendered)
-        self.assertIn("global_seqlens=1536,1024,512,512,1024", rendered)
+        self.assertIn("actual_tokens=4352", rendered)
+        self.assertIn("Planner status: feasible=", rendered)
+        self.assertIn("Split protection", rendered)
 
     def test_print_workload_uses_balancer_without_cuda(self) -> None:
         output = io.StringIO()

@@ -12,12 +12,12 @@ GPU_COUNTS=${GPU_COUNTS:-"8"}
 DATASETS=${DATASETS:-"arxiv github pile"}
 DIRECTION=${DIRECTION:-forward}
 TARGET_TOKENS=${TARGET_TOKENS:-131072}
-BALANCE_TOLERANCE=${BALANCE_TOLERANCE:-0.05}
+COMPUTE_BALANCE_TOLERANCE=${COMPUTE_BALANCE_TOLERANCE:-0.05}
 TOKEN_BALANCE_TOLERANCE=${TOKEN_BALANCE_TOLERANCE:-0.10}
-MAX_COMPUTE_BALANCE_TOLERANCE=${MAX_COMPUTE_BALANCE_TOLERANCE:-0.20}
-MAX_TOKEN_BALANCE_TOLERANCE=${MAX_TOKEN_BALANCE_TOLERANCE:-0.50}
-COMMUNICATION_WEIGHT=${COMMUNICATION_WEIGHT:-0.05}
-LOCAL_SEARCH_PASSES=${LOCAL_SEARCH_PASSES:-4}
+BEAM_WIDTH=${BEAM_WIDTH:-64}
+FINALIST_COUNT=${FINALIST_COUNT:-8}
+STRUCTURE_THRESHOLD=${STRUCTURE_THRESHOLD:-0.5}
+MAX_REPAIR_ITERATIONS=${MAX_REPAIR_ITERATIONS:-32}
 SEED=${SEED:-0}
 NUM_CASES=${NUM_CASES:-1}
 METHODS=${METHODS:-all}
@@ -78,6 +78,12 @@ fi
     die "ZEPPLIN_THRESHOLD must be a positive integer, got '$ZEPPLIN_THRESHOLD'"
 [[ "$NUM_CASES" =~ ^[1-9][0-9]*$ ]] || \
     die "NUM_CASES must be a positive integer, got '$NUM_CASES'"
+[[ "$BEAM_WIDTH" =~ ^[1-9][0-9]*$ ]] || \
+    die "BEAM_WIDTH must be a positive integer, got '$BEAM_WIDTH'"
+[[ "$FINALIST_COUNT" =~ ^[1-9][0-9]*$ ]] || \
+    die "FINALIST_COUNT must be a positive integer, got '$FINALIST_COUNT'"
+[[ "$MAX_REPAIR_ITERATIONS" =~ ^[0-9]+$ ]] || \
+    die "MAX_REPAIR_ITERATIONS must be a non-negative integer, got '$MAX_REPAIR_ITERATIONS'"
 
 gpu_counts_spec=${GPU_COUNTS//,/ }
 read -r -a GPU_COUNT_LIST <<< "$gpu_counts_spec"
@@ -142,12 +148,12 @@ run_benchmark() {
         "$entrypoint"
         --dataset "$dataset"
         --target-tokens "$TARGET_TOKENS"
-        --balance-tolerance "$BALANCE_TOLERANCE"
+        --compute-balance-tolerance "$COMPUTE_BALANCE_TOLERANCE"
         --token-balance-tolerance "$TOKEN_BALANCE_TOLERANCE"
-        --max-compute-balance-tolerance "$MAX_COMPUTE_BALANCE_TOLERANCE"
-        --max-token-balance-tolerance "$MAX_TOKEN_BALANCE_TOLERANCE"
-        --communication-weight "$COMMUNICATION_WEIGHT"
-        --local-search-passes "$LOCAL_SEARCH_PASSES"
+        --beam-width "$BEAM_WIDTH"
+        --finalist-count "$FINALIST_COUNT"
+        --structure-threshold "$STRUCTURE_THRESHOLD"
+        --max-repair-iterations "$MAX_REPAIR_ITERATIONS"
         --seed "$SEED"
         --num-cases "$NUM_CASES"
         --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM"
@@ -188,7 +194,7 @@ fi
 
 echo "Log: $LOG_FILE"
 echo "Datasets: ${DATASET_LIST[*]}"
-echo "Config: direction=$DIRECTION, target_tokens=$TARGET_TOKENS, compute_tolerance=$BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, max_compute_tolerance=$MAX_COMPUTE_BALANCE_TOLERANCE, max_token_tolerance=$MAX_TOKEN_BALANCE_TOLERANCE, communication_weight=$COMMUNICATION_WEIGHT, local_search_passes=$LOCAL_SEARCH_PASSES, seed=$SEED, num_cases=$NUM_CASES, mode=$MODE, zepplin_threshold=$ZEPPLIN_THRESHOLD"
+echo "Config: direction=$DIRECTION, target_tokens=$TARGET_TOKENS, compute_tolerance=$COMPUTE_BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, beam_width=$BEAM_WIDTH, finalist_count=$FINALIST_COUNT, structure_threshold=$STRUCTURE_THRESHOLD, max_repair_iterations=$MAX_REPAIR_ITERATIONS, seed=$SEED, num_cases=$NUM_CASES, mode=$MODE, zepplin_threshold=$ZEPPLIN_THRESHOLD"
 echo "Methods: $METHODS"
 
 for world_size in "${GPU_COUNT_LIST[@]}"; do

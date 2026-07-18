@@ -17,6 +17,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+LOG_DIR = Path(__file__).resolve().parent
+DEFAULT_FORWARD_LOG = LOG_DIR / "20260718-144919" / "benchmark_hybrid_dataset.log"
+DEFAULT_BACKWARD_LOG = (LOG_DIR / "20260718-150524" / "benchmark_hybrid_dataset_backward.log")
+
 METHODS = (
     "allgather_attention",
     "llama3_allgather_attention",
@@ -160,27 +164,27 @@ def parse_log(path: Path) -> list[SummaryRecord]:
     return records
 
 
-def discover_logs(inputs: Sequence[Path]) -> list[Path]:
-    paths: set[Path] = set()
-    for input_path in inputs:
-        if input_path.is_dir():
-            paths.update(path.resolve() for path in input_path.rglob("*.log"))
-        elif input_path.is_file():
-            paths.add(input_path.resolve())
-        else:
-            raise FileNotFoundError(f"input does not exist: {input_path}")
-    if not paths:
-        joined = ", ".join(str(path) for path in inputs)
-        raise ValueError(f"no .log files found under: {joined}")
-    return sorted(paths)
-
-
 def load_records(paths: Iterable[Path]) -> list[SummaryRecord]:
     records: list[SummaryRecord] = []
     for path in paths:
         records.extend(parse_log(path))
     if not records:
         raise ValueError("no cross-case forward/backward summary rows were found")
+    return records
+
+
+def load_direction_records(path: Path, direction: str) -> list[SummaryRecord]:
+    if not path.is_file():
+        raise FileNotFoundError(f"{direction} log does not exist: {path}")
+
+    records = load_records([path.resolve()])
+    unexpected_directions = sorted({record.direction for record in records} - {direction})
+    if unexpected_directions:
+        raise ValueError(
+            f"{direction} log {path} also contains "
+            + ", ".join(unexpected_directions)
+            + " summary rows"
+        )
     return records
 
 
@@ -348,23 +352,27 @@ def print_selection(
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    default_log_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
         description=(
-            "Read dataset benchmark logs and plot weighted forward/backward TFLOPS"
+            "Plot weighted forward/backward TFLOPS from the specified benchmark logs"
         )
     )
     parser.add_argument(
-        "inputs",
-        nargs="*",
+        "--forward-log",
         type=Path,
-        default=[default_log_dir],
-        help="Log file or directory; directories are searched recursively",
+        default=DEFAULT_FORWARD_LOG,
+        help=f"forward benchmark log (default: {DEFAULT_FORWARD_LOG})",
+    )
+    parser.add_argument(
+        "--backward-log",
+        type=Path,
+        default=DEFAULT_BACKWARD_LOG,
+        help=f"backward benchmark log (default: {DEFAULT_BACKWARD_LOG})",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=default_log_dir / "weighted_flops.png",
+        default=LOG_DIR / "weighted_flops.png",
     )
     parser.add_argument(
         "--world-size",
@@ -382,8 +390,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
-    paths = discover_logs(args.inputs)
-    records = load_records(paths)
+    records = [
+        *load_direction_records(args.forward_log, "forward"),
+        *load_direction_records(args.backward_log, "backward"),
+    ]
     world_size = choose_world_size(records, args.world_size)
     selected = select_best(records, world_size=world_size, mode=args.forward_mode)
     figure = make_figure(selected, world_size)

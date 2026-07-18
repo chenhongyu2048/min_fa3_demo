@@ -1,10 +1,13 @@
 # min_fa3_demo
 
-This directory contains a minimal Hopper FlashAttention forward/backward demo copied and trimmed from the existing `hopper/` implementation in this repository.
+This standalone directory contains a minimal Hopper FlashAttention
+forward/backward demo copied and trimmed from the original `hopper/`
+implementation.
 
 ## Source provenance
 
-The demo is built by copying Hopper forward and backward sources into `hopper/min_fa3_demo/` and trimming them down to a fixed configuration.
+The local sources preserve the structure of the Hopper forward and backward
+paths while trimming them to the fixed configuration documented below.
 
 The params structures are copied from the original Hopper forward/backward params paths and trimmed, not rewritten from scratch.
 
@@ -30,23 +33,23 @@ The params structures are copied from the original Hopper forward/backward param
 
 ## Mapping to original Hopper code
 
-- `hopper/flash.h` -> `hopper/min_fa3_demo/include/min_fa3_params.h`
-- `hopper/flash_fwd_launch_template.h` -> `hopper/min_fa3_demo/include/min_fa3_launch.h`
-- `hopper/flash_fwd_kernel_sm90.h` -> `hopper/min_fa3_demo/include/min_fa3_kernel.h`
-- `hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp` -> `hopper/min_fa3_demo/include/min_fa3_mainloop.h`
-- `hopper/epilogue_fwd.hpp` -> `hopper/min_fa3_demo/include/min_fa3_epilogue.h`
-- `hopper/tile_scheduler.hpp` -> `hopper/min_fa3_demo/include/min_fa3_scheduler.h`
-- `hopper/tile_size.h` -> `hopper/min_fa3_demo/include/min_fa3_traits.h`
-- `hopper/named_barrier.hpp` -> `hopper/min_fa3_demo/include/min_fa3_named_barrier.h`
-- `hopper/flash_fwd_kernel_sm90.h` -> `hopper/min_fa3_demo/include/min_fa3_prologue.h`
-- `hopper/instantiations/flash_fwd_hdim128_bf16_sm90.cu` -> `hopper/min_fa3_demo/csrc/min_fa3_kernel.cu`
-- `hopper/flash.h` -> `hopper/min_fa3_demo/include/min_fa3_varlen_params.h`
-- `hopper/tile_scheduler.hpp` -> `hopper/min_fa3_demo/include/min_fa3_varlen_scheduler.h`
-- `hopper/flash_fwd_launch_template.h` -> `hopper/min_fa3_demo/include/min_fa3_varlen_launch.h`
-- `hopper/flash_prepare_scheduler.cu` -> `hopper/min_fa3_demo/csrc/min_fa3_varlen_prepare_scheduler.cu`
-- `hopper/instantiations/flash_fwd_hdim128_bf16_sm90.cu` -> `hopper/min_fa3_demo/csrc/min_fa3_varlen_kernel.cu`
-- Hopper backward params and launch layers -> `hopper/min_fa3_demo/include/backward/`
-- Hopper backward instantiation and host bindings -> `hopper/min_fa3_demo/csrc/backward/`
+- `hopper/flash.h` -> `include/min_fa3_params.h`
+- `hopper/flash_fwd_launch_template.h` -> `include/min_fa3_launch.h`
+- `hopper/flash_fwd_kernel_sm90.h` -> `include/min_fa3_kernel.h`
+- `hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp` -> `include/min_fa3_mainloop.h`
+- `hopper/epilogue_fwd.hpp` -> `include/min_fa3_epilogue.h`
+- `hopper/tile_scheduler.hpp` -> `include/min_fa3_scheduler.h`
+- `hopper/tile_size.h` -> `include/min_fa3_traits.h`
+- `hopper/named_barrier.hpp` -> `include/min_fa3_named_barrier.h`
+- `hopper/flash_fwd_kernel_sm90.h` -> `include/min_fa3_prologue.h`
+- `hopper/instantiations/flash_fwd_hdim128_bf16_sm90.cu` -> `csrc/min_fa3_kernel.cu`
+- `hopper/flash.h` -> `include/min_fa3_varlen_params.h`
+- `hopper/tile_scheduler.hpp` -> `include/min_fa3_varlen_scheduler.h`
+- `hopper/flash_fwd_launch_template.h` -> `include/min_fa3_varlen_launch.h`
+- `hopper/flash_prepare_scheduler.cu` -> `csrc/min_fa3_varlen_prepare_scheduler.cu`
+- `hopper/instantiations/flash_fwd_hdim128_bf16_sm90.cu` -> `csrc/min_fa3_varlen_kernel.cu`
+- Hopper backward params and launch layers -> `include/backward/`
+- Hopper backward instantiation and host bindings -> `csrc/backward/`
 
 ## Fixed supported configuration
 
@@ -56,10 +59,11 @@ The params structures are copied from the original Hopper forward/backward param
 - Head dim: `128`
 - Layout: external API is fixed to `BSHD`
 - Q/K/V/O shapes:
-  - `q: [B, Sq, H, 128]`
-  - `k: [B, Sk, H, 128]`
-  - `v: [B, Sk, H, 128]`
-  - `o: [B, Sq, H, 128]`
+  - `q: [B, S, QH, 128]`
+  - `k: [B, S, KVH, 128]`
+  - `v: [B, S, KVH, 128]`
+  - `o: [B, S, QH, 128]`
+- GQA/MQA: supported when `QH % KVH == 0`
 - Modes: `is_causal=False` and `is_causal=True`
 
 ## Varlen sibling kernel
@@ -124,55 +128,93 @@ These strides are then fed into the copied Hopper launch path to build the inter
 
 ## Build
 
+The extension requires PyTorch with CUDA extension support, a CUDA toolkit and
+driver library, and an SM90 GPU at runtime. CUTLASS is taken from
+`third_party/cutlass` by default; `CUTLASS_DIR` may point to another CUTLASS
+root or directly to its `include/` directory.
+
 ```bash
 make
+
+# Optional external CUTLASS checkout.
+CUTLASS_DIR=/path/to/cutlass make
 ```
+
+`make clean` removes the extension and local build products.
+
+## Available entry points
+
+Run the commands below from this directory. Python files below `scripts/` are
+invoked as modules so that `min_fa3_op.py` and the in-place extension remain on
+the import path.
+
+| Entry point | Purpose |
+| --- | --- |
+| `benchmark_hybrid_dataset.sh` | Recommended dataset-shaped forward/backward benchmark wrapper for 2, 4, or 8 GPUs |
+| `ring_test/benchmark_hybrid_dataset_{forward,backward}.py` | Dataset sampling, BR-PBS placement, and hierarchical benchmark frontend |
+| `ring_test/benchmark_hybrid_{forward,backward}.py` | Explicit global-length and Buddy-ring topology benchmark |
+| `ring_test/benchmark_ring_{forward,backward}.py` | Ordinary all-CP distributed ring benchmark |
+| `balancer/test_balancer.py` | CPU-only sampler and BR-PBS tests |
+| `scripts/test_min_fa3/` | Fixed, varlen, backward, remote-load, and ordinary ring tests |
+| `scripts/test_mega_ring/` | Hierarchical mega-ring forward/backward and validation tests |
+| `scripts/legacy_benchmark/` | Direct single-kernel and remote-load microbenchmarks |
+| `dataset/build_length_bucket_stats.py` | Rebuild checked-in 256-token dataset bucket statistics |
+| `dataset/plot_sequence_length_buckets.py` | Plot the checked-in dataset length distributions |
+| `benchmark_logs/plot_weighted_flops.py` | Plot weighted throughput summaries from dataset benchmark logs |
 
 ## Test
 
+CPU-only sampler and BR-PBS tests do not require CUDA:
+
 ```bash
-python test_min_fa3.py
+python -m unittest balancer.test_balancer
 ```
 
-Varlen test:
+Fixed-layout and varlen kernel tests:
 
 ```bash
-python test_min_fa3_varlen.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --mode both
-python test_min_fa3_varlen.py --b 2 --seqlen 256 --qhead 16 --kvhead 8 --headdim 128 --mode causal
+python -m scripts.test_min_fa3.test_min_fa3 \
+  --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --mode both
+python -m scripts.test_min_fa3.test_min_fa3_varlen \
+  --b 2 --seqlen 128,256 --qhead 16 --kvhead 8 --headdim 128 --mode both
 ```
 
 Backward tests:
 
 ```bash
-python test_min_fa3_backward.py --b 2 --seqlen 128,129 --qhead 8 --kvhead 8 --headdim 128 --mode both
-python test_min_fa3_backward.py --b 2 --seqlen 128,129 --qhead 8 --kvhead 2 --headdim 128 --mode both --deterministic
-python test_min_fa3_varlen_backward.py --b 3 --seqlen 128,129 --qhead 8 --kvhead 8 --headdim 128 --mode both
-python test_min_fa3_varlen_backward.py --b 3 --seqlen 128,129 --qhead 8 --kvhead 2 --headdim 128 --mode both --deterministic
+python -m scripts.test_min_fa3.test_min_fa3_backward \
+  --b 2 --seqlen 128,129 --qhead 8 --kvhead 2 --headdim 128 \
+  --mode both --deterministic
+python -m scripts.test_min_fa3.test_min_fa3_varlen_backward \
+  --b 3 --seqlen 128,129 --qhead 8 --kvhead 2 --headdim 128 \
+  --mode both --deterministic
 ```
 
 Remote load test:
 
 ```bash
-torchrun --nproc_per_node=2 test_parallel_remote_load.py --shape 256x384 --src-rank 0
-torchrun --nproc_per_node=4 test_parallel_remote_load.py --shape 256x384,512x512 --src-rank 1
-torchrun --nproc_per_node=2 test_parallel_remote_load.py --shape 512x512 --src-rank 0 --num-blocks 64
+torchrun --standalone --nproc_per_node=2 --module \
+  scripts.test_min_fa3.test_parallel_remote_load \
+  --shape 256x384,512x512 --src-rank 0 --num-blocks 64
 ```
 
-Ring-attention varlen tests:
+Ordinary ring-attention varlen tests:
 
 ```bash
-python test_min_fa3_varlen_ring_local.py --b 2 --seqlen 128 --qhead 16 --kvhead 8 --num-comp-sm 1 --num-comm-sm 1 --mode both
-python test_min_fa3_varlen_ring_local.py --b 3 --seqlen 128,256 --qhead 16 --kvhead 8 --num-comp-sm 2 --num-comm-sm 2 --mode both
-torchrun --nproc_per_node=2 test_min_fa3_varlen_ring_multi_rank.py --b 2 --seqlen 128,256 --qhead 16 --kvhead 8 --src-rank 0 --num-comp-sm 1 --num-comm-sm 1 --mode both
+python -m scripts.test_min_fa3.test_min_fa3_varlen_ring_local \
+  --b 3 --seqlen 128,256 --qhead 16 --kvhead 8 \
+  --num-comp-sm 2 --num-comm-sm 2 --mode both
+torchrun --standalone --nproc_per_node=2 --module \
+  scripts.test_min_fa3.test_min_fa3_varlen_ring_multi_rank \
+  --b 2 --seqlen 128,256 --qhead 16 --kvhead 8 --src-rank 0 \
+  --num-comp-sm 1 --num-comm-sm 1 --mode both
 ```
 
 Hierarchical hybrid mega-ring forward test:
 
 ```bash
-sbatch mega_ring_test_hybrid.slurm
-
-torchrun --standalone --nproc_per_node=8 \
-  mega_ring_test_min_fa3_varlen_hybrid_multi_rank.py \
+torchrun --standalone --nproc_per_node=8 --module \
+  scripts.test_mega_ring.mega_ring_test_min_fa3_varlen_hybrid_multi_rank \
   --global-seqlens 8192,4096,2048,2048 \
   --ring-sizes 8,4,2,1 \
   --ring-starts 0,4,2,7 \
@@ -185,22 +227,22 @@ Hierarchical mega-ring backward tests:
 
 ```bash
 # Explicit all-CP metadata on two GPUs.
-torchrun --standalone --nproc_per_node=2 \
-  mega_ring_test_min_fa3_varlen_backward_multi_rank.py \
+torchrun --standalone --nproc_per_node=2 --module \
+  scripts.test_mega_ring.mega_ring_test_min_fa3_varlen_backward_multi_rank \
   --b 1 --seqlen 256 --qhead 16 --kvhead 8 \
   --num-comp-sm 64 --num-comm-sm 8
 
 # Overlapping G8/G4/G2/G1 subrings, including repeated backward execution.
-torchrun --standalone --nproc_per_node=8 \
-  mega_ring_test_min_fa3_varlen_backward_hybrid_multi_rank.py \
+torchrun --standalone --nproc_per_node=8 --module \
+  scripts.test_mega_ring.mega_ring_test_min_fa3_varlen_backward_hybrid_multi_rank \
   --global-seqlens 2048,1024,512,256 \
   --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
   --qhead 16 --kvhead 8 --repeat 2 \
   --num-comp-sm 100 --num-comm-sm 16
 
 # C++ binding validation failures; every case is guarded against kernel launch.
-torchrun --standalone --nproc_per_node=8 \
-  mega_ring_test_min_fa3_varlen_backward_validation_multi_rank.py
+torchrun --standalone --nproc_per_node=8 --module \
+  scripts.test_mega_ring.mega_ring_test_min_fa3_varlen_backward_validation_multi_rank
 ```
 
 Hierarchical mega-ring notes:
@@ -221,218 +263,118 @@ Hierarchical mega-ring notes:
 - Backward K/V ingress is `remote gmem -> local smem -> local gmem`. dK/dV egress decodes work by KV head and 128-token padded block, then uses one fixed `16 x 1024` FP32 TMA transaction for each remote reduce-add task. Padding stays zero and there is no unaligned tail path.
 - The full scheduler, readiness, owner-completion, and zero-rank contracts are documented in `docs/HIERARCHICAL_HYBRID_MEGA_RING_BACKWARD_DESIGN.md`.
 
-Parameterized test examples:
-
-```bash
-python test_min_fa3.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --mode both
-python test_min_fa3.py --b 2 --seqlen 256 --qhead 16 --kvhead 8 --headdim 128 --mode causal
-python test_min_fa3.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --mode causal --manual-block-count 132
-```
-
 ## Benchmark
 
-```bash
-python benchmark.py
-```
+### Dataset-shaped hierarchical benchmark
 
-Varlen benchmark:
-
-```bash
-python benchmark_varlen.py
-python benchmark_varlen.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both
-python benchmark_varlen.py --b 4 --seqlen 256 --qhead 16 --kvhead 8 --headdim 128 --mode causal
-```
-
-Backward benchmarks against the installed FA3 implementation:
+The root wrapper is the recommended entry point for current end-to-end
+experiments. It runs forward by default; set `DIRECTION=backward` for causal
+backward. `DRY_RUN=1` prints commands without launching CUDA work.
 
 ```bash
-python benchmark_backward.py --b 4 --seqlen 512,1024,2048,4096 --qhead 32 --kvhead 32 --headdim 128 --mode both
-python benchmark_backward.py --b 4 --seqlen 512,1024,2048,4096 --qhead 32 --kvhead 8 --headdim 128 --mode both --deterministic
-python benchmark_varlen_backward.py --b 4 --seqlen 512,1024,2048,4096 --qhead 32 --kvhead 32 --headdim 128 --mode both
-python benchmark_varlen_backward.py --b 4 --seqlen 512,1024,2048,4096 --qhead 32 --kvhead 8 --headdim 128 --mode both --deterministic
+DATASETS="arxiv github pile" GPU_COUNTS=8 NUM_CASES=4 ZEPPLIN_THRESHOLD=4096 \
+  ./benchmark_hybrid_dataset.sh
+
+DATASETS="arxiv github pile" GPU_COUNTS=8 NUM_CASES=4 DIRECTION=backward \
+  ZEPPLIN_THRESHOLD=4096 ./benchmark_hybrid_dataset.sh
+
+DRY_RUN=1 GPU_COUNTS="2 4 8" DATASETS=arxiv ./benchmark_hybrid_dataset.sh
 ```
 
-Both backward implementations receive preallocated `dq`, `dk`, and `dv`. Timing includes internal FP32 workspaces, semaphore initialization, preprocess, the main backward kernel, and postprocess, but excludes allocation of the final gradient tensors. `vs FA3` is `FA3 time / min_fa3 time`, so values above `1.0x` favor the minimal demo.
+The frontends sample Arxiv, Github, or Pile-CC lengths from
+`dataset/sequence_length_buckets.json`, then use BR-PBS to produce G8/G4/G2/G1
+metadata. The main planner controls are:
 
-Ring-local varlen benchmark:
+```text
+--compute-balance-tolerance 0.05
+--token-balance-tolerance 0.10
+--beam-width 64
+--finalist-count 8
+--structure-threshold 0.5
+--max-repair-iterations 32
+```
+
+The shell equivalents are `COMPUTE_BALANCE_TOLERANCE`,
+`TOKEN_BALANCE_TOLERANCE`, `BEAM_WIDTH`, `FINALIST_COUNT`,
+`STRUCTURE_THRESHOLD`, and `MAX_REPAIR_ITERATIONS`. Use the CPU-only planner
+view before a distributed run when inspecting a workload:
 
 ```bash
-python benchmark_varlen_ring_local.py
-python benchmark_varlen_ring_local.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 0 --mode both
-python benchmark_varlen_ring_local.py --b 4 --seqlen 1024 --qhead 32 --kvhead 8 --headdim 128 --num-comp-sm 128 --num-comm-sm 4 --mode causal
+python ring_test/benchmark_hybrid_dataset_forward.py \
+  --dataset arxiv --target-tokens 131072 --seed 0 \
+  --world-size 8 --print-workload
 ```
 
-Hierarchical mega-ring forward benchmark:
+Full 128K runs should use `--no-check`; the correctness reference materializes
+quadratic attention scores. With `--methods all`, methods that cannot represent
+a generated workload are reported as skipped.
+
+### Explicit topology and ordinary ring benchmarks
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
   ring_test/benchmark_hybrid_forward.py \
   --global-seqlens 8192,4096,2048,1024 \
   --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
+  --qhead 32 --kvhead 8 --headdim 128 --mode both \
+  --methods all --sm-configs 128:4,124:8,120:12,116:16 --no-check
+
+torchrun --standalone --nproc_per_node=2 \
+  ring_test/benchmark_ring_forward.py \
+  --b 16,8,4 --seqlen 512,1024,2048 \
+  --qhead 32 --kvhead 8 --headdim 128 --mode both \
+  --methods all --sm-configs 128:4,116:16 --no-check
+
+torchrun --standalone --nproc_per_node=2 \
+  ring_test/benchmark_ring_backward.py \
+  --b 4,4,4 --seqlen 256,512,1024 \
   --qhead 32 --kvhead 8 --headdim 128 \
-  --methods all --zepplin-threshold 4096 \
-  --sm-configs 128:4,124:8,120:12,116:16 \
-  --mode both --warmup-iters 10 --num-iters 40 --no-check
-
-GPU_COUNTS="2 4 8" ./benchmark_ring_1_2_4_8.sh
+  --methods all --sm-configs 128:4,116:16 --no-check
 ```
 
-Dataset-shaped hierarchical hybrid forward and backward benchmarks:
+These distributed paths are single-node because `TKParallelTensor` uses local
+CUDA IPC. The hybrid benchmark consumes global lengths and explicit Buddy-ring
+metadata; the ordinary ring benchmarks consume per-rank local lengths.
+
+### Direct kernel microbenchmarks
+
+The older direct benchmarks remain available under `scripts/legacy_benchmark`
+and are useful for isolated kernel comparisons:
 
 ```bash
-torchrun --standalone --nproc_per_node=8 \
-  ring_test/benchmark_hybrid_dataset_forward.py \
-  --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 4 \
-  --qhead 32 --kvhead 8 --headdim 128 \
-  --mode causal --methods all --zepplin-threshold 4096 --no-check
-
-DATASETS="arxiv github pile" GPU_COUNTS=8 NUM_CASES=4 ZEPPLIN_THRESHOLD=4096 \
-  ./benchmark_hybrid_dataset.sh
-
-torchrun --standalone --nproc_per_node=8 \
-  ring_test/benchmark_hybrid_dataset_backward.py \
-  --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 4 \
-  --qhead 32 --kvhead 8 --headdim 128 \
-  --methods all --zepplin-threshold 4096 \
-  --sm-configs 128:4,124:8,120:12,116:16 --no-check
-
-DATASETS="arxiv github pile" GPU_COUNTS=8 NUM_CASES=4 DIRECTION=backward \
-  ZEPPLIN_THRESHOLD=4096 ./benchmark_hybrid_dataset.sh
+python -m scripts.legacy_benchmark.benchmark \
+  --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 \
+  --headdim 128 --mode both
+python -m scripts.legacy_benchmark.benchmark_varlen \
+  --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 \
+  --headdim 128 --mode both
+python -m scripts.legacy_benchmark.benchmark_backward \
+  --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 \
+  --headdim 128 --mode both --deterministic
+python -m scripts.legacy_benchmark.benchmark_varlen_ring_local \
+  --b 4 --seqlen 512,1024 --qhead 32 --kvhead 8 --headdim 128 \
+  --num-comp-sm 116 --num-comm-sm 16 --mode causal
 ```
 
-The dataset frontends call the standalone `balancer` package to generate global
-lengths and token/compute-constrained G8/G4/G2/G1 metadata. `--seed` initializes
-one sampler RNG and `--num-cases` repeatedly samples complete packed batches
-from that stream. All cases run in one process group; each fused method sizes
-its IPC arenas for the largest case and reuses the same `TKParallelTensor`
-objects. Per-case tables are followed by latency, arithmetic-mean TFLOPS,
-workload-weighted aggregate TFLOPS, and workload-weighted per-GPU summaries.
-The Arxiv, Github, and Pile-CC distributions are loaded
-from
-`dataset/sequence_length_buckets.json`. Each distribution contains 256-token
-`(lower, upper]` bucket counts derived from the sampled document lengths;
-samples above 128K are counted in the final bucket. Run
-`python dataset/build_length_bucket_stats.py` to regenerate the JSON from the
-three `*_doc_lengths.npy` files. The planner searches the strictest feasible
-token cap, permits compute relaxation only up to its
-configured cap unless topology or emergency fallback requires more, and uses
-estimated ring token-hops as a tunable soft cost. Use `--communication-weight`
-to change that tradeoff and `--print-workload --world-size 8` to inspect the
-final caps and per-rank loads. Every sampled length is padded upward: lengths
-below 4K use `256 * 2` alignment, lengths from 4K to 8K use `256 * 4`, and
-lengths from 8K upward use `256 * 8`. The physical padded tokens participate
-in attention, so `actual_tokens` can exceed the target by fewer than 2048
-tokens.
-With the default `--methods all`, methods that cannot represent a generated
-length are reported as skipped; an explicitly requested incompatible method
-remains an error. As an exception, `mega_ring_all_cp` rounds every generated
-global sequence upward to a multiple of 2048 in its own forward and backward
-benchmark workload. Its main TFLOPS columns use the original generated lengths,
-while its Note reports TFLOPS based on the aligned physical work.
-Backward is causal-only and compares per-sequence all-gather, Llama3 whole-packed
-all-gather, FA3/NCCL zigzag ring, Zeppelin, and hierarchical fused mega-ring.
-Zeppelin independently places lengths below
-`--zepplin-threshold` (default `4096`) whole on one rank by deterministic LPT
-and splits lengths at or above the threshold across all ranks. Full 128K
-forward and backward runs should use `--no-check` because
-their correctness references have quadratic memory use.
-
-`ring_test/benchmark_hybrid_forward.py` compares per-sequence and whole-packed
-Llama3-style all-CP all-gather attention, FA3+NCCL ring attention, all-CP fused
-mega-ring, Zeppelin, and hierarchical hybrid mega-ring. The all-CP methods use
-all physical ranks; the hybrid method follows `--ring-sizes` and
-`--ring-starts`. Zeppelin uses G1 for lengths strictly below its threshold and
-Gworld for equality and above.
-It measures the complete Python op with CUDA events, reports the average of
-the per-iteration maximum elapsed times across ranks, and prints aggregate and
-average-per-GPU TFLOPS. `--check` adds output reference validation after
-timing.
-
-Distributed ring benchmark:
+Remote-load microbenchmark:
 
 ```bash
-torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py --b 16,16,16 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both --methods all --num-comp-sm 128 --num-comm-sm 4 --check
-torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py --b 16,16,16 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both --methods all --num-comp-sm 116 --num-comm-sm 16 --no-check
-torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_backward.py --b 4,4,4 --seqlen 256,512,1024 --qhead 32 --kvhead 8 --headdim 128 --methods all --num-comp-sm 64 --num-comm-sm 8 --check
+torchrun --standalone --nproc_per_node=2 --module \
+  scripts.legacy_benchmark.benchmark_parallel_remote_load \
+  --shape 4096x4096,8192x4096 --src-rank 0 --num-blocks 64
 ```
 
-Hierarchical hybrid backward benchmark:
+### Dataset maintenance and plotting
 
 ```bash
-torchrun --standalone --nproc_per_node=8 \
-  ring_test/benchmark_hybrid_backward.py \
-  --b 1,4 --seqlen 256,256 \
-  --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
-  --qhead 16 --kvhead 8 --headdim 128 \
-  --methods all --zepplin-threshold 4096 \
-  --num-comp-sm 100 --num-comm-sm 16 \
-  --warmup-iters 5 --num-iters 20
+python dataset/build_length_bucket_stats.py
+python dataset/plot_sequence_length_buckets.py
+python benchmark_logs/plot_weighted_flops.py --world-size 8
 ```
 
-`benchmark_hybrid_backward.py` treats `--b` and `--seqlen` as equal-length
-comma-separated integer lists. Each pair `(b[i], seqlen[i])` is one benchmark
-case, and `seqlen[i]` is the member-rank local length. The ring-size/start
-pattern is repeated to fill that case's batch and sorted by decreasing ring
-size; each generated global length is `seqlen[i] * ring_size`. Timing excludes
-forward preparation, owner-accumulator reset, and the pre-launch distributed
-barrier; method-internal phase barriers such as Zeppelin's are included. It
-reports the average of the per-iteration maximum wall times across ranks, and
-derives aggregate causal backward TFLOP/s. Alternatively,
-`--global-seqlens`, `--ring-sizes`, and `--ring-starts` pass one explicit
-topology, while `--sm-configs` sweeps several compute/communication allocations
-without rebuilding the workload. `--check` enables subgroup-aware FP32 autograd
-dQ/dK/dV validation for small workloads. `--methods all` includes
-`allgather_attention`, `llama3_allgather_attention`, `fa3_ring`, `zepplin`,
-`mega_ring_all_cp`, and `mega_ring_hybrid`; the four Python block baselines are
-measured once, while both fused methods are repeated for every SM configuration.
-
-Distributed ring benchmark notes:
-
-- This path is single-node only because `TKParallelTensor` uses local IPC.
-- Causal checks use the zigzag reference layout by default.
-- Output reports both aggregate visible-work `Agg TFLOPS` and per-GPU `Avg/GPU`.
-
-Remote load benchmark:
-
-```bash
-torchrun --nproc_per_node=2 benchmark_parallel_remote_load.py
-torchrun --nproc_per_node=2 benchmark_parallel_remote_load.py --shape 4096x4096,8192x4096 --src-rank 0
-torchrun --nproc_per_node=4 benchmark_parallel_remote_load.py --shape 4096x4096 --src-rank 1 --num-blocks 64
-```
-
-Parameterized benchmark examples:
-
-```bash
-python benchmark.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 32 --headdim 128 --mode both
-python benchmark.py --b 4 --seqlen 256 --qhead 16 --kvhead 8 --headdim 128 --mode causal
-python benchmark.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 32 --headdim 128 --mode noncausal
-python benchmark.py --b 4 --seqlen 1024 --qhead 32 --kvhead 32 --headdim 128 --mode causal --manual-block-count 132
-```
-
-## Slurm
-
-Default test submission:
-
-```bash
-sbatch run.slurm
-```
-
-Backward correctness, FA3 performance comparison, all-CP ring backward, and
-eight-GPU hierarchical backward validation/benchmarking:
-
-```bash
-sbatch run_backward.slurm
-```
-
-Current `run.slurm` notes:
-
-- The checked-in script currently requests `4` GPUs and `16` CPUs on one node.
-- Its active commands run the distributed `ring_test/benchmark_ring_forward.py`
-  sweep followed by three `ring_test/benchmark_hybrid_forward.py` workloads, all
-  with `torchrun --nproc_per_node=4`.
-- `run_backward.slurm` requests `8` GPUs and `32` CPUs. After the local backward
-  checks and benchmarks it runs two-GPU all-CP backward, eight-GPU hierarchical
-  correctness, binding validation failures, and the hybrid backward benchmark.
+`dataset/sample_length.py` is the manual raw-data collection utility. It
+requires `datasets` and `transformers`, and its `DATASET_CHOICE` constant selects
+which source distribution to sample before rebuilding the shared JSON.
 
 ## Python usage
 
@@ -554,6 +496,14 @@ Behavior:
 
 ## Current limitations
 
-- The demo currently requires contiguous BSHD tensors.
-- The varlen demo currently requires contiguous flattened `[total_tokens, H, D]` tensors, CUDA `int32` `cu_seqlens`, and matching CPU `int32` host copies of `cu_seqlens`.
-- The demo fixes cluster size to `1` to keep the standalone launch path small while preserving the original SM90 forward mainloop and kernel structure.
+- All kernels require Hopper SM90, `torch.bfloat16`, head dimension `128`, and
+  contiguous tensors.
+- BSHD uses `[B, S, H, 128]`; varlen uses flattened
+  `[total_tokens, H, 128]` tensors, CUDA `int32` `cu_seqlens`, and matching CPU
+  `int32` host copies.
+- Distributed ring and mega-ring paths are single-node because their parallel
+  tensors use local CUDA IPC. Hierarchical BR-PBS placement supports physical
+  world sizes `2`, `4`, and `8`.
+- Mega-ring backward is causal and non-deterministic only.
+- Cluster size is fixed to `1` to keep the standalone launch path small while
+  preserving the copied SM90 mainloop and kernel structure.

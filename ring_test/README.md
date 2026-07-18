@@ -370,10 +370,11 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_hybrid_forward.py \
 to sample an Arxiv, Github, or Pile-CC length distribution and pack global
 batches to 128K tokens by default. `--seed` initializes one RNG stream;
 `--num-cases` consumes that stream continuously to build multiple complete
-batches before assigning each sequence to a G8/G4/G2/G1 subgroup.
-Compute and local tokens are hard placement constraints; normalized token
-balance is the main objective, while compute variance and estimated ring
-token-hops are soft costs. The frontend then calls
+batches before assigning each sequence to a G8/G4/G2/G1 subgroup. The BR-PBS
+planner separately constrains maximum absolute token and attention-compute
+deviation. Within the feasible set it lexicographically protects short
+sequences from splitting before reducing communication, active groups, and
+residual imbalance. The frontend then calls
 `benchmark_hybrid_forward.main(...)` in the same process with the generated
 ring metadata.
 
@@ -394,11 +395,10 @@ the sampled `*_doc_lengths.npy` arrays with
 `python dataset/build_length_bucket_stats.py` from the demo root.
 
 Every sampled length, including the final packing residual, is padded upward.
-Lengths below 4K use `256 * 2` alignment, lengths from 4K to 8K use
-`256 * 4`, and lengths from 8K upward use `256 * 8` (including lengths at or
-above 16K). This makes each causal sequence eligible for at least its target
-G2/G4/G8 ring. The physical padded tokens participate in the benchmark, so
-`actual_tokens` can exceed `target_tokens` by fewer than 2048 tokens.
+Lengths below 2K use `256` alignment, lengths from 2K to 4K use `256 * 2`,
+lengths from 4K to 8K use `256 * 4`, and lengths from 8K upward use `256 * 8`.
+The physical padded tokens participate in the benchmark, so `actual_tokens`
+can exceed `target_tokens` by fewer than 2048 tokens.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
@@ -411,29 +411,34 @@ DATASETS="arxiv github pile" GPU_COUNTS="2 4 8" NUM_CASES=4 ZEPPLIN_THRESHOLD=40
   ./benchmark_hybrid_dataset.sh
 ```
 
-The requested compute and token tolerances default to 5% and 10%. The planner
-searches compute caps up to 20% and token caps up to 50%, stopping at the first
-token cap that has a feasible placement. The relevant controls are:
+The requested compute and token tolerances default to 5% and 10%. BR-PBS first
+places sequences whose normalized token or compute size is at least the
+structure threshold, or whose minimum useful ring is larger than one. It keeps
+a quantized Pareto beam, greedily fills the remaining singleton sequences, and
+repairs the best complete candidates with local Buddy-tree moves. When needed,
+the five length buckets `<=2K`, `2K-4K`, `4K-8K`, `8K-16K`, and `>16K` are
+unlocked from longest to shortest, with G2 before G4 before G8. The relevant
+controls are:
 
 ```text
---balance-tolerance 0.05
+--compute-balance-tolerance 0.05
 --token-balance-tolerance 0.10
---max-compute-balance-tolerance 0.20
---max-token-balance-tolerance 0.50
---communication-weight 0.05
---local-search-passes 4
+--beam-width 64
+--finalist-count 8
+--structure-threshold 0.5
+--max-repair-iterations 32
 ```
 
-The shell wrapper exposes the same settings as `BALANCE_TOLERANCE`,
-`TOKEN_BALANCE_TOLERANCE`, `MAX_COMPUTE_BALANCE_TOLERANCE`,
-`MAX_TOKEN_BALANCE_TOLERANCE`, `COMMUNICATION_WEIGHT`, and
-`LOCAL_SEARCH_PASSES`. `ZEPPLIN_THRESHOLD` defaults to `4096` and is forwarded
-to both dataset directions. `--print-workload` reports the requested, topology, and
-final caps; estimated per-rank communication; cap-relaxation flags; emergency
-fallback; and the number of accepted local-repair moves. A topology-limited
-workload can exceed the configured imbalance tolerance when a sequence cannot
-use a larger legal ring. Emergency fallback is used only when no placement is
-feasible within either configured maximum cap.
+The shell wrapper exposes the same settings as `COMPUTE_BALANCE_TOLERANCE`,
+`TOKEN_BALANCE_TOLERANCE`, `BEAM_WIDTH`, `FINALIST_COUNT`,
+`STRUCTURE_THRESHOLD`, and `MAX_REPAIR_ITERATIONS`. The load quantization step
+is fixed at 2% of the corresponding average and the residual-fill smooth-max
+lambda is fixed at 8. `ZEPPLIN_THRESHOLD` defaults to `4096` and is forwarded
+to both dataset directions. `--print-workload` reports absolute deviations,
+feasibility and violation, the relaxation level, split counts and penalties,
+the communication proxy, active groups, and accepted repair moves. If no legal
+placement satisfies both tolerances, the planner returns the lowest-violation
+plan and reports `feasible=False`.
 
 `--methods` defaults to `all`. Dataset mode runs every compatible method for
 each causal/noncausal mode and prints a skip reason for an incompatible method.

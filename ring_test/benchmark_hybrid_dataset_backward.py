@@ -18,6 +18,7 @@ for path in (THIS_DIR, DEMO_DIR):
 
 import balancer
 from benchmark_hybrid_dataset_forward import (
+    _nonnegative_int,
     _positive_int,
     _format_int_list,
     _requests_all,
@@ -34,36 +35,41 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dataset", choices=tuple(balancer.DATASET_WEIGHTS), required=True)
     parser.add_argument("--target-tokens", type=int, default=balancer.MAX_SEQUENCE_TOKENS)
-    parser.add_argument("--balance-tolerance", type=float, default=0.05)
+    parser.add_argument(
+        "--compute-balance-tolerance",
+        type=float,
+        default=0.05,
+        help="Maximum absolute attention-compute deviation from the rank average",
+    )
     parser.add_argument(
         "--token-balance-tolerance",
         type=float,
         default=0.10,
-        help="Requested maximum token imbalance relative to average",
+        help="Maximum absolute token-load deviation from the rank average",
     )
     parser.add_argument(
-        "--max-compute-balance-tolerance",
+        "--beam-width",
+        type=_positive_int,
+        default=64,
+        help="Maximum BR-PBS states retained after each structural placement",
+    )
+    parser.add_argument(
+        "--finalist-count",
+        type=_positive_int,
+        default=8,
+        help="Number of complete Beam solutions passed to local repair",
+    )
+    parser.add_argument(
+        "--structure-threshold",
         type=float,
-        default=0.20,
-        help="Maximum compute imbalance explored by the planner",
+        default=0.5,
+        help="Minimum normalized sequence size included in structural search",
     )
     parser.add_argument(
-        "--max-token-balance-tolerance",
-        type=float,
-        default=0.50,
-        help="Maximum token imbalance explored before emergency fallback",
-    )
-    parser.add_argument(
-        "--communication-weight",
-        type=float,
-        default=0.05,
-        help="Weight of estimated ring communication in placement scoring",
-    )
-    parser.add_argument(
-        "--local-search-passes",
-        type=int,
-        default=4,
-        help="Number of deterministic local-repair passes; zero disables repair",
+        "--max-repair-iterations",
+        type=_nonnegative_int,
+        default=32,
+        help="Maximum number of strict lexicographic local-repair moves",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-cases", type=_positive_int, default=1)
@@ -137,12 +143,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             num_cases=args.num_cases,
             world_size=world_size,
             mode="causal",
-            balance_tolerance=args.balance_tolerance,
+            compute_balance_tolerance=args.compute_balance_tolerance,
             token_balance_tolerance=args.token_balance_tolerance,
-            max_compute_balance_tolerance=args.max_compute_balance_tolerance,
-            max_token_balance_tolerance=args.max_token_balance_tolerance,
-            communication_weight=args.communication_weight,
-            local_search_passes=args.local_search_passes,
+            beam_width=args.beam_width,
+            finalist_count=args.finalist_count,
+            structure_threshold=args.structure_threshold,
+            max_repair_iterations=args.max_repair_iterations,
         )
     except (RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
