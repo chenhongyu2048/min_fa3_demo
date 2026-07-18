@@ -16,6 +16,7 @@ _BUCKET_STATS_PATH = (
     / "sequence_length_buckets.json"
 )
 _ALIGNMENT_TIERS = (
+    (2 * 1024, 256 * 1),
     (4 * 1024, 256 * 2),
     (8 * 1024, 256 * 4),
     (16 * 1024, 256 * 8),

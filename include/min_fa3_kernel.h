@@ -511,9 +511,16 @@ public:
                             flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
                         }
                     }
+                    bool mega_ring_initialize_output = false;
+                    if constexpr (TileScheduler::EnableMegaRing) {
+                        mega_ring_initialize_output =
+                            min_fa3_varlen_demo::mega_ring::segment_begin_step(
+                                mega_ring_segment_meta) == 0;
+                    }
                     epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma_pv,
                                    threadIdx.x - MmaThreadOffset, block_coord,
-                                   mega_ring_q_row_offset, mega_ring_seqlen_o);
+                                   mega_ring_q_row_offset, mega_ring_seqlen_o,
+                                   mega_ring_initialize_output);
                     if constexpr (TileScheduler::EnableMegaRing && !TileScheduler::EnableChunkedSegments) {
                         // MEGA_RING: publish step completion only after every epilogue thread has finished its part of the in-place O/LSE merge.
                         if (mega_ring_is_cp_batch) {

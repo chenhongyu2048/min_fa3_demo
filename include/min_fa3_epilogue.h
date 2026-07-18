@@ -248,7 +248,8 @@ struct CollectiveEpilogueFwd {
           int thread_idx,
           cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord,
           int q_row_offset_extra = 0,
-          int seqlen_o_override = -1
+          int seqlen_o_override = -1,
+          bool initialize_output = false
           ) {
 
         auto [m_block, bidh, bidb, split_idx] = block_coord;
@@ -391,104 +392,118 @@ struct CollectiveEpilogueFwd {
                             gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, seqlen_o - m_block * kBlockM
                         );
                     } else {
-                        // Set up the same coalesced gmem copy mapping used by the direct store path.
-                        // We keep the O read-modify-write on this mapping so the load/store traffic stays
-                        // vectorized even though the LSE ownership comes from the MMA layout.
+                        // Keep both the first direct store and later O read-modify-write on the same
+                        // coalesced mapping even though LSE ownership comes from the MMA layout.
                         Tensor tOcO = gmem_thr_copy_O.partition_D(cute::make_identity_tensor(select<0, 1>(TileShape_MNK_PV{})));
                         Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOsO)));
                         #pragma unroll
                         for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(params.shape_O); }
-                        Tensor tOgO_load = gmem_thr_copy_O.partition_S(gO);
                         Tensor tOgO_store = gmem_thr_copy_O.partition_D(gO);
-                        Tensor tOrO_prev = make_fragment_like(tOrO);
-
-                        // The running LSE state is owned per row by the MMA mapping, not by the gmem copy
-                        // mapping above. Only the unique row owner reads the previous LSE, merges it with
-                        // the current block LSE, and produces the scale needed to blend old O with new O.
                         constexpr int kLseFragSize = CUTE_STATIC_V(size(lse)); /* 2 */
-                        float merged_lse_vals[kLseFragSize];
-                        float block_scale_vals[kLseFragSize];
-                        bool row_valid[kLseFragSize];
-                        bool row_owner[kLseFragSize];
-                        #pragma unroll
-                        for (int m = 0; m < kLseFragSize; ++m) {
-                            int const row = m_block * kBlockM + get<0>(taccOcO_row(m));
-                            row_valid[m] = row < seqlen_o;
-                            row_owner[m] = row_valid[m] && get<1>(taccOcO_row(m)) == 0;
-                            merged_lse_vals[m] = -INFINITY;
-                            // Default to the "zero merged row" sentinel until the row owner computes
-                            // a valid online merge scale for this row.
-                            block_scale_vals[m] = -1.0f;
-                            if (row_owner[m]) {
-                                float const prev_lse = mLSE(row);
-                                float const block_lse = lse(m);
-                                if (prev_lse == -INFINITY && block_lse == -INFINITY) {
-                                    merged_lse_vals[m] = -INFINITY;
-                                } else {
-                                    float const lse_delta = block_lse - prev_lse;
-                                    float const lse_delta_abs = fabsf(lse_delta);
-                                    float const delta_exp = expf(-lse_delta_abs);
-                                    float const inv_one_plus_delta = 1.0f / (1.0f + delta_exp);
-                                    merged_lse_vals[m] = fmaxf(prev_lse, block_lse) + log1pf(delta_exp);
-                                    if (lse_delta >= 0.f) {
-                                        block_scale_vals[m] = inv_one_plus_delta;
+
+                        if (initialize_output) {
+                            // Mega-ring step 0 owns the first write to this output tile. Its running
+                            // state is exactly the current block, so avoid loading zero-initialized O.
+                            #pragma unroll
+                            for (int m = 0; m < kLseFragSize; ++m) {
+                                int const row = m_block * kBlockM + get<0>(taccOcO_row(m));
+                                bool const row_owner = row < seqlen_o && get<1>(taccOcO_row(m)) == 0;
+                                if (row_owner) { mLSE(row) = lse(m); }
+                            }
+                            flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                                gmem_tiled_copy_O, tOrO, tOgO_store, tOcO, tOpO, seqlen_o - m_block * kBlockM
+                            );
+                        } else {
+                            Tensor tOgO_load = gmem_thr_copy_O.partition_S(gO);
+                            Tensor tOrO_prev = make_fragment_like(tOrO);
+
+                            // The running LSE state is owned per row by the MMA mapping, not by the gmem copy
+                            // mapping above. Only the unique row owner reads the previous LSE, merges it with
+                            // the current block LSE, and produces the scale needed to blend old O with new O.
+                            float merged_lse_vals[kLseFragSize];
+                            float block_scale_vals[kLseFragSize];
+                            bool row_valid[kLseFragSize];
+                            bool row_owner[kLseFragSize];
+                            #pragma unroll
+                            for (int m = 0; m < kLseFragSize; ++m) {
+                                int const row = m_block * kBlockM + get<0>(taccOcO_row(m));
+                                row_valid[m] = row < seqlen_o;
+                                row_owner[m] = row_valid[m] && get<1>(taccOcO_row(m)) == 0;
+                                merged_lse_vals[m] = -INFINITY;
+                                // Default to the "zero merged row" sentinel until the row owner computes
+                                // a valid online merge scale for this row.
+                                block_scale_vals[m] = -1.0f;
+                                if (row_owner[m]) {
+                                    float const prev_lse = mLSE(row);
+                                    float const block_lse = lse(m);
+                                    if (prev_lse == -INFINITY && block_lse == -INFINITY) {
+                                        merged_lse_vals[m] = -INFINITY;
                                     } else {
-                                        block_scale_vals[m] = delta_exp * inv_one_plus_delta;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Publish the per-row block scale through epilogue smem so the threads that own
-                        // the coalesced O fragments can consume it later. This is the bridge between the
-                        // row-based LSE ownership and the gmem-copy ownership used for O.
-                        float* row_scale_smem_ptr = reinterpret_cast<float*>(shared_storage.tensors.epilogue.smem_o.data());
-                        Tensor sBlockScale = make_tensor(make_smem_ptr(row_scale_smem_ptr), Shape<Int<kBlockM>>{});
-                        #pragma unroll
-                        for (int m = 0; m < kLseFragSize; ++m) {
-                            int const row = m_block * kBlockM + get<0>(taccOcO_row(m));
-                            if (row_owner[m]) {
-                                int const local_row = get<0>(taccOcO_row(m));
-                                sBlockScale(local_row) = block_scale_vals[m];
-                                mLSE(row) = merged_lse_vals[m];
-                            }
-                        }
-
-                        // Load the previous running O tile from gmem using the same coalesced copy layout
-                        // as the final store. The merged result will be accumulated back into this fragment.
-                        flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-                            gmem_tiled_copy_O, tOgO_load, tOrO_prev, tOcO, tOpO, seqlen_o - m_block * kBlockM
-                        );
-                        // Ensure all row-scale writes are visible before threads consume them for the merge.
-                        flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-
-                        // Merge old O with the current block O in registers. Each thread reads the block
-                        // scale for the row(s) it owns in the gmem copy mapping and applies the online
-                        // update: prev_out + block_scale * (block_out - prev_out).
-                        #pragma unroll
-                        for (int m = 0; m < size<1>(tOrO_prev); ++m) {
-                            int const local_row = get<0>(tOcO(_0{}, m, _0{}));
-                            if (local_row < seqlen_o - m_block * kBlockM) {
-                                float const block_scale = sBlockScale(local_row);
-                                #pragma unroll
-                                for (int k = 0; k < size<2>(tOrO_prev); ++k) {
-                                    if (tOpO(k)) {
-                                        #pragma unroll
-                                        for (int i = 0; i < size(tOrO_prev(_, m, k)); ++i) {
-                                            tOrO_prev(i, m, k) = Element(merge_running_output_(
-                                                static_cast<float>(tOrO_prev(i, m, k)),
-                                                static_cast<float>(tOrO(i, m, k)),
-                                                block_scale));
+                                        float const lse_delta = block_lse - prev_lse;
+                                        float const lse_delta_abs = fabsf(lse_delta);
+                                        float const delta_exp = expf(-lse_delta_abs);
+                                        float const inv_one_plus_delta = 1.0f / (1.0f + delta_exp);
+                                        merged_lse_vals[m] = fmaxf(prev_lse, block_lse) + log1pf(delta_exp);
+                                        if (lse_delta >= 0.f) {
+                                            block_scale_vals[m] = inv_one_plus_delta;
+                                        } else {
+                                            block_scale_vals[m] = delta_exp * inv_one_plus_delta;
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        // Write the merged running O back to gmem on the same coalesced mapping.
-                        flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-                            gmem_tiled_copy_O, tOrO_prev, tOgO_store, tOcO, tOpO, seqlen_o - m_block * kBlockM
-                        );
+                            // Publish the per-row block scale through epilogue smem so the threads that own
+                            // the coalesced O fragments can consume it later. This is the bridge between the
+                            // row-based LSE ownership and the gmem-copy ownership used for O.
+                            float* row_scale_smem_ptr = reinterpret_cast<float*>(shared_storage.tensors.epilogue.smem_o.data());
+                            Tensor sBlockScale = make_tensor(make_smem_ptr(row_scale_smem_ptr), Shape<Int<kBlockM>>{});
+                            #pragma unroll
+                            for (int m = 0; m < kLseFragSize; ++m) {
+                                int const row = m_block * kBlockM + get<0>(taccOcO_row(m));
+                                if (row_owner[m]) {
+                                    int const local_row = get<0>(taccOcO_row(m));
+                                    sBlockScale(local_row) = block_scale_vals[m];
+                                    mLSE(row) = merged_lse_vals[m];
+                                }
+                            }
+
+                            // Load the previous running O tile from gmem using the same coalesced copy layout
+                            // as the final store. The merged result will be accumulated back into this fragment.
+                            flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                                gmem_tiled_copy_O, tOgO_load, tOrO_prev, tOcO, tOpO, seqlen_o - m_block * kBlockM
+                            );
+                            // Ensure all row-scale writes are visible before threads consume them for the merge.
+                            flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+
+                            // Merge old O with the current block O in registers. Each thread reads the block
+                            // scale for the row(s) it owns in the gmem copy mapping and applies the online
+                            // update: prev_out + block_scale * (block_out - prev_out).
+                            #pragma unroll
+                            for (int m = 0; m < size<1>(tOrO_prev); ++m) {
+                                int const local_row = get<0>(tOcO(_0{}, m, _0{}));
+                                if (local_row < seqlen_o - m_block * kBlockM) {
+                                    float const block_scale = sBlockScale(local_row);
+                                    #pragma unroll
+                                    for (int k = 0; k < size<2>(tOrO_prev); ++k) {
+                                        if (tOpO(k)) {
+                                            #pragma unroll
+                                            for (int i = 0; i < size(tOrO_prev(_, m, k)); ++i) {
+                                                tOrO_prev(i, m, k) = Element(merge_running_output_(
+                                                    static_cast<float>(tOrO_prev(i, m, k)),
+                                                    static_cast<float>(tOrO(i, m, k)),
+                                                    block_scale));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Write the merged running O back to gmem on the same coalesced mapping.
+                            flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                                gmem_tiled_copy_O, tOrO_prev, tOgO_store, tOcO, tOpO, seqlen_o - m_block * kBlockM
+                            );
+                        }
                     }
                 } else {
                     // If PackGQA, we split the work of compute O_ptr among threads in the same row
