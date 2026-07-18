@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass
 from typing import Sequence
 
-from .sampler import generate_dataset_lengths
+from .sampler import generate_dataset_length_cases
 
 
 RING_SIZES = (1, 2, 4, 8)
@@ -702,17 +702,53 @@ def make_workload(
     communication_weight: float = 0.05,
     local_search_passes: int = 4,
 ) -> HybridWorkload:
-    lengths = generate_dataset_lengths(dataset, target_tokens, seed)
-    return assign_hierarchical_rings(
-        lengths,
-        world_size,
-        is_causal=mode in ("causal", "both"),
+    return make_workloads(
+        dataset=dataset,
+        target_tokens=target_tokens,
+        seed=seed,
+        num_cases=1,
+        world_size=world_size,
+        mode=mode,
         balance_tolerance=balance_tolerance,
         token_balance_tolerance=token_balance_tolerance,
         max_compute_balance_tolerance=max_compute_balance_tolerance,
         max_token_balance_tolerance=max_token_balance_tolerance,
         communication_weight=communication_weight,
         local_search_passes=local_search_passes,
-    )
+    )[0]
 
+
+def make_workloads(
+    dataset: str,
+    target_tokens: int,
+    seed: int,
+    num_cases: int,
+    world_size: int,
+    mode: str,
+    balance_tolerance: float,
+    token_balance_tolerance: float = 0.10,
+    max_compute_balance_tolerance: float = 0.20,
+    max_token_balance_tolerance: float = 0.50,
+    communication_weight: float = 0.05,
+    local_search_passes: int = 4,
+) -> list[HybridWorkload]:
+    """Build multiple placements from one continuously advanced sampler RNG."""
+
+    length_cases = generate_dataset_length_cases(
+        dataset, target_tokens, seed, num_cases
+    )
+    return [
+        assign_hierarchical_rings(
+            lengths,
+            world_size,
+            is_causal=mode in ("causal", "both"),
+            balance_tolerance=balance_tolerance,
+            token_balance_tolerance=token_balance_tolerance,
+            max_compute_balance_tolerance=max_compute_balance_tolerance,
+            max_token_balance_tolerance=max_token_balance_tolerance,
+            communication_weight=communication_weight,
+            local_search_passes=local_search_passes,
+        )
+        for lengths in length_cases
+    ]
 

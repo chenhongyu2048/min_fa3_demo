@@ -129,13 +129,22 @@ def generate_dataset_lengths(
 ) -> list[int]:
     """Sample and pack aligned sequence lengths up to a target token budget."""
 
+    return _generate_dataset_lengths(dataset, target_tokens, random.Random(seed))
+
+
+def _generate_dataset_lengths(
+    dataset: str,
+    target_tokens: int,
+    rng: random.Random,
+) -> list[int]:
+    """Sample one packed batch while advancing an existing RNG stream."""
+
     if dataset not in _DATASET_BUCKET_COUNTS:
         raise ValueError(f"unknown dataset {dataset!r}")
     if target_tokens <= 0:
         raise ValueError(f"target_tokens must be positive, got {target_tokens}")
     counts = _DATASET_BUCKET_COUNTS[dataset]
 
-    rng = random.Random(seed)
     lengths: list[int] = []
     remaining = target_tokens
     while remaining > 0:
@@ -145,3 +154,20 @@ def generate_dataset_lengths(
         lengths.append(length)
         remaining = max(remaining - length, 0)
     return lengths
+
+
+def generate_dataset_length_cases(
+    dataset: str,
+    target_tokens: int,
+    seed: int,
+    num_cases: int,
+) -> list[list[int]]:
+    """Sample multiple packed batches from one deterministic RNG stream."""
+
+    if num_cases <= 0:
+        raise ValueError(f"num_cases must be positive, got {num_cases}")
+    rng = random.Random(seed)
+    return [
+        _generate_dataset_lengths(dataset, target_tokens, rng)
+        for _ in range(num_cases)
+    ]

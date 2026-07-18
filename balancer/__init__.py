@@ -8,12 +8,14 @@ from .load_balancer import (
     attention_compute,
     eligible_ring_sizes,
     make_workload,
+    make_workloads,
     ring_communication_per_rank,
 )
 from .sampler import (
     DATASET_WEIGHTS,
     LENGTH_BUCKETS,
     MAX_SEQUENCE_TOKENS,
+    generate_dataset_length_cases,
     generate_dataset_lengths,
 )
 
@@ -28,6 +30,8 @@ __all__ = [
     "attention_compute",
     "eligible_ring_sizes",
     "generate_dataset_lengths",
+    "generate_dataset_length_cases",
     "make_workload",
+    "make_workloads",
     "ring_communication_per_rank",
 ]

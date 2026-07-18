@@ -120,7 +120,7 @@ torchrun --standalone --nproc_per_node=8 \
 # the dense autograd reference has quadratic score memory.
 # torchrun --standalone --nproc_per_node=8 \
 #     ring_test/benchmark_hybrid_dataset_backward.py \
-#     --dataset arxiv --target-tokens 131072 --seed 0 \
+#     --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 4 \
 #     --qhead 32 --kvhead 8 --headdim 128 \
 #     --methods all \
 #     --sm-configs 128:4,124:8,120:12,116:16 \

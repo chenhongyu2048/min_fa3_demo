@@ -24,6 +24,7 @@ from benchmark_hybrid_dataset_forward import (
     _world_size,
     print_workload,
 )
+from ring_test.utils import HybridBenchmarkCase
 from zepplin import DEFAULT_ZEPPLIN_THRESHOLD
 
 
@@ -65,6 +66,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Number of deterministic local-repair passes; zero disables repair",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--num-cases", type=_positive_int, default=1)
     parser.add_argument("--world-size", type=int, choices=(2, 4, 8))
     parser.add_argument("--print-workload", action="store_true")
     parser.add_argument("--qhead", type=int, default=32)
@@ -128,10 +130,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     world_size = _world_size(args)
     try:
-        workload = balancer.make_workload(
+        workloads = balancer.make_workloads(
             dataset=args.dataset,
             target_tokens=args.target_tokens,
             seed=args.seed,
+            num_cases=args.num_cases,
             world_size=world_size,
             mode="causal",
             balance_tolerance=args.balance_tolerance,
@@ -146,23 +149,37 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if args.print_workload or local_rank == 0:
-        print_workload(
-            workload,
-            args.dataset,
-            args.seed,
-            args.target_tokens,
-            world_size,
-            "causal",
-        )
+        for case_index, workload in enumerate(workloads):
+            print(f"\nDataset case {case_index + 1}/{args.num_cases}")
+            print_workload(
+                workload,
+                args.dataset,
+                args.seed,
+                args.target_tokens,
+                world_size,
+                "causal",
+            )
     if args.print_workload:
         return
 
-    forwarded_argv = _benchmark_argv(args, workload)
+    benchmark_cases = [
+        HybridBenchmarkCase(
+            label=f"dataset={args.dataset}, case={case_index + 1}/{args.num_cases}",
+            case_index=case_index,
+            num_cases=args.num_cases,
+            global_lengths=tuple(workload.global_lengths),
+            ring_sizes=tuple(workload.ring_sizes),
+            ring_starts=tuple(workload.ring_starts),
+        )
+        for case_index, workload in enumerate(workloads)
+    ]
+    forwarded_argv = _benchmark_argv(args, workloads[0])
 
     import benchmark_hybrid_backward
 
     benchmark_hybrid_backward.main(
         forwarded_argv,
+        workload_cases=benchmark_cases,
         skip_incompatible_methods=_requests_all(args.methods),
     )
 

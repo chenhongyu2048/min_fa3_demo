@@ -282,29 +282,33 @@ Dataset-shaped hierarchical hybrid forward and backward benchmarks:
 ```bash
 torchrun --standalone --nproc_per_node=8 \
   ring_test/benchmark_hybrid_dataset_forward.py \
-  --dataset arxiv --target-tokens 131072 --seed 0 \
+  --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 4 \
   --qhead 32 --kvhead 8 --headdim 128 \
   --mode causal --methods all --zepplin-threshold 4096 --no-check
 
-DATASETS="arxiv github pile" GPU_COUNTS=8 ZEPPLIN_THRESHOLD=4096 \
+DATASETS="arxiv github pile" GPU_COUNTS=8 NUM_CASES=4 ZEPPLIN_THRESHOLD=4096 \
   ./benchmark_hybrid_dataset.sh
 
 torchrun --standalone --nproc_per_node=8 \
   ring_test/benchmark_hybrid_dataset_backward.py \
-  --dataset arxiv --target-tokens 131072 --seed 0 \
+  --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 4 \
   --qhead 32 --kvhead 8 --headdim 128 \
   --methods all --zepplin-threshold 4096 \
   --sm-configs 128:4,124:8,120:12,116:16 --no-check
 
-DATASETS="arxiv github pile" GPU_COUNTS=8 DIRECTION=backward \
+DATASETS="arxiv github pile" GPU_COUNTS=8 NUM_CASES=4 DIRECTION=backward \
   ZEPPLIN_THRESHOLD=4096 ./benchmark_hybrid_dataset.sh
 ```
 
 The dataset frontends call the standalone `balancer` package to generate global
-lengths and token/compute-constrained G8/G4/G2/G1 metadata. The forward frontend
-calls `benchmark_hybrid_forward.main(...)`; the causal backward frontend calls
-`benchmark_hybrid_backward.main(...)` with the same explicit topology. The
-Arxiv, Github, and Pile-CC distributions are loaded from
+lengths and token/compute-constrained G8/G4/G2/G1 metadata. `--seed` initializes
+one sampler RNG and `--num-cases` repeatedly samples complete packed batches
+from that stream. All cases run in one process group; each fused method sizes
+its IPC arenas for the largest case and reuses the same `TKParallelTensor`
+objects. Per-case tables are followed by latency, arithmetic-mean TFLOPS,
+workload-weighted aggregate TFLOPS, and workload-weighted per-GPU summaries.
+The Arxiv, Github, and Pile-CC distributions are loaded
+from
 `dataset/sequence_length_buckets.json`. Each distribution contains 256-token
 `(lower, upper]` bucket counts derived from the sampled document lengths;
 samples above 128K are counted in the final bucket. Run

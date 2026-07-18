@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 from typing import Callable, Sequence
 
 import torch
@@ -29,6 +32,7 @@ from hybrid_forward_baselines import (
 )
 from ring_test.utils import (
     MEGA_RING_ALL_CP_ALIGNMENT,
+    HybridBenchmarkCase,
     align_mega_ring_all_cp_lengths,
     hierarchical_reference,
     init_distributed,
@@ -95,6 +99,47 @@ class Result:
     check: str
     note: str
     rank_times_ms: list[float] | None
+
+
+@dataclass(frozen=True)
+class ForwardSummarySample:
+    case_index: int
+    method: str
+    is_causal: bool
+    config: SmConfig
+    time_ms: float
+    aggregate_tflops: float
+
+
+@dataclass
+class MegaKvPool:
+    remote_k: min_fa3_op.TKParallelTensor
+    remote_v: min_fa3_op.TKParallelTensor
+    rank_capacity: int
+    rank: int
+
+    def populate(self, local_k: torch.Tensor, local_v: torch.Tensor) -> None:
+        if local_k.size(0) > self.rank_capacity:
+            raise RuntimeError(
+                f"local K/V rows {local_k.size(0)} exceed pooled rank capacity "
+                f"{self.rank_capacity}"
+            )
+        self.remote_k.data_.zero_()
+        self.remote_v.data_.zero_()
+        owner_begin = self.rank * self.rank_capacity
+        owner_end = owner_begin + local_k.size(0)
+        self.remote_k.data_[owner_begin:owner_end].copy_(local_k)
+        self.remote_v.data_[owner_begin:owner_end].copy_(local_v)
+
+
+@dataclass
+class ForwardParallelPools:
+    all_cp: MegaKvPool | None
+    hybrid: MegaKvPool | None
+
+    def close(self) -> None:
+        self.all_cp = None
+        self.hybrid = None
 
 
 def parse_methods(spec: str) -> list[str]:
@@ -233,21 +278,43 @@ def compatible_methods_for_mode(
 
 
 def make_mega_parallel_tensors(
-    local_k: torch.Tensor,
-    local_v: torch.Tensor,
     rank: int,
     world_size: int,
     rank_capacity: int,
-) -> tuple[min_fa3_op.TKParallelTensor, min_fa3_op.TKParallelTensor]:
-    arena_shape = [world_size * rank_capacity, local_k.size(1), local_k.size(2)]
+    kv_heads: int,
+    head_dim: int,
+) -> MegaKvPool:
+    arena_shape = [world_size * rank_capacity, kv_heads, head_dim]
     remote_k = min_fa3_op.TKParallelTensor(arena_shape, torch.bfloat16, rank, world_size, False)
     remote_v = min_fa3_op.TKParallelTensor(arena_shape, torch.bfloat16, rank, world_size, False)
-    remote_k.data_.zero_()
-    remote_v.data_.zero_()
-    owner_begin = rank * rank_capacity
-    remote_k.data_[owner_begin:owner_begin + local_k.size(0)].copy_(local_k)
-    remote_v.data_[owner_begin:owner_begin + local_v.size(0)].copy_(local_v)
-    return remote_k, remote_v
+    return MegaKvPool(remote_k, remote_v, rank_capacity, rank)
+
+
+def max_hybrid_rank_capacity(
+    workload_cases: Sequence[HybridBenchmarkCase], world_size: int
+) -> int:
+    capacity = max(
+        sum(
+            local_lengths_for_rank(
+                list(case.global_lengths),
+                list(case.ring_sizes),
+                list(case.ring_starts),
+                rank,
+            )
+        )
+        for case in workload_cases
+        for rank in range(world_size)
+    )
+    return ((capacity + 127) // 128) * 128
+
+
+def max_all_cp_rank_capacity(
+    workload_cases: Sequence[HybridBenchmarkCase], world_size: int
+) -> int:
+    return max(
+        sum(align_mega_ring_all_cp_lengths(list(case.global_lengths))) // world_size
+        for case in workload_cases
+    )
 
 
 def gather_padded_rank_tensor(tensor: torch.Tensor, rank_capacity: int) -> torch.Tensor:
@@ -409,13 +476,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(
+def _main_single(
     argv: Sequence[str] | None = None,
     *,
     skip_incompatible_methods: bool = False,
-) -> None:
+    parallel_pools: ForwardParallelPools | None = None,
+    case_label: str | None = None,
+    case_index: int = 0,
+    manage_process_group: bool = True,
+) -> list[ForwardSummarySample]:
     args = parse_args(argv)
     methods = parse_methods(args.methods)
+    summary_samples: list[ForwardSummarySample] = []
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         raise SystemExit("SM90 Hopper CUDA device is required")
     if args.headdim != 128 or args.kvhead * args.headdim != 1024:
@@ -503,6 +575,8 @@ def main(
             backend_note = "not used"
 
         if rank == 0:
+            if case_label is not None:
+                print(f"\nBenchmark case: {case_label}", flush=True)
             sm_configs_s = ",".join(
                 f"{config.num_comp_sm}:{config.num_comm_sm}"
                 for config in sm_configs
@@ -689,13 +763,22 @@ def main(
                     device,
                     base_seed=args.seed,
                 )
-                mega_ring_all_cp_remote_k, mega_ring_all_cp_remote_v = make_mega_parallel_tensors(
-                    mega_ring_all_cp_k,
-                    mega_ring_all_cp_v,
-                    rank,
-                    world_size,
-                    mega_ring_all_cp_total,
+                mega_ring_all_cp_pool = (
+                    None if parallel_pools is None else parallel_pools.all_cp
                 )
+                if mega_ring_all_cp_pool is None:
+                    mega_ring_all_cp_pool = make_mega_parallel_tensors(
+                        rank,
+                        world_size,
+                        mega_ring_all_cp_total,
+                        args.kvhead,
+                        args.headdim,
+                    )
+                mega_ring_all_cp_pool.populate(
+                    mega_ring_all_cp_k, mega_ring_all_cp_v
+                )
+                mega_ring_all_cp_remote_k = mega_ring_all_cp_pool.remote_k
+                mega_ring_all_cp_remote_v = mega_ring_all_cp_pool.remote_v
                 mega_ring_all_cp_global_host = torch.tensor(
                     mega_ring_all_cp_global_lengths, dtype=torch.int32
                 )
@@ -828,13 +911,20 @@ def main(
                 capacity = torch.tensor([hybrid_local_total], device=device, dtype=torch.int32)
                 dist.all_reduce(capacity, op=dist.ReduceOp.MAX)
                 hybrid_rank_capacity = int(capacity.item())
-                hybrid_remote_k, hybrid_remote_v = make_mega_parallel_tensors(
-                    hybrid_local_k,
-                    hybrid_local_v,
-                    rank,
-                    world_size,
-                    hybrid_rank_capacity,
+                hybrid_pool = (
+                    None if parallel_pools is None else parallel_pools.hybrid
                 )
+                if hybrid_pool is None:
+                    hybrid_pool = make_mega_parallel_tensors(
+                        rank,
+                        world_size,
+                        hybrid_rank_capacity,
+                        args.kvhead,
+                        args.headdim,
+                    )
+                hybrid_pool.populate(hybrid_local_k, hybrid_local_v)
+                hybrid_remote_k = hybrid_pool.remote_k
+                hybrid_remote_v = hybrid_pool.remote_v
                 hybrid_global_host = torch.tensor(global_lengths, dtype=torch.int32)
                 hybrid_ring_sizes_host = torch.tensor(ring_sizes, dtype=torch.int32)
                 hybrid_ring_starts_host = torch.tensor(ring_starts, dtype=torch.int32)
@@ -1070,6 +1160,16 @@ def main(
                             note,
                             timing.rank_times_ms,
                         )
+                        summary_samples.append(
+                            ForwardSummarySample(
+                                case_index=case_index,
+                                method=run.name,
+                                is_causal=is_causal,
+                                config=config,
+                                time_ms=timing.max_ms,
+                                aggregate_tflops=agg_tflops,
+                            )
+                        )
                 if rank == 0:
                     print_results(
                         global_lengths,
@@ -1081,6 +1181,178 @@ def main(
                         results,
                     )
     finally:
+        if manage_process_group and dist.is_initialized():
+            dist.destroy_process_group()
+    return summary_samples
+
+
+def _replace_option(argv: Sequence[str], name: str, value: str) -> list[str]:
+    result = list(argv)
+    try:
+        index = result.index(name)
+    except ValueError as exc:
+        raise RuntimeError(f"missing required forwarded option {name}") from exc
+    if index + 1 >= len(result):
+        raise RuntimeError(f"missing value for forwarded option {name}")
+    result[index + 1] = value
+    return result
+
+
+def _argv_for_case(
+    argv: Sequence[str], workload_case: HybridBenchmarkCase
+) -> list[str]:
+    result = list(argv)
+    for name, values in (
+        ("--global-seqlens", workload_case.global_lengths),
+        ("--ring-sizes", workload_case.ring_sizes),
+        ("--ring-starts", workload_case.ring_starts),
+    ):
+        result = _replace_option(
+            result, name, ",".join(str(value) for value in values)
+        )
+    return result
+
+
+def _print_forward_summary(
+    samples: Sequence[ForwardSummarySample], total_cases: int, world_size: int
+) -> None:
+    grouped: dict[tuple[str, bool, SmConfig], list[ForwardSummarySample]] = defaultdict(list)
+    for sample in samples:
+        grouped[(sample.method, sample.is_causal, sample.config)].append(sample)
+
+    print("\nCross-case forward summary")
+    print(
+        f"{'Method':<28} {'Mode':<10} {'SM':>8} {'Cases':>8} "
+        f"{'Min ms':>10} {'Mean ms':>10} {'P50 ms':>10} {'Max ms':>10} "
+        f"{'Mean TFLOPS':>14} {'Weighted TFLOPS':>18} {'Weighted/GPU':>14}"
+    )
+    for (method, is_causal, config), records in grouped.items():
+        times = [record.time_ms for record in records]
+        weighted_tflops = sum(
+            record.aggregate_tflops * record.time_ms for record in records
+        ) / sum(times)
+        mean_tflops = sum(
+            record.aggregate_tflops for record in records
+        ) / len(records)
+        mode = "causal" if is_causal else "noncausal"
+        sm = f"{config.num_comp_sm}:{config.num_comm_sm}"
+        print(
+            f"{method:<28} {mode:<10} {sm:>8} "
+            f"{f'{len(records)}/{total_cases}':>8} "
+            f"{min(times):>10.3f} {sum(times) / len(times):>10.3f} "
+            f"{median(times):>10.3f} {max(times):>10.3f} "
+            f"{mean_tflops:>14.1f} {weighted_tflops:>18.1f} "
+            f"{weighted_tflops / world_size:>14.1f}"
+        )
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    workload_cases: Sequence[HybridBenchmarkCase] | None = None,
+    skip_incompatible_methods: bool = False,
+) -> None:
+    if workload_cases is None:
+        _main_single(
+            argv,
+            skip_incompatible_methods=skip_incompatible_methods,
+        )
+        return
+    if not workload_cases:
+        raise SystemExit("workload_cases must not be empty")
+    if argv is None:
+        raise SystemExit("workload_cases require forwarded benchmark arguments")
+
+    args = parse_args(argv)
+    methods = parse_methods(args.methods)
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        raise SystemExit("SM90 Hopper CUDA device is required")
+    if args.headdim != 128 or args.kvhead * args.headdim != 1024:
+        raise SystemExit("hierarchical communication requires D=128 and KVH * D == 1024")
+    if args.qhead % args.kvhead:
+        raise SystemExit("qhead must be divisible by kvhead")
+    for workload_case in workload_cases:
+        if any(method != "zepplin" for method in methods):
+            validate_metadata(
+                list(workload_case.global_lengths),
+                list(workload_case.ring_sizes),
+                list(workload_case.ring_starts),
+                int(os.environ["LOCAL_WORLD_SIZE"]),
+                args.mode,
+            )
+        elif not (
+            len(workload_case.global_lengths)
+            == len(workload_case.ring_sizes)
+            == len(workload_case.ring_starts)
+        ):
+            raise SystemExit(
+                "global lengths, ring sizes, and ring starts must have the same length"
+            )
+    rank, world_size = init_distributed()
+    pools: ForwardParallelPools | None = None
+    try:
+        all_cp_capacity = (
+            max_all_cp_rank_capacity(workload_cases, world_size)
+            if "mega_ring_all_cp" in methods
+            else None
+        )
+        hybrid_capacity = (
+            max_hybrid_rank_capacity(workload_cases, world_size)
+            if "mega_ring_hybrid" in methods
+            else None
+        )
+        pools = ForwardParallelPools(
+            all_cp=(
+                make_mega_parallel_tensors(
+                    rank,
+                    world_size,
+                    all_cp_capacity,
+                    args.kvhead,
+                    args.headdim,
+                )
+                if all_cp_capacity is not None
+                else None
+            ),
+            hybrid=(
+                make_mega_parallel_tensors(
+                    rank,
+                    world_size,
+                    hybrid_capacity,
+                    args.kvhead,
+                    args.headdim,
+                )
+                if hybrid_capacity is not None
+                else None
+            ),
+        )
+        if rank == 0:
+            print(
+                "Reusable forward IPC pools: "
+                f"cases={len(workload_cases)}, "
+                f"all_cp_rank_capacity={all_cp_capacity}, "
+                f"hybrid_rank_capacity={hybrid_capacity}",
+                flush=True,
+            )
+
+        all_samples: list[ForwardSummarySample] = []
+        for workload_case in workload_cases:
+            all_samples.extend(
+                _main_single(
+                    _argv_for_case(argv, workload_case),
+                    skip_incompatible_methods=skip_incompatible_methods,
+                    parallel_pools=pools,
+                    case_label=workload_case.label,
+                    case_index=workload_case.case_index,
+                    manage_process_group=False,
+                )
+            )
+        if rank == 0:
+            _print_forward_summary(all_samples, len(workload_cases), world_size)
+    finally:
+        if dist.is_initialized():
+            cuda_barrier()
+        if pools is not None:
+            pools.close()
         if dist.is_initialized():
             dist.destroy_process_group()
 

@@ -480,15 +480,15 @@ py::tuple backward_varlen_mega_ring(
     int const local_total_k = k_host[batch_size];
     TORCH_CHECK(k.size(0) == v.size(0) && k.size(0) % world_size == 0,
                 "k/v arena rows must match and be divisible by world_size");
-    int64_t const rank_kv_capacity_i64 = k.size(0) / world_size;
-    TORCH_CHECK(rank_kv_capacity_i64 > 0 && rank_kv_capacity_i64 <= std::numeric_limits<int>::max(),
-                "rank_kv_capacity must be positive and fit in int32");
-    int const rank_kv_capacity = static_cast<int>(rank_kv_capacity_i64);
-    TORCH_CHECK(rank_kv_capacity % 128 == 0,
-                "rank_kv_capacity must be 128-row aligned. Got ", rank_kv_capacity);
-    TORCH_CHECK(local_total_k >= 0 && local_total_k <= rank_kv_capacity,
-                "local_total_k must fit in rank_kv_capacity. Got ", local_total_k,
-                " vs ", rank_kv_capacity);
+    int64_t const arena_rank_capacity_i64 = k.size(0) / world_size;
+    TORCH_CHECK(arena_rank_capacity_i64 > 0 && arena_rank_capacity_i64 <= std::numeric_limits<int>::max(),
+                "arena_rank_capacity must be positive and fit in int32");
+    int const arena_rank_capacity = static_cast<int>(arena_rank_capacity_i64);
+    TORCH_CHECK(arena_rank_capacity % 128 == 0,
+                "arena_rank_capacity must be 128-row aligned. Got ", arena_rank_capacity);
+    TORCH_CHECK(local_total_k >= 0 && local_total_k <= arena_rank_capacity,
+                "local_total_k must fit in arena_rank_capacity. Got ", local_total_k,
+                " vs ", arena_rank_capacity);
     TORCH_CHECK(q_host[batch_size] == q.size(0), "cu_seqlens_q_host[-1] must equal q.size(0)");
 
     auto half_cu_seqlens_host = torch::zeros(
@@ -497,6 +497,7 @@ py::tuple backward_varlen_mega_ring(
     int previous_ring_size = 8;
     int max_local_q = 0;
     int max_local_k = 0;
+    std::array<int64_t, 8> logical_rank_rows{};
     for (int b = 0; b < batch_size; ++b) {
         int const q_len = q_host[b + 1] - q_host[b];
         int const k_len = k_host[b + 1] - k_host[b];
@@ -519,8 +520,14 @@ py::tuple backward_varlen_mega_ring(
                     ", size=", ring_size, ", world_size=", world_size);
         TORCH_CHECK(global_len % ring_size == 0,
                     "global length must be divisible by ring size at batch=", b);
+        int const member_rows = global_len / ring_size;
+        for (int owner = ring_start; owner < ring_start + ring_size; ++owner) {
+            logical_rank_rows[owner] += member_rows;
+            TORCH_CHECK(logical_rank_rows[owner] <= std::numeric_limits<int>::max(),
+                        "logical rank K/V capacity must fit in int32");
+        }
         bool const is_member = rank >= ring_start && rank < ring_start + ring_size;
-        int const expected_local_len = is_member ? global_len / ring_size : 0;
+        int const expected_local_len = is_member ? member_rows : 0;
         TORCH_CHECK(q_len == expected_local_len,
                     "local q/k length does not match ring metadata at batch=", b,
                     ". expected=", expected_local_len, ", actual=", q_len);
@@ -620,11 +627,17 @@ py::tuple backward_varlen_mega_ring(
     int const descriptor_total_q = q.size(0) > 0 ? q.size(0) : 1;
     int const total_q_padded = round_multiple(
         descriptor_total_q + batch_size * block_m, block_m);
+    int const logical_rank_capacity = static_cast<int>(*std::max_element(
+        logical_rank_rows.begin(), logical_rank_rows.begin() + world_size));
+    TORCH_CHECK(logical_rank_capacity > 0 && logical_rank_capacity <= arena_rank_capacity,
+                "logical rank K/V capacity must be positive and fit in the reusable arena. Got ",
+                logical_rank_capacity, " vs arena capacity ", arena_rank_capacity);
     int const padded_rank_capacity = round_multiple(
-        rank_kv_capacity + batch_size * block_n, block_n);
+        logical_rank_capacity + batch_size * block_n, block_n);
     int64_t const step_stride = int64_t(k.size(1)) * padded_rank_capacity * 128;
-    TORCH_CHECK(remote_dk_accum.data_.numel() == step_stride && remote_dv_accum.data_.numel() == step_stride,
-                "remote dK/dV accumulators must each contain KVH * padded_rank_capacity * 128 float elements");
+    TORCH_CHECK(remote_dk_accum.data_.numel() >= step_stride && remote_dv_accum.data_.numel() >= step_stride,
+                "remote dK/dV accumulators must each have capacity for at least "
+                "KVH * padded_rank_capacity * 128 float elements");
 
     auto float_options = q.options().dtype(torch::kFloat32);
     auto int_options = q.options().dtype(torch::kInt32);
@@ -682,7 +695,7 @@ py::tuple backward_varlen_mega_ring(
     params.num_comp_sm = static_cast<int>(num_comp_sm);
     params.num_comm_sm = static_cast<int>(num_comm_sm);
     params.local_total_k = local_total_k;
-    params.rank_kv_capacity = rank_kv_capacity;
+    params.rank_kv_capacity = arena_rank_capacity;
     params.padded_rank_capacity = padded_rank_capacity;
     params.dkv_step_stride = step_stride;
     params.half_cu_seqlens = half_cu_seqlens.data_ptr<int>();

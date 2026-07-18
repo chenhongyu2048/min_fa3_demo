@@ -265,13 +265,13 @@ placement from the global sequence lengths.
 ```bash
 torchrun --standalone --nproc_per_node=8 \
   ring_test/benchmark_hybrid_dataset_backward.py \
-  --dataset arxiv --target-tokens 131072 --seed 0 \
+  --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 4 \
   --qhead 32 --kvhead 8 --headdim 128 \
   --methods all --zepplin-threshold 4096 \
   --sm-configs 128:4,124:8,120:12,116:16 \
   --warmup-iters 10 --num-iters 40 --no-check
 
-DATASETS="arxiv github pile" GPU_COUNTS="2 4 8" DIRECTION=backward \
+DATASETS="arxiv github pile" GPU_COUNTS="2 4 8" NUM_CASES=4 DIRECTION=backward \
   ZEPPLIN_THRESHOLD=4096 ./benchmark_hybrid_dataset.sh
 ```
 
@@ -367,13 +367,23 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_hybrid_forward.py \
 ### Dataset-shaped hybrid workload
 
 `benchmark_hybrid_dataset_forward.py` uses the standalone `balancer` package
-to sample an Arxiv, Github, or Pile-CC length distribution, pack one global
-batch to 128K tokens by default, and assign each sequence to a G8/G4/G2/G1 subgroup.
+to sample an Arxiv, Github, or Pile-CC length distribution and pack global
+batches to 128K tokens by default. `--seed` initializes one RNG stream;
+`--num-cases` consumes that stream continuously to build multiple complete
+batches before assigning each sequence to a G8/G4/G2/G1 subgroup.
 Compute and local tokens are hard placement constraints; normalized token
 balance is the main objective, while compute variance and estimated ring
 token-hops are soft costs. The frontend then calls
 `benchmark_hybrid_forward.main(...)` in the same process with the generated
 ring metadata.
+
+All generated cases run under one process group. The fused mega-ring methods
+allocate K/V IPC arenas once using the largest per-rank capacity across the
+case set and refill them between cases. Backward also reuses its remote dK/dV
+accumulators and completion tensors while retaining a case-local logical dKV
+stride. Each case keeps the existing result table, followed by cross-case
+latency, arithmetic-mean TFLOPS, workload-weighted aggregate TFLOPS, and
+workload-weighted per-GPU TFLOPS summaries.
 
 The three empirical distributions live in
 `../dataset/sequence_length_buckets.json`. Each one contains 512 counts for
@@ -393,11 +403,11 @@ G2/G4/G8 ring. The physical padded tokens participate in the benchmark, so
 ```bash
 torchrun --standalone --nproc_per_node=8 \
   ring_test/benchmark_hybrid_dataset_forward.py \
-  --dataset arxiv --target-tokens 131072 --seed 0 \
+  --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 4 \
   --qhead 32 --kvhead 8 --headdim 128 \
   --mode causal --methods all --zepplin-threshold 4096 --no-check
 
-DATASETS="arxiv github pile" GPU_COUNTS="2 4 8" ZEPPLIN_THRESHOLD=4096 \
+DATASETS="arxiv github pile" GPU_COUNTS="2 4 8" NUM_CASES=4 ZEPPLIN_THRESHOLD=4096 \
   ./benchmark_hybrid_dataset.sh
 ```
 

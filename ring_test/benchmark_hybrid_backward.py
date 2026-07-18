@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from itertools import accumulate
 from pathlib import Path
+from statistics import median
 from typing import Callable, Sequence
 
 import torch
@@ -32,6 +34,7 @@ from hybrid_backward_baselines import (
 )
 from ring_test.utils import (
     MEGA_RING_ALL_CP_ALIGNMENT,
+    HybridBenchmarkCase,
     SENTINEL,
     align_mega_ring_all_cp_lengths,
     assert_all_ranks,
@@ -88,6 +91,45 @@ class BenchmarkResult:
     aggregate_tflops: float
     check: str
     note: str
+
+
+@dataclass(frozen=True)
+class BackwardSummarySample:
+    case_index: int
+    result: BenchmarkResult
+
+
+@dataclass
+class BackwardMegaPool:
+    remote_k: min_fa3_op.TKParallelTensor
+    remote_v: min_fa3_op.TKParallelTensor
+    remote_dk: min_fa3_op.TKParallelTensor
+    remote_dv: min_fa3_op.TKParallelTensor
+    completion: min_fa3_op.TKParallelTensor
+    rank_capacity: int
+    rank: int
+
+    def populate(self, local_k: torch.Tensor, local_v: torch.Tensor) -> None:
+        if local_k.size(0) > self.rank_capacity:
+            raise RuntimeError(
+                f"local K/V rows {local_k.size(0)} exceed pooled rank capacity "
+                f"{self.rank_capacity}"
+            )
+        self.remote_k.data_.fill_(SENTINEL)
+        self.remote_v.data_.fill_(SENTINEL)
+        owner_begin = self.rank * self.rank_capacity
+        owner_end = owner_begin + local_k.size(0)
+        self.remote_k.data_[owner_begin:owner_end].copy_(local_k)
+        self.remote_v.data_[owner_begin:owner_end].copy_(local_v)
+
+@dataclass
+class BackwardParallelPools:
+    all_cp: BackwardMegaPool | None
+    hybrid: BackwardMegaPool | None
+
+    def close(self) -> None:
+        self.all_cp = None
+        self.hybrid = None
 
 
 @dataclass
@@ -294,6 +336,118 @@ def make_remote_kv(
     return remote_k, remote_v
 
 
+def make_backward_pool(
+    rank: int,
+    world_size: int,
+    rank_capacity: int,
+    accum_numel: int,
+    kv_heads: int,
+    head_dim: int,
+) -> BackwardMegaPool:
+    arena_shape = [world_size * rank_capacity, kv_heads, head_dim]
+    return BackwardMegaPool(
+        remote_k=min_fa3_op.TKParallelTensor(
+            arena_shape, torch.bfloat16, rank, world_size, False
+        ),
+        remote_v=min_fa3_op.TKParallelTensor(
+            arena_shape, torch.bfloat16, rank, world_size, False
+        ),
+        remote_dk=min_fa3_op.TKParallelTensor(
+            [accum_numel], torch.float32, rank, world_size, False
+        ),
+        remote_dv=min_fa3_op.TKParallelTensor(
+            [accum_numel], torch.float32, rank, world_size, False
+        ),
+        completion=min_fa3_op.TKParallelTensor(
+            [1], torch.int32, rank, world_size, False
+        ),
+        rank_capacity=rank_capacity,
+        rank=rank,
+    )
+
+
+def _hybrid_case_rank_capacity(
+    global_lengths: Sequence[int],
+    ring_sizes: Sequence[int],
+    ring_starts: Sequence[int],
+    world_size: int,
+) -> int:
+    return max(
+        sum(
+            local_lengths_for_rank(
+                list(global_lengths),
+                list(ring_sizes),
+                list(ring_starts),
+                rank,
+            )
+        )
+        for rank in range(world_size)
+    )
+
+
+def make_backward_parallel_pools(
+    workloads: Sequence[tuple[str, list[int], list[int], list[int]]],
+    methods: Sequence[str],
+    rank: int,
+    world_size: int,
+    kv_heads: int,
+    head_dim: int,
+) -> BackwardParallelPools:
+    all_cp_pool = None
+    if "mega_ring_all_cp" in methods:
+        all_cp_cases = [
+            (
+                sum(align_mega_ring_all_cp_lengths(global_lengths)) // world_size,
+                len(global_lengths),
+            )
+            for _label, global_lengths, _ring_sizes, _ring_starts in workloads
+        ]
+        all_cp_rank_capacity = max(capacity for capacity, _batch in all_cp_cases)
+        all_cp_accum_numel = max(
+            kv_heads
+            * (((capacity + batch * 128 + 127) // 128) * 128)
+            * head_dim
+            for capacity, batch in all_cp_cases
+        )
+        all_cp_pool = make_backward_pool(
+            rank,
+            world_size,
+            all_cp_rank_capacity,
+            all_cp_accum_numel,
+            kv_heads,
+            head_dim,
+        )
+
+    hybrid_pool = None
+    if "mega_ring_hybrid" in methods:
+        hybrid_cases = [
+            (
+                _hybrid_case_rank_capacity(
+                    global_lengths, ring_sizes, ring_starts, world_size
+                ),
+                len(global_lengths),
+            )
+            for _label, global_lengths, ring_sizes, ring_starts in workloads
+        ]
+        hybrid_rank_capacity = max(capacity for capacity, _batch in hybrid_cases)
+        hybrid_rank_capacity = ((hybrid_rank_capacity + 127) // 128) * 128
+        hybrid_accum_numel = max(
+            kv_heads
+            * (((capacity + batch * 128 + 127) // 128) * 128)
+            * head_dim
+            for capacity, batch in hybrid_cases
+        )
+        hybrid_pool = make_backward_pool(
+            rank,
+            world_size,
+            hybrid_rank_capacity,
+            hybrid_accum_numel,
+            kv_heads,
+            head_dim,
+        )
+    return BackwardParallelPools(all_cp=all_cp_pool, hybrid=hybrid_pool)
+
+
 def gather_padded_rank_tensor(tensor: torch.Tensor, rank_capacity: int) -> torch.Tensor:
     padded = torch.zeros(
         (rank_capacity, tensor.size(1), tensor.size(2)),
@@ -491,6 +645,7 @@ def benchmark_topology(
     label: str,
     methods: list[str],
     allgather_backend: str | None,
+    parallel_pools: BackwardParallelPools | None = None,
 ) -> list[BenchmarkResult]:
     if any(method != "zepplin" for method in methods):
         validate_backward_metadata(global_lengths, ring_sizes, ring_starts, world_size)
@@ -693,13 +848,21 @@ def benchmark_topology(
                 rank,
             )
 
-        mega_all_cp_remote_k, mega_all_cp_remote_v = make_remote_kv(
-            mega_all_cp_k,
-            mega_all_cp_v,
-            rank,
-            world_size,
-            mega_all_cp_total,
+        mega_all_cp_pool = (
+            None if parallel_pools is None else parallel_pools.all_cp
         )
+        if mega_all_cp_pool is None:
+            mega_all_cp_remote_k, mega_all_cp_remote_v = make_remote_kv(
+                mega_all_cp_k,
+                mega_all_cp_v,
+                rank,
+                world_size,
+                mega_all_cp_total,
+            )
+        else:
+            mega_all_cp_pool.populate(mega_all_cp_k, mega_all_cp_v)
+            mega_all_cp_remote_k = mega_all_cp_pool.remote_k
+            mega_all_cp_remote_v = mega_all_cp_pool.remote_v
         mega_all_cp_k_arena = mega_all_cp_remote_k.data_
         mega_all_cp_v_arena = mega_all_cp_remote_v.data_
         mega_all_cp_global_host = torch.tensor(
@@ -766,15 +929,20 @@ def benchmark_topology(
         mega_all_cp_accum_numel = (
             args.kvhead * mega_all_cp_padded_capacity * args.headdim
         )
-        mega_all_cp_remote_dk = min_fa3_op.TKParallelTensor(
-            [mega_all_cp_accum_numel], torch.float32, rank, world_size, False
-        )
-        mega_all_cp_remote_dv = min_fa3_op.TKParallelTensor(
-            [mega_all_cp_accum_numel], torch.float32, rank, world_size, False
-        )
-        mega_all_cp_completion = min_fa3_op.TKParallelTensor(
-            [1], torch.int32, rank, world_size, False
-        )
+        if mega_all_cp_pool is None:
+            mega_all_cp_remote_dk = min_fa3_op.TKParallelTensor(
+                [mega_all_cp_accum_numel], torch.float32, rank, world_size, False
+            )
+            mega_all_cp_remote_dv = min_fa3_op.TKParallelTensor(
+                [mega_all_cp_accum_numel], torch.float32, rank, world_size, False
+            )
+            mega_all_cp_completion = min_fa3_op.TKParallelTensor(
+                [1], torch.int32, rank, world_size, False
+            )
+        else:
+            mega_all_cp_remote_dk = mega_all_cp_pool.remote_dk
+            mega_all_cp_remote_dv = mega_all_cp_pool.remote_dv
+            mega_all_cp_completion = mega_all_cp_pool.completion
 
         def prepare_all_cp_mega() -> None:
             mega_all_cp_remote_dk.data_.zero_()
@@ -904,9 +1072,15 @@ def benchmark_topology(
         capacity = torch.tensor([local_total], device=device, dtype=torch.int32)
         dist.all_reduce(capacity, op=dist.ReduceOp.MAX)
         rank_capacity = ((int(capacity.item()) + 127) // 128) * 128
-        remote_k, remote_v = make_remote_kv(
-            local_k, local_v, rank, world_size, rank_capacity
-        )
+        hybrid_pool = None if parallel_pools is None else parallel_pools.hybrid
+        if hybrid_pool is None:
+            remote_k, remote_v = make_remote_kv(
+                local_k, local_v, rank, world_size, rank_capacity
+            )
+        else:
+            hybrid_pool.populate(local_k, local_v)
+            remote_k = hybrid_pool.remote_k
+            remote_v = hybrid_pool.remote_v
         k, v = remote_k.data_, remote_v.data_
         global_host = torch.tensor(global_lengths, dtype=torch.int32)
         ring_sizes_host = torch.tensor(ring_sizes, dtype=torch.int32)
@@ -973,15 +1147,20 @@ def benchmark_topology(
             (rank_capacity + len(global_lengths) * 128 + 127) // 128
         ) * 128
         accum_numel = args.kvhead * padded_capacity * args.headdim
-        remote_dk = min_fa3_op.TKParallelTensor(
-            [accum_numel], torch.float32, rank, world_size, False
-        )
-        remote_dv = min_fa3_op.TKParallelTensor(
-            [accum_numel], torch.float32, rank, world_size, False
-        )
-        completion = min_fa3_op.TKParallelTensor(
-            [1], torch.int32, rank, world_size, False
-        )
+        if hybrid_pool is None:
+            remote_dk = min_fa3_op.TKParallelTensor(
+                [accum_numel], torch.float32, rank, world_size, False
+            )
+            remote_dv = min_fa3_op.TKParallelTensor(
+                [accum_numel], torch.float32, rank, world_size, False
+            )
+            completion = min_fa3_op.TKParallelTensor(
+                [1], torch.int32, rank, world_size, False
+            )
+        else:
+            remote_dk = hybrid_pool.remote_dk
+            remote_dv = hybrid_pool.remote_dv
+            completion = hybrid_pool.completion
 
         def prepare_hybrid() -> None:
             remote_dk.data_.zero_()
@@ -1102,6 +1281,40 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def _print_backward_summary(
+    samples: Sequence[BackwardSummarySample], total_cases: int, world_size: int
+) -> None:
+    grouped: dict[
+        tuple[str, SmConfig | None], list[BackwardSummarySample]
+    ] = defaultdict(list)
+    for sample in samples:
+        grouped[(sample.result.method, sample.result.config)].append(sample)
+
+    print("\nCross-case backward summary")
+    print(
+        f"{'Method':<28} {'SM':>8} {'Cases':>8} "
+        f"{'Min ms':>10} {'Mean ms':>10} {'P50 ms':>10} {'Max ms':>10} "
+        f"{'Mean TFLOPS':>14} {'Weighted TFLOPS':>18} {'Weighted/GPU':>14}"
+    )
+    for (method, config), records in grouped.items():
+        times = [record.result.timing.max_ms for record in records]
+        weighted_tflops = sum(
+            record.result.aggregate_tflops * record.result.timing.max_ms
+            for record in records
+        ) / sum(times)
+        mean_tflops = sum(
+            record.result.aggregate_tflops for record in records
+        ) / len(records)
+        sm = "-" if config is None else f"{config.num_comp_sm}:{config.num_comm_sm}"
+        print(
+            f"{method:<28} {sm:>8} {f'{len(records)}/{total_cases}':>8} "
+            f"{min(times):>10.3f} {sum(times) / len(times):>10.3f} "
+            f"{median(times):>10.3f} {max(times):>10.3f} "
+            f"{mean_tflops:>14.2f} {weighted_tflops:>18.2f} "
+            f"{weighted_tflops / world_size:>14.2f}"
+        )
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark hierarchical causal mega-ring backward"
@@ -1146,6 +1359,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(
     argv: Sequence[str] | None = None,
     *,
+    workload_cases: Sequence[HybridBenchmarkCase] | None = None,
     skip_incompatible_methods: bool = False,
 ) -> None:
     args = parse_args(argv)
@@ -1159,6 +1373,7 @@ def main(
     sm_configs = resolve_sm_configs(args)
 
     rank, world_size = init_distributed()
+    parallel_pools: BackwardParallelPools | None = None
     try:
         if not torch.cuda.is_available() or torch.cuda.get_device_capability(rank) != (9, 0):
             raise SystemExit("SM90 Hopper CUDA device is required")
@@ -1200,7 +1415,19 @@ def main(
                 )
                 print(f"Block baseline backend: {backend_name}", flush=True)
 
-        if args.global_seqlens is not None:
+        if workload_cases is not None:
+            if not workload_cases:
+                raise SystemExit("workload_cases must not be empty")
+            workloads = [
+                (
+                    workload_case.label,
+                    list(workload_case.global_lengths),
+                    list(workload_case.ring_sizes),
+                    list(workload_case.ring_starts),
+                )
+                for workload_case in workload_cases
+            ]
+        elif args.global_seqlens is not None:
             workloads = [
                 (
                     "explicit topology",
@@ -1222,9 +1449,48 @@ def main(
                         ring_sizes,
                         ring_starts,
                     )
+                    )
+
+        for _label, global_lengths, ring_sizes, ring_starts in workloads:
+            if any(method != "zepplin" for method in requested_methods):
+                validate_backward_metadata(
+                    global_lengths, ring_sizes, ring_starts, world_size
+                )
+            elif not (
+                len(global_lengths) == len(ring_sizes) == len(ring_starts)
+            ):
+                raise SystemExit(
+                    "global lengths, ring sizes, and ring starts must have the same length"
                 )
 
-        for label, global_lengths, ring_sizes, ring_starts in workloads:
+        parallel_pools = make_backward_parallel_pools(
+            workloads,
+            requested_methods,
+            rank,
+            world_size,
+            args.kvhead,
+            args.headdim,
+        )
+        if rank == 0:
+            all_cp_pool = parallel_pools.all_cp
+            hybrid_pool = parallel_pools.hybrid
+            print(
+                "Reusable backward IPC pools: "
+                f"cases={len(workloads)}, "
+                f"all_cp_rank_capacity="
+                f"{None if all_cp_pool is None else all_cp_pool.rank_capacity}, "
+                f"all_cp_accum_numel="
+                f"{None if all_cp_pool is None else all_cp_pool.remote_dk.data_.numel()}, "
+                f"hybrid_rank_capacity="
+                f"{None if hybrid_pool is None else hybrid_pool.rank_capacity}, "
+                f"hybrid_accum_numel="
+                f"{None if hybrid_pool is None else hybrid_pool.remote_dk.data_.numel()}",
+                flush=True,
+            )
+            del all_cp_pool, hybrid_pool
+
+        summary_samples: list[BackwardSummarySample] = []
+        for case_index, (label, global_lengths, ring_sizes, ring_starts) in enumerate(workloads):
             active_methods, skipped_methods = compatible_methods(
                 requested_methods,
                 global_lengths,
@@ -1236,7 +1502,7 @@ def main(
                 print(f"\nSkipped methods for {label}:")
                 for method, reason in skipped_methods:
                     print(f"  {method}: {reason}")
-            benchmark_topology(
+            case_results = benchmark_topology(
                 args,
                 rank,
                 world_size,
@@ -1247,8 +1513,21 @@ def main(
                 label,
                 active_methods,
                 allgather_backend,
+                parallel_pools,
             )
+            if rank == 0:
+                summary_samples.extend(
+                    BackwardSummarySample(case_index, result)
+                    for result in case_results
+                )
+        if rank == 0:
+            _print_backward_summary(summary_samples, len(workloads), world_size)
     finally:
+        if dist.is_initialized():
+            torch.cuda.synchronize()
+            dist.barrier()
+        if parallel_pools is not None:
+            parallel_pools.close()
         if dist.is_initialized():
             dist.destroy_process_group()
 

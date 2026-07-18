@@ -7,6 +7,7 @@ Copied and trimmed from
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -15,6 +16,16 @@ import torch.distributed as dist
 SENTINEL = -123.0
 BASE_SEED = 20260713
 MEGA_RING_ALL_CP_ALIGNMENT = 2048
+
+
+@dataclass(frozen=True)
+class HybridBenchmarkCase:
+    label: str
+    case_index: int
+    num_cases: int
+    global_lengths: tuple[int, ...]
+    ring_sizes: tuple[int, ...]
+    ring_starts: tuple[int, ...]
 
 
 def align_mega_ring_all_cp_lengths(global_lengths: list[int]) -> list[int]:
@@ -39,9 +50,10 @@ def init_distributed() -> tuple[int, int]:
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["LOCAL_WORLD_SIZE"])
     torch.cuda.set_device(rank)
-    dist.init_process_group(
-        backend="nccl", device_id=torch.device("cuda", rank)
-    )
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl", device_id=torch.device("cuda", rank)
+        )
     if dist.get_world_size() != world_size or world_size not in (2, 4, 8):
         raise SystemExit(
             "hierarchical mega ring requires one node with 2, 4, or 8 ranks, "

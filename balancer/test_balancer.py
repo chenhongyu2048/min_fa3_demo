@@ -105,6 +105,30 @@ class DatasetSamplerTest(unittest.TestCase):
                 self.assertGreaterEqual(sum(first), 131073)
                 self.assertLess(sum(first) - 131073, 2048)
 
+    def test_multiple_cases_advance_one_rng_stream(self) -> None:
+        cases = balancer.generate_dataset_length_cases(
+            "pile", 16385, seed=7, num_cases=3
+        )
+        self.assertEqual(
+            cases,
+            balancer.generate_dataset_length_cases(
+                "pile", 16385, seed=7, num_cases=3
+            ),
+        )
+        self.assertEqual(
+            cases[0], balancer.generate_dataset_lengths("pile", 16385, seed=7)
+        )
+        self.assertNotEqual(
+            cases[1], balancer.generate_dataset_lengths("pile", 16385, seed=8)
+        )
+        self.assertEqual(len(cases), 3)
+
+    def test_multiple_cases_reject_nonpositive_count(self) -> None:
+        with self.assertRaisesRegex(ValueError, "num_cases must be positive"):
+            balancer.generate_dataset_length_cases(
+                "arxiv", 4096, seed=0, num_cases=0
+            )
+
     def test_sampling_rejects_invalid_inputs(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown dataset"):
             balancer.generate_dataset_lengths("missing", 1024, seed=0)
@@ -186,6 +210,19 @@ class HierarchicalLoadBalancerTest(unittest.TestCase):
             balancer.make_workload(**kwargs),
         )
 
+    def test_multi_workload_first_case_matches_single_workload(self) -> None:
+        kwargs = dict(
+            dataset="pile",
+            target_tokens=16385,
+            seed=7,
+            world_size=8,
+            mode="causal",
+            balance_tolerance=0.05,
+        )
+        workloads = balancer.make_workloads(**kwargs, num_cases=2)
+        self.assertEqual(workloads[0], balancer.make_workload(**kwargs))
+        self.assertNotEqual(workloads[0].global_lengths, workloads[1].global_lengths)
+
     def test_rejects_unsupported_world_size(self) -> None:
         with self.assertRaisesRegex(ValueError, "2, 4, or 8"):
             balancer.assign_hierarchical_rings(
@@ -239,6 +276,68 @@ class DatasetBenchmarkFrontendTest(unittest.TestCase):
         self.assertIn("global_seqlens=5120", rendered)
         self.assertIn("ring_sizes=4", rendered)
 
+    def test_print_workload_samples_multiple_cases_from_one_seed(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            benchmark_hybrid_dataset_forward.main(
+                [
+                    "--dataset",
+                    "pile",
+                    "--target-tokens",
+                    "16385",
+                    "--seed",
+                    "7",
+                    "--num-cases",
+                    "2",
+                    "--world-size",
+                    "8",
+                    "--print-workload",
+                ]
+            )
+        rendered = output.getvalue()
+        self.assertIn("Dataset case 1/2", rendered)
+        self.assertIn("Dataset case 2/2", rendered)
+        self.assertEqual(rendered.count("Planner workload: dataset=pile, seed=7"), 2)
+
+    def test_forward_frontend_forwards_all_cases_in_one_call(self) -> None:
+        calls: list[tuple[list[str], dict[str, object]]] = []
+
+        def fake_main(argv, **kwargs) -> None:
+            calls.append((list(argv), dict(kwargs)))
+
+        fake_benchmark = types.SimpleNamespace(main=fake_main)
+        with mock.patch.dict(
+            os.environ,
+            {"LOCAL_RANK": "0", "LOCAL_WORLD_SIZE": "8"},
+        ), mock.patch.dict(
+            sys.modules,
+            {"benchmark_hybrid_forward": fake_benchmark},
+        ), contextlib.redirect_stdout(io.StringIO()):
+            benchmark_hybrid_dataset_forward.main(
+                [
+                    "--dataset",
+                    "pile",
+                    "--target-tokens",
+                    "16385",
+                    "--seed",
+                    "7",
+                    "--num-cases",
+                    "2",
+                    "--no-check",
+                ]
+            )
+
+        self.assertEqual(len(calls), 1)
+        _forwarded, options = calls[0]
+        workload_cases = options["workload_cases"]
+        self.assertEqual(len(workload_cases), 2)
+        self.assertEqual(workload_cases[0].case_index, 0)
+        self.assertEqual(workload_cases[1].case_index, 1)
+        self.assertNotEqual(
+            workload_cases[0].global_lengths,
+            workload_cases[1].global_lengths,
+        )
+
     def test_backward_print_workload_uses_balancer_without_cuda(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -287,6 +386,8 @@ class DatasetBenchmarkFrontendTest(unittest.TestCase):
                     "4097",
                     "--seed",
                     "0",
+                    "--num-cases",
+                    "2",
                     "--sm-configs",
                     "100:16",
                     "--no-check",
@@ -303,6 +404,7 @@ class DatasetBenchmarkFrontendTest(unittest.TestCase):
         self.assertEqual(value_after("--methods"), "all")
         self.assertIn("--no-check", forwarded)
         self.assertTrue(options["skip_incompatible_methods"])
+        self.assertEqual(len(options["workload_cases"]), 2)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ MAX_TOKEN_BALANCE_TOLERANCE=${MAX_TOKEN_BALANCE_TOLERANCE:-0.50}
 COMMUNICATION_WEIGHT=${COMMUNICATION_WEIGHT:-0.05}
 LOCAL_SEARCH_PASSES=${LOCAL_SEARCH_PASSES:-4}
 SEED=${SEED:-0}
+NUM_CASES=${NUM_CASES:-1}
 METHODS=${METHODS:-all}
 ZEPPLIN_THRESHOLD=${ZEPPLIN_THRESHOLD:-4096}
 MODE=${MODE:-causal}
@@ -75,6 +76,8 @@ fi
     die "TARGET_TOKENS must be a positive integer, got '$TARGET_TOKENS'"
 [[ "$ZEPPLIN_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || \
     die "ZEPPLIN_THRESHOLD must be a positive integer, got '$ZEPPLIN_THRESHOLD'"
+[[ "$NUM_CASES" =~ ^[1-9][0-9]*$ ]] || \
+    die "NUM_CASES must be a positive integer, got '$NUM_CASES'"
 
 gpu_counts_spec=${GPU_COUNTS//,/ }
 read -r -a GPU_COUNT_LIST <<< "$gpu_counts_spec"
@@ -146,6 +149,7 @@ run_benchmark() {
         --communication-weight "$COMMUNICATION_WEIGHT"
         --local-search-passes "$LOCAL_SEARCH_PASSES"
         --seed "$SEED"
+        --num-cases "$NUM_CASES"
         --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM"
         --zepplin-threshold "$ZEPPLIN_THRESHOLD"
         --sm-configs "$SM_CONFIGS"
@@ -184,7 +188,7 @@ fi
 
 echo "Log: $LOG_FILE"
 echo "Datasets: ${DATASET_LIST[*]}"
-echo "Config: direction=$DIRECTION, target_tokens=$TARGET_TOKENS, compute_tolerance=$BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, max_compute_tolerance=$MAX_COMPUTE_BALANCE_TOLERANCE, max_token_tolerance=$MAX_TOKEN_BALANCE_TOLERANCE, communication_weight=$COMMUNICATION_WEIGHT, local_search_passes=$LOCAL_SEARCH_PASSES, seed=$SEED, mode=$MODE, zepplin_threshold=$ZEPPLIN_THRESHOLD"
+echo "Config: direction=$DIRECTION, target_tokens=$TARGET_TOKENS, compute_tolerance=$BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, max_compute_tolerance=$MAX_COMPUTE_BALANCE_TOLERANCE, max_token_tolerance=$MAX_TOKEN_BALANCE_TOLERANCE, communication_weight=$COMMUNICATION_WEIGHT, local_search_passes=$LOCAL_SEARCH_PASSES, seed=$SEED, num_cases=$NUM_CASES, mode=$MODE, zepplin_threshold=$ZEPPLIN_THRESHOLD"
 echo "Methods: $METHODS"
 
 for world_size in "${GPU_COUNT_LIST[@]}"; do
