@@ -150,9 +150,9 @@ the import path.
 
 | Entry point | Purpose |
 | --- | --- |
-| `benchmark_hybrid_dataset.sh` | Recommended dataset-shaped forward/backward benchmark wrapper for 2, 4, or 8 GPUs |
-| `ring_test/benchmark_hybrid_dataset_{forward,backward}.py` | Dataset sampling, BR-PBS placement, and hierarchical benchmark frontend |
-| `ring_test/benchmark_hybrid_{forward,backward}.py` | Explicit global-length and Buddy-ring topology benchmark |
+| `benchmark_dataset.sh` | Recommended dataset-shaped forward/backward benchmark wrapper for 2, 4, or 8 GPUs |
+| `ring_test/benchmark_dataset_{forward,backward}.py` | Dataset sampling, BR-PBS placement, and topology benchmark frontend |
+| `ring_test/benchmark_topology_{forward,backward}.py` | Explicit global-length and Buddy-ring topology benchmark |
 | `ring_test/benchmark_ring_{forward,backward}.py` | Ordinary all-CP distributed ring benchmark |
 | `baseline/UltraAttn/packing/export_packed_causal_plan.py` | Offline Gurobi exporter for one fixed-8K UltraAttn allocation plan |
 | `baseline/UltraAttn/packing/generate_fixed_128k_plans.sh` | Offline UltraAttn plans for the fixed 1x128K through 16x8K suite |
@@ -268,7 +268,7 @@ Hierarchical mega-ring notes:
 
 ## Benchmark
 
-### Dataset-shaped hierarchical benchmark
+### Dataset-shaped topology benchmark
 
 The root wrapper is the recommended entry point for current end-to-end
 experiments. It runs forward by default; set `DIRECTION=backward` for causal
@@ -276,12 +276,12 @@ backward. `DRY_RUN=1` prints commands without launching CUDA work.
 
 ```bash
 DATASETS="arxiv github pile" GPU_COUNTS=8 NUM_CASES=4 ZEPPLIN_THRESHOLD=4096 \
-  ./benchmark_hybrid_dataset.sh
+  ./benchmark_dataset.sh
 
 DATASETS="arxiv github pile" GPU_COUNTS=8 NUM_CASES=4 DIRECTION=backward \
-  ZEPPLIN_THRESHOLD=4096 ./benchmark_hybrid_dataset.sh
+  ZEPPLIN_THRESHOLD=4096 ./benchmark_dataset.sh
 
-DRY_RUN=1 GPU_COUNTS="2 4 8" DATASETS=arxiv ./benchmark_hybrid_dataset.sh
+DRY_RUN=1 GPU_COUNTS="2 4 8" DATASETS=arxiv ./benchmark_dataset.sh
 ```
 
 The frontends sample Arxiv, Github, or Pile-CC lengths from
@@ -303,7 +303,7 @@ The shell equivalents are `COMPUTE_BALANCE_TOLERANCE`,
 view before a distributed run when inspecting a workload:
 
 ```bash
-python ring_test/benchmark_hybrid_dataset_forward.py \
+python ring_test/benchmark_dataset_forward.py \
   --dataset arxiv --target-tokens 131072 --seed 0 \
   --world-size 8 --print-workload
 ```
@@ -353,7 +353,7 @@ measured five-case results.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
-  ring_test/benchmark_hybrid_forward.py \
+  ring_test/benchmark_topology_forward.py \
   --global-seqlens 8192,4096,2048,1024 \
   --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
   --qhead 32 --kvhead 8 --headdim 128 --mode both \

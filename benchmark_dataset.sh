@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Dataset-shaped hierarchical hybrid forward/backward benchmark.
+# Dataset-shaped explicit-topology forward/backward benchmark.
 # Run inside a single-node allocation exposing 2, 4, or 8 SM90 GPUs.
 
 set -euo pipefail
@@ -36,9 +36,9 @@ TORCHRUN=${TORCHRUN:-torchrun}
 LOG_DIR=${LOG_DIR:-"benchmark_logs/$(date +%Y%m%d-%H%M%S)"}
 if [[ -z ${LOG_FILE:-} ]]; then
     if [[ "$DIRECTION" == forward ]]; then
-        LOG_FILE="$LOG_DIR/benchmark_hybrid_dataset.log"
+        LOG_FILE="$LOG_DIR/benchmark_dataset.log"
     else
-        LOG_FILE="$LOG_DIR/benchmark_hybrid_dataset_backward.log"
+        LOG_FILE="$LOG_DIR/benchmark_dataset_backward.log"
     fi
 fi
 
@@ -70,7 +70,7 @@ case "$MODE" in
     *) die "MODE must be noncausal, causal, or both, got '$MODE'" ;;
 esac
 if [[ "$DIRECTION" == backward && "$MODE" != causal ]]; then
-    die "hybrid backward supports only MODE=causal"
+    die "topology backward supports only MODE=causal"
 fi
 
 [[ "$TARGET_TOKENS" =~ ^[1-9][0-9]*$ ]] || \
@@ -142,9 +142,9 @@ run_benchmark() {
     local visible_devices=$3
     local entrypoint
     if [[ "$DIRECTION" == forward ]]; then
-        entrypoint=ring_test/benchmark_hybrid_dataset_forward.py
+        entrypoint=ring_test/benchmark_dataset_forward.py
     else
-        entrypoint=ring_test/benchmark_hybrid_dataset_backward.py
+        entrypoint=ring_test/benchmark_dataset_backward.py
     fi
     local -a command=(
         "$TORCHRUN" --standalone --nproc_per_node="$world_size"
@@ -174,7 +174,7 @@ run_benchmark() {
 
     if ((DRY_RUN)); then
         printf '\n================================================================================\n'
-        printf '[hybrid_dataset_%s] dataset=%s GPUs=%s visible=%s\n' \
+        printf '[dataset_%s] dataset=%s GPUs=%s visible=%s\n' \
             "$DIRECTION" "$dataset" "$world_size" "$visible_devices"
         printf '================================================================================\n'
         print_command "$visible_devices" "${command[@]}"
@@ -183,7 +183,7 @@ run_benchmark() {
 
     {
         printf '\n================================================================================\n'
-        printf '[hybrid_dataset_%s] dataset=%s GPUs=%s visible=%s\n' \
+        printf '[dataset_%s] dataset=%s GPUs=%s visible=%s\n' \
             "$DIRECTION" "$dataset" "$world_size" "$visible_devices"
         printf '================================================================================\n'
         print_command "$visible_devices" "${command[@]}"

@@ -1,4 +1,4 @@
-"""Dataset-shaped frontend for the hierarchical hybrid backward benchmark."""
+"""Dataset-shaped frontend for the explicit-topology backward benchmark."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ for path in (THIS_DIR, DEMO_DIR):
 
 
 import balancer
-from benchmark_hybrid_dataset_forward import (
+from benchmark_dataset_forward import (
     _nonnegative_int,
     _positive_int,
     _format_int_list,
@@ -31,7 +31,7 @@ from zepplin import DEFAULT_ZEPPLIN_THRESHOLD
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate a dataset-shaped workload and run hybrid backward"
+        description="Generate a dataset-shaped workload and run the explicit-topology backward benchmark"
     )
     parser.add_argument("--dataset", choices=tuple(balancer.DATASET_WEIGHTS), required=True)
     parser.add_argument("--target-tokens", type=int, default=balancer.MAX_SEQUENCE_TOKENS)
@@ -189,9 +189,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     ]
     forwarded_argv = _benchmark_argv(args, workloads[0])
 
-    import benchmark_hybrid_backward
+    import benchmark_topology_backward
 
-    benchmark_hybrid_backward.main(
+    benchmark_topology_backward.main(
         forwarded_argv,
         workload_cases=benchmark_cases,
         skip_incompatible_methods=_requests_all(args.methods),

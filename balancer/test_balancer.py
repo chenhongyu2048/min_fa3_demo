@@ -28,8 +28,8 @@ from dataset.build_length_bucket_stats import (
     build_statistics,
 )
 from ring_test import (
-    benchmark_hybrid_dataset_backward,
-    benchmark_hybrid_dataset_forward,
+    benchmark_dataset_backward,
+    benchmark_dataset_forward,
 )
 
 
@@ -451,7 +451,7 @@ class DatasetBenchmarkFrontendTest(unittest.TestCase):
     def test_pile_print_workload_uses_json_distribution(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            benchmark_hybrid_dataset_forward.main(
+            benchmark_dataset_forward.main(
                 [
                     "--dataset",
                     "pile",
@@ -473,7 +473,7 @@ class DatasetBenchmarkFrontendTest(unittest.TestCase):
     def test_print_workload_uses_balancer_without_cuda(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            benchmark_hybrid_dataset_forward.main(
+            benchmark_dataset_forward.main(
                 [
                     "--dataset",
                     "arxiv",
@@ -494,7 +494,7 @@ class DatasetBenchmarkFrontendTest(unittest.TestCase):
     def test_print_workload_samples_multiple_cases_from_one_seed(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            benchmark_hybrid_dataset_forward.main(
+            benchmark_dataset_forward.main(
                 [
                     "--dataset",
                     "pile",
@@ -526,9 +526,9 @@ class DatasetBenchmarkFrontendTest(unittest.TestCase):
             {"LOCAL_RANK": "0", "LOCAL_WORLD_SIZE": "8"},
         ), mock.patch.dict(
             sys.modules,
-            {"benchmark_hybrid_forward": fake_benchmark},
+            {"benchmark_topology_forward": fake_benchmark},
         ), contextlib.redirect_stdout(io.StringIO()):
-            benchmark_hybrid_dataset_forward.main(
+            benchmark_dataset_forward.main(
                 [
                     "--dataset",
                     "pile",
@@ -556,7 +556,7 @@ class DatasetBenchmarkFrontendTest(unittest.TestCase):
     def test_backward_print_workload_uses_balancer_without_cuda(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            benchmark_hybrid_dataset_backward.main(
+            benchmark_dataset_backward.main(
                 [
                     "--dataset",
                     "arxiv",
@@ -591,9 +591,9 @@ class DatasetBenchmarkFrontendTest(unittest.TestCase):
             {"LOCAL_RANK": "0", "LOCAL_WORLD_SIZE": "8"},
         ), mock.patch.dict(
             sys.modules,
-            {"benchmark_hybrid_backward": fake_benchmark},
+            {"benchmark_topology_backward": fake_benchmark},
         ), contextlib.redirect_stdout(io.StringIO()):
-            benchmark_hybrid_dataset_backward.main(
+            benchmark_dataset_backward.main(
                 [
                     "--dataset",
                     "arxiv",

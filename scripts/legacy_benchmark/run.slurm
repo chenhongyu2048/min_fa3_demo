@@ -102,7 +102,7 @@ torchrun --standalone --nproc_per_node=4 ring_test/benchmark_ring_forward.py \
     --warmup-iters 20 --num-iters 30 --no-check
 
 echo "Running multi-rank hybrid ring_test benchmark without correctness checks"
-torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
+torchrun --standalone --nproc_per_node=4 ring_test/benchmark_topology_forward.py \
     --global-seqlens 16384,1024,1024,1024,1024,512,512,512,512 \
     --ring-sizes 4,1,1,1,1,1,1,1,1 --ring-starts 0,0,1,2,3,0,1,2,3 \
     --qhead 32 --kvhead 8 --headdim 128 \
@@ -111,7 +111,7 @@ torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
     --allgather-overlapping-heads-k-stride "$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE" \
     --mode both --warmup-iters 20 --num-iters 30 --no-check
 
-torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
+torchrun --standalone --nproc_per_node=4 ring_test/benchmark_topology_forward.py \
     --global-seqlens 32768,1024,1024,1024,1024,512,512,512,512,512,512,512,512 \
     --ring-sizes 4,1,1,1,1,1,1,1,1,1,1,1,1 \
     --ring-starts 0,0,1,2,3,0,1,2,3,0,1,2,3 \
@@ -121,7 +121,7 @@ torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
     --allgather-overlapping-heads-k-stride "$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE" \
     --mode both --warmup-iters 20 --num-iters 30 --no-check
 
-torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
+torchrun --standalone --nproc_per_node=4 ring_test/benchmark_topology_forward.py \
     --global-seqlens 65536,1024,1024,1024,1024,512,512,512,512,512,512,512,512 \
     --ring-sizes 4,1,1,1,1,1,1,1,1,1,1,1,1 \
     --ring-starts 0,0,1,2,3,0,1,2,3,0,1,2,3 \

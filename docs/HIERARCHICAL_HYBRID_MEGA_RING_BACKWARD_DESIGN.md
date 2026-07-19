@@ -342,7 +342,7 @@ Dataset-shaped performance sweep:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
-  ring_test/benchmark_hybrid_dataset_backward.py \
+  ring_test/benchmark_dataset_backward.py \
   --dataset arxiv --target-tokens 131072 --seed 0 \
   --qhead 32 --kvhead 8 --headdim 128 \
   --methods all \

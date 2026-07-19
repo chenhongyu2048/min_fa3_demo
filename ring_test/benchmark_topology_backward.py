@@ -1319,7 +1319,7 @@ def _print_backward_summary(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark hierarchical causal mega-ring backward"
+        description="Benchmark explicit-topology causal mega-ring backward"
     )
     parser.add_argument(
         "--global-seqlens",
@@ -1416,7 +1416,7 @@ def main(
                 f"{config.num_comp_sm}:{config.num_comm_sm}" for config in sm_configs
             )
             print(
-                f"Hierarchical mega-ring causal backward: world_size={world_size}, "
+                f"Explicit-topology mega-ring causal backward: world_size={world_size}, "
                 f"methods={requested_methods}, "
                 f"QH={args.qhead}, KVH={args.kvhead}, D={args.headdim}, "
                 "allgather_overlapping_heads_k_stride="

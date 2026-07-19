@@ -1,4 +1,4 @@
-"""UltraAttn fixed-suite backend with hierarchical comparison baselines."""
+"""Distributed explicit-topology mega-ring forward benchmark."""
 
 from __future__ import annotations
 
@@ -15,11 +15,9 @@ import torch
 import torch.distributed as dist
 
 THIS_DIR = Path(__file__).resolve().parent
-RING_TEST_DIR = THIS_DIR.parent
-DEMO_DIR = RING_TEST_DIR.parent
-for path in (THIS_DIR, RING_TEST_DIR, DEMO_DIR):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+DEMO_DIR = THIS_DIR.parent
+if str(DEMO_DIR) not in sys.path:
+    sys.path.insert(0, str(DEMO_DIR))
 
 import min_fa3_op
 from allgather_attention import (
@@ -49,17 +47,6 @@ from zepplin import (
     make_zepplin_plan,
     zepplin_incompatibility,
 )
-from ring_test.ultraattn.ultraattn_forward import (
-    BLOCK_TOKENS as DEFAULT_ULTRAATTN_BLOCK_TOKENS,
-    UltraAttnPackedCausalForward,
-    missing_plan_command as ultraattn_missing_plan_command,
-    packed_causal_reference as ultraattn_packed_causal_reference,
-    packed_plan_path as ultraattn_plan_path,
-    plan_incompatibility as ultraattn_plan_incompatibility,
-)
-
-
-ULTRAATTN_BLOCK_TOKEN_CHOICES = (DEFAULT_ULTRAATTN_BLOCK_TOKENS,)
 
 
 METHOD_ORDER = [
@@ -67,7 +54,6 @@ METHOD_ORDER = [
     "llama3_allgather_attention",
     "fa3_ring",
     "zepplin",
-    "ultraattn",
     "mega_ring_all_cp",
     "mega_ring_hybrid",
 ]
@@ -177,10 +163,6 @@ def parse_methods(spec: str) -> list[str]:
     return deduped
 
 
-def requests_all_methods(spec: str) -> bool:
-    return any(token.strip() == "all" for token in spec.split(","))
-
-
 def parse_sm_configs(spec: str) -> list[SmConfig]:
     configs: list[SmConfig] = []
     for token in spec.split(","):
@@ -233,32 +215,7 @@ def method_incompatibility(
     world_size: int,
     is_causal: bool,
     zepplin_threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
-    *,
-    ultraattn_plan_dir: str | Path | None = None,
-    qhead: int = 32,
-    kvhead: int = 8,
-    headdim: int = 128,
-    ultraattn_block_tokens: int = DEFAULT_ULTRAATTN_BLOCK_TOKENS,
 ) -> str | None:
-    if method == "ultraattn":
-        if ultraattn_plan_dir is None:
-            return "UltraAttn plan directory was not configured"
-        reason = ultraattn_plan_incompatibility(
-            ultraattn_plan_dir,
-            global_lengths,
-            world_size,
-            qhead,
-            kvhead,
-            headdim,
-            is_causal,
-            ultraattn_block_tokens,
-        )
-        if reason is not None and "plan is missing" in reason:
-            reason = (
-                f"{reason}; generate it offline with: "
-                f"{ultraattn_missing_plan_command(ultraattn_plan_dir, global_lengths, world_size, qhead, kvhead, headdim, ultraattn_block_tokens)}"
-            )
-        return reason
     if method == "zepplin":
         return zepplin_incompatibility(
             global_lengths, world_size, is_causal, zepplin_threshold
@@ -297,13 +254,6 @@ def compatible_methods_for_mode(
     *,
     skip_incompatible: bool,
     zepplin_threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
-    ultraattn_plan_dir: str | Path | None = None,
-    qhead: int = 32,
-    kvhead: int = 8,
-    headdim: int = 128,
-    ultraattn_block_tokens: int = DEFAULT_ULTRAATTN_BLOCK_TOKENS,
-    skip_ultraattn_noncausal: bool = False,
-    skip_ultraattn_incompatible: bool = False,
 ) -> tuple[list[str], list[tuple[str, str]]]:
     compatible: list[str] = []
     skipped: list[tuple[str, str]] = []
@@ -314,21 +264,10 @@ def compatible_methods_for_mode(
             world_size,
             is_causal,
             zepplin_threshold,
-            ultraattn_plan_dir=ultraattn_plan_dir,
-            qhead=qhead,
-            kvhead=kvhead,
-            headdim=headdim,
-            ultraattn_block_tokens=ultraattn_block_tokens,
         )
         if reason is None:
             compatible.append(method)
-        elif skip_incompatible or (
-            method == "ultraattn"
-            and (
-                skip_ultraattn_incompatible
-                or (not is_causal and skip_ultraattn_noncausal)
-            )
-        ):
+        elif skip_incompatible:
             skipped.append((method, reason))
         else:
             raise SystemExit(f"method '{method}' is incompatible: {reason}")
@@ -509,7 +448,7 @@ def positive_int(value: str) -> int:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark hierarchical hybrid forward with all-CP baselines")
+    parser = argparse.ArgumentParser(description="Benchmark explicit-topology mega-ring forward with all-CP baselines")
     parser.add_argument("--global-seqlens", required=True)
     parser.add_argument("--ring-sizes", required=True)
     parser.add_argument("--ring-starts", required=True)
@@ -519,7 +458,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--allgather-overlapping-heads-k-stride",
         type=int,
-        default=1,
+        default=4,
         help="KV heads per all-gather/attention overlap pipeline chunk",
     )
     parser.add_argument("--mode", choices=("noncausal", "causal", "both"), default="causal")
@@ -540,24 +479,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--atol", type=float, default=2e-1)
     parser.add_argument("--rtol", type=float, default=2e-1)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--ultraattn-plan-dir",
-        default=str(DEMO_DIR / "baseline" / "UltraAttn" / "packing_plans"),
-        help="Directory containing offline-generated fixed-8K UltraAttn allocation plans",
-    )
-    parser.add_argument(
-        "--ultraattn-workspace-mib",
-        type=positive_int,
-        default=2048,
-        help="Maximum graph-node fusion workspace per UltraAttn varlen batch",
-    )
-    parser.add_argument(
-        "--ultraattn-block-tokens",
-        type=int,
-        choices=ULTRAATTN_BLOCK_TOKEN_CHOICES,
-        default=DEFAULT_ULTRAATTN_BLOCK_TOKENS,
-        help="Fixed UltraAttn graph scheduling block size (8192)",
-    )
     return parser.parse_args(argv)
 
 
@@ -572,7 +493,6 @@ def _main_single(
 ) -> list[ForwardSummarySample]:
     args = parse_args(argv)
     methods = parse_methods(args.methods)
-    ultraattn_selected_via_all = requests_all_methods(args.methods)
     summary_samples: list[ForwardSummarySample] = []
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         raise SystemExit("SM90 Hopper CUDA device is required")
@@ -623,8 +543,6 @@ def _main_single(
             "causal": [True],
             "both": [False, True],
         }[args.mode]
-        if args.mode == "both" and methods == ["ultraattn"]:
-            modes = [True]
         methods_by_mode: dict[bool, list[str]] = {}
         skipped_by_mode: dict[bool, list[tuple[str, str]]] = {}
         for is_causal in modes:
@@ -635,13 +553,6 @@ def _main_single(
                 is_causal,
                 skip_incompatible=skip_incompatible_methods,
                 zepplin_threshold=args.zepplin_threshold,
-                ultraattn_plan_dir=args.ultraattn_plan_dir,
-                qhead=args.qhead,
-                kvhead=args.kvhead,
-                headdim=args.headdim,
-                ultraattn_block_tokens=args.ultraattn_block_tokens,
-                skip_ultraattn_noncausal=args.mode == "both",
-                skip_ultraattn_incompatible=ultraattn_selected_via_all,
             )
             methods_by_mode[is_causal] = active_methods
             skipped_by_mode[is_causal] = skipped_methods
@@ -693,9 +604,6 @@ def _main_single(
                 f"{args.allgather_overlapping_heads_k_stride}, "
                 f"mode={args.mode}, sm_configs={sm_configs_s}, "
                 f"zepplin_threshold={args.zepplin_threshold}, "
-                f"ultraattn_plan_dir={args.ultraattn_plan_dir}, "
-                f"ultraattn_workspace_mib={args.ultraattn_workspace_mib}, "
-                f"ultraattn_block_tokens={args.ultraattn_block_tokens}, "
                 f"warmup={args.warmup_iters}, iters={args.num_iters}, "
                 f"check={args.check}"
             )
@@ -756,7 +664,6 @@ def _main_single(
                     flush=True,
                 )
             all_cp_runs: dict[str, tuple[Callable[[], object], str]] = {}
-            ultraattn_run = None
             expected_all_cp_out = None
             expected_llama3_out = None
             if any(method in BLOCK_ALL_CP_METHODS for method in active_methods):
@@ -855,57 +762,6 @@ def _main_single(
                             global_lengths,
                             is_causal,
                         )
-
-            if "ultraattn" in active_methods:
-                ultraattn_local_total = sum(global_lengths) // world_size
-                ultraattn_q, ultraattn_k, ultraattn_v = make_local_qkv(
-                    ultraattn_local_total,
-                    args.qhead,
-                    args.kvhead,
-                    args.headdim,
-                    rank,
-                    True,
-                    device,
-                    base_seed=args.seed + 73,
-                )
-                ultraattn_path = ultraattn_plan_path(
-                    args.ultraattn_plan_dir,
-                    global_lengths,
-                    world_size,
-                    args.qhead,
-                    args.kvhead,
-                    args.headdim,
-                    args.ultraattn_block_tokens,
-                )
-                ultraattn_runner = UltraAttnPackedCausalForward(
-                    dist.group.WORLD,
-                    ultraattn_q,
-                    ultraattn_k,
-                    ultraattn_v,
-                    global_lengths,
-                    ultraattn_path,
-                    workspace_mib=args.ultraattn_workspace_mib,
-                )
-                expected_ultraattn_out = None
-                expected_ultraattn_lse = None
-                if args.check:
-                    (
-                        expected_ultraattn_out,
-                        expected_ultraattn_lse,
-                    ) = ultraattn_packed_causal_reference(
-                        dist.group.WORLD,
-                        ultraattn_q,
-                        ultraattn_k,
-                        ultraattn_v,
-                        global_lengths,
-                    )
-                ultraattn_run = MethodRun(
-                    "ultraattn",
-                    ultraattn_runner.forward,
-                    expected_ultraattn_out,
-                    expected_ultraattn_lse,
-                    ultraattn_runner.note,
-                )
 
             mega_ring_all_cp_run_data = None
             if "mega_ring_all_cp" in active_methods:
@@ -1145,11 +1001,7 @@ def _main_single(
                     )
                 runs: list[MethodRun] = []
                 for method in config_methods:
-                    if method == "ultraattn":
-                        if ultraattn_run is None:
-                            raise RuntimeError("UltraAttn run was not prepared")
-                        runs.append(ultraattn_run)
-                    elif method == "zepplin":
+                    if method == "zepplin":
                         if zepplin_run is None:
                             raise RuntimeError("zepplin run was not prepared")
                         runs.append(zepplin_run)
@@ -1439,6 +1291,16 @@ def main(
         raise SystemExit("hierarchical communication requires D=128 and KVH * D == 1024")
     if args.qhead % args.kvhead:
         raise SystemExit("qhead must be divisible by kvhead")
+    if (
+        args.allgather_overlapping_heads_k_stride <= 0
+        or args.kvhead % args.allgather_overlapping_heads_k_stride
+    ):
+        raise SystemExit(
+            "--allgather-overlapping-heads-k-stride must be a positive divisor "
+            "of --kvhead, "
+            f"got stride={args.allgather_overlapping_heads_k_stride}, "
+            f"kvhead={args.kvhead}"
+        )
     for workload_case in workload_cases:
         if any(method != "zepplin" for method in methods):
             validate_metadata(

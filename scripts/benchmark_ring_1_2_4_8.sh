@@ -196,7 +196,7 @@ run_hierarchical_hybrid() {
     esac
 
     run_benchmark forward_hybrid "$world_size" "$visible_devices" \
-        ring_test/benchmark_hybrid_forward.py \
+        ring_test/benchmark_topology_forward.py \
         --global-seqlens "$global_seqlens" \
         --ring-sizes "$ring_sizes" \
         --ring-starts "$ring_starts" \

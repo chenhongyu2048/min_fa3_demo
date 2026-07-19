@@ -1,4 +1,4 @@
-"""Dataset-shaped frontend for the hierarchical hybrid forward benchmark."""
+"""Dataset-shaped frontend for the explicit-topology forward benchmark."""
 
 from __future__ import annotations
 
@@ -172,7 +172,7 @@ def print_workload(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate a dataset-shaped workload and run the hybrid forward benchmark"
+        description="Generate a dataset-shaped workload and run the explicit-topology forward benchmark"
     )
     parser.add_argument("--dataset", choices=tuple(balancer.DATASET_WEIGHTS), required=True)
     parser.add_argument("--target-tokens", type=int, default=balancer.MAX_SEQUENCE_TOKENS)
@@ -352,9 +352,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     ]
     forwarded_argv = _benchmark_argv(args, workloads[0])
 
-    import benchmark_hybrid_forward
+    import benchmark_topology_forward
 
-    benchmark_hybrid_forward.main(
+    benchmark_topology_forward.main(
         forwarded_argv,
         workload_cases=benchmark_cases,
         skip_incompatible_methods=_requests_all(args.methods),

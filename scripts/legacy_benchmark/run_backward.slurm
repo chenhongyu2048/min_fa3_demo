@@ -111,7 +111,7 @@ torchrun --standalone --nproc_per_node=8 \
 
 echo "Benchmarking hierarchical G8/G4/G2/G1 causal backward"
 torchrun --standalone --nproc_per_node=8 \
-    ring_test/benchmark_hybrid_backward.py \
+    ring_test/benchmark_topology_backward.py \
     --b 1,4 --seqlen 256,256 \
     --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
     --qhead 16 --kvhead 8 --headdim 128 \
@@ -123,7 +123,7 @@ torchrun --standalone --nproc_per_node=8 \
 # Optional full dataset-shaped sweep. Keep --no-check for the 128K workload;
 # the dense autograd reference has quadratic score memory.
 # torchrun --standalone --nproc_per_node=8 \
-#     ring_test/benchmark_hybrid_dataset_backward.py \
+#     ring_test/benchmark_dataset_backward.py \
 #     --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 4 \
 #     --qhead 32 --kvhead 8 --headdim 128 \
 #     --methods all \

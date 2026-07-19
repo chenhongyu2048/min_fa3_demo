@@ -58,7 +58,7 @@ half length `H`, and world size `W`, the front call uses `Sk=(r+1)*H` and the
 back call uses `Sk=(2*W-r)*H`. Their total KV work is identical on every rank,
 which preserves zigzag load balancing. This is the causal
 `allgather_attention` layout in both `benchmark_ring_forward.py` and
-`benchmark_hybrid_forward.py`.
+`benchmark_topology_forward.py`.
 
 If the FA3 Python package import fails, the `fa3` method falls back to the
 local `min_fa3_op.forward_varlen(..., return_lse=True)` block backend while
@@ -174,9 +174,9 @@ Use `--no-check` for timing-only sweeps. Local sequence lengths must be
 divisible by 256, and the current fused backward requires causal mode,
 `D=128`, `qhead % kvhead == 0`, and `kvhead * D == 1024`.
 
-### Hierarchical hybrid backward
+### Explicit-topology backward benchmark
 
-`benchmark_hybrid_backward.py` compares the same causal global workload with:
+`benchmark_topology_backward.py` compares the same causal global workload with:
 
 - `allgather_attention`: overlapped KV-head-sliced per-sequence zigzag all-gather backward
 - `llama3_allgather_attention`: overlapped KV-head-sliced whole-packed two-block all-gather backward
@@ -207,7 +207,7 @@ length for each generated batch is `seqlen[i] * ring_size`.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
-  ring_test/benchmark_hybrid_backward.py \
+  ring_test/benchmark_topology_backward.py \
   --b 1,4 --seqlen 256,256 \
   --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
   --qhead 16 --kvhead 8 --headdim 128 \
@@ -221,7 +221,7 @@ configuration sweep:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
-  ring_test/benchmark_hybrid_backward.py \
+  ring_test/benchmark_topology_backward.py \
   --global-seqlens 2048,1024,512,256 \
   --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
   --qhead 16 --kvhead 8 --headdim 128 \
@@ -268,12 +268,12 @@ torchrun --standalone --nproc_per_node=8 \
 The full scheduler/readiness/completion contract is recorded in
 `../docs/HIERARCHICAL_HYBRID_MEGA_RING_BACKWARD_DESIGN.md`.
 
-### Dataset-shaped hybrid backward
+### Dataset-shaped topology backward
 
-`benchmark_hybrid_dataset_backward.py` uses the same `balancer` workload as the
+`benchmark_dataset_backward.py` uses the same `balancer` workload as the
 forward dataset frontend. It samples Arxiv, Github, or Pile-CC lengths, packs
 the target token budget, prints the same placement/cap/load report, and calls
-`benchmark_hybrid_backward.main(...)` in the same process with explicit ring
+`benchmark_topology_backward.main(...)` in the same process with explicit ring
 metadata. Backward is causal-only and benchmarks the all-CP and hierarchical
 fused kernels together with the per-sequence all-gather, Llama3 all-gather,
 FA3/NCCL ring, and Zeppelin baselines. The dataset planner's hierarchical ring
@@ -282,7 +282,7 @@ placement from the global sequence lengths.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
-  ring_test/benchmark_hybrid_dataset_backward.py \
+  ring_test/benchmark_dataset_backward.py \
   --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 4 \
   --qhead 32 --kvhead 8 --headdim 128 \
   --methods all --zepplin-threshold 4096 \
@@ -290,13 +290,13 @@ torchrun --standalone --nproc_per_node=8 \
   --warmup-iters 10 --num-iters 40 --no-check
 
 DATASETS="arxiv github pile" GPU_COUNTS="2 4 8" NUM_CASES=4 DIRECTION=backward \
-  ZEPPLIN_THRESHOLD=4096 ./benchmark_hybrid_dataset.sh
+  ZEPPLIN_THRESHOLD=4096 ./benchmark_dataset.sh
 ```
 
 Planner-only inspection does not import or initialize CUDA:
 
 ```bash
-python ring_test/benchmark_hybrid_dataset_backward.py \
+python ring_test/benchmark_dataset_backward.py \
   --dataset github --target-tokens 131072 \
   --world-size 8 --print-workload
 ```
@@ -307,9 +307,9 @@ has quadratic score memory. The shell wrapper shares the forward wrapper's
 and `DRY_RUN` environment variables. `ZEPPLIN_THRESHOLD` controls the shared
 forward/backward threshold and defaults to `4096`.
 
-## Hybrid mega-ring benchmark
+## Explicit-topology mega-ring benchmark
 
-`benchmark_hybrid_forward.py` compares the same global varlen batch with six
+`benchmark_topology_forward.py` compares the same global varlen batch with six
 methods:
 
 - `allgather_attention`: KV-head-sliced, overlapped all-CP K/V all-gather with per-sequence zigzag partitioning
@@ -356,7 +356,7 @@ or UltraAttn PyNCCL.
 
 UltraAttn uses its dedicated copy of the explicit-topology frontend at
 `ring_test/ultraattn/benchmark_hybrid_forward.py`. The root-level
-`ring_test/benchmark_hybrid_forward.py` remains the original six-method
+`ring_test/benchmark_topology_forward.py` remains the original six-method
 benchmark and does not import the UltraAttn runtime.
 
 The fixed suite uses `1xG8`, `2xG4`, `4xG2`, `8xG1`, and two G1 sequences per
@@ -425,7 +425,7 @@ and the threshold must be a positive integer.
 Example:
 
 ```bash
-torchrun --standalone --nproc_per_node=2 ring_test/benchmark_hybrid_forward.py \
+torchrun --standalone --nproc_per_node=2 ring_test/benchmark_topology_forward.py \
   --global-seqlens 8192,1024,1024 \
   --ring-sizes 2,1,1 --ring-starts 0,0,1 \
   --qhead 16 --kvhead 8 --headdim 128 --methods all \
@@ -434,9 +434,9 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_hybrid_forward.py \
   --warmup-iters 5 --num-iters 20
 ```
 
-### Dataset-shaped hybrid workload
+### Dataset-shaped topology workload
 
-`benchmark_hybrid_dataset_forward.py` uses the standalone `balancer` package
+`benchmark_dataset_forward.py` uses the standalone `balancer` package
 to sample an Arxiv, Github, or Pile-CC length distribution and pack global
 batches to 128K tokens by default. `--seed` initializes one RNG stream;
 `--num-cases` consumes that stream continuously to build multiple complete
@@ -445,7 +445,7 @@ planner separately constrains maximum absolute token and attention-compute
 deviation. Within the feasible set it lexicographically protects short
 sequences from splitting before reducing communication, active groups, and
 residual imbalance. The frontend then calls
-`benchmark_hybrid_forward.main(...)` in the same process with the generated
+`benchmark_topology_forward.main(...)` in the same process with the generated
 ring metadata.
 
 All generated cases run under one process group. The fused mega-ring methods
@@ -472,13 +472,13 @@ can exceed `target_tokens` by fewer than 2048 tokens.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
-  ring_test/benchmark_hybrid_dataset_forward.py \
+  ring_test/benchmark_dataset_forward.py \
   --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 4 \
   --qhead 32 --kvhead 8 --headdim 128 \
   --mode causal --methods all --zepplin-threshold 4096 --no-check
 
 DATASETS="arxiv github pile" GPU_COUNTS="2 4 8" NUM_CASES=4 ZEPPLIN_THRESHOLD=4096 \
-  ./benchmark_hybrid_dataset.sh
+  ./benchmark_dataset.sh
 ```
 
 The requested compute and token tolerances default to 5% and 10%. BR-PBS first
