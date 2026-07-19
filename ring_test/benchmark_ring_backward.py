@@ -150,10 +150,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kvhead", type=int, default=8)
     parser.add_argument("--headdim", type=int, default=128)
     parser.add_argument(
-        "--llama3-heads-k-stride",
+        "--allgather-overlapping-heads-k-stride",
         type=int,
         default=1,
-        help="KV heads per Llama3 all-gather/attention pipeline chunk",
+        help="KV heads per all-gather/attention overlap pipeline chunk",
     )
     parser.add_argument("--methods", type=str, default="all")
     parser.add_argument("--num-comp-sm", type=int, default=64)
@@ -249,7 +249,7 @@ def build_method_runs(
     seed: int,
     allgather_backend: str,
     methods: list[str],
-    heads_k_stride: int = 1,
+    overlapping_heads_k_stride: int = 1,
 ) -> dict[str, MethodRun]:
     q, local_k, local_v, dout = make_inputs(case, local_rank, seed)
     cu, cu_host = make_cu_seqlens(case, q.device)
@@ -269,6 +269,7 @@ def build_method_runs(
         case.seqlen,
         True,
         allgather_backend,
+        heads_k_stride=overlapping_heads_k_stride,
         enable_backward=True,
     )
     allgather_run = MethodRun(
@@ -300,7 +301,7 @@ def build_method_runs(
             global_seqlens,
             True,
             allgather_backend,
-            heads_k_stride=heads_k_stride,
+            heads_k_stride=overlapping_heads_k_stride,
             enable_backward=True,
         )
         llama3_run = MethodRun(
@@ -504,7 +505,7 @@ def run_case(
         args.seed,
         args.allgather_backend,
         methods,
-        heads_k_stride=args.llama3_heads_k_stride,
+        overlapping_heads_k_stride=args.allgather_overlapping_heads_k_stride,
     )
     reference = None
     llama3_reference = None
@@ -616,12 +617,14 @@ def validate_args(
     if args.qhead % args.kvhead != 0:
         raise SystemExit("qhead must be divisible by kvhead")
     if (
-        args.llama3_heads_k_stride <= 0
-        or args.kvhead % args.llama3_heads_k_stride
+        args.allgather_overlapping_heads_k_stride <= 0
+        or args.kvhead % args.allgather_overlapping_heads_k_stride
     ):
         raise SystemExit(
-            "--llama3-heads-k-stride must be a positive divisor of --kvhead, "
-            f"got stride={args.llama3_heads_k_stride}, kvhead={args.kvhead}"
+            "--allgather-overlapping-heads-k-stride must be a positive divisor "
+            "of --kvhead, "
+            f"got stride={args.allgather_overlapping_heads_k_stride}, "
+            f"kvhead={args.kvhead}"
         )
     if args.kvhead * args.headdim != 1024:
         raise SystemExit("mega-ring communication requires kvhead * headdim == 1024")
@@ -677,7 +680,9 @@ def main() -> None:
             print(
                 f"Config: world_size={local_world_size}, methods={methods}, B={args.b}, "
                 f"seqlen={args.seqlen}, QH={args.qhead}, KVH={args.kvhead}, D={args.headdim}, "
-                f"llama3_heads_k_stride={args.llama3_heads_k_stride}, sm_configs={configs}, "
+                "allgather_overlapping_heads_k_stride="
+                f"{args.allgather_overlapping_heads_k_stride}, "
+                f"sm_configs={configs}, "
                 f"warmup={args.warmup_iters}, iters={args.num_iters}, "
                 f"check={args.check}"
             )

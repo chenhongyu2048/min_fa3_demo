@@ -363,18 +363,22 @@ torchrun --standalone --nproc_per_node=2 \
   ring_test/benchmark_ring_forward.py \
   --b 16,8,4 --seqlen 512,1024,2048 \
   --qhead 32 --kvhead 8 --headdim 128 --mode both \
-  --methods all --sm-configs 128:4,116:16 --no-check
+  --methods all --allgather-overlapping-heads-k-stride 1 \
+  --sm-configs 128:4,116:16 --no-check
 
 torchrun --standalone --nproc_per_node=2 \
   ring_test/benchmark_ring_backward.py \
   --b 4,4,4 --seqlen 256,512,1024 \
   --qhead 32 --kvhead 8 --headdim 128 \
-  --methods all --sm-configs 128:4,116:16 --no-check
+  --methods all --allgather-overlapping-heads-k-stride 1 \
+  --sm-configs 128:4,116:16 --no-check
 ```
 
 These distributed paths are single-node because `TKParallelTensor` uses local
 CUDA IPC. The hybrid benchmark consumes global lengths and explicit Buddy-ring
 metadata; the ordinary ring benchmarks consume per-rank local lengths.
+`--allgather-overlapping-heads-k-stride` is shared by the per-sequence and
+Llama3 all-gather baselines and must divide `--kvhead`.
 
 ### Direct kernel microbenchmarks
 

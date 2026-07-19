@@ -17,6 +17,7 @@ if str(RING_TEST_DIR) not in sys.path:
 
 import allgather_attention as allgather_module
 from allgather_attention import (
+    AllGatherAttention,
     Llama3AllGatherAttention,
     _llama3_block_metadata,
     llama3_rank_local_global_indices,
@@ -179,6 +180,58 @@ class Llama3AllGatherLayoutTest(unittest.TestCase):
                 [8],
                 True,
                 "min_fa3",
+                heads_k_stride=1,
+                enable_backward=True,
+            )
+            out = runner.forward()
+            dq, dk, dv = runner.backward(dout)
+
+        expected_out = q.clone()
+        for kv_head in range(k.size(1)):
+            q_head_slice = slice(2 * kv_head, 2 * (kv_head + 1))
+            expected_out[:4, q_head_slice] += k[:4, kv_head].mean(dim=0)
+            expected_out[4:, q_head_slice] += k[:, kv_head].mean(dim=0)
+        expected_dk = k * 3
+        expected_dk[:4] += k[:4] * 3
+        expected_dv = v * 5
+        expected_dv[:4] += v[:4] * 5
+
+        torch.testing.assert_close(out, expected_out)
+        torch.testing.assert_close(dq, dout * 2)
+        torch.testing.assert_close(dk, expected_dk)
+        torch.testing.assert_close(dv, expected_dv)
+
+    def test_per_sequence_kv_head_pipeline_preserves_values(self) -> None:
+        q = torch.arange(8 * 4 * 2, dtype=torch.float32).view(8, 4, 2)
+        k = torch.arange(8 * 2 * 2, dtype=torch.float32).view(8, 2, 2)
+        v = (k + 100).clone()
+        dout = torch.full_like(q, 2.0)
+
+        with (
+            mock.patch.object(allgather_module.dist, "get_rank", return_value=0),
+            mock.patch.object(allgather_module.dist, "get_world_size", return_value=1),
+            mock.patch.object(
+                allgather_module.dist,
+                "all_gather_into_tensor",
+                side_effect=_fake_all_gather_into_tensor,
+            ),
+            mock.patch.object(
+                allgather_module.dist,
+                "reduce_scatter_tensor",
+                side_effect=_fake_reduce_scatter_tensor,
+            ),
+            mock.patch.object(allgather_module, "_local_forward", side_effect=_fake_local_forward),
+            mock.patch.object(allgather_module, "_local_backward", side_effect=_fake_local_backward),
+        ):
+            runner = AllGatherAttention(
+                None,
+                q,
+                k,
+                v,
+                batch_size=1,
+                local_seqlen=8,
+                causal=True,
+                backend="min_fa3",
                 heads_k_stride=1,
                 enable_backward=True,
             )

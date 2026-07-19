@@ -23,7 +23,7 @@ export CPLUS_INCLUDE_PATH=$CUDNN_HOME/include:${CPLUS_INCLUDE_PATH:-}
 
 cd /data/home/scyb683/run/min_fa3_demo
 
-LLAMA3_HEADS_K_STRIDE=${LLAMA3_HEADS_K_STRIDE:-1}
+ALLGATHER_OVERLAPPING_HEADS_K_STRIDE=${ALLGATHER_OVERLAPPING_HEADS_K_STRIDE:-1}
 
 # The login node can build the extension. Uncomment when the job should rebuild it.
 # MAX_JOBS=2 make
@@ -94,7 +94,7 @@ echo "Benchmarking two-GPU all-CP causal ring backward"
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_backward.py \
     --b 4,4,4 --seqlen 256,512,1024 --qhead 32 --kvhead 8 --headdim 128 \
     --methods all --num-comp-sm 64 --num-comm-sm 8 \
-    --llama3-heads-k-stride "$LLAMA3_HEADS_K_STRIDE" \
+    --allgather-overlapping-heads-k-stride "$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE" \
     --warmup-iters 5 --num-iters 20 --check
 
 echo "Checking hierarchical G8/G4/G2/G1 causal backward"
@@ -117,7 +117,7 @@ torchrun --standalone --nproc_per_node=8 \
     --qhead 16 --kvhead 8 --headdim 128 \
     --methods all \
     --num-comp-sm 100 --num-comm-sm 16 \
-    --llama3-heads-k-stride "$LLAMA3_HEADS_K_STRIDE" \
+    --allgather-overlapping-heads-k-stride "$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE" \
     --warmup-iters 5 --num-iters 20
 
 # Optional full dataset-shaped sweep. Keep --no-check for the 128K workload;

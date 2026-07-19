@@ -26,6 +26,7 @@ MODE=${MODE:-causal}
 QHEAD=${QHEAD:-32}
 KVHEAD=${KVHEAD:-8}
 HEADDIM=${HEADDIM:-128}
+ALLGATHER_OVERLAPPING_HEADS_K_STRIDE=${ALLGATHER_OVERLAPPING_HEADS_K_STRIDE:-4}
 SM_CONFIGS=${SM_CONFIGS:-"128:4,124:8,120:12,116:16"}
 WARMUP_ITERS=${WARMUP_ITERS:-10}
 NUM_ITERS=${NUM_ITERS:-40}
@@ -78,6 +79,8 @@ fi
     die "ZEPPLIN_THRESHOLD must be a positive integer, got '$ZEPPLIN_THRESHOLD'"
 [[ "$NUM_CASES" =~ ^[1-9][0-9]*$ ]] || \
     die "NUM_CASES must be a positive integer, got '$NUM_CASES'"
+[[ "$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE" =~ ^[1-9][0-9]*$ ]] || \
+    die "ALLGATHER_OVERLAPPING_HEADS_K_STRIDE must be a positive integer, got '$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE'"
 [[ "$BEAM_WIDTH" =~ ^[1-9][0-9]*$ ]] || \
     die "BEAM_WIDTH must be a positive integer, got '$BEAM_WIDTH'"
 [[ "$FINALIST_COUNT" =~ ^[1-9][0-9]*$ ]] || \
@@ -157,6 +160,7 @@ run_benchmark() {
         --seed "$SEED"
         --num-cases "$NUM_CASES"
         --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM"
+        --allgather-overlapping-heads-k-stride "$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE"
         --zepplin-threshold "$ZEPPLIN_THRESHOLD"
         --sm-configs "$SM_CONFIGS"
         --warmup-iters "$WARMUP_ITERS" --num-iters "$NUM_ITERS"
@@ -195,7 +199,7 @@ fi
 echo "Log: $LOG_FILE"
 echo "Datasets: ${DATASET_LIST[*]}"
 echo "Config: direction=$DIRECTION, target_tokens=$TARGET_TOKENS, compute_tolerance=$COMPUTE_BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, beam_width=$BEAM_WIDTH, finalist_count=$FINALIST_COUNT, structure_threshold=$STRUCTURE_THRESHOLD, max_repair_iterations=$MAX_REPAIR_ITERATIONS, seed=$SEED, num_cases=$NUM_CASES, mode=$MODE, zepplin_threshold=$ZEPPLIN_THRESHOLD"
-echo "Methods: $METHODS"
+echo "Methods: $METHODS; allgather_overlapping_heads_k_stride=$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE"
 
 for world_size in "${GPU_COUNT_LIST[@]}"; do
     select_devices "$world_size"

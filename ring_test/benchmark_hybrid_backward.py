@@ -744,6 +744,7 @@ def benchmark_topology(
                 all_cp_v,
                 all_cp_lengths,
                 allgather_backend,
+                heads_k_stride=args.allgather_overlapping_heads_k_stride,
             )
             baseline_runs["allgather_attention"] = MethodRun(
                 allgather_runner.forward,
@@ -773,7 +774,7 @@ def benchmark_topology(
                 global_lengths,
                 True,
                 allgather_backend,
-                heads_k_stride=args.llama3_heads_k_stride,
+                heads_k_stride=args.allgather_overlapping_heads_k_stride,
                 enable_backward=True,
             )
             llama_reference = None
@@ -1334,10 +1335,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--kvhead", type=int, default=8)
     parser.add_argument("--headdim", type=int, default=128)
     parser.add_argument(
-        "--llama3-heads-k-stride",
+        "--allgather-overlapping-heads-k-stride",
         type=int,
         default=4,
-        help="KV heads per Llama3 all-gather/attention pipeline chunk",
+        help="KV heads per all-gather/attention overlap pipeline chunk",
     )
     parser.add_argument("--mode", choices=("causal",), default="causal")
     parser.add_argument(
@@ -1376,12 +1377,14 @@ def main(
     if args.qhead % args.kvhead:
         raise SystemExit("qhead must be divisible by kvhead")
     if (
-        args.llama3_heads_k_stride <= 0
-        or args.kvhead % args.llama3_heads_k_stride
+        args.allgather_overlapping_heads_k_stride <= 0
+        or args.kvhead % args.allgather_overlapping_heads_k_stride
     ):
         raise SystemExit(
-            "--llama3-heads-k-stride must be a positive divisor of --kvhead, "
-            f"got stride={args.llama3_heads_k_stride}, kvhead={args.kvhead}"
+            "--allgather-overlapping-heads-k-stride must be a positive divisor "
+            "of --kvhead, "
+            f"got stride={args.allgather_overlapping_heads_k_stride}, "
+            f"kvhead={args.kvhead}"
         )
     if args.warmup_iters < 0 or args.num_iters <= 0:
         raise SystemExit("warmup iterations must be non-negative and measured iterations positive")
@@ -1416,6 +1419,8 @@ def main(
                 f"Hierarchical mega-ring causal backward: world_size={world_size}, "
                 f"methods={requested_methods}, "
                 f"QH={args.qhead}, KVH={args.kvhead}, D={args.headdim}, "
+                "allgather_overlapping_heads_k_stride="
+                f"{args.allgather_overlapping_heads_k_stride}, "
                 f"sm_configs={configs}, "
                 f"zepplin_threshold={args.zepplin_threshold}, "
                 f"warmup={args.warmup_iters}, "

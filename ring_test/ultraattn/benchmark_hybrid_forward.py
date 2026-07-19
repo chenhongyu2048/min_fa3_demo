@@ -517,10 +517,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--kvhead", type=int, default=8)
     parser.add_argument("--headdim", type=int, default=128)
     parser.add_argument(
-        "--llama3-heads-k-stride",
+        "--allgather-overlapping-heads-k-stride",
         type=int,
         default=1,
-        help="KV heads per Llama3 all-gather/attention pipeline chunk",
+        help="KV heads per all-gather/attention overlap pipeline chunk",
     )
     parser.add_argument("--mode", choices=("noncausal", "causal", "both"), default="causal")
     parser.add_argument(
@@ -581,12 +581,14 @@ def _main_single(
     if args.qhead % args.kvhead:
         raise SystemExit("qhead must be divisible by kvhead")
     if (
-        args.llama3_heads_k_stride <= 0
-        or args.kvhead % args.llama3_heads_k_stride
+        args.allgather_overlapping_heads_k_stride <= 0
+        or args.kvhead % args.allgather_overlapping_heads_k_stride
     ):
         raise SystemExit(
-            "--llama3-heads-k-stride must be a positive divisor of --kvhead, "
-            f"got stride={args.llama3_heads_k_stride}, kvhead={args.kvhead}"
+            "--allgather-overlapping-heads-k-stride must be a positive divisor "
+            "of --kvhead, "
+            f"got stride={args.allgather_overlapping_heads_k_stride}, "
+            f"kvhead={args.kvhead}"
         )
     if args.warmup_iters < 0 or args.num_iters <= 0:
         raise SystemExit("warmup iterations must be non-negative and measured iterations must be positive")
@@ -687,6 +689,8 @@ def _main_single(
             print(
                 f"Config: world_size={world_size}, methods={methods}, "
                 f"QH={args.qhead}, KVH={args.kvhead}, D={args.headdim}, "
+                "allgather_overlapping_heads_k_stride="
+                f"{args.allgather_overlapping_heads_k_stride}, "
                 f"mode={args.mode}, sm_configs={sm_configs_s}, "
                 f"zepplin_threshold={args.zepplin_threshold}, "
                 f"ultraattn_plan_dir={args.ultraattn_plan_dir}, "
@@ -780,6 +784,7 @@ def _main_single(
                         all_cp_lengths,
                         is_causal,
                         block_backend,
+                        heads_k_stride=args.allgather_overlapping_heads_k_stride,
                     )
                     all_cp_runs["allgather_attention"] = (
                         allgather_runner.forward,
@@ -805,7 +810,7 @@ def _main_single(
                         global_lengths,
                         is_causal,
                         block_backend,
-                        heads_k_stride=args.llama3_heads_k_stride,
+                        heads_k_stride=args.allgather_overlapping_heads_k_stride,
                     )
                     all_cp_runs["llama3_allgather_attention"] = (
                         llama3_runner.forward,

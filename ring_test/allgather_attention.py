@@ -394,16 +394,8 @@ def _llama3_block_metadata(
     )
 
 
-@dataclass
-class _ForwardState:
-    out_front: Optional[torch.Tensor] = None
-    out_back: Optional[torch.Tensor] = None
-    lse_front: Optional[torch.Tensor] = None
-    lse_back: Optional[torch.Tensor] = None
-
-
 class AllGatherAttention:
-    """Reusable all-gather attention runner with preallocated communication buffers."""
+    """Per-sequence zigzag all-gather attention with KV-head pipelining."""
 
     def __init__(
         self,
@@ -416,6 +408,7 @@ class AllGatherAttention:
         causal: bool,
         backend: str,
         *,
+        heads_k_stride: int = 1,
         enable_backward: bool = False,
     ) -> None:
         if backend not in ("external_fa3", "min_fa3"):
@@ -425,6 +418,17 @@ class AllGatherAttention:
         expected_tokens = batch_size * local_seqlen
         if q.size(0) != expected_tokens or k.size(0) != expected_tokens or v.size(0) != expected_tokens:
             raise ValueError("Q/K/V token counts must equal batch_size * local_seqlen")
+        if k.shape != v.shape or q.size(2) != k.size(2):
+            raise ValueError("K/V shapes and Q/K/V head dimensions must match")
+        if q.size(1) % k.size(1):
+            raise ValueError(
+                f"Q head count must divide by KV head count, got QH={q.size(1)}, KVH={k.size(1)}"
+            )
+        if not 0 < heads_k_stride <= k.size(1) or k.size(1) % heads_k_stride:
+            raise ValueError(
+                "heads_k_stride must be a positive divisor of the KV head count, "
+                f"got heads_k_stride={heads_k_stride}, KVH={k.size(1)}"
+            )
 
         self.process_group = process_group
         self.rank = dist.get_rank(process_group)
@@ -437,29 +441,80 @@ class AllGatherAttention:
         self.causal = causal
         self.backend = backend
         self.enable_backward = enable_backward
+        self.heads_k_stride = heads_k_stride
+        self.q_heads_per_kv_head = q.size(1) // k.size(1)
+        self.q_heads_per_chunk = heads_k_stride * self.q_heads_per_kv_head
         self.half = local_seqlen // 2
         self.local_tokens = expected_tokens
         self.global_seqlen = self.world_size * local_seqlen
-        self.state = _ForwardState()
+        self._forward_ready = False
 
-        gathered_shape = (self.world_size * expected_tokens, k.size(1), k.size(2))
-        ordered_shape = (batch_size * self.global_seqlen, k.size(1), k.size(2))
-        self.gathered_k = torch.empty(gathered_shape, dtype=k.dtype, device=k.device)
-        self.gathered_v = torch.empty_like(self.gathered_k)
-        self.ordered_k = torch.empty(ordered_shape, dtype=k.dtype, device=k.device)
-        self.ordered_v = torch.empty_like(self.ordered_k)
+        gathered_shape = (
+            2,
+            2,
+            self.world_size * expected_tokens,
+            heads_k_stride,
+            k.size(2),
+        )
+        ordered_shape = (
+            2,
+            2,
+            batch_size * self.global_seqlen,
+            heads_k_stride,
+            k.size(2),
+        )
+        self.kv_gather = torch.empty(gathered_shape, dtype=k.dtype, device=k.device)
+        self.kv_ordered = torch.empty(ordered_shape, dtype=k.dtype, device=k.device)
+        self.kv_send = torch.empty(
+            (2, expected_tokens, heads_k_stride, k.size(2)),
+            dtype=k.dtype,
+            device=k.device,
+        )
+        self.q_chunk = torch.empty(
+            (expected_tokens, self.q_heads_per_chunk, q.size(2)),
+            dtype=q.dtype,
+            device=q.device,
+        )
         self.out = torch.empty_like(q)
         if enable_backward:
-            if not causal:
-                self.full_dk = torch.empty_like(self.ordered_k)
-                self.full_dv = torch.empty_like(self.ordered_v)
-            self.rank_major_dk = torch.empty(gathered_shape, dtype=torch.float32, device=k.device)
-            self.rank_major_dv = torch.empty_like(self.rank_major_dk)
             self.local_dk_fp32 = torch.empty_like(k, dtype=torch.float32)
             self.local_dv_fp32 = torch.empty_like(v, dtype=torch.float32)
             self.local_dk = torch.empty_like(k)
             self.local_dv = torch.empty_like(v)
             self.dq = torch.empty_like(q)
+            self.backward_dout_chunk = torch.empty_like(self.q_chunk)
+            self.backward_out_chunk = torch.empty_like(self.q_chunk)
+            self.backward_dq_chunk = torch.empty_like(self.q_chunk)
+            self.backward_block_dkv = torch.empty(
+                (
+                    2,
+                    batch_size * self.global_seqlen,
+                    heads_k_stride,
+                    k.size(2),
+                ),
+                dtype=k.dtype,
+                device=k.device,
+            )
+            self.backward_ordered_dkv = torch.empty(
+                (
+                    2,
+                    batch_size * self.global_seqlen,
+                    heads_k_stride,
+                    k.size(2),
+                ),
+                dtype=torch.float32,
+                device=k.device,
+            )
+            self.backward_rank_major_dkv = torch.empty(
+                (2, self.world_size * expected_tokens, heads_k_stride, k.size(2)),
+                dtype=torch.float32,
+                device=k.device,
+            )
+            self.backward_local_dkv_fp32 = torch.empty(
+                (2, expected_tokens, heads_k_stride, k.size(2)),
+                dtype=torch.float32,
+                device=k.device,
+            )
 
         self.full_cu_q, self.full_cu_q_host = _uniform_cu(batch_size, local_seqlen, q.device)
         self.global_cu_k, self.global_cu_k_host = _uniform_cu(batch_size, self.global_seqlen, q.device)
@@ -467,9 +522,9 @@ class AllGatherAttention:
         if causal:
             front_k_len = (self.rank + 1) * self.half
             back_k_len = (2 * self.world_size - self.rank) * self.half
-            q_half_shape = (batch_size * self.half, q.size(1), q.size(2))
-            front_k_shape = (batch_size * front_k_len, k.size(1), k.size(2))
-            back_k_shape = (batch_size * back_k_len, k.size(1), k.size(2))
+            q_half_shape = (batch_size * self.half, self.q_heads_per_chunk, q.size(2))
+            front_k_shape = (batch_size * front_k_len, heads_k_stride, k.size(2))
+            back_k_shape = (batch_size * back_k_len, heads_k_stride, k.size(2))
             self.q_front = torch.empty(q_half_shape, dtype=q.dtype, device=q.device)
             self.q_back = torch.empty_like(self.q_front)
             self.k_front = torch.empty(front_k_shape, dtype=k.dtype, device=k.device)
@@ -479,34 +534,87 @@ class AllGatherAttention:
             if enable_backward:
                 self.dout_front = torch.empty_like(self.q_front)
                 self.dout_back = torch.empty_like(self.q_back)
+                self.backward_out_front = torch.empty_like(self.q_front)
+                self.backward_out_back = torch.empty_like(self.q_back)
                 self.dq_front = torch.empty_like(self.q_front)
                 self.dq_back = torch.empty_like(self.q_back)
                 self.dk_front = torch.empty_like(self.k_front)
                 self.dv_front = torch.empty_like(self.v_front)
                 self.dk_back = torch.empty_like(self.k_back)
                 self.dv_back = torch.empty_like(self.v_back)
-                self.ordered_dk = torch.empty_like(self.ordered_k, dtype=torch.float32)
-                self.ordered_dv = torch.empty_like(self.ordered_v, dtype=torch.float32)
             self.half_cu_q, self.half_cu_q_host = _uniform_cu(batch_size, self.half, q.device)
             self.front_cu_k, self.front_cu_k_host = _uniform_cu(batch_size, front_k_len, q.device)
             self.back_cu_k, self.back_cu_k_host = _uniform_cu(batch_size, back_k_len, q.device)
 
+        lse_tokens = batch_size * (self.half if causal else local_seqlen)
+        self.forward_lse_front = torch.empty(
+            (q.size(1), lse_tokens), dtype=torch.float32, device=q.device
+        )
+        self.forward_lse_back = (
+            torch.empty_like(self.forward_lse_front) if causal else None
+        )
+
     @property
     def note(self) -> str:
-        note = backend_note(self.backend)
-        return note if self.causal else note.replace("; zigzag causal", "; noncausal")
+        backend = (
+            "external FA3"
+            if self.backend == "external_fa3"
+            else "in-repo min_fa3 fallback"
+        )
+        mode = "zigzag causal" if self.causal else "noncausal"
+        return (
+            "per-sequence KV-head-sharded all-gather "
+            f"({self.heads_k_stride} KVH/chunk, comm/compute overlap); "
+            f"{backend}; {mode}"
+        )
 
-    def _gather_and_order_kv(self) -> None:
-        dist.all_gather_into_tensor(self.gathered_k, self.k, group=self.process_group)
-        dist.all_gather_into_tensor(self.gathered_v, self.v, group=self.process_group)
-        gathered_k = self.gathered_k.view(
-            self.world_size, self.batch_size, self.local_seqlen, self.k.size(1), self.k.size(2)
+    def _q_head_slice(self, kv_head_start: int) -> slice:
+        q_head_start = kv_head_start * self.q_heads_per_kv_head
+        return slice(q_head_start, q_head_start + self.q_heads_per_chunk)
+
+    def _start_kv_all_gather(
+        self, buffer_idx: int, kv_head_start: int
+    ) -> tuple[object, object]:
+        kv_head_slice = slice(kv_head_start, kv_head_start + self.heads_k_stride)
+        self.kv_send[0].copy_(self.k[:, kv_head_slice])
+        self.kv_send[1].copy_(self.v[:, kv_head_slice])
+        k_work = dist.all_gather_into_tensor(
+            self.kv_gather[buffer_idx, 0],
+            self.kv_send[0],
+            group=self.process_group,
+            async_op=True,
         )
-        gathered_v = self.gathered_v.view_as(gathered_k)
-        ordered_k = self.ordered_k.view(
-            self.batch_size, self.global_seqlen, self.k.size(1), self.k.size(2)
+        v_work = dist.all_gather_into_tensor(
+            self.kv_gather[buffer_idx, 1],
+            self.kv_send[1],
+            group=self.process_group,
+            async_op=True,
         )
-        ordered_v = self.ordered_v.view_as(ordered_k)
+        if k_work is None or v_work is None:
+            raise RuntimeError("asynchronous K/V all-gather returned no Work handle")
+        return k_work, v_work
+
+    @staticmethod
+    def _wait_kv_all_gather(work: tuple[object, object]) -> None:
+        for item in work:
+            item.wait()  # type: ignore[attr-defined]
+
+    def _order_kv_chunk(self, buffer_idx: int) -> None:
+        gathered_k = self.kv_gather[buffer_idx, 0].view(
+            self.world_size,
+            self.batch_size,
+            self.local_seqlen,
+            self.heads_k_stride,
+            self.k.size(2),
+        )
+        gathered_v = self.kv_gather[buffer_idx, 1].view_as(gathered_k)
+        ordered_k = self.kv_ordered[buffer_idx, 0].view(
+            self.batch_size,
+            self.global_seqlen,
+            self.heads_k_stride,
+            self.k.size(2),
+        )
+        ordered_v = self.kv_ordered[buffer_idx, 1].view_as(ordered_k)
 
         for batch_idx in range(self.batch_size):
             if not self.causal:
@@ -545,74 +653,114 @@ class AllGatherAttention:
         )
 
     def forward(self) -> torch.Tensor:
-        self._gather_and_order_kv()
-        if not self.causal:
-            out, lse = self._run_forward_block(
-                self.q,
-                self.ordered_k,
-                self.ordered_v,
-                self.full_cu_q,
-                self.global_cu_k,
-                self.full_cu_q_host,
-                self.global_cu_k_host,
-                self.local_seqlen,
+        self._forward_ready = False
+        current_buffer = 0
+        current_work = self._start_kv_all_gather(current_buffer, 0)
+        for kv_head_start in range(0, self.k.size(1), self.heads_k_stride):
+            self._wait_kv_all_gather(current_work)
+            self._order_kv_chunk(current_buffer)
+
+            q_head_slice = self._q_head_slice(kv_head_start)
+            self.q_chunk.copy_(self.q[:, q_head_slice])
+            next_kv_head_start = kv_head_start + self.heads_k_stride
+            if next_kv_head_start < self.k.size(1):
+                next_buffer = 1 - current_buffer
+                current_work = self._start_kv_all_gather(
+                    next_buffer, next_kv_head_start
+                )
+
+            if not self.causal:
+                out, lse = self._run_forward_block(
+                    self.q_chunk,
+                    self.kv_ordered[current_buffer, 0],
+                    self.kv_ordered[current_buffer, 1],
+                    self.full_cu_q,
+                    self.global_cu_k,
+                    self.full_cu_q_host,
+                    self.global_cu_k_host,
+                    self.local_seqlen,
+                    self.global_seqlen,
+                    False,
+                )
+                self.out[:, q_head_slice].copy_(out)
+                self.forward_lse_front[q_head_slice].copy_(lse)
+                current_buffer = 1 - current_buffer
+                continue
+
+            ordered_k = self.kv_ordered[current_buffer, 0].view(
+                self.batch_size,
                 self.global_seqlen,
-                False,
+                self.heads_k_stride,
+                self.k.size(2),
             )
-            self.out.copy_(out)
-            self.state = _ForwardState(out_front=out, lse_front=lse)
-            return self.out
+            ordered_v = self.kv_ordered[current_buffer, 1].view_as(ordered_k)
+            q = self.q_chunk.view(
+                self.batch_size, self.local_seqlen, self.q_heads_per_chunk, self.q.size(2)
+            )
+            q_front = self.q_front.view(
+                self.batch_size, self.half, self.q_heads_per_chunk, self.q.size(2)
+            )
+            q_back = self.q_back.view_as(q_front)
+            k_front = self.k_front.view(
+                self.batch_size, -1, self.heads_k_stride, self.k.size(2)
+            )
+            v_front = self.v_front.view_as(k_front)
+            k_back = self.k_back.view(
+                self.batch_size, -1, self.heads_k_stride, self.k.size(2)
+            )
+            v_back = self.v_back.view_as(k_back)
+            for batch_idx in range(self.batch_size):
+                q_front[batch_idx].copy_(q[batch_idx, : self.half])
+                q_back[batch_idx].copy_(q[batch_idx, self.half :])
+                k_front[batch_idx].copy_(ordered_k[batch_idx, : k_front.size(1)])
+                v_front[batch_idx].copy_(ordered_v[batch_idx, : v_front.size(1)])
+                k_back[batch_idx].copy_(ordered_k[batch_idx, : k_back.size(1)])
+                v_back[batch_idx].copy_(ordered_v[batch_idx, : v_back.size(1)])
 
-        ordered_k = self.ordered_k.view(
-            self.batch_size, self.global_seqlen, self.k.size(1), self.k.size(2)
-        )
-        ordered_v = self.ordered_v.view_as(ordered_k)
-        q = self.q.view(self.batch_size, self.local_seqlen, self.q.size(1), self.q.size(2))
-        k_front = self.k_front.view(self.batch_size, -1, self.k.size(1), self.k.size(2))
-        v_front = self.v_front.view_as(k_front)
-        k_back = self.k_back.view(self.batch_size, -1, self.k.size(1), self.k.size(2))
-        v_back = self.v_back.view_as(k_back)
-        q_front = self.q_front.view(self.batch_size, self.half, self.q.size(1), self.q.size(2))
-        q_back = self.q_back.view_as(q_front)
-        for batch_idx in range(self.batch_size):
-            q_front[batch_idx].copy_(q[batch_idx, : self.half])
-            q_back[batch_idx].copy_(q[batch_idx, self.half :])
-            k_front[batch_idx].copy_(ordered_k[batch_idx, : k_front.size(1)])
-            v_front[batch_idx].copy_(ordered_v[batch_idx, : v_front.size(1)])
-            k_back[batch_idx].copy_(ordered_k[batch_idx, : k_back.size(1)])
-            v_back[batch_idx].copy_(ordered_v[batch_idx, : v_back.size(1)])
+            out_front, lse_front = self._run_forward_block(
+                self.q_front,
+                self.k_front,
+                self.v_front,
+                self.half_cu_q,
+                self.front_cu_k,
+                self.half_cu_q_host,
+                self.front_cu_k_host,
+                self.half,
+                self.k_front.size(0) // self.batch_size,
+                True,
+            )
+            out_back, lse_back = self._run_forward_block(
+                self.q_back,
+                self.k_back,
+                self.v_back,
+                self.half_cu_q,
+                self.back_cu_k,
+                self.half_cu_q_host,
+                self.back_cu_k_host,
+                self.half,
+                self.k_back.size(0) // self.batch_size,
+                True,
+            )
+            out_view = self.out.view(
+                self.batch_size, self.local_seqlen, self.q.size(1), self.q.size(2)
+            )
+            packed_front = out_front.view(
+                self.batch_size, self.half, self.q_heads_per_chunk, self.q.size(2)
+            )
+            packed_back = out_back.view_as(packed_front)
+            for batch_idx in range(self.batch_size):
+                out_view[batch_idx, : self.half, q_head_slice].copy_(
+                    packed_front[batch_idx]
+                )
+                out_view[batch_idx, self.half :, q_head_slice].copy_(
+                    packed_back[batch_idx]
+                )
+            self.forward_lse_front[q_head_slice].copy_(lse_front)
+            assert self.forward_lse_back is not None
+            self.forward_lse_back[q_head_slice].copy_(lse_back)
+            current_buffer = 1 - current_buffer
 
-        out_front, lse_front = self._run_forward_block(
-            self.q_front,
-            self.k_front,
-            self.v_front,
-            self.half_cu_q,
-            self.front_cu_k,
-            self.half_cu_q_host,
-            self.front_cu_k_host,
-            self.half,
-            self.k_front.size(0) // self.batch_size,
-            True,
-        )
-        out_back, lse_back = self._run_forward_block(
-            self.q_back,
-            self.k_back,
-            self.v_back,
-            self.half_cu_q,
-            self.back_cu_k,
-            self.half_cu_q_host,
-            self.back_cu_k_host,
-            self.half,
-            self.k_back.size(0) // self.batch_size,
-            True,
-        )
-        out = self.out.view(self.batch_size, self.local_seqlen, self.q.size(1), self.q.size(2))
-        packed_front = out_front.view(self.batch_size, self.half, self.q.size(1), self.q.size(2))
-        packed_back = out_back.view_as(packed_front)
-        for batch_idx in range(self.batch_size):
-            out[batch_idx, : self.half].copy_(packed_front[batch_idx])
-            out[batch_idx, self.half :].copy_(packed_back[batch_idx])
-        self.state = _ForwardState(out_front, out_back, lse_front, lse_back)
+        self._forward_ready = True
         return self.out
 
     def _run_backward_block(
@@ -642,10 +790,17 @@ class AllGatherAttention:
 
     def _ordered_grads_to_rank_major(self, ordered: torch.Tensor, rank_major: torch.Tensor) -> None:
         ordered_view = ordered.view(
-            self.batch_size, self.global_seqlen, self.k.size(1), self.k.size(2)
+            self.batch_size,
+            self.global_seqlen,
+            self.heads_k_stride,
+            self.k.size(2),
         )
         rank_view = rank_major.view(
-            self.world_size, self.batch_size, self.local_seqlen, self.k.size(1), self.k.size(2)
+            self.world_size,
+            self.batch_size,
+            self.local_seqlen,
+            self.heads_k_stride,
+            self.k.size(2),
         )
         for batch_idx in range(self.batch_size):
             for rank_idx in range(self.world_size):
@@ -662,109 +817,189 @@ class AllGatherAttention:
     def backward(self, dout: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not self.enable_backward:
             raise RuntimeError("all-gather attention runner was created without backward workspaces")
-        if self.state.out_front is None or self.state.lse_front is None:
+        if not self._forward_ready:
             raise RuntimeError("all-gather attention backward requires a prepared forward")
+        if dout.shape != self.q.shape:
+            raise ValueError("dout must match the local Q shape")
 
-        if not self.causal:
-            dq, dk, dv = self._run_backward_block(
-                dout,
-                self.q,
-                self.ordered_k,
-                self.ordered_v,
-                self.state.out_front,
-                self.state.lse_front,
-                self.full_cu_q,
-                self.global_cu_k,
-                self.local_seqlen,
-                self.global_seqlen,
-                False,
-                self.dq,
-                self.full_dk,
-                self.full_dv,
-            )
-            self._ordered_grads_to_rank_major(dk, self.rank_major_dk)
-            self._ordered_grads_to_rank_major(dv, self.rank_major_dv)
-        else:
-            if self.state.out_back is None or self.state.lse_back is None:
-                raise RuntimeError("zigzag all-gather backward is missing back-half forward state")
-            dout_view = dout.view(
-                self.batch_size, self.local_seqlen, self.q.size(1), self.q.size(2)
-            )
-            packed_dout_front = self.dout_front.view(
-                self.batch_size, self.half, self.q.size(1), self.q.size(2)
-            )
-            packed_dout_back = self.dout_back.view_as(packed_dout_front)
-            for batch_idx in range(self.batch_size):
-                packed_dout_front[batch_idx].copy_(dout_view[batch_idx, : self.half])
-                packed_dout_back[batch_idx].copy_(dout_view[batch_idx, self.half :])
+        current_buffer = 0
+        current_work = self._start_kv_all_gather(current_buffer, 0)
+        for kv_head_start in range(0, self.k.size(1), self.heads_k_stride):
+            self._wait_kv_all_gather(current_work)
+            self._order_kv_chunk(current_buffer)
 
-            dq_front, dk_front, dv_front = self._run_backward_block(
-                self.dout_front,
-                self.q_front,
-                self.k_front,
-                self.v_front,
-                self.state.out_front,
-                self.state.lse_front,
-                self.half_cu_q,
-                self.front_cu_k,
-                self.half,
-                self.k_front.size(0) // self.batch_size,
-                True,
-                self.dq_front,
-                self.dk_front,
-                self.dv_front,
-            )
-            dq_back, dk_back, dv_back = self._run_backward_block(
-                self.dout_back,
-                self.q_back,
-                self.k_back,
-                self.v_back,
-                self.state.out_back,
-                self.state.lse_back,
-                self.half_cu_q,
-                self.back_cu_k,
-                self.half,
-                self.k_back.size(0) // self.batch_size,
-                True,
-                self.dq_back,
-                self.dk_back,
-                self.dv_back,
-            )
-            dq = self.dq
-            dq_view = dq.view(self.batch_size, self.local_seqlen, self.q.size(1), self.q.size(2))
-            dq_front_view = dq_front.view(self.batch_size, self.half, self.q.size(1), self.q.size(2))
-            dq_back_view = dq_back.view_as(dq_front_view)
-            for batch_idx in range(self.batch_size):
-                dq_view[batch_idx, : self.half].copy_(dq_front_view[batch_idx])
-                dq_view[batch_idx, self.half :].copy_(dq_back_view[batch_idx])
+            q_head_slice = self._q_head_slice(kv_head_start)
+            self.q_chunk.copy_(self.q[:, q_head_slice])
+            self.backward_dout_chunk.copy_(dout[:, q_head_slice])
+            self.backward_out_chunk.copy_(self.out[:, q_head_slice])
+            next_kv_head_start = kv_head_start + self.heads_k_stride
+            if next_kv_head_start < self.k.size(1):
+                next_buffer = 1 - current_buffer
+                current_work = self._start_kv_all_gather(
+                    next_buffer, next_kv_head_start
+                )
 
-            self.ordered_dk.zero_()
-            self.ordered_dv.zero_()
-            ordered_dk = self.ordered_dk.view(
-                self.batch_size, self.global_seqlen, self.k.size(1), self.k.size(2)
-            )
-            ordered_dv = self.ordered_dv.view_as(ordered_dk)
-            dk_front = dk_front.view(self.batch_size, -1, self.k.size(1), self.k.size(2))
-            dv_front = dv_front.view_as(dk_front)
-            dk_back = dk_back.view(self.batch_size, -1, self.k.size(1), self.k.size(2))
-            dv_back = dv_back.view_as(dk_back)
-            for batch_idx in range(self.batch_size):
-                ordered_dk[batch_idx, : dk_front.size(1)].add_(dk_front[batch_idx])
-                ordered_dv[batch_idx, : dv_front.size(1)].add_(dv_front[batch_idx])
-                ordered_dk[batch_idx, : dk_back.size(1)].add_(dk_back[batch_idx])
-                ordered_dv[batch_idx, : dv_back.size(1)].add_(dv_back[batch_idx])
-            self._ordered_grads_to_rank_major(self.ordered_dk, self.rank_major_dk)
-            self._ordered_grads_to_rank_major(self.ordered_dv, self.rank_major_dv)
+            self.backward_ordered_dkv.zero_()
+            if not self.causal:
+                dk = self.backward_block_dkv[0]
+                dv = self.backward_block_dkv[1]
+                dq, dk, dv = self._run_backward_block(
+                    self.backward_dout_chunk,
+                    self.q_chunk,
+                    self.kv_ordered[current_buffer, 0],
+                    self.kv_ordered[current_buffer, 1],
+                    self.backward_out_chunk,
+                    self.forward_lse_front[q_head_slice],
+                    self.full_cu_q,
+                    self.global_cu_k,
+                    self.local_seqlen,
+                    self.global_seqlen,
+                    False,
+                    self.backward_dq_chunk,
+                    dk,
+                    dv,
+                )
+                self.backward_ordered_dkv[0].copy_(dk)
+                self.backward_ordered_dkv[1].copy_(dv)
+                self.dq[:, q_head_slice].copy_(dq)
+            else:
+                assert self.forward_lse_back is not None
+                q = self.q_chunk.view(
+                    self.batch_size,
+                    self.local_seqlen,
+                    self.q_heads_per_chunk,
+                    self.q.size(2),
+                )
+                dout_view = self.backward_dout_chunk.view_as(q)
+                out_view = self.backward_out_chunk.view_as(q)
+                q_front = self.q_front.view(
+                    self.batch_size,
+                    self.half,
+                    self.q_heads_per_chunk,
+                    self.q.size(2),
+                )
+                q_back = self.q_back.view_as(q_front)
+                dout_front = self.dout_front.view_as(q_front)
+                dout_back = self.dout_back.view_as(q_front)
+                out_front = self.backward_out_front.view_as(q_front)
+                out_back = self.backward_out_back.view_as(q_front)
+                ordered_k = self.kv_ordered[current_buffer, 0].view(
+                    self.batch_size,
+                    self.global_seqlen,
+                    self.heads_k_stride,
+                    self.k.size(2),
+                )
+                ordered_v = self.kv_ordered[current_buffer, 1].view_as(ordered_k)
+                k_front = self.k_front.view(
+                    self.batch_size, -1, self.heads_k_stride, self.k.size(2)
+                )
+                v_front = self.v_front.view_as(k_front)
+                k_back = self.k_back.view(
+                    self.batch_size, -1, self.heads_k_stride, self.k.size(2)
+                )
+                v_back = self.v_back.view_as(k_back)
+                for batch_idx in range(self.batch_size):
+                    q_front[batch_idx].copy_(q[batch_idx, : self.half])
+                    q_back[batch_idx].copy_(q[batch_idx, self.half :])
+                    dout_front[batch_idx].copy_(dout_view[batch_idx, : self.half])
+                    dout_back[batch_idx].copy_(dout_view[batch_idx, self.half :])
+                    out_front[batch_idx].copy_(out_view[batch_idx, : self.half])
+                    out_back[batch_idx].copy_(out_view[batch_idx, self.half :])
+                    k_front[batch_idx].copy_(ordered_k[batch_idx, : k_front.size(1)])
+                    v_front[batch_idx].copy_(ordered_v[batch_idx, : v_front.size(1)])
+                    k_back[batch_idx].copy_(ordered_k[batch_idx, : k_back.size(1)])
+                    v_back[batch_idx].copy_(ordered_v[batch_idx, : v_back.size(1)])
 
-        dist.reduce_scatter_tensor(
-            self.local_dk_fp32, self.rank_major_dk, group=self.process_group
-        )
-        dist.reduce_scatter_tensor(
-            self.local_dv_fp32, self.rank_major_dv, group=self.process_group
-        )
+                dq_front, dk_front, dv_front = self._run_backward_block(
+                    self.dout_front,
+                    self.q_front,
+                    self.k_front,
+                    self.v_front,
+                    out_front.reshape_as(self.q_front),
+                    self.forward_lse_front[q_head_slice],
+                    self.half_cu_q,
+                    self.front_cu_k,
+                    self.half,
+                    self.k_front.size(0) // self.batch_size,
+                    True,
+                    self.dq_front,
+                    self.dk_front,
+                    self.dv_front,
+                )
+                dq_back, dk_back, dv_back = self._run_backward_block(
+                    self.dout_back,
+                    self.q_back,
+                    self.k_back,
+                    self.v_back,
+                    out_back.reshape_as(self.q_back),
+                    self.forward_lse_back[q_head_slice],
+                    self.half_cu_q,
+                    self.back_cu_k,
+                    self.half,
+                    self.k_back.size(0) // self.batch_size,
+                    True,
+                    self.dq_back,
+                    self.dk_back,
+                    self.dv_back,
+                )
+                dq_view = self.dq.view(
+                    self.batch_size, self.local_seqlen, self.q.size(1), self.q.size(2)
+                )
+                dq_front_view = dq_front.view_as(q_front)
+                dq_back_view = dq_back.view_as(q_back)
+                ordered_dk = self.backward_ordered_dkv[0].view(
+                    self.batch_size,
+                    self.global_seqlen,
+                    self.heads_k_stride,
+                    self.k.size(2),
+                )
+                ordered_dv = self.backward_ordered_dkv[1].view_as(ordered_dk)
+                dk_front = dk_front.view_as(k_front)
+                dv_front = dv_front.view_as(v_front)
+                dk_back = dk_back.view_as(k_back)
+                dv_back = dv_back.view_as(v_back)
+                for batch_idx in range(self.batch_size):
+                    dq_view[batch_idx, : self.half, q_head_slice].copy_(
+                        dq_front_view[batch_idx]
+                    )
+                    dq_view[batch_idx, self.half :, q_head_slice].copy_(
+                        dq_back_view[batch_idx]
+                    )
+                    ordered_dk[batch_idx, : dk_front.size(1)].add_(dk_front[batch_idx])
+                    ordered_dv[batch_idx, : dv_front.size(1)].add_(dv_front[batch_idx])
+                    ordered_dk[batch_idx, : dk_back.size(1)].add_(dk_back[batch_idx])
+                    ordered_dv[batch_idx, : dv_back.size(1)].add_(dv_back[batch_idx])
+
+            self._ordered_grads_to_rank_major(
+                self.backward_ordered_dkv[0], self.backward_rank_major_dkv[0]
+            )
+            self._ordered_grads_to_rank_major(
+                self.backward_ordered_dkv[1], self.backward_rank_major_dkv[1]
+            )
+            dist.reduce_scatter_tensor(
+                self.backward_local_dkv_fp32[0],
+                self.backward_rank_major_dkv[0],
+                group=self.process_group,
+            )
+            dist.reduce_scatter_tensor(
+                self.backward_local_dkv_fp32[1],
+                self.backward_rank_major_dkv[1],
+                group=self.process_group,
+            )
+            kv_head_slice = slice(
+                kv_head_start, kv_head_start + self.heads_k_stride
+            )
+            self.local_dk_fp32[:, kv_head_slice].copy_(
+                self.backward_local_dkv_fp32[0]
+            )
+            self.local_dv_fp32[:, kv_head_slice].copy_(
+                self.backward_local_dkv_fp32[1]
+            )
+            current_buffer = 1 - current_buffer
+
         self.local_dk.copy_(self.local_dk_fp32)
         self.local_dv.copy_(self.local_dv_fp32)
-        return dq, self.local_dk, self.local_dv
+        return self.dq, self.local_dk, self.local_dv
 
 
 class Llama3AllGatherAttention:

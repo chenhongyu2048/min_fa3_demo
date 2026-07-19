@@ -121,7 +121,7 @@ class _BlockBackend:
 
 
 class VarlenAllGatherBackward(_BlockBackend):
-    """Per-sequence zigzag all-gather with batched varlen FA backward."""
+    """KV-head-pipelined per-sequence all-gather with varlen FA backward."""
 
     def __init__(
         self,
@@ -131,12 +131,23 @@ class VarlenAllGatherBackward(_BlockBackend):
         v: torch.Tensor,
         local_lengths: list[int],
         backend: str,
+        *,
+        heads_k_stride: int = 1,
     ) -> None:
         super().__init__(backend)
         if not local_lengths or any(length <= 0 or length % 2 for length in local_lengths):
             raise ValueError("causal all-gather requires positive even local lengths")
         if q.size(0) != sum(local_lengths) or k.size(0) != q.size(0) or v.shape != k.shape:
             raise ValueError("Q/K/V do not match the packed local lengths")
+        if q.size(1) % k.size(1):
+            raise ValueError(
+                f"Q head count must divide by KV head count, got QH={q.size(1)}, KVH={k.size(1)}"
+            )
+        if not 0 < heads_k_stride <= k.size(1) or k.size(1) % heads_k_stride:
+            raise ValueError(
+                "heads_k_stride must be a positive divisor of the KV head count, "
+                f"got heads_k_stride={heads_k_stride}, KVH={k.size(1)}"
+            )
 
         self.process_group = process_group
         self.rank = dist.get_rank(process_group)
@@ -146,6 +157,9 @@ class VarlenAllGatherBackward(_BlockBackend):
         self.v = v
         self.local_total = sum(local_lengths)
         self.global_total = self.world_size * self.local_total
+        self.heads_k_stride = heads_k_stride
+        self.q_heads_per_kv_head = q.size(1) // k.size(1)
+        self.q_heads_per_chunk = heads_k_stride * self.q_heads_per_kv_head
 
         global_order: list[int] = []
         q_front_indices: list[int] = []
@@ -190,40 +204,75 @@ class VarlenAllGatherBackward(_BlockBackend):
         self.max_front_k = max(front_k_lengths)
         self.max_back_k = max(back_k_lengths)
 
-        gathered_shape = (self.global_total, k.size(1), k.size(2))
-        self.gathered_k = torch.empty(gathered_shape, dtype=k.dtype, device=device)
-        self.gathered_v = torch.empty_like(self.gathered_k)
-        self.ordered_k = torch.empty_like(self.gathered_k)
-        self.ordered_v = torch.empty_like(self.gathered_v)
-        self.q_front = q.index_select(0, self.q_front_indices).contiguous()
-        self.q_back = q.index_select(0, self.q_back_indices).contiguous()
+        kv_chunk_shape = (
+            2,
+            2,
+            self.global_total,
+            heads_k_stride,
+            k.size(2),
+        )
+        self.kv_gather = torch.empty(kv_chunk_shape, dtype=k.dtype, device=device)
+        self.kv_ordered = torch.empty_like(self.kv_gather)
+        self.kv_send = torch.empty(
+            (2, self.local_total, heads_k_stride, k.size(2)),
+            dtype=k.dtype,
+            device=device,
+        )
+        self.q_chunk = torch.empty(
+            (self.local_total, self.q_heads_per_chunk, q.size(2)),
+            dtype=q.dtype,
+            device=device,
+        )
+        self.q_front = torch.empty(
+            (len(q_front_indices), self.q_heads_per_chunk, q.size(2)),
+            dtype=q.dtype,
+            device=device,
+        )
+        self.q_back = torch.empty_like(self.q_front)
         self.k_front = torch.empty(
-            (len(k_front_indices), k.size(1), k.size(2)), dtype=k.dtype, device=device
+            (len(k_front_indices), heads_k_stride, k.size(2)),
+            dtype=k.dtype,
+            device=device,
         )
         self.v_front = torch.empty_like(self.k_front)
         self.k_back = torch.empty(
-            (len(k_back_indices), k.size(1), k.size(2)), dtype=k.dtype, device=device
+            (len(k_back_indices), heads_k_stride, k.size(2)),
+            dtype=k.dtype,
+            device=device,
         )
         self.v_back = torch.empty_like(self.k_back)
         self.out = torch.empty_like(q)
-        self.out_front: torch.Tensor | None = None
-        self.out_back: torch.Tensor | None = None
-        self.lse_front: torch.Tensor | None = None
-        self.lse_back: torch.Tensor | None = None
+        self.lse_front = torch.empty(
+            (q.size(1), len(q_front_indices)), dtype=torch.float32, device=device
+        )
+        self.lse_back = torch.empty_like(self.lse_front)
+        self._forward_ready = False
 
         self.dout_front = torch.empty_like(self.q_front)
         self.dout_back = torch.empty_like(self.q_back)
+        self.out_front = torch.empty_like(self.q_front)
+        self.out_back = torch.empty_like(self.q_back)
         self.dq_front = torch.empty_like(self.q_front)
         self.dq_back = torch.empty_like(self.q_back)
         self.dk_front = torch.empty_like(self.k_front)
         self.dv_front = torch.empty_like(self.v_front)
         self.dk_back = torch.empty_like(self.k_back)
         self.dv_back = torch.empty_like(self.v_back)
+        self.dout_chunk = torch.empty_like(self.q_chunk)
+        self.out_chunk = torch.empty_like(self.q_chunk)
+        self.dq_chunk = torch.empty_like(self.q_chunk)
         self.dq = torch.empty_like(q)
-        self.ordered_dk = torch.empty_like(self.ordered_k, dtype=torch.float32)
-        self.ordered_dv = torch.empty_like(self.ordered_v, dtype=torch.float32)
-        self.rank_major_dk = torch.empty_like(self.gathered_k, dtype=torch.float32)
-        self.rank_major_dv = torch.empty_like(self.gathered_v, dtype=torch.float32)
+        self.ordered_dkv = torch.empty(
+            (2, self.global_total, heads_k_stride, k.size(2)),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.rank_major_dkv = torch.empty_like(self.ordered_dkv)
+        self.local_dkv_fp32 = torch.empty(
+            (2, self.local_total, heads_k_stride, k.size(2)),
+            dtype=torch.float32,
+            device=device,
+        )
         self.local_dk_fp32 = torch.empty_like(k, dtype=torch.float32)
         self.local_dv_fp32 = torch.empty_like(v, dtype=torch.float32)
         self.local_dk = torch.empty_like(k)
@@ -231,101 +280,280 @@ class VarlenAllGatherBackward(_BlockBackend):
 
     @property
     def note(self) -> str:
-        return f"per-sequence all-gather; {self.backend_name}; zigzag causal"
+        return (
+            "per-sequence KV-head-sharded all-gather "
+            f"({self.heads_k_stride} KVH/chunk, comm/compute overlap); "
+            f"{self.backend_name}; zigzag causal"
+        )
+
+    def _q_head_slice(self, kv_head_start: int) -> slice:
+        q_head_start = kv_head_start * self.q_heads_per_kv_head
+        return slice(q_head_start, q_head_start + self.q_heads_per_chunk)
+
+    def _start_kv_all_gather(
+        self, buffer_idx: int, kv_head_start: int
+    ) -> tuple[object, object]:
+        kv_head_slice = slice(kv_head_start, kv_head_start + self.heads_k_stride)
+        self.kv_send[0].copy_(self.k[:, kv_head_slice])
+        self.kv_send[1].copy_(self.v[:, kv_head_slice])
+        k_work = dist.all_gather_into_tensor(
+            self.kv_gather[buffer_idx, 0],
+            self.kv_send[0],
+            group=self.process_group,
+            async_op=True,
+        )
+        v_work = dist.all_gather_into_tensor(
+            self.kv_gather[buffer_idx, 1],
+            self.kv_send[1],
+            group=self.process_group,
+            async_op=True,
+        )
+        if k_work is None or v_work is None:
+            raise RuntimeError("asynchronous K/V all-gather returned no Work handle")
+        return k_work, v_work
+
+    @staticmethod
+    def _wait_kv_all_gather(work: tuple[object, object]) -> None:
+        for item in work:
+            item.wait()  # type: ignore[attr-defined]
+
+    def _order_kv_chunk(self, buffer_idx: int) -> None:
+        torch.index_select(
+            self.kv_gather[buffer_idx, 0],
+            0,
+            self.global_order,
+            out=self.kv_ordered[buffer_idx, 0],
+        )
+        torch.index_select(
+            self.kv_gather[buffer_idx, 1],
+            0,
+            self.global_order,
+            out=self.kv_ordered[buffer_idx, 1],
+        )
 
     def forward(self) -> torch.Tensor:
-        dist.all_gather_into_tensor(self.gathered_k, self.k, group=self.process_group)
-        dist.all_gather_into_tensor(self.gathered_v, self.v, group=self.process_group)
-        torch.index_select(self.gathered_k, 0, self.global_order, out=self.ordered_k)
-        torch.index_select(self.gathered_v, 0, self.global_order, out=self.ordered_v)
-        torch.index_select(self.ordered_k, 0, self.k_front_indices, out=self.k_front)
-        torch.index_select(self.ordered_v, 0, self.k_front_indices, out=self.v_front)
-        torch.index_select(self.ordered_k, 0, self.k_back_indices, out=self.k_back)
-        torch.index_select(self.ordered_v, 0, self.k_back_indices, out=self.v_back)
+        self._forward_ready = False
+        current_buffer = 0
+        current_work = self._start_kv_all_gather(current_buffer, 0)
+        for kv_head_start in range(0, self.k.size(1), self.heads_k_stride):
+            self._wait_kv_all_gather(current_work)
+            self._order_kv_chunk(current_buffer)
 
-        self.out_front, self.lse_front = self.forward_block(
-            self.q_front,
-            self.k_front,
-            self.v_front,
-            self.half_cu,
-            self.front_k_cu,
-            self.half_cu_host,
-            self.front_k_cu_host,
-            self.max_half,
-            self.max_front_k,
-            True,
-        )
-        self.out_back, self.lse_back = self.forward_block(
-            self.q_back,
-            self.k_back,
-            self.v_back,
-            self.half_cu,
-            self.back_k_cu,
-            self.half_cu_host,
-            self.back_k_cu_host,
-            self.max_half,
-            self.max_back_k,
-            True,
-        )
-        self.out.index_copy_(0, self.q_front_indices, self.out_front)
-        self.out.index_copy_(0, self.q_back_indices, self.out_back)
+            q_head_slice = self._q_head_slice(kv_head_start)
+            self.q_chunk.copy_(self.q[:, q_head_slice])
+            next_kv_head_start = kv_head_start + self.heads_k_stride
+            if next_kv_head_start < self.k.size(1):
+                next_buffer = 1 - current_buffer
+                current_work = self._start_kv_all_gather(
+                    next_buffer, next_kv_head_start
+                )
+
+            torch.index_select(
+                self.q_chunk, 0, self.q_front_indices, out=self.q_front
+            )
+            torch.index_select(
+                self.q_chunk, 0, self.q_back_indices, out=self.q_back
+            )
+            torch.index_select(
+                self.kv_ordered[current_buffer, 0],
+                0,
+                self.k_front_indices,
+                out=self.k_front,
+            )
+            torch.index_select(
+                self.kv_ordered[current_buffer, 1],
+                0,
+                self.k_front_indices,
+                out=self.v_front,
+            )
+            torch.index_select(
+                self.kv_ordered[current_buffer, 0],
+                0,
+                self.k_back_indices,
+                out=self.k_back,
+            )
+            torch.index_select(
+                self.kv_ordered[current_buffer, 1],
+                0,
+                self.k_back_indices,
+                out=self.v_back,
+            )
+
+            out_front, lse_front = self.forward_block(
+                self.q_front,
+                self.k_front,
+                self.v_front,
+                self.half_cu,
+                self.front_k_cu,
+                self.half_cu_host,
+                self.front_k_cu_host,
+                self.max_half,
+                self.max_front_k,
+                True,
+            )
+            out_back, lse_back = self.forward_block(
+                self.q_back,
+                self.k_back,
+                self.v_back,
+                self.half_cu,
+                self.back_k_cu,
+                self.half_cu_host,
+                self.back_k_cu_host,
+                self.max_half,
+                self.max_back_k,
+                True,
+            )
+            self.out[:, q_head_slice].index_copy_(
+                0, self.q_front_indices, out_front
+            )
+            self.out[:, q_head_slice].index_copy_(
+                0, self.q_back_indices, out_back
+            )
+            self.lse_front[q_head_slice].copy_(lse_front)
+            self.lse_back[q_head_slice].copy_(lse_back)
+            current_buffer = 1 - current_buffer
+
+        self._forward_ready = True
         return self.out
 
     def backward(self, dout: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.out_front is None or self.out_back is None:
+        if not self._forward_ready:
             raise RuntimeError("all-gather backward requires a prepared forward")
-        if self.lse_front is None or self.lse_back is None:
-            raise RuntimeError("all-gather backward is missing forward LSE")
-        torch.index_select(dout, 0, self.q_front_indices, out=self.dout_front)
-        torch.index_select(dout, 0, self.q_back_indices, out=self.dout_back)
-        dq_front, dk_front, dv_front = self.backward_block(
-            self.dout_front,
-            self.q_front,
-            self.k_front,
-            self.v_front,
-            self.out_front,
-            self.lse_front,
-            self.half_cu,
-            self.front_k_cu,
-            self.max_half,
-            self.max_front_k,
-            True,
-            self.dq_front,
-            self.dk_front,
-            self.dv_front,
-        )
-        dq_back, dk_back, dv_back = self.backward_block(
-            self.dout_back,
-            self.q_back,
-            self.k_back,
-            self.v_back,
-            self.out_back,
-            self.lse_back,
-            self.half_cu,
-            self.back_k_cu,
-            self.max_half,
-            self.max_back_k,
-            True,
-            self.dq_back,
-            self.dk_back,
-            self.dv_back,
-        )
-        self.dq.index_copy_(0, self.q_front_indices, dq_front)
-        self.dq.index_copy_(0, self.q_back_indices, dq_back)
-        self.ordered_dk.zero_()
-        self.ordered_dv.zero_()
-        self.ordered_dk.index_add_(0, self.k_front_indices, dk_front.float())
-        self.ordered_dv.index_add_(0, self.k_front_indices, dv_front.float())
-        self.ordered_dk.index_add_(0, self.k_back_indices, dk_back.float())
-        self.ordered_dv.index_add_(0, self.k_back_indices, dv_back.float())
-        self.rank_major_dk.index_copy_(0, self.global_order, self.ordered_dk)
-        self.rank_major_dv.index_copy_(0, self.global_order, self.ordered_dv)
-        dist.reduce_scatter_tensor(
-            self.local_dk_fp32, self.rank_major_dk, group=self.process_group
-        )
-        dist.reduce_scatter_tensor(
-            self.local_dv_fp32, self.rank_major_dv, group=self.process_group
-        )
+        if dout.shape != self.q.shape:
+            raise ValueError("dout must match the local Q shape")
+
+        current_buffer = 0
+        current_work = self._start_kv_all_gather(current_buffer, 0)
+        for kv_head_start in range(0, self.k.size(1), self.heads_k_stride):
+            self._wait_kv_all_gather(current_work)
+            self._order_kv_chunk(current_buffer)
+
+            q_head_slice = self._q_head_slice(kv_head_start)
+            self.q_chunk.copy_(self.q[:, q_head_slice])
+            self.dout_chunk.copy_(dout[:, q_head_slice])
+            self.out_chunk.copy_(self.out[:, q_head_slice])
+            next_kv_head_start = kv_head_start + self.heads_k_stride
+            if next_kv_head_start < self.k.size(1):
+                next_buffer = 1 - current_buffer
+                current_work = self._start_kv_all_gather(
+                    next_buffer, next_kv_head_start
+                )
+
+            torch.index_select(
+                self.q_chunk, 0, self.q_front_indices, out=self.q_front
+            )
+            torch.index_select(
+                self.q_chunk, 0, self.q_back_indices, out=self.q_back
+            )
+            torch.index_select(
+                self.dout_chunk, 0, self.q_front_indices, out=self.dout_front
+            )
+            torch.index_select(
+                self.dout_chunk, 0, self.q_back_indices, out=self.dout_back
+            )
+            torch.index_select(
+                self.out_chunk, 0, self.q_front_indices, out=self.out_front
+            )
+            torch.index_select(
+                self.out_chunk, 0, self.q_back_indices, out=self.out_back
+            )
+            torch.index_select(
+                self.kv_ordered[current_buffer, 0],
+                0,
+                self.k_front_indices,
+                out=self.k_front,
+            )
+            torch.index_select(
+                self.kv_ordered[current_buffer, 1],
+                0,
+                self.k_front_indices,
+                out=self.v_front,
+            )
+            torch.index_select(
+                self.kv_ordered[current_buffer, 0],
+                0,
+                self.k_back_indices,
+                out=self.k_back,
+            )
+            torch.index_select(
+                self.kv_ordered[current_buffer, 1],
+                0,
+                self.k_back_indices,
+                out=self.v_back,
+            )
+
+            dq_front, dk_front, dv_front = self.backward_block(
+                self.dout_front,
+                self.q_front,
+                self.k_front,
+                self.v_front,
+                self.out_front,
+                self.lse_front[q_head_slice],
+                self.half_cu,
+                self.front_k_cu,
+                self.max_half,
+                self.max_front_k,
+                True,
+                self.dq_front,
+                self.dk_front,
+                self.dv_front,
+            )
+            dq_back, dk_back, dv_back = self.backward_block(
+                self.dout_back,
+                self.q_back,
+                self.k_back,
+                self.v_back,
+                self.out_back,
+                self.lse_back[q_head_slice],
+                self.half_cu,
+                self.back_k_cu,
+                self.max_half,
+                self.max_back_k,
+                True,
+                self.dq_back,
+                self.dk_back,
+                self.dv_back,
+            )
+            self.dq_chunk.index_copy_(0, self.q_front_indices, dq_front)
+            self.dq_chunk.index_copy_(0, self.q_back_indices, dq_back)
+            self.dq[:, q_head_slice].copy_(self.dq_chunk)
+
+            self.ordered_dkv.zero_()
+            self.ordered_dkv[0].index_add_(
+                0, self.k_front_indices, dk_front.float()
+            )
+            self.ordered_dkv[1].index_add_(
+                0, self.k_front_indices, dv_front.float()
+            )
+            self.ordered_dkv[0].index_add_(
+                0, self.k_back_indices, dk_back.float()
+            )
+            self.ordered_dkv[1].index_add_(
+                0, self.k_back_indices, dv_back.float()
+            )
+            self.rank_major_dkv[0].index_copy_(
+                0, self.global_order, self.ordered_dkv[0]
+            )
+            self.rank_major_dkv[1].index_copy_(
+                0, self.global_order, self.ordered_dkv[1]
+            )
+            dist.reduce_scatter_tensor(
+                self.local_dkv_fp32[0],
+                self.rank_major_dkv[0],
+                group=self.process_group,
+            )
+            dist.reduce_scatter_tensor(
+                self.local_dkv_fp32[1],
+                self.rank_major_dkv[1],
+                group=self.process_group,
+            )
+            kv_head_slice = slice(
+                kv_head_start, kv_head_start + self.heads_k_stride
+            )
+            self.local_dk_fp32[:, kv_head_slice].copy_(self.local_dkv_fp32[0])
+            self.local_dv_fp32[:, kv_head_slice].copy_(self.local_dkv_fp32[1])
+            current_buffer = 1 - current_buffer
+
         self.local_dk.copy_(self.local_dk_fp32)
         self.local_dv.copy_(self.local_dv_fp32)
         return self.dq, self.local_dk, self.local_dv

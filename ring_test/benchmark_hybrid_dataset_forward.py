@@ -219,6 +219,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--qhead", type=int, default=32)
     parser.add_argument("--kvhead", type=int, default=8)
     parser.add_argument("--headdim", type=int, default=128)
+    parser.add_argument(
+        "--allgather-overlapping-heads-k-stride",
+        type=_positive_int,
+        default=4,
+        help="KV heads per all-gather/attention overlap pipeline chunk",
+    )
     parser.add_argument("--mode", choices=("noncausal", "causal", "both"), default="causal")
     parser.add_argument("--methods", default="all")
     parser.add_argument(
@@ -273,6 +279,8 @@ def _benchmark_argv(
         str(args.kvhead),
         "--headdim",
         str(args.headdim),
+        "--allgather-overlapping-heads-k-stride",
+        str(args.allgather_overlapping_heads_k_stride),
         "--mode",
         args.mode,
         "--methods",

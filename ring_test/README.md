@@ -10,14 +10,15 @@ The `fa3` method runs a real Python-side ring:
 - each block attention call returns `(out, lse)`
 - per-step outputs are merged with the usual online LSE update
 
-`allgather_attention` is the all-CP baseline. It gathers every rank's K/V,
-reorders the gathered tensors into one batch-major global sequence, and runs
-varlen FlashAttention for the local Q. The timed forward includes K/V
-all-gather, reordering, and attention. The baseline uses the external FA3
-varlen forward/backward implementation when it is importable on every rank;
-otherwise every rank consistently falls back to the local
-`min_fa3_op.forward_varlen` / `backward_varlen` implementation. The result Note
-column reports the backend that was selected.
+`allgather_attention` is the per-sequence all-CP baseline. It preserves the
+existing per-sequence zigzag ordering, but gathers K/V one contiguous KV-head
+slice at a time. Its two receive buffers ping-pong: after slice `i` is ready,
+the all-gather for slice `i + 1` starts before attention runs for slice `i`.
+The timed forward includes K/V all-gather, reordering, and attention. The
+baseline uses the external FA3 varlen forward/backward implementation when it
+is importable on every rank; otherwise every rank consistently falls back to
+the local `min_fa3_op.forward_varlen` / `backward_varlen` implementation. The
+result Note column reports the backend that was selected.
 
 `llama3_allgather_attention` is the whole-packed all-CP baseline. Instead of
 zigzag-partitioning every sequence independently, it concatenates the global
@@ -32,15 +33,16 @@ current attention work while preserving the GQA mapping from each KV slice to
 its corresponding Q-head range. It uses the same external-FA3/local-min-FA3
 backend selection as `allgather_attention`.
 
-`--llama3-heads-k-stride` controls the number of KV heads in one pipeline
-slice. It must be a positive divisor of `--kvhead` and defaults to `1`.
+`--allgather-overlapping-heads-k-stride` controls the number of KV heads in
+one pipeline slice for both `allgather_attention` and
+`llama3_allgather_attention`. It must be a positive divisor of `--kvhead`.
 Smaller values create more communication/computation overlap but launch more
 all-gathers and attention calls; larger values reduce launch overhead. The
-same head slicing is used by the Llama3 all-gather backward path before each
-FP32 dK/dV reduce-scatter. This option is supported by the ring, hybrid, and
-UltraAttn hybrid benchmark entry points. The checked-in Slurm scripts and the
-`scripts/benchmark_ring_1_2_4_8.sh` sweep expose the same setting through
-`LLAMA3_HEADS_K_STRIDE`, also defaulting to `1`.
+same head slicing is used by both all-gather backward paths before each FP32
+dK/dV reduce-scatter. The ordinary ring and retained UltraAttn entry points
+default to `1`; the explicit and dataset-shaped hybrid entry points default to
+`4`. The checked-in shell and Slurm scripts pass the option explicitly through
+`ALLGATHER_OVERLAPPING_HEADS_K_STRIDE`.
 
 For causal attention, each rank keeps the same zigzag `[front | back]` layout
 used by the mega-ring path. Gathered K/V are ordered as:
@@ -109,7 +111,8 @@ To compare the per-sequence and whole-packed all-gather baselines:
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
   --b 3 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 \
   --mode both --methods allgather_attention,llama3_allgather_attention \
-  --llama3-heads-k-stride 1 --warmup-iters 1 --num-iters 3 --check
+  --allgather-overlapping-heads-k-stride 1 \
+  --warmup-iters 1 --num-iters 3 --check
 ```
 
 To run only the single-step min ring path with correctness checks:
@@ -125,9 +128,9 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
 
 `benchmark_ring_backward.py` benchmarks the causal varlen backward paths:
 
-- `allgather_attention` prepares its all-gather zigzag forward outside the
-  timed interval, then times both varlen backward calls, global dK/dV gradient
-  merging and inverse reordering, and the FP32 dK/dV reduce-scatter
+- `allgather_attention` prepares its zigzag forward outside the timed interval,
+  then pipelines KV-head-sliced all-gathers with the two varlen backward calls,
+  global dK/dV gradient merging, inverse reordering, and FP32 reduce-scatter
 - `llama3_allgather_attention` uses the same timing boundary but partitions the
   complete packed batch into two zigzag blocks per rank. It pipelines
   KV-head-sliced all-gathers with the block backward calls; each slice's dK/dV
@@ -175,8 +178,8 @@ divisible by 256, and the current fused backward requires causal mode,
 
 `benchmark_hybrid_backward.py` compares the same causal global workload with:
 
-- `allgather_attention`: per-sequence zigzag all-gather plus batched varlen backward
-- `llama3_allgather_attention`: whole-packed two-block all-gather backward
+- `allgather_attention`: overlapped KV-head-sliced per-sequence zigzag all-gather backward
+- `llama3_allgather_attention`: overlapped KV-head-sliced whole-packed two-block all-gather backward
 - `fa3_ring`: NCCL zigzag K/V and FP32 dKV ring using FA3 block backward
 - `zepplin`: short-sequence G1 attention plus long-sequence all-rank FA3 ring
 - `mega_ring_all_cp`: fused backward with every sequence split across all ranks
@@ -309,7 +312,7 @@ forward/backward threshold and defaults to `4096`.
 `benchmark_hybrid_forward.py` compares the same global varlen batch with six
 methods:
 
-- `allgather_attention`: all-CP K/V all-gather followed by batched varlen attention
+- `allgather_attention`: KV-head-sliced, overlapped all-CP K/V all-gather with per-sequence zigzag partitioning
 - `llama3_allgather_attention`: KV-head-sliced, overlapped all-CP K/V all-gather with whole-packed zigzag partitioning
 - `fa3_ring`: all-CP Python ring using FA3 blocks plus NCCL P2P
 - `zepplin`: LPT-placed rank-local attention for short sequences and an all-rank ring for long sequences
