@@ -154,6 +154,9 @@ the import path.
 | `ring_test/benchmark_hybrid_dataset_{forward,backward}.py` | Dataset sampling, BR-PBS placement, and hierarchical benchmark frontend |
 | `ring_test/benchmark_hybrid_{forward,backward}.py` | Explicit global-length and Buddy-ring topology benchmark |
 | `ring_test/benchmark_ring_{forward,backward}.py` | Ordinary all-CP distributed ring benchmark |
+| `baseline/UltraAttn/packing/export_packed_causal_plan.py` | Offline Gurobi exporter for one fixed-8K UltraAttn allocation plan |
+| `baseline/UltraAttn/packing/generate_fixed_128k_plans.sh` | Offline UltraAttn plans for the fixed 1x128K through 16x8K suite |
+| `ring_test/ultraattn/benchmark_hybrid_fixed_forward.py` | Five-case UltraAttn versus Mega Ring Hybrid comparison without dataset sampling |
 | `balancer/test_balancer.py` | CPU-only sampler and BR-PBS tests |
 | `scripts/test_min_fa3/` | Fixed, varlen, backward, remote-load, and ordinary ring tests |
 | `scripts/test_mega_ring/` | Hierarchical mega-ring forward/backward and validation tests |
@@ -308,6 +311,41 @@ python ring_test/benchmark_hybrid_dataset_forward.py \
 Full 128K runs should use `--no-check`; the correctness reference materializes
 quadratic attention scores. With `--methods all`, methods that cannot represent
 a generated workload are reported as skipped.
+
+### UltraAttn 8K graph baseline
+
+The forward benchmark accepts `--methods ultraattn` only for the fixed
+eight-GPU `1x128K`, `2x64K`, `4x32K`, `8x16K`, and `16x8K` suite. It consumes
+an offline UltraAttn QxK allocation and compiles it into input-communication,
+compute, partial-return, and owner-merge dependency nodes. Communication uses
+asynchronous `torch.distributed` NCCL; compute nodes call this demo's
+`min_fa3_op.forward_varlen`; partial O/LSE is merged in FP32.
+
+The normal `.venv` needs no UltraAttn runtime install, external FlashAttention,
+PyNCCL, or Gurobi. Generate the five plans in the isolated planner environment
+and run the comparison with:
+
+```bash
+PLANNER_PY=/home/hychen/.venvs/ultraattn-planner/bin/python \
+BLOCK_TOKENS=8192 WORLD_SIZE=8 QHEAD=32 KVHEAD=8 HEADDIM=128 \
+TIME_LIMIT=1800 GUROBI_NUM_THREADS=32 \
+baseline/UltraAttn/packing/generate_fixed_128k_plans.sh
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+.venv/bin/torchrun --standalone --nproc_per_node=8 \
+  ring_test/ultraattn/benchmark_hybrid_fixed_forward.py \
+  --qhead 32 --kvhead 8 --headdim 128 \
+  --methods ultraattn,mega_ring_hybrid \
+  --ultraattn-plan-dir baseline/UltraAttn/packing_plans \
+  --ultraattn-block-tokens 8192 \
+  --ultraattn-workspace-mib 2048 \
+  --sm-configs 128:4 --warmup-iters 10 --num-iters 40 --no-check
+```
+
+There is no staged, 256-token packing, dataset-sampler, all-CP, round-robin, or
+Buddy-ring fallback for this method. See `baseline/UltraAttnREADME.md` for the
+planner environment, graph execution boundary, correctness commands, and
+measured five-case results.
 
 ### Explicit topology and ordinary ring benchmarks
 

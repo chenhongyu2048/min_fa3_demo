@@ -112,7 +112,7 @@ class BSA_Repr():   # OK
             return block_table, cmap, successed
         # simplify cmap
         if cmap is not None:
-            new_cmap = np.empty_like(cmap, (new_par_d))
+            new_cmap = np.empty_like(cmap, shape=(new_par_d,))
             for i in range(new_par_d):
                 if cmap[i * 2] != cmap[i * 2 + 1]:
                     new_cmap = None
@@ -146,13 +146,14 @@ class BSA_Repr():   # OK
         # simplify cmap
         if cmap is not None:
             assert Par_Q == Par_KV, f'Now not support (Par_Q={Par_Q}) != (Par_KV={Par_KV}) for cmap simplification'
-            new_par_d = Par_Q
-            new_cmap = np.empty_like(cmap, (new_par_d))
+            new_par_d = new_Par_Q
+            new_cmap = np.empty_like(cmap, shape=(new_par_d,))
             for i in range(new_par_d):
-                if cmap[i * 2] != cmap[i * 2 + 1]:
+                group = cmap[i * k: (i + 1) * k]
+                if np.any(group != group[0]):
                     new_cmap = None
                     break
-                new_cmap[i] = cmap[i * 2]
+                new_cmap[i] = group[0]
         else:
             new_cmap = None
         return new_block_table, new_cmap, successed

@@ -313,6 +313,56 @@ that batch's ring and zero for other ranks. External FA3 is used by all three
 all-CP block baselines and Zeppelin when available; all four consistently fall
 back to the local min-FA3 varlen block when it is unavailable.
 
+### UltraAttn fixed-8K graph baseline
+
+`ultraattn` is restricted to eight GPUs, BF16 causal forward,
+`QH/KVH/D=32/8/128`, `block_tokens=8192`, and the five fixed 128K-token
+workloads. It does not use the benchmark's Buddy-ring placement or all-CP
+placement. The portable `.npz` contains UltraAttn's QxK allocation and default
+contiguous `cmap`.
+
+At runtime the allocation is compiled into input-Q, input-KV, fused compute,
+partial-return, and owner-merge graph nodes. Input collectives are launched
+asynchronously; local-only nodes run first, remote-Q nodes run when Q arrives,
+and the remaining nodes run when K/V arrives. Attention computation uses
+`min_fa3_op.forward_varlen`, and partial O/LSE is returned and merged in FP32.
+There is no staged or 256-token packing fallback.
+
+The timed callable includes graph input packing/communication, min-FA3 task
+launches, distributed partial return, and final O/LSE merge. Plan loading,
+graph compilation, buffer allocation, and outer benchmark synchronization are
+outside it. The normal `.venv` does not import Gurobi, external FlashAttention,
+or UltraAttn PyNCCL.
+
+UltraAttn uses its dedicated copy of the explicit-topology frontend at
+`ring_test/ultraattn/benchmark_hybrid_forward.py`. The root-level
+`ring_test/benchmark_hybrid_forward.py` remains the original six-method
+benchmark and does not import the UltraAttn runtime.
+
+The fixed suite uses `1xG8`, `2xG4`, `4xG2`, `8xG1`, and two G1 sequences per
+rank for Mega Ring Hybrid; every rank owns 16K tokens. UltraAttn ignores these
+ring topologies:
+
+```bash
+PLANNER_PY=/path/to/planner-venv/bin/python \
+QHEAD=32 KVHEAD=8 HEADDIM=128 BLOCK_TOKENS=8192 TIME_LIMIT=1800 \
+baseline/UltraAttn/packing/generate_fixed_128k_plans.sh
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+.venv/bin/torchrun --standalone --nproc_per_node=8 \
+  ring_test/ultraattn/benchmark_hybrid_fixed_forward.py \
+  --qhead 32 --kvhead 8 --headdim 128 \
+  --methods ultraattn,mega_ring_hybrid \
+  --ultraattn-plan-dir baseline/UltraAttn/packing_plans \
+  --ultraattn-block-tokens 8192 \
+  --sm-configs 128:4 --warmup-iters 10 --num-iters 40 --no-check
+```
+
+Explicit selection fails for any non-fixed workload or missing plan. Selection
+through `--methods all` reports the incompatibility and skips UltraAttn. See
+`baseline/UltraAttnREADME.md` for planner installation, correctness commands,
+solver status, and formal five-case results.
+
 Zeppelin uses `--zepplin-threshold` (default `4096`) independently of the
 hierarchical metadata. A sequence with `global_length < threshold` is placed
 whole on one rank (G1); equality belongs to the long side, so length `4096`

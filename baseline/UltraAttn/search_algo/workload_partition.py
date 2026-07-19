@@ -1,10 +1,17 @@
 import os
-import pulp
+try:
+    import pulp
+except ImportError:  # Only the legacy PuLP entry points require this package.
+    pulp = None
 import time
 import math
 # import cvxpy as cp
-import gurobipy as gp
-from gurobipy import GRB
+try:
+    import gurobipy as gp
+    from gurobipy import GRB
+except ImportError:  # Runtime consumers load exported plans and do not need Gurobi.
+    gp = None
+    GRB = None
 import numpy as np
 from enum import Enum
 from typing import Union, Optional
@@ -269,7 +276,21 @@ def Quad_LP_GUROBI(N: int):
     print_lp_result(N, N, Vars, 'x')
 
 @use_all_cpus
-def Quad_LP_GUROBI_from_block_config(block_config: Union[Block_Attention_Config, BSA_Config], fob: bool, hierarchy: bool, ParD: Optional[int]):
+def Quad_LP_GUROBI_from_block_config(
+    block_config: Union[Block_Attention_Config, BSA_Config],
+    fob: bool,
+    hierarchy: bool,
+    ParD: Optional[int],
+    *,
+    communication_costs: Optional[dict] = None,
+    causal_pattern: Optional[bool] = None,
+    time_limit: Optional[float] = None,
+    solver_seed: int = 0,
+):
+    if gp is None or GRB is None:
+        raise RuntimeError(
+            "Quad_LP_GUROBI_from_block_config requires gurobipy in the offline planner environment"
+        )
     # fwd
     # Arguments: Begin -----------------------------------------------
     problem_type = 'OPT'
@@ -283,12 +304,31 @@ def Quad_LP_GUROBI_from_block_config(block_config: Union[Block_Attention_Config,
     Var_cat_default = GRB.INTEGER
     # Arguments: End -------------------------------------------------
     
+    if communication_costs is None:
+        communication_costs = {"q": 1, "kv": 2, "partial": 1}
+    required_costs = {"q", "kv", "partial"}
+    if set(communication_costs) != required_costs:
+        raise ValueError(
+            f"communication_costs must have exactly {sorted(required_costs)}, "
+            f"got {sorted(communication_costs)}"
+        )
+    q_cost = int(communication_costs["q"])
+    kv_cost = int(communication_costs["kv"])
+    partial_cost = int(communication_costs["partial"])
+    if min(q_cost, kv_cost, partial_cost) <= 0:
+        raise ValueError("all communication costs must be positive")
+    if fob != 0 and communication_costs != {"q": 1, "kv": 2, "partial": 1}:
+        raise ValueError("custom communication costs are currently supported only for forward")
+    if causal_pattern is None:
+        causal_pattern = bsa_is_causal(block_config)
+
     # LP Problem
     mylp = gp.Model("Workload_Partition_Allocation_GUROBI")
     mylp.setParam('OutputFlag', 0)  # [NOTE]: disable output of gurobi
     CPUS_NUM = int(os.getenv('GUROBI_NUM_THREADS', default=64))
     mylp.setParam('Threads', CPUS_NUM)
-    mylp.setParam('TimeLimit', TIME_BUDGET)
+    mylp.setParam('TimeLimit', TIME_BUDGET if time_limit is None else float(time_limit))
+    mylp.setParam('Seed', int(solver_seed))
     # Variables & Bound
     constraints = []
     # Quad_Bound = 1 / (N * N)
@@ -407,8 +447,20 @@ def Quad_LP_GUROBI_from_block_config(block_config: Union[Block_Attention_Config,
         # mylp += Vars[f'A_{g}'] * 1 + Vars[f'C_{g}'] * 1 + Vars[f'B_{g}'] * 2 <= Vars[f'Comm_Volume']
         # mylp += Vars[f'A_{g}'] * 1 + Vars[f'C_{g}'] * 1 + Vars[f'D_{g}'] * 2 <= Vars[f'Comm_Volume']
         if fob == 0:    # Forward
-            mylp.addConstr(Vars[f'A_{g}'] * 1 + Vars[f'C_{g}'] * 1 + Vars[f'B_{g}'] * 2 == Vars[f'Cin_{g}'])
-            mylp.addConstr(Vars[f'A_{g}'] * 1 + Vars[f'C_{g}'] * 1 + Vars[f'D_{g}'] * 2 == Vars[f'Cout_{g}'])
+            # A: remote Q consumed by g; C: local Q consumed remotely.
+            # Each remote Q produces one partial O/LSE in the reverse direction.
+            mylp.addConstr(
+                Vars[f'A_{g}'] * q_cost
+                + Vars[f'C_{g}'] * partial_cost
+                + Vars[f'B_{g}'] * kv_cost
+                == Vars[f'Cin_{g}']
+            )
+            mylp.addConstr(
+                Vars[f'A_{g}'] * partial_cost
+                + Vars[f'C_{g}'] * q_cost
+                + Vars[f'D_{g}'] * kv_cost
+                == Vars[f'Cout_{g}']
+            )
         else:           # Backward
             mylp.addConstr(Vars[f'A_{g}'] * 2 + Vars[f'B_{g}'] * 2 + Vars[f'C_{g}'] * 1 + Vars[f'D_{g}'] * 2 == Vars[f'Cin_{g}'])
             mylp.addConstr(Vars[f'A_{g}'] * 1 + Vars[f'B_{g}'] * 2 + Vars[f'C_{g}'] * 2 + Vars[f'D_{g}'] * 2 == Vars[f'Cout_{g}'])
@@ -424,15 +476,15 @@ def Quad_LP_GUROBI_from_block_config(block_config: Union[Block_Attention_Config,
             # [HACK] for fob=0_bsa_config={CP=(8, 1)_repr=[[20000000][12000000][11200000][11120000][10112000][10011200][10001120][10000112]]}
             if CP_ == 8 and COMP_TOTAL == 22:
                 COMP_UB += 0.5  # 3.5
-            if bsa_is_causal(block_config): # causal
+            if causal_pattern: # causal, including packed block-diagonal causal
                 COMP_UB += 0.5
         else:   # Inter schedule
             COMP_TOTAL = calc_table_comp_relative_time(cur_block_table) # 1 unit stands for 1 full block at Par_D split
             COMP_UB = int(math.ceil(COMP_TOTAL / CP_))
             # [HACK]: Find a more general strategy
-            if CP_ == 2 and not bsa_is_causal(block_config):
+            if CP_ == 2 and not causal_pattern:
                 COMP_UB += 1
-            if CP_ == 8 and bsa_is_causal(block_config):
+            if CP_ == 8 and causal_pattern:
                 COMP_UB += 0.5
             # END
         # print_rank_0(f'COMP_TOTAL: {COMP_TOTAL}, COMP_UB: {COMP_UB}')
@@ -460,13 +512,41 @@ def Quad_LP_GUROBI_from_block_config(block_config: Union[Block_Attention_Config,
     print(f'LP solve time: {t1 - t0} s', flush=True)
     # print(f'Model status: {mylp.status}', flush=True)
     # # print_lp_result
+    status_names = {
+        GRB.OPTIMAL: "OPTIMAL",
+        GRB.TIME_LIMIT: "TIME_LIMIT",
+        GRB.INFEASIBLE: "INFEASIBLE",
+        GRB.INF_OR_UNBD: "INF_OR_UNBD",
+        GRB.UNBOUNDED: "UNBOUNDED",
+        GRB.INTERRUPTED: "INTERRUPTED",
+    }
+    status = status_names.get(mylp.status, f"STATUS_{mylp.status}")
     if mylp.status == gp.GRB.OPTIMAL:
         print(f"Optimal value: {mylp.objVal}")
+    if mylp.SolCount <= 0:
+        raise RuntimeError(f"Gurobi produced no feasible allocation (status={status})")
     # print_lp_result(CP_, ParD, Vars, 'x', cmap=cmap, diagonal_full=diagonal_full)
     return {
         'Par_D': ParD,
         'cmap': cmap,
-        'table': convert_result_to_np(CP_, ParD, Vars, 'x', cmap=cmap, diagonal_full=diagonal_full)
+        'table': convert_result_to_np(CP_, ParD, Vars, 'x', cmap=cmap, diagonal_full=diagonal_full),
+        'solver': {
+            'name': 'gurobi',
+            'version': '.'.join(str(value) for value in gp.gurobi.version()),
+            'status': status,
+            'objective': float(mylp.ObjVal),
+            'best_bound': float(mylp.ObjBound),
+            'mip_gap': float(mylp.MIPGap),
+            'runtime_seconds': float(mylp.Runtime),
+            'time_limit_seconds': float(TIME_BUDGET if time_limit is None else time_limit),
+            'seed': int(solver_seed),
+            'threads': int(CPUS_NUM),
+            'communication_costs': {
+                'q': q_cost,
+                'kv': kv_cost,
+                'partial': partial_cost,
+            },
+        },
     }
 
     # causal = True, fwd
