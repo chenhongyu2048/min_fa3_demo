@@ -9,7 +9,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR"
 
 GPU_COUNTS=${GPU_COUNTS:-"8"}
-DATASETS=${DATASETS:-"arxiv github pile"}
+DATASETS=${DATASETS:-"arxiv freelaw github pile"}
 DIRECTION=${DIRECTION:-forward}
 TARGET_TOKENS=${TARGET_TOKENS:-131072}
 COMPUTE_BALANCE_TOLERANCE=${COMPUTE_BALANCE_TOLERANCE:-0.05}
@@ -103,8 +103,8 @@ read -r -a DATASET_LIST <<< "$datasets_spec"
 ((${#DATASET_LIST[@]} > 0)) || die "DATASETS must not be empty"
 for dataset in "${DATASET_LIST[@]}"; do
     case "$dataset" in
-        arxiv|github|pile) ;;
-        *) die "DATASETS must contain only arxiv, github, or pile, got '$dataset'" ;;
+        arxiv|github|pile|freelaw) ;;
+        *) die "DATASETS must contain only arxiv, freelaw, github, or pile, got '$dataset'" ;;
     esac
 done
 

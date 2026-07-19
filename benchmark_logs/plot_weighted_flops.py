@@ -18,8 +18,8 @@ import matplotlib.pyplot as plt
 
 
 LOG_DIR = Path(__file__).resolve().parent
-DEFAULT_FORWARD_LOG = LOG_DIR / "20260718-144919" / "benchmark_hybrid_dataset.log"
-DEFAULT_BACKWARD_LOG = (LOG_DIR / "20260718-150524" / "benchmark_hybrid_dataset_backward.log")
+DEFAULT_FORWARD_LOG = LOG_DIR / "20260719-214850" / "benchmark_hybrid_dataset.log"
+DEFAULT_BACKWARD_LOG = (LOG_DIR / "20260719-215626" / "benchmark_hybrid_dataset_backward.log")
 
 METHODS = (
     "allgather_attention",
@@ -48,6 +48,7 @@ METHOD_COLORS = {
 }
 DATASET_LABELS = {
     "arxiv": "ArXiv",
+    "freelaw": "FreeLaw",
     "github": "GitHub",
     "pile": "Pile-CC",
 }

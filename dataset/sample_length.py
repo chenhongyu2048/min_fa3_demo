@@ -9,7 +9,7 @@ from collections import Counter
 # ======================================================================
 # Config
 # ======================================================================
-DATASET_CHOICE = "github"        # options: "pile" / "arxiv" / "github"
+DATASET_CHOICE = "arxiv"        # options: "pile" / "arxiv" / "github"
 NUM_SAMPLES = 20_000            # number of samples to collect
 TOKENIZER_NAME = "gpt2"
 
@@ -46,6 +46,14 @@ DATASET_CONFIG = {
         "text_field": "text",
         "filter_fn": lambda ex:
             ex.get("meta", {}).get("pile_set_name", "") == "Github",
+    },
+    # freelaw: FreeLaw subset of Pile
+    "freelaw": {
+        "path": "monology/pile-uncopyrighted",
+        "name": None,
+        "text_field": "text",
+        "filter_fn": lambda ex:
+            ex.get("meta", {}).get("pile_set_name", "") == "FreeLaw",
     },
 }
 

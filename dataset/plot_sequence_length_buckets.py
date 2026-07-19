@@ -1,4 +1,4 @@
-"""Plot per-bin sequence-length frequencies for the three sampled datasets."""
+"""Plot per-bin sequence-length frequencies for the sampled datasets."""
 
 from __future__ import annotations
 
@@ -17,14 +17,19 @@ from matplotlib.ticker import FuncFormatter, MultipleLocator, PercentFormatter
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = SCRIPT_DIR / "sequence_length_buckets.json"
 DEFAULT_OUTPUT = SCRIPT_DIR / "sequence_length_buckets_frequency.png"
-COLORS = ("#4C78A8", "#F58518", "#54A24B")
-DISPLAY_NAMES = {"arxiv": "ArXiv", "github": "GitHub", "pile": "Pile"}
+COLORS = ("#4C78A8", "#F58518", "#54A24B", "#E45756")
+DISPLAY_NAMES = {
+    "arxiv": "ArXiv",
+    "github": "GitHub",
+    "pile": "Pile",
+    "freelaw": "FreeLaw",
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Plot sequence-length bucket frequencies as three vertically "
+            "Plot sequence-length bucket frequencies as vertically "
             "stacked bar charts."
         )
     )
@@ -60,8 +65,8 @@ def load_statistics(path: Path) -> tuple[int, int, dict[str, dict[str, Any]]]:
         raise ValueError("max_sequence_tokens must be a positive integer")
     if max_sequence_tokens % bucket_size != 0:
         raise ValueError("max_sequence_tokens must be divisible by bucket_size")
-    if not isinstance(datasets, dict) or len(datasets) != 3:
-        raise ValueError("datasets must contain exactly three datasets")
+    if not isinstance(datasets, dict) or not datasets:
+        raise ValueError("datasets must contain at least one dataset")
 
     expected_bins = max_sequence_tokens // bucket_size
     for name, dataset in datasets.items():
@@ -103,16 +108,20 @@ def plot_statistics(
     datasets: dict[str, dict[str, Any]],
     output_path: Path,
 ) -> None:
+    dataset_items = list(datasets.items())
     figure, axes = plt.subplots(
-        nrows=3,
+        nrows=len(dataset_items),
         ncols=1,
-        figsize=(15, 10),
+        figsize=(15, 3 * len(dataset_items) + 1),
         sharex=True,
         constrained_layout=True,
     )
+    if len(dataset_items) == 1:
+        axes = [axes]
     bin_left_edges = range(0, max_sequence_tokens, bucket_size)
 
-    for axis, (name, dataset), color in zip(axes, datasets.items(), COLORS):
+    for index, (axis, (name, dataset)) in enumerate(zip(axes, dataset_items)):
+        color = COLORS[index % len(COLORS)]
         counts = dataset["bucket_counts"]
         sample_count = dataset["sample_count"]
         frequencies = [count / sample_count for count in counts]

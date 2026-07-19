@@ -11,7 +11,7 @@ import numpy as np
 
 BUCKET_SIZE = 256
 MAX_SEQUENCE_TOKENS = 128 * 1024
-DATASET_NAMES = ("arxiv", "github", "pile")
+DATASET_NAMES = ("arxiv", "github", "pile", "freelaw")
 TOKENIZER_NAME = "gpt2"
 OUTPUT_NAME = "sequence_length_buckets.json"
 
