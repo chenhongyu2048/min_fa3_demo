@@ -24,6 +24,8 @@ export http_proxy=http://u-MS9MdQ:Qixfk8ku@10.248.0.7:3128
 
 cd /data/home/scyb683/run/min_fa3_demo
 
+LLAMA3_HEADS_K_STRIDE=${LLAMA3_HEADS_K_STRIDE:-1}
+
 # make clean && make
 
 # Flash Attention 3 (FA3) benchmark:
@@ -96,6 +98,7 @@ echo "========================================================="
 torchrun --standalone --nproc_per_node=4 ring_test/benchmark_ring_forward.py \
     --b 1,1,1,1,1,1,1,1 --seqlen 512,1024,2048,4096,8192,16384,32768,65536 --qhead 32 --kvhead 8 --headdim 128 \
     --mode causal --methods all --sm-configs 128:4,124:8,116:16 \
+    --llama3-heads-k-stride "$LLAMA3_HEADS_K_STRIDE" \
     --warmup-iters 20 --num-iters 30 --no-check
 
 echo "Running multi-rank hybrid ring_test benchmark without correctness checks"
@@ -105,6 +108,7 @@ torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
     --qhead 32 --kvhead 8 --headdim 128 \
     --methods allgather_attention,llama3_allgather_attention,fa3_ring,mega_ring_hybrid \
     --sm-configs 128:4,124:8,116:16 \
+    --llama3-heads-k-stride "$LLAMA3_HEADS_K_STRIDE" \
     --mode both --warmup-iters 20 --num-iters 30 --no-check
 
 torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
@@ -114,6 +118,7 @@ torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
     --qhead 32 --kvhead 8 --headdim 128 \
     --methods allgather_attention,llama3_allgather_attention,fa3_ring,mega_ring_hybrid \
     --sm-configs 128:4,124:8,116:16 \
+    --llama3-heads-k-stride "$LLAMA3_HEADS_K_STRIDE" \
     --mode both --warmup-iters 20 --num-iters 30 --no-check
 
 torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
@@ -123,6 +128,7 @@ torchrun --standalone --nproc_per_node=4 ring_test/benchmark_hybrid_forward.py \
     --qhead 32 --kvhead 8 --headdim 128 \
     --methods allgather_attention,llama3_allgather_attention,fa3_ring,mega_ring_hybrid \
     --sm-configs 128:4,124:8,116:16 \
+    --llama3-heads-k-stride "$LLAMA3_HEADS_K_STRIDE" \
     --mode both --warmup-iters 20 --num-iters 30 --no-check
 
 # Memory sanitizer runs:

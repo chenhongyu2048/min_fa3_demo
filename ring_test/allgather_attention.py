@@ -768,7 +768,13 @@ class AllGatherAttention:
 
 
 class Llama3AllGatherAttention:
-    """All-gather attention over a whole-packed two-block zigzag partition."""
+    """Whole-packed zigzag all-gather attention with KV-head pipelining.
+
+    Each iteration gathers one contiguous KV-head slice.  Once that slice is
+    ready, the next slice's all-gather is launched before FlashAttention runs
+    over the current slice.  The two all-gather receive buffers are ping-ponged
+    so NCCL never overwrites data that the CUDA compute stream still consumes.
+    """
 
     def __init__(
         self,
@@ -780,6 +786,7 @@ class Llama3AllGatherAttention:
         causal: bool,
         backend: str,
         *,
+        heads_k_stride: int = 1,
         enable_backward: bool = False,
     ) -> None:
         if backend not in ("external_fa3", "min_fa3"):
@@ -790,6 +797,17 @@ class Llama3AllGatherAttention:
             raise ValueError("Q/K/V must use flattened [tokens, heads, head_dim] layout")
         if k.shape != v.shape:
             raise ValueError("K and V must have matching shapes")
+        if q.size(2) != k.size(2):
+            raise ValueError("Q, K, and V must have matching head dimensions")
+        if q.size(1) % k.size(1):
+            raise ValueError(
+                f"Q head count must divide by KV head count, got QH={q.size(1)}, KVH={k.size(1)}"
+            )
+        if not 0 < heads_k_stride <= k.size(1) or k.size(1) % heads_k_stride:
+            raise ValueError(
+                "heads_k_stride must be a positive divisor of the KV head count, "
+                f"got heads_k_stride={heads_k_stride}, KVH={k.size(1)}"
+            )
 
         self.process_group = process_group
         self.rank = dist.get_rank(process_group)
@@ -815,9 +833,10 @@ class Llama3AllGatherAttention:
         self.causal = causal
         self.backend = backend
         self.enable_backward = enable_backward
+        self.heads_k_stride = heads_k_stride
+        self.q_heads_per_kv_head = q.size(1) // k.size(1)
+        self.q_heads_per_chunk = heads_k_stride * self.q_heads_per_kv_head
         self.out = torch.empty_like(q)
-        self.forward_out: list[torch.Tensor] = []
-        self.forward_lse: list[torch.Tensor] = []
 
         global_order = torch.tensor(
             llama3_rank_major_to_global_order(self.total_tokens, self.world_size),
@@ -826,11 +845,23 @@ class Llama3AllGatherAttention:
         )
         self.global_order = global_order
         self.inverse_global_order = torch.argsort(global_order)
-        global_shape = (self.total_tokens, k.size(1), k.size(2))
-        self.gathered_k = torch.empty(global_shape, dtype=k.dtype, device=k.device)
-        self.gathered_v = torch.empty_like(self.gathered_k)
-        self.ordered_k = torch.empty_like(self.gathered_k)
-        self.ordered_v = torch.empty_like(self.gathered_v)
+
+        # [ping-pong slot, K/V, gathered tokens, KV heads in this slice, D].
+        # The ordered buffers are contiguous, which is required by the local
+        # min_fa3 fallback after a head slice is extracted from Q/K/V.
+        kv_chunk_shape = (2, 2, self.total_tokens, heads_k_stride, k.size(2))
+        self.kv_gather = torch.empty(kv_chunk_shape, dtype=k.dtype, device=k.device)
+        self.kv_ordered = torch.empty_like(self.kv_gather)
+        self.kv_send = torch.empty(
+            (2, self.local_tokens, heads_k_stride, k.size(2)),
+            dtype=k.dtype,
+            device=k.device,
+        )
+        self.q_chunk = torch.empty(
+            (self.local_tokens, self.q_heads_per_chunk, q.size(2)),
+            dtype=q.dtype,
+            device=q.device,
+        )
 
         front_begin = self.rank * self.chunk
         back_block = 2 * self.world_size - 1 - self.rank
@@ -853,23 +884,53 @@ class Llama3AllGatherAttention:
                 q.device,
             ),
         ]
+        self.forward_out = [self.out[block.local_slice] for block in self.blocks]
+        self.forward_lse = [
+            torch.empty(
+                (q.size(1), self.chunk), dtype=torch.float32, device=q.device
+            )
+            for _ in self.blocks
+        ]
+        self._forward_ready = False
 
         if enable_backward:
             self.dq = torch.empty_like(q)
-            self.ordered_dk = torch.empty(global_shape, dtype=torch.float32, device=k.device)
-            self.ordered_dv = torch.empty_like(self.ordered_dk)
-            self.rank_major_dk = torch.empty_like(self.ordered_dk)
-            self.rank_major_dv = torch.empty_like(self.ordered_dv)
             self.local_dk_fp32 = torch.empty_like(k, dtype=torch.float32)
             self.local_dv_fp32 = torch.empty_like(v, dtype=torch.float32)
             self.local_dk = torch.empty_like(k)
             self.local_dv = torch.empty_like(v)
-            self.block_dk = [
-                torch.empty_like(self.ordered_k[block.global_k_slice]) for block in self.blocks
+            self.backward_dout_chunk = torch.empty_like(self.q_chunk)
+            self.backward_out_chunk = torch.empty_like(self.q_chunk)
+            self.backward_dq_chunk = torch.empty_like(self.q_chunk)
+            self.backward_lse = [
+                torch.empty(
+                    (self.q_heads_per_chunk, self.chunk),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+                for _ in self.blocks
             ]
-            self.block_dv = [
-                torch.empty_like(self.ordered_v[block.global_k_slice]) for block in self.blocks
-            ]
+            max_block_k_tokens = max(
+                block.global_k_slice.stop - block.global_k_slice.start
+                for block in self.blocks
+            )
+            self.backward_block_dkv = torch.empty(
+                (2, max_block_k_tokens, heads_k_stride, k.size(2)),
+                dtype=k.dtype,
+                device=k.device,
+            )
+            self.backward_ordered_dkv = torch.empty(
+                (2, self.total_tokens, heads_k_stride, k.size(2)),
+                dtype=torch.float32,
+                device=k.device,
+            )
+            self.backward_rank_major_dkv = torch.empty_like(self.backward_ordered_dkv)
+            self.backward_local_dk_fp32 = torch.empty(
+                (self.local_tokens, heads_k_stride, k.size(2)),
+                dtype=torch.float32,
+                device=k.device,
+            )
+            self.backward_local_dv_fp32 = torch.empty_like(self.backward_local_dk_fp32)
 
     @property
     def note(self) -> str:
@@ -879,14 +940,63 @@ class Llama3AllGatherAttention:
             else "in-repo min_fa3 fallback"
         )
         mode = "causal" if self.causal else "noncausal"
-        return f"whole-packed zigzag all-gather; {backend}; {mode}"
+        return (
+            "whole-packed zigzag KV-head-sharded all-gather "
+            f"({self.heads_k_stride} KVH/chunk, comm/compute overlap); {backend}; {mode}"
+        )
+
+    def _q_head_slice(self, kv_head_start: int) -> slice:
+        q_head_start = kv_head_start * self.q_heads_per_kv_head
+        return slice(q_head_start, q_head_start + self.q_heads_per_chunk)
+
+    def _start_kv_all_gather(
+        self, buffer_idx: int, kv_head_start: int
+    ) -> tuple[object, object]:
+        kv_head_slice = slice(kv_head_start, kv_head_start + self.heads_k_stride)
+        self.kv_send[0].copy_(self.k[:, kv_head_slice])
+        self.kv_send[1].copy_(self.v[:, kv_head_slice])
+        k_work = dist.all_gather_into_tensor(
+            self.kv_gather[buffer_idx, 0],
+            self.kv_send[0],
+            group=self.process_group,
+            async_op=True,
+        )
+        v_work = dist.all_gather_into_tensor(
+            self.kv_gather[buffer_idx, 1],
+            self.kv_send[1],
+            group=self.process_group,
+            async_op=True,
+        )
+        if k_work is None or v_work is None:
+            raise RuntimeError("asynchronous K/V all-gather returned no Work handle")
+        return k_work, v_work
+
+    @staticmethod
+    def _wait_kv_all_gather(work: tuple[object, object]) -> None:
+        for item in work:
+            item.wait()  # type: ignore[attr-defined]
+
+    def _order_kv_chunk(self, buffer_idx: int) -> None:
+        torch.index_select(
+            self.kv_gather[buffer_idx, 0],
+            0,
+            self.global_order,
+            out=self.kv_ordered[buffer_idx, 0],
+        )
+        torch.index_select(
+            self.kv_gather[buffer_idx, 1],
+            0,
+            self.global_order,
+            out=self.kv_ordered[buffer_idx, 1],
+        )
 
     def _run_forward_block(
-        self, block: _Llama3BlockMetadata
+        self,
+        block: _Llama3BlockMetadata,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        q = self.q[block.local_slice]
-        k = self.ordered_k[block.global_k_slice]
-        v = self.ordered_v[block.global_k_slice]
         if self.backend == "external_fa3":
             return _external_forward(
                 q, k, v, block.cu_q, block.cu_k, block.max_q, block.max_k, self.causal
@@ -905,40 +1015,63 @@ class Llama3AllGatherAttention:
         )
 
     def forward(self) -> torch.Tensor:
-        dist.all_gather_into_tensor(self.gathered_k, self.k, group=self.process_group)
-        dist.all_gather_into_tensor(self.gathered_v, self.v, group=self.process_group)
-        torch.index_select(self.gathered_k, 0, self.global_order, out=self.ordered_k)
-        torch.index_select(self.gathered_v, 0, self.global_order, out=self.ordered_v)
+        self._forward_ready = False
+        current_buffer = 0
+        current_work = self._start_kv_all_gather(current_buffer, 0)
+        for kv_head_start in range(0, self.k.size(1), self.heads_k_stride):
+            self._wait_kv_all_gather(current_work)
+            self._order_kv_chunk(current_buffer)
 
-        self.forward_out = []
-        self.forward_lse = []
-        for block in self.blocks:
-            out, lse = self._run_forward_block(block)
-            self.out[block.local_slice].copy_(out)
-            self.forward_out.append(out)
-            self.forward_lse.append(lse)
+            q_head_slice = self._q_head_slice(kv_head_start)
+            self.q_chunk.copy_(self.q[:, q_head_slice])
+            next_kv_head_start = kv_head_start + self.heads_k_stride
+            if next_kv_head_start < self.k.size(1):
+                next_buffer = 1 - current_buffer
+                current_work = self._start_kv_all_gather(
+                    next_buffer, next_kv_head_start
+                )
+
+            for block_idx, block in enumerate(self.blocks):
+                out, lse = self._run_forward_block(
+                    block,
+                    self.q_chunk[block.local_slice],
+                    self.kv_ordered[current_buffer, 0][block.global_k_slice],
+                    self.kv_ordered[current_buffer, 1][block.global_k_slice],
+                )
+                self.out[block.local_slice, q_head_slice].copy_(out)
+                target_lse = self.forward_lse[block_idx][q_head_slice]
+                if lse.shape != target_lse.shape:
+                    raise RuntimeError(
+                        "FlashAttention returned an unexpected LSE shape for a KV-head slice: "
+                        f"got {tuple(lse.shape)}, expected {tuple(target_lse.shape)}"
+                    )
+                target_lse.copy_(lse)
+
+            current_buffer = 1 - current_buffer
+        self._forward_ready = True
         return self.out
 
     def _run_backward_block(
         self,
-        block_idx: int,
         dout: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        block: _Llama3BlockMetadata,
+        dq: torch.Tensor,
+        dk: torch.Tensor,
+        dv: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        block = self.blocks[block_idx]
-        q = self.q[block.local_slice]
-        k = self.ordered_k[block.global_k_slice]
-        v = self.ordered_v[block.global_k_slice]
-        dq = self.dq[block.local_slice]
-        dk = self.block_dk[block_idx]
-        dv = self.block_dv[block_idx]
         if self.backend == "external_fa3":
             return _external_backward(
                 dout,
                 q,
                 k,
                 v,
-                self.forward_out[block_idx],
-                self.forward_lse[block_idx],
+                out,
+                lse,
                 block.cu_q,
                 block.cu_k,
                 block.max_q,
@@ -953,8 +1086,8 @@ class Llama3AllGatherAttention:
             q,
             k,
             v,
-            self.forward_out[block_idx],
-            self.forward_lse[block_idx],
+            out,
+            lse,
             block.cu_q,
             block.cu_k,
             block.max_q,
@@ -968,31 +1101,86 @@ class Llama3AllGatherAttention:
     def backward(self, dout: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not self.enable_backward:
             raise RuntimeError("Llama3 all-gather runner was created without backward workspaces")
-        if len(self.forward_out) != 2 or len(self.forward_lse) != 2:
+        if not self._forward_ready:
             raise RuntimeError("Llama3 all-gather backward requires a prepared forward")
         if dout.shape != self.q.shape:
             raise ValueError("dout must match the local Q shape")
 
-        self.ordered_dk.zero_()
-        self.ordered_dv.zero_()
-        for block_idx, block in enumerate(self.blocks):
-            dq, dk, dv = self._run_backward_block(block_idx, dout[block.local_slice])
-            self.dq[block.local_slice].copy_(dq)
-            self.ordered_dk[block.global_k_slice].add_(dk)
-            self.ordered_dv[block.global_k_slice].add_(dv)
+        self.local_dk_fp32.zero_()
+        self.local_dv_fp32.zero_()
+        current_buffer = 0
+        current_work = self._start_kv_all_gather(current_buffer, 0)
+        for kv_head_start in range(0, self.k.size(1), self.heads_k_stride):
+            self._wait_kv_all_gather(current_work)
+            self._order_kv_chunk(current_buffer)
 
-        torch.index_select(
-            self.ordered_dk, 0, self.inverse_global_order, out=self.rank_major_dk
-        )
-        torch.index_select(
-            self.ordered_dv, 0, self.inverse_global_order, out=self.rank_major_dv
-        )
-        dist.reduce_scatter_tensor(
-            self.local_dk_fp32, self.rank_major_dk, group=self.process_group
-        )
-        dist.reduce_scatter_tensor(
-            self.local_dv_fp32, self.rank_major_dv, group=self.process_group
-        )
+            q_head_slice = self._q_head_slice(kv_head_start)
+            self.q_chunk.copy_(self.q[:, q_head_slice])
+            self.backward_dout_chunk.copy_(dout[:, q_head_slice])
+            self.backward_out_chunk.copy_(self.out[:, q_head_slice])
+            for block_idx, block_lse in enumerate(self.forward_lse):
+                self.backward_lse[block_idx].copy_(block_lse[q_head_slice])
+
+            next_kv_head_start = kv_head_start + self.heads_k_stride
+            if next_kv_head_start < self.k.size(1):
+                next_buffer = 1 - current_buffer
+                current_work = self._start_kv_all_gather(
+                    next_buffer, next_kv_head_start
+                )
+
+            self.backward_ordered_dkv.zero_()
+            for block_idx, block in enumerate(self.blocks):
+                k_tokens = block.global_k_slice.stop - block.global_k_slice.start
+                block_dk = self.backward_block_dkv[0, :k_tokens]
+                block_dv = self.backward_block_dkv[1, :k_tokens]
+                block_dk.zero_()
+                block_dv.zero_()
+                dq, dk, dv = self._run_backward_block(
+                    self.backward_dout_chunk[block.local_slice],
+                    self.q_chunk[block.local_slice],
+                    self.kv_ordered[current_buffer, 0][block.global_k_slice],
+                    self.kv_ordered[current_buffer, 1][block.global_k_slice],
+                    self.backward_out_chunk[block.local_slice],
+                    self.backward_lse[block_idx],
+                    block,
+                    self.backward_dq_chunk[block.local_slice],
+                    block_dk,
+                    block_dv,
+                )
+                self.backward_ordered_dkv[0, block.global_k_slice].add_(dk)
+                self.backward_ordered_dkv[1, block.global_k_slice].add_(dv)
+                self.backward_dq_chunk[block.local_slice].copy_(dq)
+
+            self.dq[:, q_head_slice].copy_(self.backward_dq_chunk)
+            torch.index_select(
+                self.backward_ordered_dkv[0],
+                0,
+                self.inverse_global_order,
+                out=self.backward_rank_major_dkv[0],
+            )
+            torch.index_select(
+                self.backward_ordered_dkv[1],
+                0,
+                self.inverse_global_order,
+                out=self.backward_rank_major_dkv[1],
+            )
+            dist.reduce_scatter_tensor(
+                self.backward_local_dk_fp32,
+                self.backward_rank_major_dkv[0],
+                group=self.process_group,
+            )
+            dist.reduce_scatter_tensor(
+                self.backward_local_dv_fp32,
+                self.backward_rank_major_dkv[1],
+                group=self.process_group,
+            )
+            kv_head_slice = slice(
+                kv_head_start, kv_head_start + self.heads_k_stride
+            )
+            self.local_dk_fp32[:, kv_head_slice].copy_(self.backward_local_dk_fp32)
+            self.local_dv_fp32[:, kv_head_slice].copy_(self.backward_local_dv_fp32)
+            current_buffer = 1 - current_buffer
+
         self.local_dk.copy_(self.local_dk_fp32)
         self.local_dv.copy_(self.local_dv_fp32)
         return self.dq, self.local_dk, self.local_dv

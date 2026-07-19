@@ -23,10 +23,24 @@ column reports the backend that was selected.
 zigzag-partitioning every sequence independently, it concatenates the global
 varlen batch into one packed token stream, divides that stream into `2 * W`
 equal blocks, and gives rank `r` blocks `r` and `2 * W - 1 - r`. Its two local
-blocks may cross sequence boundaries. The timed path includes full K/V
-all-gather, restoration of global packed order, and two varlen attention calls.
-It uses the same external-FA3/local-min-FA3 backend selection as
-`allgather_attention`.
+blocks may cross sequence boundaries. Rather than materializing one full K/V
+all-gather, it processes a contiguous KV-head slice at a time. Two receive
+buffers ping-pong: after slice `i` is gathered and restored to global packed
+order, the all-gather for slice `i + 1` is launched before the two varlen
+attention calls for slice `i`. This overlaps the next K/V all-gather with the
+current attention work while preserving the GQA mapping from each KV slice to
+its corresponding Q-head range. It uses the same external-FA3/local-min-FA3
+backend selection as `allgather_attention`.
+
+`--llama3-heads-k-stride` controls the number of KV heads in one pipeline
+slice. It must be a positive divisor of `--kvhead` and defaults to `1`.
+Smaller values create more communication/computation overlap but launch more
+all-gathers and attention calls; larger values reduce launch overhead. The
+same head slicing is used by the Llama3 all-gather backward path before each
+FP32 dK/dV reduce-scatter. This option is supported by the ring, hybrid, and
+UltraAttn hybrid benchmark entry points. The checked-in Slurm scripts and the
+`scripts/benchmark_ring_1_2_4_8.sh` sweep expose the same setting through
+`LLAMA3_HEADS_K_STRIDE`, also defaulting to `1`.
 
 For causal attention, each rank keeps the same zigzag `[front | back]` layout
 used by the mega-ring path. Gathered K/V are ordered as:
@@ -95,7 +109,7 @@ To compare the per-sequence and whole-packed all-gather baselines:
 torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
   --b 3 --seqlen 256 --qhead 8 --kvhead 8 --headdim 128 \
   --mode both --methods allgather_attention,llama3_allgather_attention \
-  --warmup-iters 1 --num-iters 3 --check
+  --llama3-heads-k-stride 1 --warmup-iters 1 --num-iters 3 --check
 ```
 
 To run only the single-step min ring path with correctness checks:
@@ -115,9 +129,10 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
   timed interval, then times both varlen backward calls, global dK/dV gradient
   merging and inverse reordering, and the FP32 dK/dV reduce-scatter
 - `llama3_allgather_attention` uses the same timing boundary but partitions the
-  complete packed batch into two zigzag blocks per rank; its dK/dV contributions
-  are accumulated in global packed order before inverse reordering and FP32
-  reduce-scatter.
+  complete packed batch into two zigzag blocks per rank. It pipelines
+  KV-head-sliced all-gathers with the block backward calls; each slice's dK/dV
+  contributions are accumulated in global packed order before inverse
+  reordering and FP32 reduce-scatter.
 - `min_varlen_python_ring` is a complete zigzag ring baseline using local
   min_fa3 varlen backward block kernels plus NCCL K/V and FP32 dK/dV P2P.
 - `min_varlen_mega_ring` is the fused persistent compute/communication kernel.
@@ -295,7 +310,7 @@ forward/backward threshold and defaults to `4096`.
 methods:
 
 - `allgather_attention`: all-CP K/V all-gather followed by batched varlen attention
-- `llama3_allgather_attention`: all-CP K/V all-gather with whole-packed zigzag partitioning
+- `llama3_allgather_attention`: KV-head-sliced, overlapped all-CP K/V all-gather with whole-packed zigzag partitioning
 - `fa3_ring`: all-CP Python ring using FA3 blocks plus NCCL P2P
 - `zepplin`: LPT-placed rank-local attention for short sequences and an all-rank ring for long sequences
 - `mega_ring_all_cp`: fused mega-ring with every sequence split across all ranks
@@ -314,6 +329,8 @@ all-CP block baselines and Zeppelin when available; all four consistently fall
 back to the local min-FA3 varlen block when it is unavailable.
 
 ### UltraAttn fixed-8K graph baseline
+
+`ultraattn` has been removed in main branch, but keeped in the `ultraattn_baseline` branch.
 
 `ultraattn` is restricted to eight GPUs, BF16 causal forward,
 `QH/KVH/D=32/8/128`, `block_tokens=8192`, and the five fixed 128K-token

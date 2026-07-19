@@ -1,5 +1,7 @@
 # UltraAttn Graph baseline：8K 固定五 case
 
+`UltraAttn` 基线已经被移动至 `ultraattn_baseline` 分支。
+
 本文档记录 `ring_test` 中唯一受支持的 UltraAttn forward baseline：
 
 ```text

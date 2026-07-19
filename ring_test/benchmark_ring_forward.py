@@ -213,6 +213,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kvhead", type=int, default=8, help="Number of key/value heads.")
     parser.add_argument("--headdim", type=int, default=128, help="Head dimension D.")
     parser.add_argument(
+        "--llama3-heads-k-stride",
+        type=int,
+        default=1,
+        help="KV heads per Llama3 all-gather/attention pipeline chunk.",
+    )
+    parser.add_argument(
         "--mode",
         choices=("noncausal", "causal", "both"),
         default="both",
@@ -536,6 +542,7 @@ def build_method_runs(
                 global_seqlens,
                 case.is_causal,
                 args.allgather_backend,
+                heads_k_stride=args.llama3_heads_k_stride,
             )
             runs.append(MethodRun(method, runner.forward, runner.note))
         elif method == "pytorch":
@@ -1012,6 +1019,14 @@ def validate_args(
     if args.warmup_iters < 0:
         raise SystemExit(f"--warmup-iters must be non-negative, got {args.warmup_iters}")
     if "llama3_allgather_attention" in methods:
+        if (
+            args.llama3_heads_k_stride <= 0
+            or args.kvhead % args.llama3_heads_k_stride
+        ):
+            raise SystemExit(
+                "--llama3-heads-k-stride must be a positive divisor of --kvhead, "
+                f"got stride={args.llama3_heads_k_stride}, kvhead={args.kvhead}"
+            )
         invalid = [
             (case.batch_size, case.seqlen, case.is_causal)
             for case in make_cases(args)
@@ -1108,7 +1123,8 @@ def main() -> None:
             print(
                 f"Config: world_size={local_world_size}, methods={methods}, B={args.b}, "
                 f"seqlen={args.seqlen}, qhead={args.qhead}, kvhead={args.kvhead}, "
-                f"D={args.headdim}, mode={args.mode}, sm_configs={sm_configs_s}, "
+                f"D={args.headdim}, llama3_heads_k_stride={args.llama3_heads_k_stride}, "
+                f"mode={args.mode}, sm_configs={sm_configs_s}, "
                 f"warmup={args.warmup_iters}, iters={args.num_iters}, "
                 f"check={args.check}"
             )

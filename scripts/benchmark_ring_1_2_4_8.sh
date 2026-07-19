@@ -14,6 +14,7 @@ NUM_ITERS=${NUM_ITERS:-40}
 QHEAD=${QHEAD:-32}
 KVHEAD=${KVHEAD:-8}
 HEADDIM=${HEADDIM:-128}
+LLAMA3_HEADS_K_STRIDE=${LLAMA3_HEADS_K_STRIDE:-1}
 CHECK=${CHECK:-0}
 DRY_RUN=${DRY_RUN:-0}
 TORCHRUN=${TORCHRUN:-torchrun}
@@ -200,6 +201,7 @@ run_hierarchical_hybrid() {
         --ring-sizes "$ring_sizes" \
         --ring-starts "$ring_starts" \
         --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM" \
+        --llama3-heads-k-stride "$LLAMA3_HEADS_K_STRIDE" \
         --mode causal --methods all --sm-configs "$sm_configs" \
         --warmup-iters "$WARMUP_ITERS" --num-iters "$NUM_ITERS" \
         "${CHECK_ARGS[@]}"
@@ -211,7 +213,7 @@ if ((DRY_RUN == 0)); then
 fi
 
 echo "Log: $LOG_FILE"
-echo "Common config: causal varlen, QH=$QHEAD, KVH=$KVHEAD, D=$HEADDIM, warmup=$WARMUP_ITERS, iters=$NUM_ITERS, check=$CHECK"
+echo "Common config: causal varlen, QH=$QHEAD, KVH=$KVHEAD, D=$HEADDIM, llama3_heads_k_stride=$LLAMA3_HEADS_K_STRIDE, warmup=$WARMUP_ITERS, iters=$NUM_ITERS, check=$CHECK"
 
 for world_size in "${GPU_COUNT_LIST[@]}"; do
     select_devices "$world_size"
@@ -252,6 +254,7 @@ for world_size in "${GPU_COUNT_LIST[@]}"; do
         --b "$ALL_CP_BATCH" \
         --seqlen "$all_cp_local_seqlens" \
         --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM" \
+        --llama3-heads-k-stride "$LLAMA3_HEADS_K_STRIDE" \
         --mode causal --methods "$ALL_CP_METHODS" \
         --sm-configs "$forward_sm_configs" \
         --warmup-iters "$WARMUP_ITERS" --num-iters "$NUM_ITERS" \
@@ -271,6 +274,7 @@ for world_size in "${GPU_COUNT_LIST[@]}"; do
         --b "$BACKWARD_BATCH" \
         --seqlen "$backward_local_seqlens" \
         --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM" \
+        --llama3-heads-k-stride "$LLAMA3_HEADS_K_STRIDE" \
         --methods "$BACKWARD_METHODS" \
         --sm-configs "$BACKWARD_SM_CONFIGS" \
         --warmup-iters "$WARMUP_ITERS" --num-iters "$NUM_ITERS" \

@@ -516,6 +516,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--qhead", type=int, default=32)
     parser.add_argument("--kvhead", type=int, default=8)
     parser.add_argument("--headdim", type=int, default=128)
+    parser.add_argument(
+        "--llama3-heads-k-stride",
+        type=int,
+        default=1,
+        help="KV heads per Llama3 all-gather/attention pipeline chunk",
+    )
     parser.add_argument("--mode", choices=("noncausal", "causal", "both"), default="causal")
     parser.add_argument(
         "--methods",
@@ -574,6 +580,14 @@ def _main_single(
         raise SystemExit("hierarchical communication requires D=128 and KVH * D == 1024")
     if args.qhead % args.kvhead:
         raise SystemExit("qhead must be divisible by kvhead")
+    if (
+        args.llama3_heads_k_stride <= 0
+        or args.kvhead % args.llama3_heads_k_stride
+    ):
+        raise SystemExit(
+            "--llama3-heads-k-stride must be a positive divisor of --kvhead, "
+            f"got stride={args.llama3_heads_k_stride}, kvhead={args.kvhead}"
+        )
     if args.warmup_iters < 0 or args.num_iters <= 0:
         raise SystemExit("warmup iterations must be non-negative and measured iterations must be positive")
 
@@ -791,6 +805,7 @@ def _main_single(
                         global_lengths,
                         is_causal,
                         block_backend,
+                        heads_k_stride=args.llama3_heads_k_stride,
                     )
                     all_cp_runs["llama3_allgather_attention"] = (
                         llama3_runner.forward,

@@ -314,6 +314,8 @@ a generated workload are reported as skipped.
 
 ### UltraAttn 8K graph baseline
 
+`ultraattn` has been removed in main branch, but keeped in the `ultraattn_baseline` branch.
+
 The forward benchmark accepts `--methods ultraattn` only for the fixed
 eight-GPU `1x128K`, `2x64K`, `4x32K`, `8x16K`, and `16x8K` suite. It consumes
 an offline UltraAttn QxK allocation and compiles it into input-communication,
