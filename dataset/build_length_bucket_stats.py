@@ -11,8 +11,15 @@ import numpy as np
 
 BUCKET_SIZE = 256
 MAX_SEQUENCE_TOKENS = 128 * 1024
-DATASET_NAMES = ("arxiv", "github", "pile", "freelaw")
 TOKENIZER_NAME = "gpt2"
+DATASET_NAMES = ("arxiv", "github", "pile", "freelaw", "prolong")
+DATASET_TOKENIZERS = {
+    "arxiv": TOKENIZER_NAME,
+    "github": TOKENIZER_NAME,
+    "pile": TOKENIZER_NAME,
+    "freelaw": TOKENIZER_NAME,
+    "prolong": "source_pretokenized",
+}
 OUTPUT_NAME = "sequence_length_buckets.json"
 
 
@@ -49,6 +56,7 @@ def build_statistics(dataset_dir: Path) -> dict[str, object]:
         counts = bucket_counts(lengths)
         datasets[dataset] = {
             "sample_count": int(lengths.size),
+            "tokenizer": DATASET_TOKENIZERS[dataset],
             "bucket_counts": counts,
         }
 

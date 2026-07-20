@@ -289,7 +289,7 @@ torchrun --standalone --nproc_per_node=8 \
   --sm-configs 128:4,124:8,120:12,116:16 \
   --warmup-iters 10 --num-iters 40 --no-check
 
-DATASETS="arxiv github pile" GPU_COUNTS="2 4 8" NUM_CASES=4 DIRECTION=backward \
+DATASETS="arxiv github pile freelaw prolong" GPU_COUNTS="2 4 8" NUM_CASES=4 DIRECTION=backward \
   ZEPPLIN_THRESHOLD=4096 ./benchmark_dataset.sh
 ```
 
@@ -456,7 +456,7 @@ stride. Each case keeps the existing result table, followed by cross-case
 latency, arithmetic-mean TFLOPS, workload-weighted aggregate TFLOPS, and
 workload-weighted per-GPU TFLOPS summaries.
 
-The three empirical distributions live in
+The five empirical distributions live in
 `../dataset/sequence_length_buckets.json`. Each one contains 512 counts for
 256-token `(lower, upper]` buckets up to 128K. Samples longer than 128K are
 merged into the final bucket, and a sampled bucket contributes its upper bound
@@ -477,7 +477,7 @@ torchrun --standalone --nproc_per_node=8 \
   --qhead 32 --kvhead 8 --headdim 128 \
   --mode causal --methods all --zepplin-threshold 4096 --no-check
 
-DATASETS="arxiv github pile" GPU_COUNTS="2 4 8" NUM_CASES=4 ZEPPLIN_THRESHOLD=4096 \
+DATASETS="arxiv github pile freelaw prolong" GPU_COUNTS="2 4 8" NUM_CASES=4 ZEPPLIN_THRESHOLD=4096 \
   ./benchmark_dataset.sh
 ```
 

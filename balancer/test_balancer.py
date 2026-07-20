@@ -23,6 +23,7 @@ from balancer.load_balancer import (
 )
 from balancer.sampler import _align_sequence_length, _load_bucket_counts
 from dataset.build_length_bucket_stats import (
+    DATASET_NAMES,
     MAX_SEQUENCE_TOKENS,
     bucket_counts,
     build_statistics,
@@ -51,7 +52,7 @@ class DatasetBucketStatisticsTest(unittest.TestCase):
         expected = build_statistics(DATASET_DIR)
         actual = json.loads(BUCKET_STATS_PATH.read_text(encoding="utf-8"))
         self.assertEqual(actual, expected)
-        self.assertEqual(tuple(actual["datasets"]), ("arxiv", "github", "pile"))
+        self.assertEqual(tuple(actual["datasets"]), DATASET_NAMES)
         for statistics in actual["datasets"].values():
             self.assertEqual(statistics["sample_count"], 20_000)
             self.assertEqual(sum(statistics["bucket_counts"]), 20_000)
@@ -72,7 +73,7 @@ class DatasetSamplerTest(unittest.TestCase):
         self.assertEqual(len(balancer.LENGTH_BUCKETS), 512)
         self.assertEqual(balancer.LENGTH_BUCKETS[:4], (256, 512, 768, 1024))
         self.assertEqual(balancer.LENGTH_BUCKETS[-1], 128 * 1024)
-        self.assertEqual(tuple(balancer.DATASET_WEIGHTS), ("arxiv", "github", "pile"))
+        self.assertEqual(tuple(balancer.DATASET_WEIGHTS), DATASET_NAMES)
 
     def test_alignment_boundaries_round_up(self) -> None:
         expected = {

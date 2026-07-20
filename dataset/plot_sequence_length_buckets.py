@@ -17,12 +17,13 @@ from matplotlib.ticker import FuncFormatter, MultipleLocator, PercentFormatter
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = SCRIPT_DIR / "sequence_length_buckets.json"
 DEFAULT_OUTPUT = SCRIPT_DIR / "sequence_length_buckets_frequency.png"
-COLORS = ("#4C78A8", "#F58518", "#54A24B", "#E45756")
+COLORS = ("#4C78A8", "#F58518", "#54A24B", "#E45756", "#B279A2")
 DISPLAY_NAMES = {
     "arxiv": "ArXiv",
     "github": "GitHub",
     "pile": "Pile",
     "freelaw": "FreeLaw",
+    "prolong": "ProLong",
 }
 
 

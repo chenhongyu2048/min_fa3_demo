@@ -275,16 +275,16 @@ experiments. It runs forward by default; set `DIRECTION=backward` for causal
 backward. `DRY_RUN=1` prints commands without launching CUDA work.
 
 ```bash
-DATASETS="arxiv github pile" GPU_COUNTS=8 NUM_CASES=4 ZEPPLIN_THRESHOLD=4096 \
+DATASETS="arxiv github pile freelaw prolong" GPU_COUNTS=8 NUM_CASES=4 ZEPPLIN_THRESHOLD=4096 \
   ./benchmark_dataset.sh
 
-DATASETS="arxiv github pile" GPU_COUNTS=8 NUM_CASES=4 DIRECTION=backward \
+DATASETS="arxiv github pile freelaw prolong" GPU_COUNTS=8 NUM_CASES=4 DIRECTION=backward \
   ZEPPLIN_THRESHOLD=4096 ./benchmark_dataset.sh
 
 DRY_RUN=1 GPU_COUNTS="2 4 8" DATASETS=arxiv ./benchmark_dataset.sh
 ```
 
-The frontends sample Arxiv, Github, or Pile-CC lengths from
+The frontends sample ArXiv, GitHub, Pile-CC, FreeLaw, or ProLong lengths from
 `dataset/sequence_length_buckets.json`, then use BR-PBS to produce G8/G4/G2/G1
 metadata. The main planner controls are:
 
