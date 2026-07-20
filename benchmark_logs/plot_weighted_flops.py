@@ -18,8 +18,8 @@ import matplotlib.pyplot as plt
 
 
 LOG_DIR = Path(__file__).resolve().parent
-DEFAULT_FORWARD_LOG = LOG_DIR / "20260719-214850" / "benchmark_hybrid_dataset.log"
-DEFAULT_BACKWARD_LOG = (LOG_DIR / "20260719-215626" / "benchmark_hybrid_dataset_backward.log")
+DEFAULT_FORWARD_LOG = LOG_DIR / "20260720-105750" / "benchmark_dataset.log"
+DEFAULT_BACKWARD_LOG = (LOG_DIR / "20260720-110739" / "benchmark_dataset_backward.log")
 
 METHODS = (
     "allgather_attention",
@@ -55,7 +55,7 @@ DATASET_LABELS = {
 DATASET_ORDER = {name: index for index, name in enumerate(DATASET_LABELS)}
 
 SECTION_RE = re.compile(
-    r"^\[hybrid_dataset_(forward|backward)\]\s+dataset=(\S+)\s+GPUs=(\d+)"
+    r"^\[(?:hybrid_dataset_|dataset_)(forward|backward)\]\s+dataset=(\S+)\s+GPUs=(\d+)"
 )
 PLANNER_RE = re.compile(
     r"^Planner workload:\s+dataset=(\S+),.*?world_size=(\d+)"
