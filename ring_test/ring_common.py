@@ -211,7 +211,9 @@ def ring_varlen_forward(
     v: torch.Tensor,
     is_causal: bool,
     block_attention: BlockAttention,
-) -> torch.Tensor:
+    *,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run a full Python-side ring attention forward for one backend.
 
     `block_attention` is the per-step attention implementation. For noncausal
@@ -244,7 +246,12 @@ def ring_varlen_forward(
 
     if out is None:
         raise RuntimeError("ring attention produced no output blocks")
-    return out.to(q.dtype)
+    output = out.to(q.dtype)
+    if return_lse:
+        if lse is None:
+            raise RuntimeError("ring attention produced no LSE")
+        return output, lse.squeeze(-1).transpose(0, 1).contiguous()
+    return output
 
 
 def zigzag_ring_varlen_forward(

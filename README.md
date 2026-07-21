@@ -315,6 +315,16 @@ Full 128K runs should use `--no-check`; the correctness reference materializes
 quadratic attention scores. With `--methods all`, methods that cannot represent
 a generated workload are reported as skipped.
 
+`megatron_hybrid_cp` is an independent baseline copied and trimmed from
+Megatron-LM commit `368fa88e382b274c8fc12af851331cc1d30d69cc`. It ignores the
+BR-PBS ring placement and compiles its own CP1/2/4/8 execution groups from the
+same global lengths. Set `MEGATRON_MAX_SEQLEN_PER_RANK` in the shell wrapper or
+pass `--megatron-max-seqlen-per-rank` to either dataset/topology frontend; the
+default is 8192. Oversized or alignment-incompatible samples are skipped by
+`--methods all` and are errors when the method is requested explicitly. See
+`baseline/megatron_hybrid_cp/README.md` for schedule semantics, frontend
+integration, backend fallback, and the separate forward/backward timing bounds.
+
 ### UltraAttn 8K graph baseline
 
 `ultraattn` has been removed in main branch, but keeped in the `ultraattn_baseline` branch.

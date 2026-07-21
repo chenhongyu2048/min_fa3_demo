@@ -20,6 +20,14 @@ if str(DEMO_DIR) not in sys.path:
     sys.path.insert(0, str(DEMO_DIR))
 
 import min_fa3_op
+from baseline.megatron_hybrid_cp import (
+    MegatronHybridCPAttention,
+    build_hybrid_cp_plan,
+    create_hybrid_cp_process_groups,
+    forward_reference as megatron_hybrid_cp_forward_reference,
+    hybrid_cp_incompatibility,
+    make_packed_hybrid_cp_inputs,
+)
 from allgather_attention import (
     Llama3AllGatherAttention,
     repartition_sequence_shards_to_llama3,
@@ -53,11 +61,17 @@ METHOD_ORDER = [
     "allgather_attention",
     "llama3_allgather_attention",
     "fa3_ring",
+    "megatron_hybrid_cp",
     "zepplin",
     "mega_ring_all_cp",
     "mega_ring_hybrid",
 ]
 SM_SWEEP_METHODS = {"mega_ring_all_cp", "mega_ring_hybrid"}
+FUSED_MEGA_RING_METHODS = {"mega_ring_all_cp", "mega_ring_hybrid"}
+OVERLAPPED_ALLGATHER_METHODS = {
+    "allgather_attention",
+    "llama3_allgather_attention",
+}
 
 ALL_CP_METHODS = {
     "allgather_attention",
@@ -215,7 +229,15 @@ def method_incompatibility(
     world_size: int,
     is_causal: bool,
     zepplin_threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
+    megatron_max_seqlen_per_rank: int = 8192,
 ) -> str | None:
+    if method == "megatron_hybrid_cp":
+        return hybrid_cp_incompatibility(
+            global_lengths,
+            world_size,
+            is_causal,
+            max_seqlen_per_rank=megatron_max_seqlen_per_rank,
+        )
     if method == "zepplin":
         return zepplin_incompatibility(
             global_lengths, world_size, is_causal, zepplin_threshold
@@ -254,6 +276,7 @@ def compatible_methods_for_mode(
     *,
     skip_incompatible: bool,
     zepplin_threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
+    megatron_max_seqlen_per_rank: int = 8192,
 ) -> tuple[list[str], list[tuple[str, str]]]:
     compatible: list[str] = []
     skipped: list[tuple[str, str]] = []
@@ -264,6 +287,7 @@ def compatible_methods_for_mode(
             world_size,
             is_causal,
             zepplin_threshold,
+            megatron_max_seqlen_per_rank,
         )
         if reason is None:
             compatible.append(method)
@@ -473,6 +497,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=positive_int,
         default=DEFAULT_ZEPPLIN_THRESHOLD,
     )
+    parser.add_argument(
+        "--megatron-max-seqlen-per-rank",
+        type=positive_int,
+        default=8192,
+    )
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--num-iters", type=int, default=40)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
@@ -496,11 +525,16 @@ def _main_single(
     summary_samples: list[ForwardSummarySample] = []
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         raise SystemExit("SM90 Hopper CUDA device is required")
-    if args.headdim != 128 or args.kvhead * args.headdim != 1024:
-        raise SystemExit("hierarchical communication requires D=128 and KVH * D == 1024")
+    if args.headdim != 128:
+        raise SystemExit("this benchmark requires D=128")
+    if (
+        any(method in FUSED_MEGA_RING_METHODS for method in methods)
+        and args.kvhead * args.headdim != 1024
+    ):
+        raise SystemExit("fused mega-ring methods require KVH * D == 1024")
     if args.qhead % args.kvhead:
         raise SystemExit("qhead must be divisible by kvhead")
-    if (
+    if any(method in OVERLAPPED_ALLGATHER_METHODS for method in methods) and (
         args.allgather_overlapping_heads_k_stride <= 0
         or args.kvhead % args.allgather_overlapping_heads_k_stride
     ):
@@ -553,6 +587,7 @@ def _main_single(
                 is_causal,
                 skip_incompatible=skip_incompatible_methods,
                 zepplin_threshold=args.zepplin_threshold,
+                megatron_max_seqlen_per_rank=args.megatron_max_seqlen_per_rank,
             )
             methods_by_mode[is_causal] = active_methods
             skipped_by_mode[is_causal] = skipped_methods
@@ -576,6 +611,7 @@ def _main_single(
                         "allgather_attention",
                         "llama3_allgather_attention",
                         "fa3_ring",
+                        "megatron_hybrid_cp",
                         "zepplin",
                     )
                 )
@@ -604,6 +640,8 @@ def _main_single(
                 f"{args.allgather_overlapping_heads_k_stride}, "
                 f"mode={args.mode}, sm_configs={sm_configs_s}, "
                 f"zepplin_threshold={args.zepplin_threshold}, "
+                "megatron_max_seqlen_per_rank="
+                f"{args.megatron_max_seqlen_per_rank}, "
                 f"warmup={args.warmup_iters}, iters={args.num_iters}, "
                 f"check={args.check}"
             )
@@ -984,6 +1022,58 @@ def _main_single(
                     expected_hybrid_lse,
                 )
 
+            megatron_hybrid_cp_run = None
+            if "megatron_hybrid_cp" in active_methods:
+                if block_backend is None:
+                    raise RuntimeError(
+                        "Megatron hybrid-CP baseline requires a block backend"
+                    )
+                megatron_plan = build_hybrid_cp_plan(
+                    global_lengths,
+                    world_size,
+                    args.megatron_max_seqlen_per_rank,
+                )
+                megatron_groups = create_hybrid_cp_process_groups(
+                    dist.group.WORLD
+                )
+                megatron_inputs = make_packed_hybrid_cp_inputs(
+                    megatron_plan,
+                    rank,
+                    args.qhead,
+                    args.kvhead,
+                    args.headdim,
+                    device,
+                    is_causal=is_causal,
+                    seed=args.seed + 53,
+                )
+                megatron_runner = MegatronHybridCPAttention(
+                    megatron_plan,
+                    megatron_groups,
+                    megatron_inputs.q,
+                    megatron_inputs.k,
+                    megatron_inputs.v,
+                    is_causal,
+                    block_backend,
+                )
+                expected_megatron_out = None
+                expected_megatron_lse = None
+                if args.check:
+                    (
+                        expected_megatron_out,
+                        expected_megatron_lse,
+                    ) = megatron_hybrid_cp_forward_reference(megatron_runner)
+
+                def launch_megatron_hybrid_cp() -> tuple[torch.Tensor, torch.Tensor]:
+                    return megatron_runner.forward_all(), megatron_runner.lse
+
+                megatron_hybrid_cp_run = MethodRun(
+                    "megatron_hybrid_cp",
+                    launch_megatron_hybrid_cp,
+                    expected_megatron_out,
+                    expected_megatron_lse,
+                    megatron_runner.note,
+                )
+
             cuda_barrier()
             for config_index, config in enumerate(sm_configs):
                 config_methods = [
@@ -1005,6 +1095,12 @@ def _main_single(
                         if zepplin_run is None:
                             raise RuntimeError("zepplin run was not prepared")
                         runs.append(zepplin_run)
+                    elif method == "megatron_hybrid_cp":
+                        if megatron_hybrid_cp_run is None:
+                            raise RuntimeError(
+                                "Megatron hybrid-CP run was not prepared"
+                            )
+                        runs.append(megatron_hybrid_cp_run)
                     elif method in all_cp_runs:
                         launch, note = all_cp_runs[method]
                         expected_out = (
@@ -1287,11 +1383,16 @@ def main(
     methods = parse_methods(args.methods)
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         raise SystemExit("SM90 Hopper CUDA device is required")
-    if args.headdim != 128 or args.kvhead * args.headdim != 1024:
-        raise SystemExit("hierarchical communication requires D=128 and KVH * D == 1024")
+    if args.headdim != 128:
+        raise SystemExit("this benchmark requires D=128")
+    if (
+        any(method in FUSED_MEGA_RING_METHODS for method in methods)
+        and args.kvhead * args.headdim != 1024
+    ):
+        raise SystemExit("fused mega-ring methods require KVH * D == 1024")
     if args.qhead % args.kvhead:
         raise SystemExit("qhead must be divisible by kvhead")
-    if (
+    if any(method in OVERLAPPED_ALLGATHER_METHODS for method in methods) and (
         args.allgather_overlapping_heads_k_stride <= 0
         or args.kvhead % args.allgather_overlapping_heads_k_stride
     ):

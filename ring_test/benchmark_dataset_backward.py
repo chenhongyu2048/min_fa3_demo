@@ -90,6 +90,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=_positive_int,
         default=DEFAULT_ZEPPLIN_THRESHOLD,
     )
+    parser.add_argument(
+        "--megatron-max-seqlen-per-rank",
+        type=_positive_int,
+        default=8192,
+    )
     parser.add_argument("--sm-configs", default="128:4,124:8,120:12,116:16")
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--num-iters", type=int, default=40)
@@ -122,6 +127,8 @@ def _benchmark_argv(
         args.methods,
         "--zepplin-threshold",
         str(args.zepplin_threshold),
+        "--megatron-max-seqlen-per-rank",
+        str(args.megatron_max_seqlen_per_rank),
         "--sm-configs",
         args.sm_configs,
         "--warmup-iters",

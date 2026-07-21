@@ -20,6 +20,27 @@ is importable on every rank; otherwise every rank consistently falls back to
 the local `min_fa3_op.forward_varlen` / `backward_varlen` implementation. The
 result Note column reports the backend that was selected.
 
+`megatron_hybrid_cp` is the standalone Megatron-scheduled hybrid baseline in
+`../baseline/megatron_hybrid_cp/`. It derives CP1/2/4/8 assignments from the
+input global lengths rather than consuming the benchmark's Buddy-ring
+placement. Its scheduler is copied and trimmed from Megatron-LM commit
+`368fa88e382b274c8fc12af851331cc1d30d69cc`; there is no runtime Megatron-LM or
+Transformer Engine import. CP1 uses local FA3, while CP>1 uses the existing
+ordinary/zigzag P2P FA3 rings. External FA3 is selected only when every rank
+can import it, otherwise all ranks use the local min-FA3 fallback.
+
+The method executes every execution group and per-rank sample list in forward
+order, with exactly one world barrier between groups. Backward is causal-only
+and intentionally uses the same forward order after a complete retained
+forward phase. Forward timing includes all group compute, P2P, and internal
+barriers. Backward preparation runs the complete forward outside timing, then
+the timed interval covers the complete backward phase. Use
+`--megatron-max-seqlen-per-rank` (default 8192) to control the initial CP-size
+threshold. `--methods all` skips workloads whose required power-of-two CP size
+exceeds the world or whose actual CP shard violates divisibility/causal
+alignment; explicitly requesting the method reports the incompatibility as an
+error.
+
 `llama3_allgather_attention` is the whole-packed all-CP baseline. Instead of
 zigzag-partitioning every sequence independently, it concatenates the global
 varlen batch into one packed token stream, divides that stream into `2 * W`
@@ -181,14 +202,15 @@ divisible by 256, and the current fused backward requires causal mode,
 - `allgather_attention`: overlapped KV-head-sliced per-sequence zigzag all-gather backward
 - `llama3_allgather_attention`: overlapped KV-head-sliced whole-packed two-block all-gather backward
 - `fa3_ring`: NCCL zigzag K/V and FP32 dKV ring using FA3 block backward
+- `megatron_hybrid_cp`: Megatron length schedule with CP1/2/4/8 FA3 P2P phases
 - `zepplin`: short-sequence G1 attention plus long-sequence all-rank FA3 ring
 - `mega_ring_all_cp`: fused backward with every sequence split across all ranks
 - `mega_ring_hybrid`: fused G8/G4/G2/G1 hierarchical backward
 
-The four block baselines prefer external FA3 consistently across all ranks
+The five block baselines prefer external FA3 consistently across all ranks
 and fall back to this repository's min-FA3 varlen forward/backward ops when it
 is unavailable. `mega_ring_all_cp` and `mega_ring_hybrid` sweep every requested
-SM configuration; the four block baselines run once. Results
+SM configuration; the five block baselines run once. Results
 include the average of the per-iteration maximum end-to-end wall times and
 each rank's average time, aggregate/average-per-GPU causal backward TFLOP/s,
 and the fused compute/communication SM split. Forward preparation is outside

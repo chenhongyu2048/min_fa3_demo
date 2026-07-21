@@ -22,6 +22,14 @@ for path in (THIS_DIR, DEMO_DIR):
         sys.path.insert(0, str(path))
 
 import min_fa3_op
+from baseline.megatron_hybrid_cp import (
+    MegatronHybridCPAttention,
+    backward_reference as megatron_hybrid_cp_backward_reference,
+    build_hybrid_cp_plan,
+    create_hybrid_cp_process_groups,
+    hybrid_cp_incompatibility,
+    make_packed_hybrid_cp_inputs,
+)
 from allgather_attention import (
     Llama3AllGatherAttention,
     repartition_sequence_shards_to_llama3,
@@ -56,6 +64,7 @@ METHOD_ORDER = [
     "allgather_attention",
     "llama3_allgather_attention",
     "fa3_ring",
+    "megatron_hybrid_cp",
     "zepplin",
     "mega_ring_all_cp",
     "mega_ring_hybrid",
@@ -69,6 +78,11 @@ BLOCK_BASELINE_METHODS = {
 ALL_CP_METHODS = BLOCK_BASELINE_METHODS - {"zepplin"} | {"mega_ring_all_cp"}
 BLOCK_ALL_CP_METHODS = ALL_CP_METHODS - {"mega_ring_all_cp"}
 SM_SWEEP_METHODS = {"mega_ring_all_cp", "mega_ring_hybrid"}
+FUSED_MEGA_RING_METHODS = {"mega_ring_all_cp", "mega_ring_hybrid"}
+OVERLAPPED_ALLGATHER_METHODS = {
+    "allgather_attention",
+    "llama3_allgather_attention",
+}
 
 
 @dataclass(frozen=True)
@@ -169,7 +183,15 @@ def method_incompatibility(
     global_lengths: list[int],
     world_size: int,
     zepplin_threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
+    megatron_max_seqlen_per_rank: int = 8192,
 ) -> str | None:
+    if method == "megatron_hybrid_cp":
+        return hybrid_cp_incompatibility(
+            global_lengths,
+            world_size,
+            True,
+            max_seqlen_per_rank=megatron_max_seqlen_per_rank,
+        )
     if method == "zepplin":
         return zepplin_incompatibility(
             global_lengths, world_size, True, zepplin_threshold
@@ -206,12 +228,17 @@ def compatible_methods(
     *,
     skip_incompatible: bool,
     zepplin_threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
+    megatron_max_seqlen_per_rank: int = 8192,
 ) -> tuple[list[str], list[tuple[str, str]]]:
     active: list[str] = []
     skipped: list[tuple[str, str]] = []
     for method in methods:
         reason = method_incompatibility(
-            method, global_lengths, world_size, zepplin_threshold
+            method,
+            global_lengths,
+            world_size,
+            zepplin_threshold,
+            megatron_max_seqlen_per_rank,
         )
         if reason is None:
             active.append(method)
@@ -695,6 +722,52 @@ def benchmark_topology(
 
     baseline_runs: dict[str, MethodRun] = {}
     all_cp_mega_runs: dict[SmConfig, MethodRun] = {}
+    if "megatron_hybrid_cp" in methods:
+        if allgather_backend is None:
+            raise RuntimeError(
+                "Megatron hybrid-CP baseline requires a block backend"
+            )
+        megatron_plan = build_hybrid_cp_plan(
+            global_lengths,
+            world_size,
+            args.megatron_max_seqlen_per_rank,
+        )
+        megatron_groups = create_hybrid_cp_process_groups(dist.group.WORLD)
+        megatron_inputs = make_packed_hybrid_cp_inputs(
+            megatron_plan,
+            rank,
+            args.qhead,
+            args.kvhead,
+            args.headdim,
+            device,
+            is_causal=True,
+            seed=args.seed + 151,
+            with_dout=True,
+        )
+        if megatron_inputs.dout is None:
+            raise AssertionError("backward input preparation did not create dO")
+        megatron_runner = MegatronHybridCPAttention(
+            megatron_plan,
+            megatron_groups,
+            megatron_inputs.q,
+            megatron_inputs.k,
+            megatron_inputs.v,
+            True,
+            allgather_backend,
+            dout=megatron_inputs.dout,
+        )
+        megatron_reference = (
+            megatron_hybrid_cp_backward_reference(megatron_runner)
+            if args.check
+            else None
+        )
+        baseline_runs["megatron_hybrid_cp"] = MethodRun(
+            megatron_runner.forward_all,
+            megatron_runner.backward_all,
+            megatron_reference,
+            megatron_runner.note
+            + "; complete forward preparation excluded from backward timing",
+        )
     if any(method in BLOCK_ALL_CP_METHODS for method in methods):
         if allgather_backend is None:
             raise RuntimeError("block baselines require a selected block backend")
@@ -1352,6 +1425,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=positive_int,
         default=DEFAULT_ZEPPLIN_THRESHOLD,
     )
+    parser.add_argument(
+        "--megatron-max-seqlen-per-rank",
+        type=positive_int,
+        default=8192,
+    )
     parser.add_argument("--num-comp-sm", type=int)
     parser.add_argument("--num-comm-sm", type=int)
     parser.add_argument("--warmup-iters", type=int, default=5)
@@ -1372,11 +1450,18 @@ def main(
 ) -> None:
     args = parse_args(argv)
     requested_methods = parse_methods(args.methods)
-    if args.headdim != 128 or args.kvhead * args.headdim != 1024:
-        raise SystemExit("This path requires D=128 and KVH * D == 1024")
+    if args.headdim != 128:
+        raise SystemExit("this benchmark requires D=128")
+    if (
+        any(method in FUSED_MEGA_RING_METHODS for method in requested_methods)
+        and args.kvhead * args.headdim != 1024
+    ):
+        raise SystemExit("fused mega-ring methods require KVH * D == 1024")
     if args.qhead % args.kvhead:
         raise SystemExit("qhead must be divisible by kvhead")
-    if (
+    if any(
+        method in OVERLAPPED_ALLGATHER_METHODS for method in requested_methods
+    ) and (
         args.allgather_overlapping_heads_k_stride <= 0
         or args.kvhead % args.allgather_overlapping_heads_k_stride
     ):
@@ -1407,7 +1492,11 @@ def main(
 
         allgather_backend = (
             select_fa3_backend(dist.group.WORLD, require_backward=True)
-            if any(method in BLOCK_BASELINE_METHODS for method in requested_methods)
+            if any(
+                method in BLOCK_BASELINE_METHODS
+                or method == "megatron_hybrid_cp"
+                for method in requested_methods
+            )
             else None
         )
 
@@ -1423,6 +1512,8 @@ def main(
                 f"{args.allgather_overlapping_heads_k_stride}, "
                 f"sm_configs={configs}, "
                 f"zepplin_threshold={args.zepplin_threshold}, "
+                "megatron_max_seqlen_per_rank="
+                f"{args.megatron_max_seqlen_per_rank}, "
                 f"warmup={args.warmup_iters}, "
                 f"iters={args.num_iters}, check={args.check}",
                 flush=True,
@@ -1517,6 +1608,7 @@ def main(
                 world_size,
                 skip_incompatible=skip_incompatible_methods,
                 zepplin_threshold=args.zepplin_threshold,
+                megatron_max_seqlen_per_rank=args.megatron_max_seqlen_per_rank,
             )
             if rank == 0 and skipped_methods:
                 print(f"\nSkipped methods for {label}:")

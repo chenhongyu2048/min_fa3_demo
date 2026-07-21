@@ -18,13 +18,14 @@ import matplotlib.pyplot as plt
 
 
 LOG_DIR = Path(__file__).resolve().parent
-DEFAULT_FORWARD_LOG = LOG_DIR / "20260721-095134" / "benchmark_dataset.log"
-DEFAULT_BACKWARD_LOG = (LOG_DIR / "20260721-102727" / "benchmark_dataset_backward.log")
+DEFAULT_FORWARD_LOG = LOG_DIR / "20260721-215504" / "benchmark_dataset.log"
+DEFAULT_BACKWARD_LOG = (LOG_DIR / "20260721-221009" / "benchmark_dataset_backward.log")
 
 METHODS = (
     "allgather_attention",
     "llama3_allgather_attention",
     "fa3_ring",
+    "megatron_hybrid_cp",
     "zepplin",
     "mega_ring_all_cp",
     "mega_ring_hybrid",
@@ -34,6 +35,7 @@ METHOD_LABELS = {
     "allgather_attention": "allgather_attention",
     "llama3_allgather_attention": "llama3_allgather_attention",
     "fa3_ring": "ring_flash_attention",
+    "megatron_hybrid_cp": "megatron_hybrid_cp",
     "zepplin": "zepplin",
     "mega_ring_all_cp": "mega_ring_all_cp",
     "mega_ring_hybrid": "mega_ring_hybrid",
@@ -42,6 +44,7 @@ METHOD_COLORS = {
     "allgather_attention": "#4C78A8",
     "llama3_allgather_attention": "#59A14F",
     "fa3_ring": "#9C755F",
+    "megatron_hybrid_cp": "#F28E2B",
     "zepplin": "#ECA82C",
     "mega_ring_all_cp": "#E15759",
     "mega_ring_hybrid": "#B07AA1",
@@ -51,6 +54,7 @@ DATASET_LABELS = {
     "freelaw": "FreeLaw",
     "github": "GitHub",
     "pile": "Pile-CC",
+    "prolong": "ProLong",
 }
 DATASET_ORDER = {name: index for index, name in enumerate(DATASET_LABELS)}
 
