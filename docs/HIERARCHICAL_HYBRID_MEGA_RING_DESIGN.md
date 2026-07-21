@@ -1,5 +1,11 @@
 # Hierarchical Hybrid Mega-Ring Forward Design
 
+> **文档状态：历史 forward 设计记录。** 当前统一实现说明见
+> [MegaRing Hybrid Megakernel 设计](./MEGARING_HYBRID_KERNEL_DESIGN.md)。本文中的
+> topology、arena 和接口契约仍可作为细节参考；涉及 causal remote work scheduler
+> 时，当前实现已经采用 readiness-driven multi-segment claim，并支持 communication
+> CTA 完成搬运后转换为 compute CTA，因此以统一文档和当前源码为准。
+
 ## Status
 
 本文记录物理 `world_size=2/4/8` 下层级 hybrid mega-ring forward 的实现方案

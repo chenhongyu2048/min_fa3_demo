@@ -250,6 +250,9 @@ torchrun --standalone --nproc_per_node=8 --module \
 
 Hierarchical mega-ring notes:
 
+- The canonical forward/backward architecture, scheduling, SM-role, TMA-tile,
+  reduction, and paper-oriented design notes are documented in
+  [docs/MEGARING_HYBRID_KERNEL_DESIGN.md](docs/MEGARING_HYBRID_KERNEL_DESIGN.md).
 - Forward supports one node with 2, 4, or 8 SM90 GPUs. Backward supports physical world size 1, 2, 4, or 8; world size 1 permits only G1. A logical ring cannot exceed the physical world size.
 - The 8-GPU path uses one fused persistent launch for G8/G4/G2/G1 sequences; the 2-GPU path similarly fuses G2/G1.
 - Batches are ordered by non-increasing ring size and explicitly pass global lengths, ring sizes, and aligned ring starts.

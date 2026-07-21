@@ -1,5 +1,10 @@
 # Hierarchical Hybrid Mega-Ring Backward Design
 
+> **文档状态：backward 专项细节。** Forward/backward 的统一架构、设计动机、TMA
+> 粒度与论文实验建议见
+> [MegaRing Hybrid Megakernel 设计](./MEGARING_HYBRID_KERNEL_DESIGN.md)。本文继续作为
+> backward tensor、readiness 和 completion contract 的专项参考。
+
 ## Status And Scope
 
 This document describes the implemented causal varlen hierarchical mega-ring

@@ -2,6 +2,10 @@
 
 本文档描述 `balancer/` 中当前已经实现的负载均衡算法，而不是一个与代码脱节的理想化方案。核心实现位于 [load_balancer.py](./load_balancer.py)，数据集长度采样位于 [sampler.py](./sampler.py)，CPU-only 行为测试位于 [test_balancer.py](./test_balancer.py)。
 
+Balancer 输出如何由 forward/backward megakernel 消费，以及层级 ring、SM 角色、
+TMA 通信和归约协议，见
+[MegaRing Hybrid Megakernel 设计](../docs/MEGARING_HYBRID_KERNEL_DESIGN.md)。
+
 算法名称为 **Buddy-Ring Pareto Beam Scheduler（BR-PBS）**。它解决的问题是：在 2、4 或 8 个 rank 上，为一批不同长度的序列选择合法的 G1/G2/G4/G8 buddy ring，在 token 负载和 attention compute 负载都满足容差的前提下，尽量避免切分短序列，并降低通信和拓扑复杂度。
 
 ## 1. 设计目标
