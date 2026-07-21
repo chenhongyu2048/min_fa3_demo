@@ -18,8 +18,8 @@ import matplotlib.pyplot as plt
 
 
 LOG_DIR = Path(__file__).resolve().parent
-DEFAULT_FORWARD_LOG = LOG_DIR / "20260720-105750" / "benchmark_dataset.log"
-DEFAULT_BACKWARD_LOG = (LOG_DIR / "20260720-110739" / "benchmark_dataset_backward.log")
+DEFAULT_FORWARD_LOG = LOG_DIR / "20260721-095134" / "benchmark_dataset.log"
+DEFAULT_BACKWARD_LOG = (LOG_DIR / "20260721-102727" / "benchmark_dataset_backward.log")
 
 METHODS = (
     "allgather_attention",
