@@ -18,17 +18,23 @@ import matplotlib.pyplot as plt
 
 
 LOG_DIR = Path(__file__).resolve().parent
-DEFAULT_FORWARD_LOG = LOG_DIR / "20260721-215504" / "benchmark_dataset.log"
-DEFAULT_BACKWARD_LOG = (LOG_DIR / "20260721-221009" / "benchmark_dataset_backward.log")
+DEFAULT_FORWARD_LOG = LOG_DIR / "20260722-005516" / "benchmark_dataset.log"
+DEFAULT_BACKWARD_LOG = (LOG_DIR / "20260722-093016" / "benchmark_dataset_backward.log")
 
 METHODS = (
     "allgather_attention",
     "llama3_allgather_attention",
     "fa3_ring",
     "megatron_hybrid_cp",
+    "magi_attention",
     "zepplin",
     "mega_ring_all_cp",
     "mega_ring_hybrid",
+)
+HYBRID_COMPARISON_METHODS = tuple(
+    method
+    for method in METHODS
+    if method not in {"mega_ring_all_cp", "mega_ring_hybrid"}
 )
 TUNED_METHODS = frozenset(("mega_ring_all_cp", "mega_ring_hybrid"))
 METHOD_LABELS = {
@@ -36,6 +42,7 @@ METHOD_LABELS = {
     "llama3_allgather_attention": "llama3_allgather_attention",
     "fa3_ring": "ring_flash_attention",
     "megatron_hybrid_cp": "megatron_hybrid_cp",
+    "magi_attention": "magi_attention",
     "zepplin": "zepplin",
     "mega_ring_all_cp": "mega_ring_all_cp",
     "mega_ring_hybrid": "mega_ring_hybrid",
@@ -45,16 +52,17 @@ METHOD_COLORS = {
     "llama3_allgather_attention": "#59A14F",
     "fa3_ring": "#9C755F",
     "megatron_hybrid_cp": "#F28E2B",
+    "magi_attention": "#17A2B8",
     "zepplin": "#ECA82C",
     "mega_ring_all_cp": "#E15759",
     "mega_ring_hybrid": "#B07AA1",
 }
 DATASET_LABELS = {
+    "prolong": "ProLong",
     "arxiv": "ArXiv",
     "freelaw": "FreeLaw",
     "github": "GitHub",
     "pile": "Pile-CC",
-    "prolong": "ProLong",
 }
 DATASET_ORDER = {name: index for index, name in enumerate(DATASET_LABELS)}
 
@@ -250,20 +258,17 @@ def select_best(
             sources = ", ".join(str(item.source) for item in candidates)
             raise ValueError(f"multiple untuned baseline rows for {key}: {sources}")
 
-    datasets = sorted(
-        {dataset for dataset, _direction, _method in selected},
-        key=lambda name: (DATASET_ORDER.get(name, len(DATASET_ORDER)), name),
-    )
-    missing = [
-        f"{dataset}/{direction}/{method}"
-        for dataset in datasets
-        for direction in ("forward", "backward")
-        for method in METHODS
-        if (dataset, direction, method) not in selected
-    ]
-    if missing:
-        raise ValueError("missing required summary rows: " + ", ".join(missing))
     return selected
+
+
+def weighted_gpu_tflops_or_zero(
+    selected: dict[tuple[str, str, str], SummaryRecord],
+    dataset: str,
+    direction: str,
+    method: str,
+) -> float:
+    record = selected.get((dataset, direction, method))
+    return record.weighted_gpu_tflops if record is not None else 0.0
 
 
 def make_figure(
@@ -283,7 +288,9 @@ def make_figure(
         for method_index, method in enumerate(METHODS):
             offset = (method_index - (len(METHODS) - 1) / 2) * bar_width
             values = [
-                selected[(dataset, direction, method)].weighted_gpu_tflops
+                weighted_gpu_tflops_or_zero(
+                    selected, dataset, direction, method
+                )
                 for dataset in datasets
             ]
             ax.bar(
@@ -295,6 +302,39 @@ def make_figure(
                 linewidth=0.6,
                 label=METHOD_LABELS[method],
             )
+
+        hybrid_method = "mega_ring_hybrid"
+        hybrid_index = METHODS.index(hybrid_method)
+        hybrid_offset = (
+            hybrid_index - (len(METHODS) - 1) / 2
+        ) * bar_width
+        for x, dataset in zip(x_positions, datasets):
+            hybrid_value = weighted_gpu_tflops_or_zero(
+                selected, dataset, direction, hybrid_method
+            )
+            best_baseline = max(
+                weighted_gpu_tflops_or_zero(
+                    selected, dataset, direction, method
+                )
+                for method in HYBRID_COMPARISON_METHODS
+            )
+            speedup = (
+                f"{hybrid_value / best_baseline:.2f}x"
+                if best_baseline > 0.0
+                else "N/A"
+            )
+            ax.annotate(
+                speedup,
+                xy=(x + hybrid_offset, hybrid_value),
+                xytext=(0, 4),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                color="#704E6F",
+                fontsize=8.5,
+                fontweight="bold",
+            )
+
         ax.set_title(direction.capitalize(), fontsize=14)
         ax.set_xticks(
             x_positions,
@@ -304,6 +344,7 @@ def make_figure(
         ax.grid(axis="y", color="#D8D8D8", linewidth=0.8, alpha=0.8)
         ax.set_axisbelow(True)
         ax.spines[["top", "right"]].set_visible(False)
+        ax.margins(y=0.12)
 
     axes[0].set_ylabel("Weighted aggregate TFLOPS")
     handles, labels = axes[0].get_legend_handles_labels()
@@ -324,7 +365,7 @@ def make_figure(
     fig.text(
         0.5,
         0.01,
-        "Mega-ring methods use the best Weighted TFLOPS/GPU SM configuration for each dataset and direction.",
+        "Mega-ring uses the best SM configuration; hybrid labels show speedup over the best baseline excluding mega_ring_all_cp.",
         ha="center",
         fontsize=9,
         color="#555555",
@@ -348,7 +389,14 @@ def print_selection(
     for dataset in datasets:
         for direction in ("forward", "backward"):
             for method in METHODS:
-                record = selected[(dataset, direction, method)]
+                record = selected.get((dataset, direction, method))
+                if record is None:
+                    print(
+                        f"{dataset:<10} {direction:<10} "
+                        f"{METHOD_LABELS[method]:<29} {'-':>7} "
+                        f"{0.0:>17.2f} {0.0:>14.2f}"
+                    )
+                    continue
                 print(
                     f"{dataset:<10} {direction:<10} {METHOD_LABELS[method]:<29} "
                     f"{record.sm_config:>7} {record.weighted_gpu_tflops:>17.2f} "

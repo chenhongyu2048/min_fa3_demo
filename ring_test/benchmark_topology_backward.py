@@ -22,6 +22,11 @@ for path in (THIS_DIR, DEMO_DIR):
         sys.path.insert(0, str(path))
 
 import min_fa3_op
+from baseline.magi_attention import (
+    MagiAttentionBaseline,
+    MagiAttentionConfig,
+    probe_magi_attention_all_ranks,
+)
 from baseline.megatron_hybrid_cp import (
     MegatronHybridCPAttention,
     backward_reference as megatron_hybrid_cp_backward_reference,
@@ -65,6 +70,7 @@ METHOD_ORDER = [
     "llama3_allgather_attention",
     "fa3_ring",
     "megatron_hybrid_cp",
+    "magi_attention",
     "zepplin",
     "mega_ring_all_cp",
     "mega_ring_hybrid",
@@ -176,6 +182,24 @@ def parse_methods(spec: str) -> list[str]:
     if not deduped:
         raise SystemExit("--methods must provide at least one method")
     return deduped
+
+
+def requests_all_methods(spec: str) -> bool:
+    return any(token.strip() == "all" for token in spec.split(","))
+
+
+def resolve_magi_attention_availability(
+    methods: list[str], method_spec: str
+) -> tuple[list[str], str | None]:
+    if "magi_attention" not in methods:
+        return methods, None
+    available, reason = probe_magi_attention_all_ranks(dist.group.WORLD)
+    if available:
+        return methods, None
+    detail = reason or "unknown import failure"
+    if requests_all_methods(method_spec):
+        return [method for method in methods if method != "magi_attention"], detail
+    raise SystemExit(f"magi_attention is unavailable: {detail}")
 
 
 def method_incompatibility(
@@ -674,9 +698,11 @@ def benchmark_topology(
     allgather_backend: str | None,
     parallel_pools: BackwardParallelPools | None = None,
 ) -> list[BenchmarkResult]:
-    if any(method != "zepplin" for method in methods):
+    if any(method not in {"zepplin", "magi_attention"} for method in methods):
         validate_backward_metadata(global_lengths, ring_sizes, ring_starts, world_size)
-    elif not (len(global_lengths) == len(ring_sizes) == len(ring_starts)):
+    elif "zepplin" in methods and not (
+        len(global_lengths) == len(ring_sizes) == len(ring_starts)
+    ):
         raise SystemExit(
             "global lengths, ring sizes, and ring starts must have the same length"
         )
@@ -722,6 +748,28 @@ def benchmark_topology(
 
     baseline_runs: dict[str, MethodRun] = {}
     all_cp_mega_runs: dict[SmConfig, MethodRun] = {}
+    if "magi_attention" in methods:
+        magi_runner = MagiAttentionBaseline(
+            dist.group.WORLD,
+            global_lengths,
+            args.qhead,
+            args.kvhead,
+            args.headdim,
+            True,
+            device,
+            config=MagiAttentionConfig(
+                overlap_degree=args.magi_overlap_degree,
+                seed=args.seed,
+            ),
+            enable_backward=True,
+        )
+        baseline_runs["magi_attention"] = MethodRun(
+            magi_runner.prepare_backward,
+            magi_runner.backward,
+            None,
+            magi_runner.note
+            + "; forward preparation excluded from backward timing",
+        )
     if "megatron_hybrid_cp" in methods:
         if allgather_backend is None:
             raise RuntimeError(
@@ -1356,6 +1404,13 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def magi_overlap_degree(value: str) -> int:
+    parsed = int(value)
+    if not 1 <= parsed <= 8:
+        raise argparse.ArgumentTypeError("value must be an integer in [1, 8]")
+    return parsed
+
+
 def _print_backward_summary(
     samples: Sequence[BackwardSummarySample], total_cases: int, world_size: int
 ) -> None:
@@ -1430,6 +1485,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=positive_int,
         default=8192,
     )
+    parser.add_argument(
+        "--magi-overlap-degree",
+        type=magi_overlap_degree,
+        default=2,
+        help="Static MagiAttention overlap degree (1-8)",
+    )
     parser.add_argument("--num-comp-sm", type=int)
     parser.add_argument("--num-comm-sm", type=int)
     parser.add_argument("--warmup-iters", type=int, default=5)
@@ -1480,6 +1541,9 @@ def main(
     try:
         if not torch.cuda.is_available() or torch.cuda.get_device_capability(rank) != (9, 0):
             raise SystemExit("SM90 Hopper CUDA device is required")
+        requested_methods, magi_skip_reason = resolve_magi_attention_availability(
+            requested_methods, args.methods
+        )
         sm_count = torch.cuda.get_device_properties(rank).multi_processor_count
         for config in sm_configs:
             if config.num_comp_sm <= 0 or config.num_comm_sm <= 0:
@@ -1514,6 +1578,7 @@ def main(
                 f"zepplin_threshold={args.zepplin_threshold}, "
                 "megatron_max_seqlen_per_rank="
                 f"{args.megatron_max_seqlen_per_rank}, "
+                f"magi_overlap_degree={args.magi_overlap_degree}, "
                 f"warmup={args.warmup_iters}, "
                 f"iters={args.num_iters}, check={args.check}",
                 flush=True,
@@ -1525,6 +1590,12 @@ def main(
                     else "in-repo min_fa3 fallback"
                 )
                 print(f"Block baseline backend: {backend_name}", flush=True)
+            if magi_skip_reason is not None:
+                print(
+                    "Skipped method magi_attention: "
+                    f"{magi_skip_reason}",
+                    flush=True,
+                )
 
         if workload_cases is not None:
             if not workload_cases:
@@ -1563,11 +1634,14 @@ def main(
                     )
 
         for _label, global_lengths, ring_sizes, ring_starts in workloads:
-            if any(method != "zepplin" for method in requested_methods):
+            if any(
+                method not in {"zepplin", "magi_attention"}
+                for method in requested_methods
+            ):
                 validate_backward_metadata(
                     global_lengths, ring_sizes, ring_starts, world_size
                 )
-            elif not (
+            elif "zepplin" in requested_methods and not (
                 len(global_lengths) == len(ring_sizes) == len(ring_starts)
             ):
                 raise SystemExit(

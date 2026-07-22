@@ -7,6 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR"
+export CUDA_DEVICE_MAX_CONNECTIONS=8
 
 GPU_COUNTS=${GPU_COUNTS:-"8"}
 DATASETS=${DATASETS:-"arxiv freelaw github pile prolong"}
@@ -23,6 +24,7 @@ NUM_CASES=${NUM_CASES:-1}
 METHODS=${METHODS:-all}
 ZEPPLIN_THRESHOLD=${ZEPPLIN_THRESHOLD:-8192}
 MEGATRON_MAX_SEQLEN_PER_RANK=${MEGATRON_MAX_SEQLEN_PER_RANK:-8192}
+MAGI_OVERLAP_DEGREE=${MAGI_OVERLAP_DEGREE:-2}
 MODE=${MODE:-causal}
 QHEAD=${QHEAD:-32}
 KVHEAD=${KVHEAD:-8}
@@ -80,6 +82,8 @@ fi
     die "ZEPPLIN_THRESHOLD must be a positive integer, got '$ZEPPLIN_THRESHOLD'"
 [[ "$MEGATRON_MAX_SEQLEN_PER_RANK" =~ ^[1-9][0-9]*$ ]] || \
     die "MEGATRON_MAX_SEQLEN_PER_RANK must be a positive integer, got '$MEGATRON_MAX_SEQLEN_PER_RANK'"
+[[ "$MAGI_OVERLAP_DEGREE" =~ ^[1-8]$ ]] || \
+    die "MAGI_OVERLAP_DEGREE must be an integer in [1, 8], got '$MAGI_OVERLAP_DEGREE'"
 [[ "$NUM_CASES" =~ ^[1-9][0-9]*$ ]] || \
     die "NUM_CASES must be a positive integer, got '$NUM_CASES'"
 [[ "$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE" =~ ^[1-9][0-9]*$ ]] || \
@@ -166,6 +170,7 @@ run_benchmark() {
         --allgather-overlapping-heads-k-stride "$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE"
         --zepplin-threshold "$ZEPPLIN_THRESHOLD"
         --megatron-max-seqlen-per-rank "$MEGATRON_MAX_SEQLEN_PER_RANK"
+        --magi-overlap-degree "$MAGI_OVERLAP_DEGREE"
         --sm-configs "$SM_CONFIGS"
         --warmup-iters "$WARMUP_ITERS" --num-iters "$NUM_ITERS"
         "${CHECK_ARGS[@]}"
@@ -202,7 +207,7 @@ fi
 
 echo "Log: $LOG_FILE"
 echo "Datasets: ${DATASET_LIST[*]}"
-echo "Config: direction=$DIRECTION, target_tokens=$TARGET_TOKENS, compute_tolerance=$COMPUTE_BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, beam_width=$BEAM_WIDTH, finalist_count=$FINALIST_COUNT, structure_threshold=$STRUCTURE_THRESHOLD, max_repair_iterations=$MAX_REPAIR_ITERATIONS, seed=$SEED, num_cases=$NUM_CASES, mode=$MODE, zepplin_threshold=$ZEPPLIN_THRESHOLD, megatron_max_seqlen_per_rank=$MEGATRON_MAX_SEQLEN_PER_RANK"
+echo "Config: direction=$DIRECTION, target_tokens=$TARGET_TOKENS, compute_tolerance=$COMPUTE_BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, beam_width=$BEAM_WIDTH, finalist_count=$FINALIST_COUNT, structure_threshold=$STRUCTURE_THRESHOLD, max_repair_iterations=$MAX_REPAIR_ITERATIONS, seed=$SEED, num_cases=$NUM_CASES, mode=$MODE, zepplin_threshold=$ZEPPLIN_THRESHOLD, megatron_max_seqlen_per_rank=$MEGATRON_MAX_SEQLEN_PER_RANK, magi_overlap_degree=$MAGI_OVERLAP_DEGREE"
 echo "Methods: $METHODS; allgather_overlapping_heads_k_stride=$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE"
 
 for world_size in "${GPU_COUNT_LIST[@]}"; do

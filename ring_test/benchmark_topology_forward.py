@@ -20,6 +20,11 @@ if str(DEMO_DIR) not in sys.path:
     sys.path.insert(0, str(DEMO_DIR))
 
 import min_fa3_op
+from baseline.magi_attention import (
+    MagiAttentionBaseline,
+    MagiAttentionConfig,
+    probe_magi_attention_all_ranks,
+)
 from baseline.megatron_hybrid_cp import (
     MegatronHybridCPAttention,
     build_hybrid_cp_plan,
@@ -62,6 +67,7 @@ METHOD_ORDER = [
     "llama3_allgather_attention",
     "fa3_ring",
     "megatron_hybrid_cp",
+    "magi_attention",
     "zepplin",
     "mega_ring_all_cp",
     "mega_ring_hybrid",
@@ -103,6 +109,7 @@ class MethodRun:
     expected_lse: torch.Tensor | None
     note: str
     aligned_global_lengths: tuple[int, ...] | None = None
+    checkable: bool = True
 
 
 @dataclass(frozen=True)
@@ -175,6 +182,24 @@ def parse_methods(spec: str) -> list[str]:
     if not deduped:
         raise SystemExit("--methods must provide at least one method")
     return deduped
+
+
+def requests_all_methods(spec: str) -> bool:
+    return any(token.strip() == "all" for token in spec.split(","))
+
+
+def resolve_magi_attention_availability(
+    methods: list[str], method_spec: str
+) -> tuple[list[str], str | None]:
+    if "magi_attention" not in methods:
+        return methods, None
+    available, reason = probe_magi_attention_all_ranks(dist.group.WORLD)
+    if available:
+        return methods, None
+    detail = reason or "unknown import failure"
+    if requests_all_methods(method_spec):
+        return [method for method in methods if method != "magi_attention"], detail
+    raise SystemExit(f"magi_attention is unavailable: {detail}")
 
 
 def parse_sm_configs(spec: str) -> list[SmConfig]:
@@ -471,6 +496,13 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def magi_overlap_degree(value: str) -> int:
+    parsed = int(value)
+    if not 1 <= parsed <= 8:
+        raise argparse.ArgumentTypeError("value must be an integer in [1, 8]")
+    return parsed
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark explicit-topology mega-ring forward with all-CP baselines")
     parser.add_argument("--global-seqlens", required=True)
@@ -501,6 +533,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--megatron-max-seqlen-per-rank",
         type=positive_int,
         default=8192,
+    )
+    parser.add_argument(
+        "--magi-overlap-degree",
+        type=magi_overlap_degree,
+        default=2,
+        help="Static MagiAttention overlap degree (1-8)",
     )
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--num-iters", type=int, default=40)
@@ -549,15 +587,20 @@ def _main_single(
 
     rank, world_size = init_distributed()
     try:
+        methods, magi_skip_reason = resolve_magi_attention_availability(
+            methods, args.methods
+        )
         global_lengths = parse_int_list(args.global_seqlens, "--global-seqlens")
         mega_ring_all_cp_global_lengths = align_mega_ring_all_cp_lengths(global_lengths)
         ring_sizes = parse_int_list(args.ring_sizes, "--ring-sizes")
         ring_starts = parse_int_list(args.ring_starts, "--ring-starts")
-        if any(method != "zepplin" for method in methods):
+        if any(method not in {"zepplin", "magi_attention"} for method in methods):
             validate_metadata(
                 global_lengths, ring_sizes, ring_starts, world_size, args.mode
             )
-        elif not (len(global_lengths) == len(ring_sizes) == len(ring_starts)):
+        elif "zepplin" in methods and not (
+            len(global_lengths) == len(ring_sizes) == len(ring_starts)
+        ):
             raise SystemExit(
                 "global lengths, ring sizes, and ring starts must have the same length"
             )
@@ -591,6 +634,8 @@ def _main_single(
             )
             methods_by_mode[is_causal] = active_methods
             skipped_by_mode[is_causal] = skipped_methods
+            if magi_skip_reason is not None:
+                skipped_methods.append(("magi_attention", magi_skip_reason))
 
         zepplin_plans: dict[bool, ZepplinPlan] = {}
         for is_causal in modes:
@@ -642,6 +687,7 @@ def _main_single(
                 f"zepplin_threshold={args.zepplin_threshold}, "
                 "megatron_max_seqlen_per_rank="
                 f"{args.megatron_max_seqlen_per_rank}, "
+                f"magi_overlap_degree={args.magi_overlap_degree}, "
                 f"warmup={args.warmup_iters}, iters={args.num_iters}, "
                 f"check={args.check}"
             )
@@ -681,8 +727,8 @@ def _main_single(
             )
             if args.check:
                 print(
-                    "Checks compare each method with the matching full-rank "
-                    "reference output."
+                    "Checks compare each checkable method with the matching "
+                    "full-rank reference output; performance-only methods skip."
                 )
             for is_causal in modes:
                 mode = "causal" if is_causal else "noncausal"
@@ -800,6 +846,30 @@ def _main_single(
                             global_lengths,
                             is_causal,
                         )
+
+            magi_run = None
+            if "magi_attention" in active_methods:
+                magi_runner = MagiAttentionBaseline(
+                    dist.group.WORLD,
+                    global_lengths,
+                    args.qhead,
+                    args.kvhead,
+                    args.headdim,
+                    is_causal,
+                    device,
+                    config=MagiAttentionConfig(
+                        overlap_degree=args.magi_overlap_degree,
+                        seed=args.seed,
+                    ),
+                )
+                magi_run = MethodRun(
+                    "magi_attention",
+                    magi_runner.forward,
+                    None,
+                    None,
+                    magi_runner.note,
+                    checkable=False,
+                )
 
             mega_ring_all_cp_run_data = None
             if "mega_ring_all_cp" in active_methods:
@@ -1101,6 +1171,10 @@ def _main_single(
                                 "Megatron hybrid-CP run was not prepared"
                             )
                         runs.append(megatron_hybrid_cp_run)
+                    elif method == "magi_attention":
+                        if magi_run is None:
+                            raise RuntimeError("MagiAttention run was not prepared")
+                        runs.append(magi_run)
                     elif method in all_cp_runs:
                         launch, note = all_cp_runs[method]
                         expected_out = (
@@ -1228,7 +1302,7 @@ def _main_single(
                         timing.max_ms,
                     )
                     check_status = "skip"
-                    if args.check:
+                    if args.check and run.checkable:
                         result = run.launch()
                         torch.cuda.synchronize()
                         out = result[0] if isinstance(result, tuple) else result
@@ -1403,7 +1477,7 @@ def main(
             f"kvhead={args.kvhead}"
         )
     for workload_case in workload_cases:
-        if any(method != "zepplin" for method in methods):
+        if any(method not in {"zepplin", "magi_attention"} for method in methods):
             validate_metadata(
                 list(workload_case.global_lengths),
                 list(workload_case.ring_sizes),
@@ -1411,7 +1485,7 @@ def main(
                 int(os.environ["LOCAL_WORLD_SIZE"]),
                 args.mode,
             )
-        elif not (
+        elif "zepplin" in methods and not (
             len(workload_case.global_lengths)
             == len(workload_case.ring_sizes)
             == len(workload_case.ring_starts)

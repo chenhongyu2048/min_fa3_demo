@@ -203,6 +203,7 @@ divisible by 256, and the current fused backward requires causal mode,
 - `llama3_allgather_attention`: overlapped KV-head-sliced whole-packed two-block all-gather backward
 - `fa3_ring`: NCCL zigzag K/V and FP32 dKV ring using FA3 block backward
 - `megatron_hybrid_cp`: Megatron length schedule with CP1/2/4/8 FA3 P2P phases
+- `magi_attention`: full-WORLD MagiAttention dynamic packing/dispatch baseline
 - `zepplin`: short-sequence G1 attention plus long-sequence all-rank FA3 ring
 - `mega_ring_all_cp`: fused backward with every sequence split across all ranks
 - `mega_ring_hybrid`: fused G8/G4/G2/G1 hierarchical backward
@@ -298,9 +299,10 @@ the target token budget, prints the same placement/cap/load report, and calls
 `benchmark_topology_backward.main(...)` in the same process with explicit ring
 metadata. Backward is causal-only and benchmarks the all-CP and hierarchical
 fused kernels together with the per-sequence all-gather, Llama3 all-gather,
-FA3/NCCL ring, and Zeppelin baselines. The dataset planner's hierarchical ring
-metadata is forwarded unchanged; Zeppelin independently rebuilds its G1/Gworld
-placement from the global sequence lengths.
+FA3/NCCL ring, MagiAttention, and Zeppelin baselines. The dataset planner's
+hierarchical ring metadata is forwarded unchanged; MagiAttention ignores that
+metadata and dynamically dispatches the same global lengths over WORLD, while
+Zeppelin independently rebuilds its G1/Gworld placement.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
@@ -331,12 +333,14 @@ forward/backward threshold and defaults to `4096`.
 
 ## Explicit-topology mega-ring benchmark
 
-`benchmark_topology_forward.py` compares the same global varlen batch with six
+`benchmark_topology_forward.py` compares the same global varlen batch with eight
 methods:
 
 - `allgather_attention`: KV-head-sliced, overlapped all-CP K/V all-gather with per-sequence zigzag partitioning
 - `llama3_allgather_attention`: KV-head-sliced, overlapped all-CP K/V all-gather with whole-packed zigzag partitioning
 - `fa3_ring`: all-CP Python ring using FA3 blocks plus NCCL P2P
+- `megatron_hybrid_cp`: independently scheduled Megatron CP1/2/4/8 groups
+- `magi_attention`: full-WORLD dynamic packing/dispatch through MagiAttention
 - `zepplin`: LPT-placed rank-local attention for short sequences and an all-rank ring for long sequences
 - `mega_ring_all_cp`: fused mega-ring with every sequence split across all ranks
 - `mega_ring_hybrid`: fused mega-ring using the requested per-batch ring hierarchy
@@ -352,6 +356,18 @@ evenly over all physical ranks. `mega_ring_hybrid` instead uses `--ring-sizes` a
 that batch's ring and zero for other ranks. External FA3 is used by all three
 all-CP block baselines and Zeppelin when available; all four consistently fall
 back to the local min-FA3 varlen block when it is unavailable.
+
+`magi_attention` is a performance-only baseline using the same global lengths
+but not the explicit `ring_sizes`/`ring_starts` Hybrid-CP placement. It lets
+MagiAttention pad, pack, and dynamically dispatch tokens over the full WORLD
+group. It runs once per case rather than participating in the mega-ring SM
+sweep; `--magi-overlap-degree` defaults to 2 and accepts 1 through 8. Forward
+timing includes only `calc_attn`; backward preparation builds a fresh forward
+graph outside timing and the measured callable is only `out.backward(dout)`.
+TFLOPS count the original effective full/causal mask area, not padding work.
+MagiAttention always reports `Check=skip`. Installation, availability behavior,
+automatic chunking, padding notes, and CUDA 12.8 caveats are documented in
+[`../baseline/magi_attention/README.md`](../baseline/magi_attention/README.md).
 
 ### UltraAttn fixed-8K graph baseline
 
@@ -439,7 +455,7 @@ of 2048, ensuring that each causal rank-local half is 128-aligned on eight GPUs.
 Its table TFLOPS use the original unaligned lengths; its Note reports aggregate
 and average-per-GPU TFLOPS using the physically executed aligned lengths and
 the same measured latency. Use `--methods` to select a subset or
-`--methods all` for all six. Zeppelin only requires sequences at or above its
+`--methods all` for all eight. Zeppelin only requires sequences at or above its
 threshold to be divisible by `world_size`; causal long shards must also be even
 for the zigzag ring. Short G1 sequences have no all-CP divisibility constraint,
 and the threshold must be a positive integer.
@@ -525,8 +541,9 @@ The shell wrapper exposes the same settings as `COMPUTE_BALANCE_TOLERANCE`,
 `TOKEN_BALANCE_TOLERANCE`, `BEAM_WIDTH`, `FINALIST_COUNT`,
 `STRUCTURE_THRESHOLD`, and `MAX_REPAIR_ITERATIONS`. The load quantization step
 is fixed at 2% of the corresponding average and the residual-fill smooth-max
-lambda is fixed at 8. `ZEPPLIN_THRESHOLD` defaults to `4096` and is forwarded
-to both dataset directions. `--print-workload` reports absolute deviations,
+lambda is fixed at 8. `ZEPPLIN_THRESHOLD` defaults to `4096`, and
+`MAGI_OVERLAP_DEGREE` defaults to `2`; both are forwarded to both dataset
+directions. `--print-workload` reports absolute deviations,
 feasibility and violation, the relaxation level, split counts and penalties,
 the communication proxy, active groups, and accepted repair moves. If no legal
 placement satisfies both tolerances, the planner returns the lowest-violation

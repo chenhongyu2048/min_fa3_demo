@@ -325,6 +325,19 @@ default is 8192. Oversized or alignment-incompatible samples are skipped by
 `baseline/megatron_hybrid_cp/README.md` for schedule semantics, frontend
 integration, backend fallback, and the separate forward/backward timing bounds.
 
+`magi_attention` is an optional performance-only baseline for the topology and
+dataset frontends. It consumes the same global sequence lengths but ignores the
+BR-PBS `ring_sizes`/`ring_starts`, using the full WORLD group and MagiAttention's
+own padding, packing, and dynamic dispatch. Set `MAGI_OVERLAP_DEGREE` in the
+shell wrapper or pass `--magi-overlap-degree` (default 2, valid range 1-8).
+Forward times only `calc_attn`; backward rebuilds its forward graph outside the
+timed region and times only autograd backward. Useful FLOPS use original lengths
+and exclude padding work, while the result Note reports original/padded tokens.
+See [`baseline/magi_attention/README.md`](baseline/magi_attention/README.md) for
+the `uv pip` CUDA 12.8 installation, recursive CUTLASS initialization, optional
+dependency probe behavior, timing details, and the upstream CUDA 13 performance
+recommendation.
+
 ### UltraAttn 8K graph baseline
 
 `ultraattn` has been removed in main branch, but keeped in the `ultraattn_baseline` branch.

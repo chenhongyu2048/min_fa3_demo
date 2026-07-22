@@ -15,6 +15,7 @@ QHEAD=${QHEAD:-32}
 KVHEAD=${KVHEAD:-8}
 HEADDIM=${HEADDIM:-128}
 ALLGATHER_OVERLAPPING_HEADS_K_STRIDE=${ALLGATHER_OVERLAPPING_HEADS_K_STRIDE:-1}
+MAGI_OVERLAP_DEGREE=${MAGI_OVERLAP_DEGREE:-2}
 CHECK=${CHECK:-0}
 DRY_RUN=${DRY_RUN:-0}
 TORCHRUN=${TORCHRUN:-torchrun}
@@ -74,6 +75,9 @@ case "$DRY_RUN" in
     0|1) ;;
     *) die "DRY_RUN must be 0 or 1, got '$DRY_RUN'" ;;
 esac
+
+[[ "$MAGI_OVERLAP_DEGREE" =~ ^[1-8]$ ]] || \
+    die "MAGI_OVERLAP_DEGREE must be an integer in [1, 8], got '$MAGI_OVERLAP_DEGREE'"
 
 gpu_counts_spec=${GPU_COUNTS//,/ }
 read -r -a GPU_COUNT_LIST <<< "$gpu_counts_spec"
@@ -202,6 +206,7 @@ run_hierarchical_hybrid() {
         --ring-starts "$ring_starts" \
         --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM" \
         --allgather-overlapping-heads-k-stride "$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE" \
+        --magi-overlap-degree "$MAGI_OVERLAP_DEGREE" \
         --mode causal --methods all --sm-configs "$sm_configs" \
         --warmup-iters "$WARMUP_ITERS" --num-iters "$NUM_ITERS" \
         "${CHECK_ARGS[@]}"
@@ -213,7 +218,7 @@ if ((DRY_RUN == 0)); then
 fi
 
 echo "Log: $LOG_FILE"
-echo "Common config: causal varlen, QH=$QHEAD, KVH=$KVHEAD, D=$HEADDIM, allgather_overlapping_heads_k_stride=$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE, warmup=$WARMUP_ITERS, iters=$NUM_ITERS, check=$CHECK"
+echo "Common config: causal varlen, QH=$QHEAD, KVH=$KVHEAD, D=$HEADDIM, allgather_overlapping_heads_k_stride=$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE, magi_overlap_degree=$MAGI_OVERLAP_DEGREE, warmup=$WARMUP_ITERS, iters=$NUM_ITERS, check=$CHECK"
 
 for world_size in "${GPU_COUNT_LIST[@]}"; do
     select_devices "$world_size"

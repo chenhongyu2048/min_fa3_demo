@@ -18,6 +18,7 @@ for path in (THIS_DIR, DEMO_DIR):
 
 import balancer
 from benchmark_dataset_forward import (
+    _magi_overlap_degree,
     _nonnegative_int,
     _positive_int,
     _format_int_list,
@@ -95,6 +96,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=_positive_int,
         default=8192,
     )
+    parser.add_argument(
+        "--magi-overlap-degree",
+        type=_magi_overlap_degree,
+        default=2,
+        help="Static MagiAttention overlap degree (1-8)",
+    )
     parser.add_argument("--sm-configs", default="128:4,124:8,120:12,116:16")
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--num-iters", type=int, default=40)
@@ -129,6 +136,8 @@ def _benchmark_argv(
         str(args.zepplin_threshold),
         "--megatron-max-seqlen-per-rank",
         str(args.megatron_max_seqlen_per_rank),
+        "--magi-overlap-degree",
+        str(args.magi_overlap_degree),
         "--sm-configs",
         args.sm_configs,
         "--warmup-iters",
