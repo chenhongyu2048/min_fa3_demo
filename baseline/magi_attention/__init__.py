@@ -3,6 +3,8 @@
 from .attention import (
     MagiAttentionBaseline,
     MagiAttentionConfig,
+    MagiAttentionMetadata,
+    build_magi_attention_metadata,
     probe_magi_attention,
     probe_magi_attention_all_ranks,
 )
@@ -10,6 +12,8 @@ from .attention import (
 __all__ = [
     "MagiAttentionBaseline",
     "MagiAttentionConfig",
+    "MagiAttentionMetadata",
+    "build_magi_attention_metadata",
     "probe_magi_attention",
     "probe_magi_attention_all_ranks",
 ]

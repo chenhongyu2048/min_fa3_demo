@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
 
-# Dataset-shaped explicit-topology forward/backward benchmark.
-# Run inside a single-node allocation exposing 2, 4, or 8 SM90 GPUs.
+# Dataset-shaped metadata-only forward/backward load-balance benchmark.
+# Runs the same dataset/GPU matrix style as benchmark_dataset.sh, but does not
+# time or launch attention kernels.
 
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR"
-
-# MagiAttention-specific environment variables for better performance and stability.
 export CUDA_DEVICE_MAX_CONNECTIONS=8
-export NCCL_CGA_CLUSTER_SIZE=1
-export TORCH_NCCL_HIGH_PRIORITY=1
 
 GPU_COUNTS=${GPU_COUNTS:-"8"}
 DATASETS=${DATASETS:-"arxiv freelaw github pile prolong"}
@@ -34,20 +31,10 @@ QHEAD=${QHEAD:-32}
 KVHEAD=${KVHEAD:-8}
 HEADDIM=${HEADDIM:-128}
 ALLGATHER_OVERLAPPING_HEADS_K_STRIDE=${ALLGATHER_OVERLAPPING_HEADS_K_STRIDE:-4}
-SM_CONFIGS=${SM_CONFIGS:-"128:4,124:8,120:12,116:16"}
-WARMUP_ITERS=${WARMUP_ITERS:-10}
-NUM_ITERS=${NUM_ITERS:-40}
-CHECK=${CHECK:-0}
 DRY_RUN=${DRY_RUN:-0}
 TORCHRUN=${TORCHRUN:-torchrun}
 LOG_DIR=${LOG_DIR:-"benchmark_logs/$(date +%Y%m%d-%H%M%S)"}
-if [[ -z ${LOG_FILE:-} ]]; then
-    if [[ "$DIRECTION" == forward ]]; then
-        LOG_FILE="$LOG_DIR/benchmark_dataset.log"
-    else
-        LOG_FILE="$LOG_DIR/benchmark_dataset_backward.log"
-    fi
-fi
+LOG_FILE=${LOG_FILE:-"$LOG_DIR/benchmark_load_balance_${DIRECTION}.log"}
 
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
@@ -55,12 +42,6 @@ die() {
     echo "error: $*" >&2
     exit 1
 }
-
-case "$CHECK" in
-    0) CHECK_ARGS=(--no-check) ;;
-    1) CHECK_ARGS=(--check) ;;
-    *) die "CHECK must be 0 or 1, got '$CHECK'" ;;
-esac
 
 case "$DRY_RUN" in
     0|1) ;;
@@ -77,27 +58,37 @@ case "$MODE" in
     *) die "MODE must be noncausal, causal, or both, got '$MODE'" ;;
 esac
 if [[ "$DIRECTION" == backward && "$MODE" != causal ]]; then
-    die "topology backward supports only MODE=causal"
+    die "DIRECTION=backward requires MODE=causal, got MODE='$MODE'"
 fi
 
 [[ "$TARGET_TOKENS" =~ ^[1-9][0-9]*$ ]] || \
     die "TARGET_TOKENS must be a positive integer, got '$TARGET_TOKENS'"
-[[ "$ZEPPLIN_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || \
-    die "ZEPPLIN_THRESHOLD must be a positive integer, got '$ZEPPLIN_THRESHOLD'"
-[[ "$MEGATRON_MAX_SEQLEN_PER_RANK" =~ ^[1-9][0-9]*$ ]] || \
-    die "MEGATRON_MAX_SEQLEN_PER_RANK must be a positive integer, got '$MEGATRON_MAX_SEQLEN_PER_RANK'"
-[[ "$MAGI_OVERLAP_DEGREE" =~ ^[1-8]$ ]] || \
-    die "MAGI_OVERLAP_DEGREE must be an integer in [1, 8], got '$MAGI_OVERLAP_DEGREE'"
-[[ "$NUM_CASES" =~ ^[1-9][0-9]*$ ]] || \
-    die "NUM_CASES must be a positive integer, got '$NUM_CASES'"
-[[ "$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE" =~ ^[1-9][0-9]*$ ]] || \
-    die "ALLGATHER_OVERLAPPING_HEADS_K_STRIDE must be a positive integer, got '$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE'"
 [[ "$BEAM_WIDTH" =~ ^[1-9][0-9]*$ ]] || \
     die "BEAM_WIDTH must be a positive integer, got '$BEAM_WIDTH'"
 [[ "$FINALIST_COUNT" =~ ^[1-9][0-9]*$ ]] || \
     die "FINALIST_COUNT must be a positive integer, got '$FINALIST_COUNT'"
 [[ "$MAX_REPAIR_ITERATIONS" =~ ^[0-9]+$ ]] || \
     die "MAX_REPAIR_ITERATIONS must be a non-negative integer, got '$MAX_REPAIR_ITERATIONS'"
+[[ "$NUM_CASES" =~ ^[1-9][0-9]*$ ]] || \
+    die "NUM_CASES must be a positive integer, got '$NUM_CASES'"
+[[ "$ZEPPLIN_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || \
+    die "ZEPPLIN_THRESHOLD must be a positive integer, got '$ZEPPLIN_THRESHOLD'"
+[[ "$MEGATRON_MAX_SEQLEN_PER_RANK" =~ ^[1-9][0-9]*$ ]] || \
+    die "MEGATRON_MAX_SEQLEN_PER_RANK must be a positive integer, got '$MEGATRON_MAX_SEQLEN_PER_RANK'"
+[[ "$MAGI_OVERLAP_DEGREE" =~ ^[1-8]$ ]] || \
+    die "MAGI_OVERLAP_DEGREE must be an integer in [1, 8], got '$MAGI_OVERLAP_DEGREE'"
+[[ "$QHEAD" =~ ^[1-9][0-9]*$ ]] || \
+    die "QHEAD must be a positive integer, got '$QHEAD'"
+[[ "$KVHEAD" =~ ^[1-9][0-9]*$ ]] || \
+    die "KVHEAD must be a positive integer, got '$KVHEAD'"
+[[ "$HEADDIM" == 128 ]] || die "HEADDIM must be 128, got '$HEADDIM'"
+((QHEAD % KVHEAD == 0)) || \
+    die "QHEAD must be divisible by KVHEAD, got QHEAD=$QHEAD KVHEAD=$KVHEAD"
+[[ "$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE" =~ ^[1-9][0-9]*$ ]] || \
+    die "ALLGATHER_OVERLAPPING_HEADS_K_STRIDE must be a positive integer, got '$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE'"
+((KVHEAD % ALLGATHER_OVERLAPPING_HEADS_K_STRIDE == 0)) || \
+    die "ALLGATHER_OVERLAPPING_HEADS_K_STRIDE must divide KVHEAD"
+[[ -n "$METHODS" ]] || die "METHODS must not be empty"
 
 gpu_counts_spec=${GPU_COUNTS//,/ }
 read -r -a GPU_COUNT_LIST <<< "$gpu_counts_spec"
@@ -151,15 +142,10 @@ run_benchmark() {
     local dataset=$1
     local world_size=$2
     local visible_devices=$3
-    local entrypoint
-    if [[ "$DIRECTION" == forward ]]; then
-        entrypoint=ring_test/benchmark_dataset_forward.py
-    else
-        entrypoint=ring_test/benchmark_dataset_backward.py
-    fi
     local -a command=(
         "$TORCHRUN" --standalone --nproc_per_node="$world_size"
-        "$entrypoint"
+        ring_test/benchmark_load_balance.py
+        --direction "$DIRECTION"
         --dataset "$dataset"
         --target-tokens "$TARGET_TOKENS"
         --compute-balance-tolerance "$COMPUTE_BALANCE_TOLERANCE"
@@ -171,23 +157,16 @@ run_benchmark() {
         --seed "$SEED"
         --num-cases "$NUM_CASES"
         --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM"
+        --mode "$MODE" --methods "$METHODS"
         --allgather-overlapping-heads-k-stride "$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE"
         --zepplin-threshold "$ZEPPLIN_THRESHOLD"
         --megatron-max-seqlen-per-rank "$MEGATRON_MAX_SEQLEN_PER_RANK"
         --magi-overlap-degree "$MAGI_OVERLAP_DEGREE"
-        --sm-configs "$SM_CONFIGS"
-        --warmup-iters "$WARMUP_ITERS" --num-iters "$NUM_ITERS"
-        "${CHECK_ARGS[@]}"
     )
-    if [[ "$DIRECTION" == forward ]]; then
-        command+=(--mode "$MODE" --methods "$METHODS")
-    else
-        command+=(--methods "$METHODS")
-    fi
 
     if ((DRY_RUN)); then
         printf '\n================================================================================\n'
-        printf '[dataset_%s] dataset=%s GPUs=%s visible=%s\n' \
+        printf '[load_balance_%s] dataset=%s GPUs=%s visible=%s\n' \
             "$DIRECTION" "$dataset" "$world_size" "$visible_devices"
         printf '================================================================================\n'
         print_command "$visible_devices" "${command[@]}"
@@ -196,7 +175,7 @@ run_benchmark() {
 
     {
         printf '\n================================================================================\n'
-        printf '[dataset_%s] dataset=%s GPUs=%s visible=%s\n' \
+        printf '[load_balance_%s] dataset=%s GPUs=%s visible=%s\n' \
             "$DIRECTION" "$dataset" "$world_size" "$visible_devices"
         printf '================================================================================\n'
         print_command "$visible_devices" "${command[@]}"

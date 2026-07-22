@@ -151,8 +151,10 @@ the import path.
 | Entry point | Purpose |
 | --- | --- |
 | `benchmark_dataset.sh` | Recommended dataset-shaped forward/backward benchmark wrapper for 2, 4, or 8 GPUs |
+| `benchmark_load_balance.sh` | Dataset/GPU matrix wrapper for the metadata-only forward/backward load-balance benchmark |
 | `ring_test/benchmark_dataset_{forward,backward}.py` | Dataset sampling, BR-PBS placement, and topology benchmark frontend |
 | `ring_test/benchmark_topology_{forward,backward}.py` | Explicit global-length and Buddy-ring topology benchmark |
+| `ring_test/benchmark_load_balance.py` | Metadata-only forward/backward token, FLOP, communication, and logical-tile load analysis |
 | `ring_test/benchmark_ring_{forward,backward}.py` | Ordinary all-CP distributed ring benchmark |
 | `baseline/UltraAttn/packing/export_packed_causal_plan.py` | Offline Gurobi exporter for one fixed-8K UltraAttn allocation plan |
 | `baseline/UltraAttn/packing/generate_fixed_128k_plans.sh` | Offline UltraAttn plans for the fixed 1x128K through 16x8K suite |
@@ -374,6 +376,68 @@ There is no staged, 256-token packing, dataset-sampler, all-CP, round-robin, or
 Buddy-ring fallback for this method. See `baseline/UltraAttnREADME.md` for the
 planner environment, graph execution boundary, correctness commands, and
 measured five-case results.
+
+### Forward/backward load-balance metadata benchmark
+
+`ring_test/benchmark_load_balance.py` statically analyzes the same eight
+baselines registered by the explicit-topology forward and backward latency
+benchmarks. It does not time or launch an attention kernel, dispatch tensors,
+or build an autograd graph. `--direction` defaults to `forward`; backward is
+causal-only BF16 with head dimension 128 and world size 2, 4, or 8.
+
+This is a breaking rename: the old `benchmark_load_balance_forward.py` and
+`benchmark_load_balance_forward.sh` entry points are not retained.
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  ring_test/benchmark_load_balance.py \
+  --global-seqlens 8192,4096,2048 \
+  --ring-sizes 8,4,2 --ring-starts 0,0,4 \
+  --qhead 32 --kvhead 8 --headdim 128 \
+  --mode causal --methods all
+
+torchrun --standalone --nproc_per_node=8 \
+  ring_test/benchmark_load_balance.py --direction backward \
+  --global-seqlens 8192,4096,2048 \
+  --ring-sizes 8,4,2 --ring-starts 0,0,4 \
+  --qhead 32 --kvhead 8 --headdim 128 \
+  --mode causal --methods all
+```
+
+For a dataset/GPU matrix with timestamped terminal logs, use the shell wrapper:
+
+```bash
+DIRECTION=backward GPU_COUNTS="2 4 8" \
+  DATASETS="arxiv freelaw github pile prolong" \
+  NUM_CASES=4 ./benchmark_load_balance.sh
+
+DRY_RUN=1 DIRECTION=backward GPU_COUNTS="2 4 8" DATASETS=arxiv \
+  ./benchmark_load_balance.sh
+```
+
+The wrapper uses `DIRECTION=forward|backward`, defaulting to `forward`, and
+writes `benchmark_load_balance_<direction>.log`. It retains the dataset/GPU
+matrix and existing sampler, head, method, baseline, device, and logging
+overrides. It has no warmup, iteration, SM-sweep, correctness, or explicit
+topology variables.
+
+MagiAttention metadata construction requires `torchrun`, CUDA, and the Magi
+extensions. Without Magi, the other methods can be analyzed on CPU with ordinary
+Python and `--world-size 2|4|8`; `--methods all` prints a Magi skip reason in
+that mode. Effective fields retain the original workload; physical fields use
+the baseline's actual task area, including all-CP 2048-token alignment and Magi
+metadata. Forward FLOPs remain `4 * visible_scores * QH * D`. Backward FLOPs
+match the latency benchmark at `10 * visible_scores * QH * D`.
+
+Forward keeps the `KV tiles / QO visit` lower/upper metric. Backward reports the
+single mirrored `Q tiles / K-dKV` ratio: logical 128-token Q tiles read per
+logical K tile visit and dK/dV update, with both counters expanded by Q heads.
+Backward communication includes only work inside its measured boundary: BF16
+K/V movement and gradient return/reduction payloads. Communication load uses
+sent bytes only for every method, so each transfer contributes once rather than
+once at each endpoint. Setup repartition, untimed forward preparation, barriers,
+semaphores, and Magi input dispatch are excluded. See `ring_test/README.md` for
+per-baseline accounting details.
 
 ### Explicit topology and ordinary ring benchmarks
 

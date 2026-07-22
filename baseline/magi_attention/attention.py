@@ -23,8 +23,130 @@ class MagiAttentionConfig:
     seed: int = 0
 
 
+@dataclass(frozen=True)
+class MagiAttentionMetadata:
+    """References to a Magi runtime plan without dispatched Q/K/V tensors."""
+
+    key: object
+    dispatch_meta_q: object
+    dispatch_meta_k: object
+    calc_meta: object
+    comm_meta: object
+    enable_qo_comm: bool
+    use_native_grpcoll: bool
+    fwd_hp_reduce: bool
+    bwd_hp_reduce: bool
+    kernel_backend: object
+    save_tail_stage: bool
+    original_tokens: int
+    padded_tokens: int
+    chunk_size: int
+    overlap_degree: int
+
+
 def _load_magi_api() -> ModuleType:
     return importlib.import_module("magi_attention.api")
+
+
+def _make_dist_attn_config(api: ModuleType, config: MagiAttentionConfig):
+    return api.DistAttnConfig(
+        dispatch_config=api.DispatchConfig(
+            chunk_size=None,
+            alg=api.MinHeapDispatchAlg(),
+        ),
+        overlap_config=api.OverlapConfig(
+            mode=api.AttnOverlapMode.STATIC,
+            degree=config.overlap_degree,
+            min_chunk_size=512,
+            max_num_chunks=4096,
+            alg=api.UniformOverlapAlg(
+                random_costs=True,
+                random_seed=config.seed,
+            ),
+        ),
+    )
+
+
+def _validate_metadata_inputs(
+    process_group: dist.ProcessGroup,
+    global_lengths: Sequence[int],
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    config: MagiAttentionConfig,
+) -> tuple[int, ...]:
+    lengths = tuple(int(length) for length in global_lengths)
+    if not lengths or any(length <= 0 for length in lengths):
+        raise ValueError("MagiAttention requires non-empty positive global lengths")
+    if head_dim != 128:
+        raise ValueError(f"MagiAttention requires head_dim=128, got {head_dim}")
+    if q_heads <= 0 or kv_heads <= 0 or q_heads % kv_heads:
+        raise ValueError(
+            "MagiAttention requires positive heads and q_heads % kv_heads == 0"
+        )
+    if not 1 <= config.overlap_degree <= 8:
+        raise ValueError("MagiAttention overlap degree must be in [1, 8]")
+    if dist.get_world_size(process_group) != dist.get_world_size():
+        raise ValueError("MagiAttention process group must cover all benchmark ranks")
+    return lengths
+
+
+def build_magi_attention_metadata(
+    process_group: dist.ProcessGroup,
+    global_lengths: Sequence[int],
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    is_causal: bool,
+    *,
+    config: MagiAttentionConfig = MagiAttentionConfig(),
+) -> MagiAttentionMetadata:
+    """Build the runtime plan without dispatching data or launching attention."""
+
+    lengths = _validate_metadata_inputs(
+        process_group,
+        global_lengths,
+        q_heads,
+        kv_heads,
+        head_dim,
+        config,
+    )
+    api = _load_magi_api()
+    cu_seqlens = torch.tensor(
+        [0, *accumulate(lengths)],
+        dtype=torch.int32,
+        device="cpu",
+    )
+    key = api.magi_attn_varlen_key(
+        cu_seqlens,
+        cu_seqlens,
+        num_heads_q=q_heads,
+        num_heads_kv=kv_heads,
+        head_dim=head_dim,
+        pad_size=0,
+        cp_group_or_mesh=process_group,
+        causal=is_causal,
+        dist_attn_config=_make_dist_attn_config(api, config),
+    )
+    runtime_mgr = api.dist_attn_runtime_dict_mgr[key]
+    runtime = runtime_mgr.dist_attn_runtime
+    return MagiAttentionMetadata(
+        key=key,
+        dispatch_meta_q=runtime_mgr.dispatch_meta_q,
+        dispatch_meta_k=runtime_mgr.dispatch_meta_k,
+        calc_meta=runtime.calc_meta,
+        comm_meta=runtime.comm_meta,
+        enable_qo_comm=runtime.enable_qo_comm,
+        use_native_grpcoll=runtime.use_native_grpcoll,
+        fwd_hp_reduce=runtime.fwd_hp_reduce,
+        bwd_hp_reduce=runtime.bwd_hp_reduce,
+        kernel_backend=runtime.kernel_backend,
+        save_tail_stage=runtime.save_tail_stage,
+        original_tokens=sum(lengths),
+        padded_tokens=int(key.total_seqlen_q),
+        chunk_size=int(key.chunk_size),
+        overlap_degree=config.overlap_degree,
+    )
 
 
 def probe_magi_attention() -> tuple[bool, str | None]:
@@ -94,54 +216,17 @@ class MagiAttentionBaseline:
         enable_backward: bool = False,
     ) -> None:
         lengths = tuple(int(length) for length in global_lengths)
-        if not lengths or any(length <= 0 for length in lengths):
-            raise ValueError("MagiAttention requires non-empty positive global lengths")
-        if head_dim != 128:
-            raise ValueError(f"MagiAttention requires head_dim=128, got {head_dim}")
-        if q_heads <= 0 or kv_heads <= 0 or q_heads % kv_heads:
-            raise ValueError(
-                "MagiAttention requires positive heads and q_heads % kv_heads == 0"
-            )
-        if not 1 <= config.overlap_degree <= 8:
-            raise ValueError("MagiAttention overlap degree must be in [1, 8]")
-        if dist.get_world_size(process_group) != dist.get_world_size():
-            raise ValueError(
-                "MagiAttention process group must cover all benchmark ranks"
-            )
-
+        metadata = build_magi_attention_metadata(
+            process_group,
+            lengths,
+            q_heads,
+            kv_heads,
+            head_dim,
+            is_causal,
+            config=config,
+        )
         api = _load_magi_api()
-        dist_attn_config = api.DistAttnConfig(
-            dispatch_config=api.DispatchConfig(
-                chunk_size=None,
-                alg=api.MinHeapDispatchAlg(),
-            ),
-            overlap_config=api.OverlapConfig(
-                mode=api.AttnOverlapMode.STATIC,
-                degree=config.overlap_degree,
-                min_chunk_size=512,
-                max_num_chunks=4096,
-                alg=api.UniformOverlapAlg(
-                    random_costs=True,
-                    random_seed=config.seed,
-                ),
-            ),
-        )
-        cu_seqlens = torch.tensor(
-            [0, *accumulate(lengths)],
-            dtype=torch.int32,
-            device="cpu",
-        )
-        self._key = api.magi_attn_varlen_key(
-            cu_seqlens,
-            cu_seqlens,
-            num_heads_q=q_heads,
-            num_heads_kv=kv_heads,
-            head_dim=head_dim,
-            pad_size=0,
-            cp_group_or_mesh=process_group,
-            causal=is_causal,
-            dist_attn_config=dist_attn_config,
-        )
+        self._key = metadata.key
         self._calc_attn = api.calc_attn
 
         original_tokens = sum(lengths)
@@ -186,10 +271,9 @@ class MagiAttentionBaseline:
                 generator=generator,
             )
 
-        padded_tokens = int(self._key.total_seqlen_q)
         self._note = (
             f"chunk_size={int(self._key.chunk_size)}, "
-            f"tokens(original/padded)={original_tokens}/{padded_tokens}, "
+            f"tokens(original/padded)={original_tokens}/{metadata.padded_tokens}, "
             f"overlap_degree={config.overlap_degree}; dispatch excluded; "
             "performance-only"
         )

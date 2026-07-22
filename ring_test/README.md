@@ -331,6 +331,158 @@ has quadratic score memory. The shell wrapper shares the forward wrapper's
 and `DRY_RUN` environment variables. `ZEPPLIN_THRESHOLD` controls the shared
 forward/backward threshold and defaults to `4096`.
 
+## Forward/backward load-balance metadata benchmark
+
+`benchmark_load_balance.py` is the unified static analysis entry point for all
+eight baselines in `benchmark_topology_forward.py` and
+`benchmark_topology_backward.py`:
+
+- `allgather_attention`
+- `llama3_allgather_attention`
+- `fa3_ring`
+- `megatron_hybrid_cp`
+- `magi_attention`
+- `zepplin`
+- `mega_ring_all_cp`
+- `mega_ring_hybrid`
+
+`--direction` accepts `forward` or `backward` and defaults to `forward`.
+Backward accepts only `--mode causal`; `noncausal` and `both` are errors. Both
+directions are BF16, D=128, and world size 2, 4, or 8. The old
+`benchmark_load_balance_forward.py` and `../benchmark_load_balance_forward.sh`
+names were removed rather than retained as aliases.
+
+The tool does not run attention kernels, measure latency, perform warmup, sweep
+SM allocations, check numerical output, or construct an autograd graph. Regular
+adapters consume the latency runners' placement and task boundaries. The Magi
+adapter calls the same metadata key builder and reads `DispatchMeta`, `CalcMeta`,
+backward `AttnArg`, collective splits, precision flags, backend, and tail-stage
+policy. It never calls `dispatch`, `calc_attn`, or `backward()`.
+
+Explicit topology:
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  ring_test/benchmark_load_balance.py \
+  --global-seqlens 8192,4096,2048 \
+  --ring-sizes 8,4,2 --ring-starts 0,0,4 \
+  --qhead 32 --kvhead 8 --headdim 128 \
+  --mode causal --methods all
+```
+
+Dataset workload with the existing BR-PBS controls:
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  ring_test/benchmark_load_balance.py --direction backward \
+  --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 4 \
+  --qhead 32 --kvhead 8 --headdim 128 \
+  --mode causal --methods all
+```
+
+Run a dataset/GPU matrix with the same environment-variable style as
+`benchmark_dataset.sh`:
+
+```bash
+DIRECTION=backward GPU_COUNTS="2 4 8" \
+  DATASETS="arxiv freelaw github pile prolong" \
+  NUM_CASES=4 ./benchmark_load_balance.sh
+
+DRY_RUN=1 DIRECTION=backward GPU_COUNTS="2 4 8" DATASETS=arxiv \
+  ./benchmark_load_balance.sh
+```
+
+`DIRECTION`, `TARGET_TOKENS`, both balance tolerances, `BEAM_WIDTH`,
+`FINALIST_COUNT`, `STRUCTURE_THRESHOLD`, `MAX_REPAIR_ITERATIONS`, `SEED`,
+`NUM_CASES`, `MODE`, `METHODS`, head settings, baseline settings,
+`CUDA_VISIBLE_DEVICES`, `TORCHRUN`, `LOG_DIR`, and `LOG_FILE` can be overridden.
+The default log is
+`benchmark_logs/<timestamp>/benchmark_load_balance_<direction>.log`. The
+wrapper does not expose explicit topology, timing, SM-sweep, or correctness
+settings; explicit topology remains a direct Python invocation.
+
+The non-Magi methods also support CPU-only static analysis:
+
+```bash
+python ring_test/benchmark_load_balance.py --direction backward \
+  --global-seqlens 2048,1024 --ring-sizes 2,1 --ring-starts 0,1 \
+  --world-size 2 --qhead 32 --kvhead 8 --headdim 128 \
+  --mode causal --methods allgather_attention,fa3_ring,mega_ring_hybrid
+```
+
+Selecting `magi_attention` explicitly requires `torchrun`, an SM90 CUDA device,
+and both Magi extensions. Under ordinary Python, `--methods all` reports a Magi
+skip reason and continues with the CPU adapters. As in the latency frontends,
+`all` prints a reason for any method that cannot represent a case, while an
+explicit incompatible selection is an error.
+
+Each method prints load, efficiency, and min/avg/max/max-to-avg summary tables.
+Dataset runs also sum every rank field over cases and recompute ratios from the
+cumulative counters. Shared fields use these definitions:
+
+- Effective tokens/scores describe the original visible full or causal
+  workload. `mega_ring_all_cp` uses the original world-normalized share here.
+- Physical tokens/scores describe the baseline's executed workload, including
+  the all-CP mega-ring's 2048-token alignment and Magi padding/slices.
+- Forward FLOPs are `4 * score_count * QH * D` for QK and PV only. Backward
+  FLOPs are `10 * score_count * QH * D`, matching the backward latency
+  benchmark. Neither adds mask, softmax, scheduler, atomic, or address FLOPs.
+- `Sent` counts logical payload inside the corresponding latency benchmark's
+  measured forward/backward boundary. Communication load and `Send/avg` use
+  only each rank's sent bytes for every method. Received bytes are retained
+  internally only to validate `sum(Sent) == sum(Received)` and are not reported
+  as load. Consequently the global transmitted payload is `sum(Sent)`. Fabric
+  routing, NCCL protocols, barriers, atomics, semaphores, and completion
+  counters are excluded.
+- BF16 Q/K/V/O/dO elements use 2 bytes. FP32 LSE and high-precision gradient
+  payloads use 4 bytes.
+- Q and KV tiles are algorithm-level 128-token tiles for every backend. A Q/O
+  visit is one attention task or segment reading a Q tile and writing its
+  partial/final O tile. A KV tile read means that tile intersects the task's
+  full, causal, inverse-causal, or bi-causal mask.
+- `KV tiles / QO visit` is recomputed from aggregate counters. Larger values
+  mean more KV work per Q read/O write visit; it is not a hardware counter.
+
+For causal fused mega-ring, `[lower,upper]` captures dynamic segment formation.
+The numerator is fixed. The lower bound uses the worst case where every remote
+step is a separate Q/O segment; the upper bound uses the best case where all
+consecutive ready steps allowed by the scheduler merge. G1 and non-dynamic
+paths have equal bounds. Dataset multi-case output prints every case and then
+sums rank fields across cases; its ratio is recomputed from cumulative tile
+counters rather than averaging per-case ratios.
+
+Backward uses a separate mirrored efficiency metric. A `Q tile read` is one
+logical 128-token Q tile intersecting the causal mask for the current K/dKV
+task. A `K/dKV visit` is one task visiting a logical 128-token K tile for K/V
+read and dK/dV update. Both counters are expanded by Q heads, matching backward
+scheduler work. `Q tiles / K-dKV` is their quotient. Backward has no
+multi-step segment fusion, so every method reports one value rather than a
+lower/upper interval.
+
+Backward communication follows each runner's actual boundary:
+
+- All-gather and Llama3 repeat the BF16 K/V all-gather and perform FP32 dK/dV
+  reduce-scatter. Setup repartition and untimed forward preparation are
+  excluded.
+- FA3 ring, Megatron CP2/4/8, and Zeppelin Gworld use `p-1` BF16 K/V ring
+  steps and `p` FP32 dK/dV owner-return steps. Megatron CP1 and Zeppelin's LPT
+  G1 sequences are local with zero payload. Inter-group and phase barriers are
+  excluded.
+- Fused mega-ring fetches remote BF16 K/V with its causal half/full row rule.
+  Every remote step store-adds FP32 dK/dV directly to its final owner using the
+  real accumulator layout, including one extra 128-row gap for every batch in
+  that level. As for every other method, communication load counts each
+  transfer once at its sending endpoint. Step 0's local owner store, resets,
+  counters, semaphores, and barriers are excluded. `mega_ring_all_cp`
+  additionally uses 2048-token aligned physical work while retaining the
+  original world-normalized effective share.
+- Magi reads physical tasks from `CalcMeta` and backward `AttnArg`. Backward KV
+  fetch, dKV reduction, and optional Q/O/dO/LSE fetch plus dQ reduction are
+  included. Q/K/V/O/dO use BF16, LSE uses FP32, and dQ/dK/dV use the runtime's
+  native/high-precision/backend dtype branch. A forward-cached tail stage is
+  not fetched again in backward, but its gradient reduction remains included.
+  Input dispatch and untimed forward graph preparation are excluded.
+
 ## Explicit-topology mega-ring benchmark
 
 `benchmark_topology_forward.py` compares the same global varlen batch with eight

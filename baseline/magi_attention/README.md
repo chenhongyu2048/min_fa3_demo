@@ -74,3 +74,27 @@ full or causal attention area. Work introduced by MagiAttention padding stays
 in measured latency but is not counted as useful FLOPS. The result Note reports
 the resolved chunk size and original/padded token counts so padding overhead is
 visible.
+
+## Metadata-only load accounting
+
+`ring_test/benchmark_load_balance.py` uses `build_magi_attention_metadata()` to
+inspect the same runtime plan without allocating or dispatching Q/K/V and
+without calling `calc_attn` or autograd. The metadata object exposes dispatch,
+calculation, and communication metadata together with `enable_qo_comm`, native
+group-collective selection, forward/backward high-precision reduction flags,
+kernel backend, and `save_tail_stage`.
+
+Forward load accounting includes runtime KV/Q fetch and partial O/LSE reduction
+inside the measured forward boundary. Causal backward accounting reads the
+backward Q/K ranges and masks from each `AttnArg`, then includes runtime KV
+fetch and dKV reduce. When Q/O communication is enabled, Q/O/dO/LSE fetch and
+dQ reduce are also included. K/V/Q/O/dO payloads are BF16 and LSE is FP32;
+dQ/dK/dV use BF16 or FP32 according to the runtime's backend, native collective,
+and backward high-precision reduction branch. If `save_tail_stage` retained the
+last remote K/V stage during untimed forward preparation, backward omits that
+stage's repeated fetch but still counts its gradient reduction.
+
+The metadata benchmark excludes input dispatch, untimed forward/autograd graph
+preparation, barriers, and protocol overhead. It requires `torchrun`, CUDA,
+SM90, and the Magi extensions; ordinary CPU analysis remains available for the
+other seven methods.
