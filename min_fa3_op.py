@@ -16,6 +16,7 @@ from _min_fa3_op import (
     forward,
     forward_varlen as _forward_varlen_cuda,
     forward_varlen_mega_ring as _forward_varlen_mega_ring_cuda,
+    forward_varlen_mega_ring_ablation as _forward_varlen_mega_ring_ablation_cuda,
     forward_varlen_ring as _forward_varlen_ring_cuda,
     parallel_remote_load as _parallel_remote_load_cuda,
     parallel_remote_load_vec as _parallel_remote_load_vec_cuda,
@@ -406,6 +407,11 @@ def forward_varlen_mega_ring(
         bool(return_lse),
         stats,
     )
+
+
+def _forward_varlen_mega_ring_ablation(*args, **kwargs):
+    """Internal preallocated runner used by ring_test.forward_ablation."""
+    return _forward_varlen_mega_ring_ablation_cuda(*args, **kwargs)
 
 
 __all__ = [

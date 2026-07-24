@@ -101,6 +101,7 @@ ext_modules = [
             # MEGA_RING: explicit default-off multi-step fused ring path.
             "csrc/mega_ring_min_fa3_varlen_ring_launch.cu",
             "csrc/mega_ring_min_fa3_varlen_ring_bindings.cu",
+            "csrc/mega_ring_forward_ablation.cu",
             "csrc/parallel/remote_load.cu",
             "csrc/parallel/remote_load_bindings.cu",
         ],

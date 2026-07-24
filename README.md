@@ -155,6 +155,7 @@ the import path.
 | `ring_test/load_balance_bench/run.sh` | Dataset/GPU wrapper for the fixed five-method runtime load-balance suite |
 | `ring_test/benchmark_dataset_{forward,backward}.py` | Dataset sampling, BR-PBS placement, and topology benchmark frontend |
 | `ring_test/load_balance_bench/benchmark_{forward,backward}.py` | Native Megatron/Zepllin versus three placement-mapped fused Mega Ring runtime frontends |
+| `ring_test/benchmark_forward_ablation.py` | Strict causal W8 six-level forward accumulation ablation with preallocated plans |
 | `ring_test/benchmark_topology_{forward,backward}.py` | Explicit global-length and Buddy-ring topology benchmark |
 | `ring_test/benchmark_load_balance.py` | Metadata-only forward/backward token, FLOP, communication, and logical-tile load analysis |
 | `ring_test/benchmark_ring_{forward,backward}.py` | Ordinary all-CP distributed ring benchmark |
@@ -252,6 +253,21 @@ torchrun --standalone --nproc_per_node=8 --module \
 torchrun --standalone --nproc_per_node=8 --module \
   scripts.test_mega_ring.mega_ring_test_min_fa3_varlen_backward_validation_multi_rank
 ```
+
+Strict six-level forward ablation on eight H100s:
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  ring_test/benchmark_forward_ablation.py \
+  --b 8 --seqlen 16384,12288,8192,6144,4096,2048,2048,2048 \
+  --qhead 16 --kvhead 8 --headdim 128 --mode causal
+```
+
+The driver fixes the SM split at `116:16`, canonicalizes every input length to
+2048 exactly once, runs L1-L5 as all-CP G8, and maps L6 to BR-PBS metadata on
+the same canonical lengths. Defaults are 10 warmups, 40 measured iterations,
+and 3 interleaved rounds. Use `--correctness-only` for the representative
+five-repeat all-CP and mixed-hierarchy checks without the latency experiment.
 
 Hierarchical mega-ring notes:
 

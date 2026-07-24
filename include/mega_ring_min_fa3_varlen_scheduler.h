@@ -282,6 +282,12 @@ private:
                         found_segment_meta = min_fa3_varlen_demo::mega_ring::pack_segment_meta(
                             begin_step, end_step, end_step == last_step);
                         found_work = base_work;
+                        if constexpr (CollectStats) {
+                            int const span = end_step - begin_step + 1;
+                            atomicAdd(params.mega_ring_completed_tiles + 1, span);
+                            atomicMax(params.mega_ring_completed_tiles + 2, span);
+                            atomicAdd(params.mega_ring_completed_tiles + 3, 1);
+                        }
                         break;
                     }
                     if (found_reduction_idx < 0) { __nanosleep(64); }

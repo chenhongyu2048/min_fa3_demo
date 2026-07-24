@@ -14,6 +14,7 @@
 
 // MEGA_RING: use the fused multi-step mega-ring launch instead of the
 // single-step ring launch.
+#include "mega_ring_forward_ablation_api.h"
 #include "mega_ring_min_fa3_varlen_ring_launch.h"
 #include "min_fa3_varlen_params.h"
 
@@ -563,7 +564,8 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     auto kv_ready_counts = torch::zeros({11}, q.options().dtype(torch::kInt32));
     auto step_ready = torch::zeros({std::max<int64_t>(reduction_tiles, 1)}, q.options().dtype(torch::kInt32));
     auto scan_cursor = torch::zeros({1}, q.options().dtype(torch::kInt32));
-    auto completed_tiles = torch::zeros({1}, q.options().dtype(torch::kInt32));
+    auto completed_tiles = torch::zeros(
+        {stats.defined() ? 4 : 1}, q.options().dtype(torch::kInt32));
 
     torch::Tensor q_descriptor = q;
     torch::Tensor out_descriptor = out;
@@ -619,9 +621,238 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     return py::cast(out);
 }
 
+min_fa3_varlen_demo::MegaRingHierarchyDesc parse_ablation_hierarchy(
+    const torch::Tensor& hierarchy_host) {
+    TORCH_CHECK(!hierarchy_host.is_cuda(), "hierarchy_host must be a CPU tensor");
+    TORCH_CHECK(hierarchy_host.scalar_type() == torch::kInt32,
+                "hierarchy_host must have dtype torch.int32");
+    TORCH_CHECK(hierarchy_host.is_contiguous() && hierarchy_host.dim() == 1,
+                "hierarchy_host must be contiguous and 1D");
+    constexpr int kLevelFields = 11;
+    constexpr int kHierarchyFields =
+        min_fa3_varlen_demo::kMegaRingNumLevels * kLevelFields + 4;
+    TORCH_CHECK(hierarchy_host.numel() == kHierarchyFields,
+                "hierarchy_host must have ", kHierarchyFields, " int32 values");
+    int const* values = hierarchy_host.data_ptr<int>();
+    min_fa3_varlen_demo::MegaRingHierarchyDesc hierarchy{};
+    int cursor = 0;
+    for (int level_idx = 0;
+         level_idx < min_fa3_varlen_demo::kMegaRingNumLevels;
+         ++level_idx) {
+        auto& level = hierarchy.levels[level_idx];
+        level.ring_size = values[cursor++];
+        level.batch_begin = values[cursor++];
+        level.batch_end = values[cursor++];
+        level.row_begin = values[cursor++];
+        level.full_rows = values[cursor++];
+        level.half_row_begin = values[cursor++];
+        level.half_rows = values[cursor++];
+        level.full_tiles = values[cursor++];
+        level.half_tiles = values[cursor++];
+        level.reduction_base = values[cursor++];
+        level.kv_ready_base = values[cursor++];
+        TORCH_CHECK(
+            level.ring_size == min_fa3_varlen_demo::mega_ring_size_for_level(level_idx),
+            "invalid hierarchy ring size at level ", level_idx);
+    }
+    hierarchy.base_work_tiles = values[cursor++];
+    hierarchy.total_work_tiles = values[cursor++];
+    hierarchy.reduction_tiles = values[cursor++];
+    hierarchy.remote_tiles = values[cursor++];
+    TORCH_CHECK(hierarchy.base_work_tiles >= 0
+                    && hierarchy.total_work_tiles >= hierarchy.base_work_tiles
+                    && hierarchy.reduction_tiles >= 0
+                    && hierarchy.remote_tiles >= 0,
+                "invalid hierarchy totals");
+    return hierarchy;
+}
+
+void check_ablation_int_cuda(
+    const torch::Tensor& tensor,
+    const torch::Tensor& q,
+    int64_t min_size,
+    const char* name) {
+    TORCH_CHECK(tensor.is_cuda() && tensor.device() == q.device(),
+                name, " must be on the same CUDA device as q");
+    TORCH_CHECK(tensor.scalar_type() == torch::kInt32,
+                name, " must have dtype torch.int32");
+    TORCH_CHECK(tensor.is_contiguous() && tensor.dim() == 1
+                    && tensor.numel() >= min_size,
+                name, " must be contiguous 1D with at least ", min_size, " values");
+}
+
+py::tuple forward_varlen_mega_ring_ablation(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    kittens::py::TKParallelTensor& remote_k,
+    kittens::py::TKParallelTensor& remote_v,
+    torch::Tensor cu_seqlens_q,
+    torch::Tensor cu_seqlens_k,
+    int64_t max_seqlen_q,
+    int64_t max_seqlen_k,
+    int64_t profile_id,
+    int64_t num_comp_sm,
+    int64_t num_comm_sm,
+    torch::Tensor ring_sizes,
+    torch::Tensor half_cu_seqlens,
+    torch::Tensor hierarchy_host,
+    torch::Tensor scheduler_metadata,
+    torch::Tensor kv_ready_counts,
+    torch::Tensor step_ready,
+    torch::Tensor scan_cursor,
+    torch::Tensor completed_tiles,
+    torch::Tensor out,
+    torch::Tensor lse,
+    torch::Tensor scratch_out,
+    torch::Tensor scratch_lse,
+    bool scheduler_prepared,
+    bool prepare_only,
+    py::object stats_obj) {
+    check_varlen_qkv(q, "q");
+    check_varlen_qkv(k, "k");
+    check_varlen_qkv(v, "v");
+    check_parallel_varlen_qkv(remote_k, "remote_k");
+    check_parallel_varlen_qkv(remote_v, "remote_v");
+    check_cu_seqlens(cu_seqlens_q, "cu_seqlens_q");
+    check_cu_seqlens(cu_seqlens_k, "cu_seqlens_k");
+    check_out(out, q, "out");
+    check_lse(lse, q, "lse");
+    check_out(scratch_out, q, "scratch_out");
+    check_lse(scratch_lse, q, "scratch_lse");
+    TORCH_CHECK(q.size(0) > 0, "forward ablation requires non-empty local q");
+    TORCH_CHECK(q.device() == k.device() && q.device() == v.device(),
+                "q, k, and v must share a CUDA device");
+    TORCH_CHECK(remote_k.data_.data_ptr() == k.data_ptr()
+                    && remote_v.data_.data_ptr() == v.data_ptr(),
+                "k/v must be owned by remote_k/remote_v");
+    TORCH_CHECK(remote_k.local_world_size_ == 8
+                    && remote_v.local_world_size_ == 8,
+                "forward ablation requires exactly 8 local GPUs");
+    TORCH_CHECK(remote_k.local_rank_ == q.get_device()
+                    && remote_v.local_rank_ == q.get_device(),
+                "remote tensor ranks must match q.device");
+    TORCH_CHECK(q.size(1) % k.size(1) == 0 && k.size(1) == v.size(1),
+                "qhead must be divisible by matching KV heads");
+    TORCH_CHECK(k.size(1) * k.size(2) == 1024,
+                "forward ablation requires KVH * D == 1024");
+    TORCH_CHECK(profile_id >= 1 && profile_id <= 6,
+                "profile_id must be in [1, 6]");
+    TORCH_CHECK(num_comp_sm == 116 && num_comm_sm == 16,
+                "forward ablation fixes the SM split at 116:16");
+    TORCH_CHECK(max_seqlen_q > 0 && max_seqlen_k > 0
+                    && max_seqlen_q <= std::numeric_limits<int>::max()
+                    && max_seqlen_k <= std::numeric_limits<int>::max(),
+                "max seqlens must be positive int32 values");
+    TORCH_CHECK(q.size(0) <= std::numeric_limits<int>::max()
+                    && q.size(1) <= std::numeric_limits<int>::max()
+                    && k.size(0) <= std::numeric_limits<int>::max()
+                    && k.size(1) <= std::numeric_limits<int>::max(),
+                "q/k token and head counts must fit in int32");
+
+    int const batch_size = cu_seqlens_q.numel() - 1;
+    auto hierarchy = parse_ablation_hierarchy(hierarchy_host);
+    TORCH_CHECK(hierarchy.base_work_tiles <= std::numeric_limits<int>::max()
+                    && hierarchy.total_work_tiles <= std::numeric_limits<int>::max()
+                    && hierarchy.reduction_tiles <= std::numeric_limits<int>::max()
+                    && hierarchy.remote_tiles <= std::numeric_limits<int>::max(),
+                "hierarchy totals must fit in int32");
+    check_ablation_int_cuda(ring_sizes, q, batch_size, "ring_sizes");
+    check_ablation_int_cuda(
+        half_cu_seqlens, q, batch_size + 1, "half_cu_seqlens");
+    int const metadata_size = 1 + round_multiple(batch_size, 4) * 4;
+    check_ablation_int_cuda(
+        scheduler_metadata, q, metadata_size, "scheduler_metadata");
+    check_ablation_int_cuda(
+        kv_ready_counts, q,
+        min_fa3_varlen_demo::kMegaRingNumKvReadySections,
+        "kv_ready_counts");
+    check_ablation_int_cuda(
+        step_ready, q, std::max(hierarchy.reduction_tiles, 1), "step_ready");
+    check_ablation_int_cuda(scan_cursor, q, 1, "scan_cursor");
+
+    torch::Tensor stats;
+    if (!stats_obj.is_none()) {
+        stats = stats_obj.cast<torch::Tensor>();
+        check_mega_ring_stats(stats, q);
+    }
+    check_ablation_int_cuda(
+        completed_tiles, q, stats.defined() ? 4 : 1, "completed_tiles");
+
+    c10::cuda::CUDAGuard device_guard(q.device());
+    auto* props = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(props->major == 9 && props->minor == 0,
+                "forward ablation requires Hopper SM90");
+    TORCH_CHECK(k.size(0) == v.size(0) && k.size(0) % 8 == 0,
+                "K/V arena rows must match and be divisible by 8");
+    int64_t const rank_capacity_i64 = k.size(0) / 8;
+    TORCH_CHECK(rank_capacity_i64 > 0
+                    && rank_capacity_i64 <= std::numeric_limits<int>::max()
+                    && rank_capacity_i64 % 128 == 0,
+                "rank K/V capacity must be positive, int32, and 128-aligned");
+
+    auto params = make_mega_ring_varlen_params(
+        q, k, v, cu_seqlens_q, cu_seqlens_k,
+        static_cast<int>(max_seqlen_q),
+        static_cast<int>(max_seqlen_k),
+        static_cast<int>(rank_capacity_i64),
+        out, lse, scheduler_metadata, true,
+        static_cast<int>(num_comp_sm),
+        static_cast<int>(num_comm_sm),
+        remote_k.local_rank_, remote_k.local_world_size_,
+        ring_sizes.data_ptr<int>(), hierarchy,
+        half_cu_seqlens.data_ptr<int>(),
+        kv_ready_counts, step_ready, scan_cursor, completed_tiles,
+        q.data_ptr(), out.data_ptr(), lse.data_ptr(),
+        stats.defined()
+            ? reinterpret_cast<unsigned long long*>(stats.data_ptr<int64_t>())
+            : nullptr);
+    params.skip_scheduler_metadata_computation = scheduler_prepared;
+    params.prepare_varlen_pdl = false;
+
+    auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+    min_fa3_varlen_demo::forward_ablation::run(
+        params, remote_k, remote_v, scratch_out, scratch_lse,
+        static_cast<min_fa3_varlen_demo::forward_ablation::Profile>(profile_id),
+        completed_tiles.numel(), stream, prepare_only);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return py::make_tuple(out, lse);
+}
+
 }  // namespace
 
 void bind_varlen_mega_ring(py::module_& m) {
+    m.def(
+        "forward_varlen_mega_ring_ablation",
+        &forward_varlen_mega_ring_ablation,
+        py::arg("q"),
+        py::arg("k"),
+        py::arg("v"),
+        py::arg("remote_k"),
+        py::arg("remote_v"),
+        py::arg("cu_seqlens_q"),
+        py::arg("cu_seqlens_k"),
+        py::arg("max_seqlen_q"),
+        py::arg("max_seqlen_k"),
+        py::arg("profile_id"),
+        py::arg("num_comp_sm"),
+        py::arg("num_comm_sm"),
+        py::arg("ring_sizes"),
+        py::arg("half_cu_seqlens"),
+        py::arg("hierarchy_host"),
+        py::arg("scheduler_metadata"),
+        py::arg("kv_ready_counts"),
+        py::arg("step_ready"),
+        py::arg("scan_cursor"),
+        py::arg("completed_tiles"),
+        py::arg("out"),
+        py::arg("lse"),
+        py::arg("scratch_out"),
+        py::arg("scratch_lse"),
+        py::arg("scheduler_prepared"),
+        py::arg("prepare_only"),
+        py::arg("stats") = py::none(),
+        "Preallocated causal W8 forward-ablation runner.");
     m.def(
         "forward_varlen_mega_ring",
         &forward_varlen_mega_ring,
