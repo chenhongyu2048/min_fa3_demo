@@ -253,6 +253,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sm-configs", default="128:4,124:8,120:12,116:16")
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--num-iters", type=int, default=40)
+    parser.add_argument("--collect-mega-ring-stats", action="store_true")
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--atol", type=float, default=2e-1)
     parser.add_argument("--rtol", type=float, default=2e-1)
@@ -315,6 +316,7 @@ def _benchmark_argv(
         str(args.warmup_iters),
         "--num-iters",
         str(args.num_iters),
+        *(["--collect-mega-ring-stats"] if args.collect_mega_ring_stats else []),
         "--atol",
         str(args.atol),
         "--rtol",

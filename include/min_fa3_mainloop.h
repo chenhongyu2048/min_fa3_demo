@@ -11,6 +11,7 @@
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
+#include <cstdint>
 #include "cutlass/pipeline/pipeline.hpp"
 
 #include "cute/tensor.hpp"
@@ -410,6 +411,7 @@ struct CollectiveMainloopFwdSm90 {
         int const mega_ring_rank_kv_capacity = 0;
         int const* const mega_ring_ring_sizes = nullptr;
         min_fa3_varlen_demo::MegaRingHierarchyDesc const mega_ring_hierarchy{};
+        unsigned long long* const mega_ring_stats = nullptr;
     };
 
     // Device side kernel params
@@ -476,6 +478,7 @@ struct CollectiveMainloopFwdSm90 {
         int const mega_ring_rank_kv_capacity = 0;
         int const* const mega_ring_ring_sizes = nullptr;
         min_fa3_varlen_demo::MegaRingHierarchyDesc const mega_ring_hierarchy{};
+        unsigned long long* const mega_ring_stats = nullptr;
     };
 
     static Params
@@ -590,7 +593,7 @@ struct CollectiveMainloopFwdSm90 {
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
                 args.mega_ring_kv_ready_counts, args.mega_ring_step_ready, args.mega_ring_half_cu_seqlens,
                 args.mega_ring_rank, args.mega_ring_world_size, args.mega_ring_rank_kv_capacity,
-                args.mega_ring_ring_sizes, args.mega_ring_hierarchy};
+                args.mega_ring_ring_sizes, args.mega_ring_hierarchy, args.mega_ring_stats};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -1145,7 +1148,8 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
-    template <bool EnableMegaRing=false, typename SharedStorage, typename FrgTensorO, typename Softmax>
+    template <bool EnableMegaRing=false, bool CollectMegaRingStats=false,
+              typename SharedStorage, typename FrgTensorO, typename Softmax>
     CUTLASS_DEVICE bool
     mma(Params const& params,
         MainloopPipelineK pipeline_k,
@@ -1158,7 +1162,9 @@ struct CollectiveMainloopFwdSm90 {
         SeqlenInfo_t const& seqlen_info,
         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage,
-        int mega_ring_segment_meta = 0
+        int mega_ring_segment_meta = 0,
+        unsigned long long* mega_ring_qo_visits = nullptr,
+        unsigned long long* mega_ring_kv_tile_reads = nullptr
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -1240,6 +1246,14 @@ struct CollectiveMainloopFwdSm90 {
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
+        }
+        if constexpr (CollectMegaRingStats) {
+            // Only the fixed first consumer thread accumulates CTA-local work.
+            // The count uses the final range that the attention KV loop consumes.
+            if (thread_idx == 0) {
+                ++*mega_ring_qo_visits;
+                *mega_ring_kv_tile_reads += static_cast<unsigned long long>(n_block_max - n_block_min);
+            }
         }
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});

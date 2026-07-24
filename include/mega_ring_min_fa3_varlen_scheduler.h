@@ -12,7 +12,8 @@ namespace flash {
 // (ring_step, original_varlen_tile). The underlying varlen tile decoding stays
 // copied from VarlenDynamicPersistentTileScheduler.
 template<int kBlockM, int kBlockN, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
-         bool Split=false, bool PackGQA=false, bool WarpSpecialized=true, bool LPT = false, bool Sort = false, bool Prepared = true>
+         bool Split=false, bool PackGQA=false, bool WarpSpecialized=true, bool LPT = false, bool Sort = false, bool Prepared = true,
+         bool CollectStats = false>
 class MegaRingVarlenDynamicPersistentTileScheduler: public VarlenDynamicPersistentTileScheduler<kBlockM, kBlockN, NumMmaThreads, NumProducerThreads,
                                                                                                 Split, PackGQA, WarpSpecialized, LPT, Sort, Prepared> {
     using Base = VarlenDynamicPersistentTileScheduler<kBlockM, kBlockN, NumMmaThreads, NumProducerThreads, Split, PackGQA, WarpSpecialized, LPT, Sort, Prepared>;
@@ -20,6 +21,7 @@ class MegaRingVarlenDynamicPersistentTileScheduler: public VarlenDynamicPersiste
 public:
     static constexpr bool EnableMegaRing = true;
     static constexpr bool EnableQueuedInitialWork = true;
+    static constexpr bool CollectMegaRingStats = CollectStats;
     // MEGA_RING_ZIGZAG: this scheduler is instantiated with LPT == IsCausal in
     // the mega-ring launch. Effectively that means:
     //   - causal instantiations use LPT=true and enable zigzag

@@ -380,6 +380,7 @@ def forward_varlen_mega_ring(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
+    stats: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     # K/V are rank-major [world_size * rank_kv_capacity, 8, 128] IPC arenas.
     return _forward_varlen_mega_ring_cuda(
@@ -403,6 +404,7 @@ def forward_varlen_mega_ring(
         out,
         lse,
         bool(return_lse),
+        stats,
     )
 
 

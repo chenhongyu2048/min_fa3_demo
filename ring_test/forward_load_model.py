@@ -31,6 +31,7 @@ METHOD_ORDER = (
 )
 
 TILE_TOKENS = 128
+MEGA_RING_NONCAUSAL_KV_TILE_TOKENS = 176
 BF16_BYTES = 2
 FP32_BYTES = 4
 
@@ -67,9 +68,9 @@ class RankLoadRecord:
     physical_scores: float = 0
     effective_flops: float = 0
     physical_flops: float = 0
-    comm_tx_bytes: int = 0
-    comm_rx_bytes: int = 0
-    comm_total_bytes: int = 0
+    comm_tx_bytes: float = 0
+    comm_rx_bytes: float = 0
+    comm_total_bytes: float = 0
     kv_tile_reads: int = 0
     qo_visits_worst: int = 0
     qo_visits_best: int = 0
@@ -99,8 +100,8 @@ class _MutableRankLoad:
     physical_tokens: float = 0
     effective_scores: float = 0
     physical_scores: float = 0
-    comm_tx_bytes: int = 0
-    comm_rx_bytes: int = 0
+    comm_tx_bytes: float = 0
+    comm_rx_bytes: float = 0
     kv_tile_reads: int = 0
     qo_visits_worst: int = 0
     qo_visits_best: int = 0
@@ -137,8 +138,9 @@ def _kv_tiles_for_q_tile(
     q_tokens: int,
     kv_tokens: int,
     mask_type: str,
+    kv_tile_tokens: int = TILE_TOKENS,
 ) -> int:
-    num_kv_tiles = ceil(kv_tokens / TILE_TOKENS)
+    num_kv_tiles = ceil(kv_tokens / kv_tile_tokens)
     if q_begin >= q_tokens or num_kv_tiles == 0:
         return 0
     q_end = min(q_end, q_tokens)
@@ -146,11 +148,11 @@ def _kv_tiles_for_q_tile(
         return num_kv_tiles
     if mask_type == CAUSAL:
         max_k = q_end - 1 + kv_tokens - q_tokens
-        return min(max(max_k // TILE_TOKENS + 1, 0), num_kv_tiles)
+        return min(max(max_k // kv_tile_tokens + 1, 0), num_kv_tiles)
     if mask_type == INV_CAUSAL:
         if q_begin >= kv_tokens:
             return 0
-        return num_kv_tiles - q_begin // TILE_TOKENS
+        return num_kv_tiles - q_begin // kv_tile_tokens
 
     delta = kv_tokens - q_tokens
     if delta < 0:
@@ -159,11 +161,16 @@ def _kv_tiles_for_q_tile(
     last_k = min(q_end - 1 + delta, kv_tokens - 1)
     if first_k > last_k:
         return 0
-    return last_k // TILE_TOKENS - first_k // TILE_TOKENS + 1
+    return last_k // kv_tile_tokens - first_k // kv_tile_tokens + 1
 
 
-def task_tile_counters(task: AttentionTask, q_heads: int = 1) -> tuple[int, int]:
-    """Return ``(KV tile reads, Q/O visits)`` using logical 128-token tiles."""
+def task_tile_counters(
+    task: AttentionTask,
+    q_heads: int = 1,
+    *,
+    kv_tile_tokens: int = TILE_TOKENS,
+) -> tuple[int, int]:
+    """Return ``(KV tile reads, Q/O visits)`` at the selected KV tile size."""
 
     visits = ceil(task.q_tokens / TILE_TOKENS) * q_heads
     reads = 0
@@ -174,6 +181,7 @@ def task_tile_counters(task: AttentionTask, q_heads: int = 1) -> tuple[int, int]
             task.q_tokens,
             task.kv_tokens,
             task.mask_type,
+            kv_tile_tokens,
         )
     return reads * q_heads, visits
 
@@ -401,6 +409,11 @@ def _placements_loads(
 ) -> list[_MutableRankLoad]:
     loads = [_MutableRankLoad() for _ in range(world_size)]
     row_bytes = kv_heads * head_dim * BF16_BYTES * 2
+    kv_tile_tokens = (
+        MEGA_RING_NONCAUSAL_KV_TILE_TOKENS
+        if communication == "mega-ring" and not is_causal
+        else TILE_TOKENS
+    )
 
     for placement in placements:
         length = placement.global_length
@@ -421,7 +434,9 @@ def _placements_loads(
                 area = attention_area(task)
                 load.effective_scores += area
                 load.physical_scores += area
-                reads, visits = task_tile_counters(task, q_heads)
+                reads, visits = task_tile_counters(
+                    task, q_heads, kv_tile_tokens=kv_tile_tokens
+                )
                 sequence_reads += reads
                 sequence_worst += visits
             load.kv_tile_reads += sequence_reads
@@ -464,6 +479,78 @@ def _placements_loads(
         else:
             raise ValueError(f"unsupported communication model {communication!r}")
     return loads
+
+
+def _replace_token_and_communication_with_original_lengths(
+    loads: Sequence[_MutableRankLoad],
+    execution_placements: Sequence[Placement],
+    original_global_lengths: Sequence[int],
+    world_size: int,
+    kv_heads: int,
+    head_dim: int,
+    is_causal: bool,
+    *,
+    communication: str,
+) -> None:
+    """Report input tokens and traffic without alignment-only padding.
+
+    The forward implementations may pad an execution sequence so FA3's ring
+    layout is valid.  Their score/FLOP and tile counters must continue to
+    describe that physical execution.  Load-balance token and communication
+    comparisons, however, should describe the caller's original workload.
+    """
+
+    if len(execution_placements) != len(original_global_lengths):
+        raise ValueError("execution and original placement lengths must match")
+    if len(loads) != world_size:
+        raise ValueError("load count must match world size")
+
+    physical_tokens = [0.0] * world_size
+    comm_tx_bytes = [0.0] * world_size
+    comm_rx_bytes = [0.0] * world_size
+    row_bytes = kv_heads * head_dim * BF16_BYTES * 2
+
+    for placement, original_length in zip(execution_placements, original_global_lengths):
+        if original_length <= 0:
+            raise ValueError("original global lengths must be positive")
+        ring_size = placement.ring_size
+        ring_start = placement.ring_start
+        if ring_size <= 0 or not 0 <= ring_start <= world_size - ring_size:
+            raise ValueError("invalid execution placement")
+
+        local_length = original_length / ring_size
+        for rank in range(ring_start, ring_start + ring_size):
+            physical_tokens[rank] += local_length
+
+        if ring_size == 1:
+            continue
+        if communication == "python-ring":
+            per_rank_bytes = (ring_size - 1) * local_length * row_bytes
+            for rank in range(ring_start, ring_start + ring_size):
+                comm_tx_bytes[rank] += per_rank_bytes
+                comm_rx_bytes[rank] += per_rank_bytes
+        elif communication == "mega-ring":
+            half = local_length / 2
+            for ring_local_rank in range(ring_size):
+                receiver = ring_start + ring_local_rank
+                for step in range(1, ring_size):
+                    rows = (
+                        half
+                        if is_causal and step <= ring_local_rank
+                        else local_length
+                    )
+                    source_local = (ring_local_rank - step) % ring_size
+                    source = ring_start + source_local
+                    transfer_bytes = rows * row_bytes
+                    comm_rx_bytes[receiver] += transfer_bytes
+                    comm_tx_bytes[source] += transfer_bytes
+        else:
+            raise ValueError(f"unsupported communication model {communication!r}")
+
+    for rank, load in enumerate(loads):
+        load.physical_tokens = physical_tokens[rank]
+        load.comm_tx_bytes = comm_tx_bytes[rank]
+        load.comm_rx_bytes = comm_rx_bytes[rank]
 
 
 def analyze_fa3_ring(
@@ -518,6 +605,16 @@ def analyze_megatron(
         is_causal,
         communication="python-ring",
     )
+    _replace_token_and_communication_with_original_lengths(
+        loads,
+        placements,
+        global_lengths,
+        world_size,
+        kv_heads,
+        head_dim,
+        is_causal,
+        communication="python-ring",
+    )
     for load in loads:
         load.effective_tokens = 0
         load.effective_scores = 0
@@ -535,7 +632,8 @@ def analyze_megatron(
     note = (
         f"Megatron scheduler with post-schedule FA3 ring padding; "
         f"{plan.num_execution_groups} execution groups; padding={padding} tokens; "
-        f"max_seqlen_per_rank={max_seqlen_per_rank}"
+        f"max_seqlen_per_rank={max_seqlen_per_rank}; token and communication "
+        "counters use original sequence lengths; FLOPs use execution lengths"
     )
     if saturation:
         note = f"{note}; {saturation}"
@@ -575,9 +673,20 @@ def analyze_zepplin(
         is_causal,
         communication="python-ring",
     )
+    _replace_token_and_communication_with_original_lengths(
+        loads,
+        placements,
+        global_lengths,
+        world_size,
+        kv_heads,
+        head_dim,
+        is_causal,
+        communication="python-ring",
+    )
     note = (
         f"threshold={threshold}; G1={len(plan.short_indices)}, "
-        f"Gworld={len(plan.long_indices)}; LPT short-sequence owners"
+        f"Gworld={len(plan.long_indices)}; LPT short-sequence owners; token and "
+        "communication counters use original sequence lengths"
     )
     return _finalize("zepplin", is_causal, loads, q_heads, head_dim, note)
 
@@ -644,6 +753,16 @@ def analyze_mega_ring_all_cp(
         communication="mega-ring",
         mega_ratio_bounds=True,
     )
+    _replace_token_and_communication_with_original_lengths(
+        loads,
+        placements,
+        global_lengths,
+        world_size,
+        kv_heads,
+        head_dim,
+        is_causal,
+        communication="mega-ring",
+    )
     effective_tokens = sum(global_lengths) / world_size
     effective_scores = score_count(global_lengths, is_causal) / world_size
     for load in loads:
@@ -652,6 +771,8 @@ def analyze_mega_ring_all_cp(
     padded = sum(aligned) - sum(global_lengths)
     note = (
         f"all-CP fused mega-ring; 2048-token alignment; padding={padded} tokens; "
+        "token and communication counters use original sequence lengths; FLOPs use "
+        "execution lengths; "
         + (
             "causal remote segments shown as worst/best scheduler bounds"
             if is_causal
@@ -983,10 +1104,21 @@ def cumulative_result(results: Sequence[MethodLoadResult]) -> MethodLoadResult:
         "qo_visits_best",
     )
     stable_notes = {
-        "megatron_hybrid_cp": "Megatron scheduler; execution groups vary by case",
+        "megatron_hybrid_cp": (
+            "Megatron scheduler; execution groups vary by case; token and "
+            "communication counters use original sequence lengths; FLOPs use "
+            "execution lengths"
+        ),
         "magi_attention": "metadata-only Magi plans; dispatch excluded; chunking/padding vary by case",
-        "zepplin": "Zeppelin LPT G1/Gworld placement varies by case",
-        "mega_ring_all_cp": "all-CP fused mega-ring; per-case 2048-token alignment",
+        "zepplin": (
+            "Zeppelin LPT G1/Gworld placement varies by case; token and "
+            "communication counters use original sequence lengths"
+        ),
+        "mega_ring_all_cp": (
+            "all-CP fused mega-ring; per-case 2048-token alignment; token and "
+            "communication counters use original sequence lengths; FLOPs use "
+            "execution lengths"
+        ),
     }
     note = (
         f"cumulative over {len(results)} cases; "

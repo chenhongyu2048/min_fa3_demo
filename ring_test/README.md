@@ -443,10 +443,11 @@ cumulative counters. Shared fields use these definitions:
   counters are excluded.
 - BF16 Q/K/V/O/dO elements use 2 bytes. FP32 LSE and high-precision gradient
   payloads use 4 bytes.
-- Q and KV tiles are algorithm-level 128-token tiles for every backend. A Q/O
+- Q/O tiles are 128-token tiles. KV tiles are also 128 tokens except for the
+  noncausal fused mega-ring mainloop, whose actual `kBlockN` is 176 rows. A Q/O
   visit is one attention task or segment reading a Q tile and writing its
   partial/final O tile. A KV tile read means that tile intersects the task's
-  full, causal, inverse-causal, or bi-causal mask.
+  full, causal, inverse-causal, or bi-causal mask at the backend's KV tile size.
 - `KV tiles / QO visit` is recomputed from aggregate counters. Larger values
   mean more KV work per Q read/O write visit; it is not a hardware counter.
 
@@ -616,6 +617,16 @@ of 2048, ensuring that each causal rank-local half is 128-aligned on eight GPUs.
 above. For both methods, table and cross-case TFLOPS use original lengths; the
 Note reports `tokens(original/aligned)`, padding, and aggregate/average-per-GPU
 TFLOPS for the physically executed lengths using the same measured latency.
+`--collect-mega-ring-stats` adds one separate single post-timing probe for each
+fused `mega_ring_all_cp` or `mega_ring_hybrid` configuration. It reports the
+per-rank and global device counters `[qo_visits, kv_tile_reads]`, where a Q/O
+visit is an actual scheduler tile or causal merged ready segment with positive
+KV work, and a KV read is one attention mainloop KV tile. It excludes the
+16-row TMA communication subtransfers. The printed global ratio is
+`sum(KV) / sum(QO)`, not an average of rank ratios; reset, probe, synchronization,
+and collection are outside event timing and TFLOPS. Causal ready-segment timing
+can make the observed Q/O visit count and ratio fall anywhere in the static
+`benchmark_load_balance.py` lower/upper range, while KV reads remain stable.
 Use `--methods` to select a subset or
 `--methods all` for all eight. Zeppelin only requires sequences at or above its
 threshold to be divisible by `world_size`; causal long shards must also be even
@@ -631,7 +642,7 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_topology_forward.py
   --qhead 16 --kvhead 8 --headdim 128 --methods all \
   --zepplin-threshold 4096 \
   --sm-configs 128:4,116:16 --mode both \
-  --warmup-iters 5 --num-iters 20
+  --warmup-iters 5 --num-iters 20 --collect-mega-ring-stats
 ```
 
 ### Dataset-shaped topology workload
@@ -675,11 +686,16 @@ torchrun --standalone --nproc_per_node=8 \
   ring_test/benchmark_dataset_forward.py \
   --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 4 \
   --qhead 32 --kvhead 8 --headdim 128 \
-  --mode causal --methods all --zepplin-threshold 4096 --no-check
+  --mode causal --methods all --zepplin-threshold 4096 \
+  --collect-mega-ring-stats --no-check
 
 DATASETS="arxiv github pile freelaw prolong" GPU_COUNTS="2 4 8" NUM_CASES=4 ZEPPLIN_THRESHOLD=4096 \
   ./benchmark_dataset.sh
 ```
+
+Set `COLLECT_MEGA_RING_STATS=1` on `benchmark_dataset.sh` to forward
+`--collect-mega-ring-stats` for forward runs. The wrapper rejects that setting
+with `DIRECTION=backward`, where the forward-only counters do not apply.
 
 The requested compute and token tolerances default to 5% and 10%. BR-PBS first
 places sequences whose normalized token or compute size is at least the

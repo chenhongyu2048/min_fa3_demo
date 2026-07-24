@@ -59,6 +59,15 @@ void check_lse(const torch::Tensor& t, const torch::Tensor& q, const char* name)
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 }
 
+void check_mega_ring_stats(const torch::Tensor& t, const torch::Tensor& q) {
+    TORCH_CHECK(t.is_cuda(), "stats must be a CUDA tensor");
+    TORCH_CHECK(t.scalar_type() == torch::kInt64, "stats must have dtype torch.int64");
+    TORCH_CHECK(t.dim() == 1 && t.numel() == 2,
+                "stats must have shape [2] laid out as [qo_visits, kv_tile_reads]");
+    TORCH_CHECK(t.device() == q.device(), "stats must be on the same CUDA device as q");
+    TORCH_CHECK(t.is_contiguous(), "stats must be contiguous");
+}
+
 torch::Tensor resolve_out(py::object out_obj, const torch::Tensor& q) {
     if (out_obj.is_none()) {
         return torch::zeros_like(q);
@@ -224,7 +233,8 @@ RingVarlenParams make_mega_ring_varlen_params(const torch::Tensor& q,
                                               torch::Tensor& completed_tiles,
                                               void* q_descriptor_ptr,
                                               void* o_descriptor_ptr,
-                                              void* lse_descriptor_ptr) {
+                                              void* lse_descriptor_ptr,
+                                              unsigned long long* mega_ring_stats) {
     RingVarlenParams params{};
     static_cast<VarlenParams&>(params) = make_varlen_params(
         q,
@@ -254,6 +264,7 @@ RingVarlenParams make_mega_ring_varlen_params(const torch::Tensor& q,
     params.mega_ring_step_ready = step_ready.data_ptr<int>();
     params.mega_ring_scan_cursor = scan_cursor.data_ptr<int>();
     params.mega_ring_completed_tiles = completed_tiles.data_ptr<int>();
+    params.mega_ring_stats = mega_ring_stats;
     params.q_ptr = q_descriptor_ptr;
     params.o_ptr = o_descriptor_ptr;
     params.softmax_lse_ptr = lse_descriptor_ptr;
@@ -309,7 +320,8 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
                                     torch::Tensor ring_starts_host,
                                     py::object out_obj,
                                     py::object lse_obj,
-                                    bool return_lse) {
+                                    bool return_lse,
+                                    py::object stats_obj) {
     check_varlen_qkv(q, "q");
     check_varlen_qkv(k, "k");
     check_varlen_qkv(v, "v");
@@ -359,6 +371,12 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     TORCH_CHECK(num_comm_sm >= 0, "num_comm_sm must be non-negative. Got ", num_comm_sm);
     TORCH_CHECK(num_comp_sm <= std::numeric_limits<int>::max() && num_comm_sm <= std::numeric_limits<int>::max(),
                 "num_comp_sm and num_comm_sm must fit in int32");
+
+    torch::Tensor stats;
+    if (!stats_obj.is_none()) {
+        stats = stats_obj.cast<torch::Tensor>();
+        check_mega_ring_stats(stats, q);
+    }
 
     c10::cuda::CUDAGuard device_guard(q.device());
     auto* props = at::cuda::getCurrentDeviceProperties();
@@ -556,6 +574,10 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
         lse_descriptor = torch::empty({q.size(1), 1}, q.options().dtype(torch::kFloat));
     }
     auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+    if (stats.defined()) {
+        C10_CUDA_CHECK(cudaMemsetAsync(
+            stats.data_ptr<int64_t>(), 0, 2 * sizeof(int64_t), stream));
+    }
 
     auto params = make_mega_ring_varlen_params(
         q,
@@ -583,7 +605,10 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
         completed_tiles,
         q_descriptor.data_ptr(),
         out_descriptor.data_ptr(),
-        lse_descriptor.data_ptr());
+        lse_descriptor.data_ptr(),
+        stats.defined()
+            ? reinterpret_cast<unsigned long long*>(stats.data_ptr<int64_t>())
+            : nullptr);
 
     // MEGA_RING: one fused launch runs communication CTAs and compute CTAs.
     min_fa3_varlen_demo::run_mega_ring_min_fa3_varlen_ring_fwd(params, remote_k, remote_v, stream);
@@ -620,6 +645,7 @@ void bind_varlen_mega_ring(py::module_& m) {
         py::arg("out") = py::none(),
         py::arg("lse") = py::none(),
         py::arg("return_lse") = false,
+        py::arg("stats") = py::none(),
         "MEGA_RING: hierarchical fused Hopper varlen ring-attention forward.\n\n"
         "K/V must be contiguous [world_size * rank_kv_capacity, 8, 128] arenas. "
         "The kernel performs persistent compute and remote K/V TMA loads in one launch.");

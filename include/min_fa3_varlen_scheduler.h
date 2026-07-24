@@ -60,6 +60,7 @@ public:
     // MEGA_RING: default scheduler does not expose ring-step metadata.
     static constexpr bool EnableMegaRing = false;
     static constexpr bool EnableChunkedSegments = false;
+    static constexpr bool CollectMegaRingStats = false;
     static constexpr bool EnableQueuedInitialWork = false;
     // MEGA_RING: expose the existing scheduler barrier participant count to
     // the copied mega-ring scheduler variant.

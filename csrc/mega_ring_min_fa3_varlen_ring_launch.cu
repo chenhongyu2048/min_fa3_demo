@@ -39,9 +39,17 @@ void run_mega_ring_min_fa3_varlen_ring_fwd(
                 "Mega ring varlen kernel requires num_comm_sm > 0 when replay work is present");
 
     if (params.is_causal) {
-        mega_ring_detail::dispatch_mega_ring_world_size<true>(params, remote_k, remote_v, stream);
+        if (params.mega_ring_stats != nullptr) {
+            mega_ring_detail::dispatch_mega_ring_world_size<true, true>(params, remote_k, remote_v, stream);
+        } else {
+            mega_ring_detail::dispatch_mega_ring_world_size<true, false>(params, remote_k, remote_v, stream);
+        }
     } else {
-        mega_ring_detail::dispatch_mega_ring_world_size<false>(params, remote_k, remote_v, stream);
+        if (params.mega_ring_stats != nullptr) {
+            mega_ring_detail::dispatch_mega_ring_world_size<false, true>(params, remote_k, remote_v, stream);
+        } else {
+            mega_ring_detail::dispatch_mega_ring_world_size<false, false>(params, remote_k, remote_v, stream);
+        }
     }
 }
 

@@ -112,6 +112,9 @@ struct Ring_fwd_params : public Flash_fwd_params {
     MegaRingHierarchyDesc mega_ring_hierarchy{};
     int* __restrict__ mega_ring_half_cu_seqlens = nullptr;
     int* __restrict__ mega_ring_kv_ready_counts = nullptr;
+    // Per-invocation [Q/O visits, KV tile reads] counters for the optional
+    // mega-ring statistics kernel variant. The normal variant leaves this null.
+    unsigned long long* __restrict__ mega_ring_stats = nullptr;
     // MEGA_RING_SEGMENTS: causal mode encodes next_step in the low bits and a
     // transient scheduler lock in the high bit. Non-causal mode keeps the old
     // completed-step counter behavior.

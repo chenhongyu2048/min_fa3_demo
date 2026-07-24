@@ -112,6 +112,7 @@ class MethodRun:
     note: str
     aligned_global_lengths: tuple[int, ...] | None = None
     checkable: bool = True
+    stats_probe: Callable[[torch.Tensor], object] | None = None
 
 
 @dataclass(frozen=True)
@@ -410,6 +411,47 @@ def measure_distributed_ms(
     return TimingResult(local_avg, max_avg, rank_times)
 
 
+def collect_mega_ring_stats(
+    method: str,
+    stats_probe: Callable[[torch.Tensor], object],
+    rank: int,
+) -> None:
+    """Run one untimed mega-ring probe and report the device-side counters."""
+    local_stats = torch.empty(2, device="cuda", dtype=torch.int64)
+    stats_probe(local_stats)
+    torch.cuda.synchronize()
+
+    rank_stats = [torch.empty_like(local_stats) for _ in range(dist.get_world_size())]
+    dist.all_gather(rank_stats, local_stats)
+    global_stats = local_stats.clone()
+    dist.all_reduce(global_stats, op=dist.ReduceOp.SUM)
+
+    if rank != 0:
+        return
+    print(f"  Mega-ring stats for {method} (single post-timing probe):")
+    for stats_rank, counters in enumerate(rank_stats):
+        qo_visits = int(counters[0].item())
+        kv_tile_reads = int(counters[1].item())
+        ratio = kv_tile_reads / qo_visits if qo_visits else 0.0
+        ratio_text = f"{ratio:.4f}" if qo_visits else "n/a"
+        print(
+            f"    rank {stats_rank}: qo_visits={qo_visits}, "
+            f"kv_tile_reads={kv_tile_reads}, kv_tile_reads/qo_visits={ratio_text}"
+        )
+    global_qo_visits = int(global_stats[0].item())
+    global_kv_tile_reads = int(global_stats[1].item())
+    global_ratio = (
+        global_kv_tile_reads / global_qo_visits if global_qo_visits else 0.0
+    )
+    global_ratio_text = f"{global_ratio:.4f}" if global_qo_visits else "n/a"
+    print(
+        f"    global: qo_visits={global_qo_visits}, "
+        f"kv_tile_reads={global_kv_tile_reads}, "
+        f"sum(KV)/sum(QO)={global_ratio_text}",
+        flush=True,
+    )
+
+
 def aggregate_score_count(global_lengths: Sequence[int], is_causal: bool) -> int:
     if is_causal:
         return sum(length * (length + 1) // 2 for length in global_lengths)
@@ -544,6 +586,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--num-iters", type=int, default=40)
+    parser.add_argument(
+        "--collect-mega-ring-stats",
+        action="store_true",
+        help="run one untimed post-benchmark device-side mega-ring statistics probe",
+    )
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--atol", type=float, default=2e-1)
     parser.add_argument("--rtol", type=float, default=2e-1)
@@ -1222,7 +1269,9 @@ def _main_single(
                             expected_mega_ring_all_cp_lse,
                         ) = mega_ring_all_cp_run_data
 
-                        def launch_all_cp_mega() -> tuple[torch.Tensor, torch.Tensor]:
+                        def launch_all_cp_mega(
+                            stats: torch.Tensor | None = None,
+                        ) -> tuple[torch.Tensor, torch.Tensor]:
                             return min_fa3_op.forward_varlen_mega_ring(
                                 mega_ring_all_cp_q,
                                 mega_ring_all_cp_remote_k.data_,
@@ -1242,6 +1291,7 @@ def _main_single(
                                 ring_sizes_host=mega_ring_all_cp_ring_sizes_host,
                                 ring_starts_host=mega_ring_all_cp_ring_starts_host,
                                 return_lse=True,
+                                stats=stats,
                             )
 
                         runs.append(
@@ -1252,6 +1302,7 @@ def _main_single(
                                 expected_mega_ring_all_cp_lse,
                                 "all-CP fused mega-ring",
                                 tuple(mega_ring_all_cp_global_lengths),
+                                stats_probe=launch_all_cp_mega,
                             )
                         )
                     elif method == "mega_ring_hybrid":
@@ -1269,7 +1320,9 @@ def _main_single(
                             expected_hybrid_lse,
                         ) = hybrid_run_data
 
-                        def launch_hybrid_mega() -> tuple[torch.Tensor, torch.Tensor]:
+                        def launch_hybrid_mega(
+                            stats: torch.Tensor | None = None,
+                        ) -> tuple[torch.Tensor, torch.Tensor]:
                             return min_fa3_op.forward_varlen_mega_ring(
                                 hybrid_q,
                                 hybrid_remote_k.data_,
@@ -1289,6 +1342,7 @@ def _main_single(
                                 ring_sizes_host=hybrid_ring_sizes_host,
                                 ring_starts_host=hybrid_ring_starts_host,
                                 return_lse=True,
+                                stats=stats,
                             )
 
                         runs.append(
@@ -1298,6 +1352,7 @@ def _main_single(
                                 expected_hybrid_out,
                                 expected_hybrid_lse,
                                 "hierarchical hybrid fused mega-ring",
+                                stats_probe=launch_hybrid_mega,
                             )
                         )
                     else:
@@ -1308,6 +1363,8 @@ def _main_single(
                     timing = measure_distributed_ms(
                         run.launch, args.warmup_iters, args.num_iters, rank
                     )
+                    if args.collect_mega_ring_stats and run.stats_probe is not None:
+                        collect_mega_ring_stats(run.name, run.stats_probe, rank)
                     agg_tflops = aggregate_tflops(
                         global_lengths,
                         args.qhead,

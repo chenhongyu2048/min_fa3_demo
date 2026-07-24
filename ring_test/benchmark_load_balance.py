@@ -573,6 +573,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "(metadata only, BF16, logical tiles=128x128)"
                 )
                 print(
+                    "Aligned-method token and communication counters use original "
+                    "sequence lengths; FLOPs retain execution padding"
+                )
+                print(
                     f"Config: source={source}, world_size={world_size}, "
                     f"QH={args.qhead}, KVH={args.kvhead}, D={args.headdim}, "
                     f"mode={args.mode}, methods={methods}"

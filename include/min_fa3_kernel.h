@@ -389,6 +389,8 @@ public:
             mainloop.mma_init();
 
             int work_idx = 0;
+            unsigned long long mega_ring_qo_visits = 0;
+            unsigned long long mega_ring_kv_tile_reads = 0;
             CUTLASS_PRAGMA_NO_UNROLL
             for (auto work_tile_info = get_initial_scheduler_work</*IsProducerWarp=*/false>(scheduler, params.scheduler, start_from_work_queue);
                  work_tile_info.is_valid(params.scheduler);
@@ -465,10 +467,18 @@ public:
                 Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
                 bool tile_valid;
                 // if constexpr (!LargeHeadDimV) {
-                tile_valid = mainloop.template mma<TileScheduler::EnableMegaRing>(
-                    params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
-                    tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info,
-                    block_coord, shared_storage, mega_ring_segment_meta);
+                if constexpr (TileScheduler::CollectMegaRingStats) {
+                    tile_valid = mainloop.template mma<TileScheduler::EnableMegaRing, true>(
+                        params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
+                        tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info,
+                        block_coord, shared_storage, mega_ring_segment_meta,
+                        &mega_ring_qo_visits, &mega_ring_kv_tile_reads);
+                } else {
+                    tile_valid = mainloop.template mma<TileScheduler::EnableMegaRing>(
+                        params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
+                        tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info,
+                        block_coord, shared_storage, mega_ring_segment_meta);
+                }
                 // } else {  // mma_pv might not compile if !LargeHeadDimV
                 //     if (warp_group_idx == 1) {
                 //         tile_valid = mainloop.mma(
@@ -605,6 +615,14 @@ public:
                 }
             }
             epilogue.store_tail();
+            if constexpr (TileScheduler::CollectMegaRingStats) {
+                // Persistent CTAs submit their two CTA-local totals once after
+                // all scheduler work is exhausted. Empty CTAs perform no atomics.
+                if (threadIdx.x == MmaThreadOffset && mega_ring_qo_visits != 0) {
+                    atomicAdd(params.mainloop.mega_ring_stats, mega_ring_qo_visits);
+                    atomicAdd(params.mainloop.mega_ring_stats + 1, mega_ring_kv_tile_reads);
+                }
+            }
         }
 
     }

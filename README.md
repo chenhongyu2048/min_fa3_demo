@@ -283,6 +283,9 @@ backward. `DRY_RUN=1` prints commands without launching CUDA work.
 DATASETS="arxiv github pile freelaw prolong" GPU_COUNTS=8 NUM_CASES=4 ZEPPLIN_THRESHOLD=4096 \
   ./benchmark_dataset.sh
 
+GPU_COUNTS=8 DATASETS=arxiv NUM_CASES=1 METHODS=mega_ring_all_cp,mega_ring_hybrid \
+  COLLECT_MEGA_RING_STATS=1 CHECK=0 ./benchmark_dataset.sh
+
 DATASETS="arxiv github pile freelaw prolong" GPU_COUNTS=8 NUM_CASES=4 DIRECTION=backward \
   ZEPPLIN_THRESHOLD=4096 ./benchmark_dataset.sh
 
@@ -311,6 +314,13 @@ view before a distributed run when inspecting a workload:
 python ring_test/benchmark_dataset_forward.py \
   --dataset arxiv --target-tokens 131072 --seed 0 \
   --world-size 8 --print-workload
+
+torchrun --standalone --nproc_per_node=8 \
+  ring_test/benchmark_dataset_forward.py \
+  --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 1 \
+  --qhead 32 --kvhead 8 --headdim 128 --mode causal \
+  --methods mega_ring_all_cp,mega_ring_hybrid \
+  --collect-mega-ring-stats --no-check
 ```
 
 Full 128K runs should use `--no-check`; the correctness reference materializes
@@ -456,7 +466,8 @@ torchrun --standalone --nproc_per_node=8 \
   --global-seqlens 8192,4096,2048,1024 \
   --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
   --qhead 32 --kvhead 8 --headdim 128 --mode both \
-  --methods all --sm-configs 128:4,124:8,120:12,116:16 --no-check
+  --methods all --sm-configs 128:4,124:8,120:12,116:16 \
+  --collect-mega-ring-stats --no-check
 
 torchrun --standalone --nproc_per_node=2 \
   ring_test/benchmark_ring_forward.py \
@@ -478,6 +489,19 @@ CUDA IPC. The hybrid benchmark consumes global lengths and explicit Buddy-ring
 metadata; the ordinary ring benchmarks consume per-rank local lengths.
 `--allgather-overlapping-heads-k-stride` is shared by the per-sequence and
 Llama3 all-gather baselines and must divide `--kvhead`.
+
+For `mega_ring_all_cp` and `mega_ring_hybrid`, add
+`--collect-mega-ring-stats` to either the topology or dataset-shaped forward
+frontend. After each measured fused configuration it runs one separate,
+single post-timing probe and prints device-side `qo_visits`, `kv_tile_reads`,
+and `kv_tile_reads / qo_visits` for every rank plus `sum(KV) / sum(QO)`.
+`qo_visits` counts actual scheduler work tiles or causal merged segments with
+positive KV work; `kv_tile_reads` counts attention KV tiles in the mainloop and
+does not count the 16-row communication TMA subtransfers. The probe, counter
+reset, synchronization, and distributed collection are outside latency and
+TFLOPS timing. In causal mode the dynamic ready-segment merge changes observed
+Q/O visits, so its ratio can fall within the static lower/upper range reported
+by `ring_test/benchmark_load_balance.py`; the KV-tile total is stable.
 
 ### Direct kernel microbenchmarks
 

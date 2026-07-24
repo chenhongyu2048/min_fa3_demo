@@ -38,6 +38,7 @@ SM_CONFIGS=${SM_CONFIGS:-"128:4,124:8,120:12,116:16"}
 WARMUP_ITERS=${WARMUP_ITERS:-10}
 NUM_ITERS=${NUM_ITERS:-40}
 CHECK=${CHECK:-0}
+COLLECT_MEGA_RING_STATS=${COLLECT_MEGA_RING_STATS:-0}
 DRY_RUN=${DRY_RUN:-0}
 TORCHRUN=${TORCHRUN:-torchrun}
 LOG_DIR=${LOG_DIR:-"benchmark_logs/$(date +%Y%m%d-%H%M%S)"}
@@ -62,6 +63,11 @@ case "$CHECK" in
     *) die "CHECK must be 0 or 1, got '$CHECK'" ;;
 esac
 
+case "$COLLECT_MEGA_RING_STATS" in
+    0|1) ;;
+    *) die "COLLECT_MEGA_RING_STATS must be 0 or 1, got '$COLLECT_MEGA_RING_STATS'" ;;
+esac
+
 case "$DRY_RUN" in
     0|1) ;;
     *) die "DRY_RUN must be 0 or 1, got '$DRY_RUN'" ;;
@@ -78,6 +84,9 @@ case "$MODE" in
 esac
 if [[ "$DIRECTION" == backward && "$MODE" != causal ]]; then
     die "topology backward supports only MODE=causal"
+fi
+if [[ "$DIRECTION" == backward && "$COLLECT_MEGA_RING_STATS" == 1 ]]; then
+    die "COLLECT_MEGA_RING_STATS is supported only when DIRECTION=forward"
 fi
 
 [[ "$TARGET_TOKENS" =~ ^[1-9][0-9]*$ ]] || \
@@ -181,6 +190,9 @@ run_benchmark() {
     )
     if [[ "$DIRECTION" == forward ]]; then
         command+=(--mode "$MODE" --methods "$METHODS")
+        if ((COLLECT_MEGA_RING_STATS)); then
+            command+=(--collect-mega-ring-stats)
+        fi
     else
         command+=(--methods "$METHODS")
     fi
@@ -211,7 +223,7 @@ fi
 
 echo "Log: $LOG_FILE"
 echo "Datasets: ${DATASET_LIST[*]}"
-echo "Config: direction=$DIRECTION, target_tokens=$TARGET_TOKENS, compute_tolerance=$COMPUTE_BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, beam_width=$BEAM_WIDTH, finalist_count=$FINALIST_COUNT, structure_threshold=$STRUCTURE_THRESHOLD, max_repair_iterations=$MAX_REPAIR_ITERATIONS, seed=$SEED, num_cases=$NUM_CASES, mode=$MODE, zepplin_threshold=$ZEPPLIN_THRESHOLD, megatron_max_seqlen_per_rank=$MEGATRON_MAX_SEQLEN_PER_RANK, magi_overlap_degree=$MAGI_OVERLAP_DEGREE"
+echo "Config: direction=$DIRECTION, target_tokens=$TARGET_TOKENS, compute_tolerance=$COMPUTE_BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, beam_width=$BEAM_WIDTH, finalist_count=$FINALIST_COUNT, structure_threshold=$STRUCTURE_THRESHOLD, max_repair_iterations=$MAX_REPAIR_ITERATIONS, seed=$SEED, num_cases=$NUM_CASES, mode=$MODE, zepplin_threshold=$ZEPPLIN_THRESHOLD, megatron_max_seqlen_per_rank=$MEGATRON_MAX_SEQLEN_PER_RANK, magi_overlap_degree=$MAGI_OVERLAP_DEGREE, collect_mega_ring_stats=$COLLECT_MEGA_RING_STATS"
 echo "Methods: $METHODS; allgather_overlapping_heads_k_stride=$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE"
 
 for world_size in "${GPU_COUNT_LIST[@]}"; do
