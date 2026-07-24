@@ -152,7 +152,9 @@ the import path.
 | --- | --- |
 | `benchmark_dataset.sh` | Recommended dataset-shaped forward/backward benchmark wrapper for 2, 4, or 8 GPUs |
 | `benchmark_load_balance.sh` | Dataset/GPU matrix wrapper for the metadata-only forward/backward load-balance benchmark |
+| `ring_test/load_balance_bench/run.sh` | Dataset/GPU wrapper for the fixed five-method runtime load-balance suite |
 | `ring_test/benchmark_dataset_{forward,backward}.py` | Dataset sampling, BR-PBS placement, and topology benchmark frontend |
+| `ring_test/load_balance_bench/benchmark_{forward,backward}.py` | Native Megatron/Zepllin versus three placement-mapped fused Mega Ring runtime frontends |
 | `ring_test/benchmark_topology_{forward,backward}.py` | Explicit global-length and Buddy-ring topology benchmark |
 | `ring_test/benchmark_load_balance.py` | Metadata-only forward/backward token, FLOP, communication, and logical-tile load analysis |
 | `ring_test/benchmark_ring_{forward,backward}.py` | Ordinary all-CP distributed ring benchmark |
@@ -169,10 +171,11 @@ the import path.
 
 ## Test
 
-CPU-only sampler and BR-PBS tests do not require CUDA:
+CPU-only sampler, BR-PBS, and load-balance topology-adapter tests do not
+require CUDA:
 
 ```bash
-python -m unittest balancer.test_balancer
+python -m unittest balancer.test_balancer ring_test.load_balance_bench.test_topology
 ```
 
 Fixed-layout and varlen kernel tests:
@@ -542,6 +545,45 @@ python benchmark_logs/plot_weighted_flops.py --world-size 8
 `dataset/sample_length.py` is the manual raw-data collection utility. It
 requires `datasets` and `transformers`, and its `DATASET_CHOICE` constant selects
 which source distribution to sample before rebuilding the shared JSON.
+
+### Five-method runtime load-balance suite
+
+`ring_test/load_balance_bench/` is a separate fixed comparison suite. It uses
+the same un-reordered dataset sample lengths for every result and always emits:
+`native_megatron_hybrid_cp`, `native_zepplin`,
+`mega_ring_hybrid_br_pbs`, `mega_ring_hybrid_megatron_cp`, and
+`mega_ring_hybrid_zepplin`. The forward entry point accepts `noncausal`,
+`causal`, or `both`; backward is causal-only. It does not modify the CUDA
+kernel or public `min_fa3_op` API.
+
+```bash
+# CPU-only placement inspection: no CUDA or process group is initialized.
+python ring_test/load_balance_bench/benchmark_forward.py \
+  --dataset arxiv --target-tokens 131072 --world-size 8 \
+  --mode both --print-workload
+
+# One two-GPU forward smoke run of the five fixed results.
+torchrun --standalone --nproc_per_node=2 \
+  ring_test/load_balance_bench/benchmark_forward.py \
+  --dataset arxiv --target-tokens 16385 --num-cases 1 \
+  --qhead 32 --kvhead 8 --headdim 128 --mode causal \
+  --sm-configs 100:4 --warmup-iters 1 --num-iters 2 --no-check
+
+# Dataset/GPU matrix wrapper. Set DIRECTION=backward for causal backward.
+GPU_COUNTS=8 DATASETS="arxiv freelaw github pile prolong" \
+  ring_test/load_balance_bench/run.sh
+```
+
+Megatron's mapped fused result uses its final padded FA3-ring CP placement,
+but it does not replay Megatron execution groups. Zepllin's mapped fused
+result retains its LPT G1 owners and Gworld placement, then orders those
+metadata rows as G8/G4/G2/G1 for the fused kernel, but it does not replay the
+native two-phase execution. BR-PBS and Zepllin never receive implicit padding:
+an incompatible 128-row or causal half-row fused layout fails with the planner,
+mode, and sample id. Megatron alone retains the padding already explicit in its
+FA3-ring planner. Planner construction, input packing, IPC pool allocation,
+scheduler preparation, and optional statistics probes are reported separately
+or run outside the existing CUDA-event timing boundaries.
 
 ## Python usage
 

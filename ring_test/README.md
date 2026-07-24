@@ -740,6 +740,87 @@ requesting another incompatible method remains an error. Use
 assignments without CUDA. Keep `--no-check` for the full 128K workload because
 the current correctness reference materializes quadratic attention scores.
 
+### Five-method dataset-shaped runtime suite
+
+`load_balance_bench/` is a separate fixed suite for comparing three planner
+placements on exactly the same sampled raw sequence lengths. It always reports
+the following five labels in this order:
+
+- `native_megatron_hybrid_cp`: the existing Megatron Hybrid-CP baseline with
+  its own execution-group schedule.
+- `native_zepplin`: the existing Zepllin G1/Gworld two-phase baseline with its
+  own LPT placement of short sequences.
+- `mega_ring_hybrid_br_pbs`: one fused Mega Ring Hybrid launch using BR-PBS
+  Buddy-ring metadata.
+- `mega_ring_hybrid_megatron_cp`: one fused Mega Ring Hybrid launch using only
+  the final FA3-aligned Megatron CP placement.
+- `mega_ring_hybrid_zepplin`: one fused Mega Ring Hybrid launch using only the
+  Zepllin G1 owner/Gworld placement.
+
+Forward accepts `--mode noncausal`, `causal`, or `both`; `both` emits all five
+rows for each mode. Backward is always causal and rejects another mode. The
+native rows consume the un-reordered raw lengths. The fused rows consume a
+planner-specific metadata order, but each entry retains its original sample id
+as a deterministic tie-breaker. BR-PBS and Zepllin rows are never silently
+padded: if their effective local sequence does not meet the fused 128-row
+alignment, or causal G2/G4/G8 half-row alignment, the run fails with the
+planner, mode, and sample id. Megatron is the sole exception because its own
+`build_hybrid_cp_plan_for_fa3_ring()` already explicitly pads its final CP
+assignments; its diagnostics show original/executed tokens and padding.
+
+The native and mapped-fused rows are intentionally not identical schedule
+semantics. Native Megatron times its serial execution groups and their barriers.
+Native Zepllin times its Gworld phase barrier, distributed long phase, and
+rank-local short phase. The Megatron- and Zepllin-derived fused rows reuse only
+their placement metadata and run one fused Mega Ring launch; they do not replay
+the native groups or phases. Interpret the comparison as native end-to-end
+runtime versus fused-kernel runtime under the same source placement, not as two
+implementations of one execution schedule.
+
+The existing runner timing boundaries remain in force: planner construction,
+input creation/packing, IPC allocation, pre-timing synchronization, scheduler
+preparation, owner-accumulator reset, and optional Mega Ring statistics probes
+are outside the CUDA-event interval. Forward and backward both reuse one IPC
+pool sized for the maximum rank capacity across the three fused topologies and
+all selected dataset cases. The summary reports min/mean/P50/max latency and
+mean/workload-weighted TFLOPS for each fixed label.
+The suite defaults to `--dq-atol 3.0` for fused backward dQ checks; retain the
+existing `--dkv-atol 0.5` and `--rtol 0.2`, or override any of them for a
+stricter experiment.
+
+```bash
+# CPU-only: raw lengths, all three planner topologies, padding, and diagnostics.
+python ring_test/load_balance_bench/benchmark_forward.py \
+  --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 1 \
+  --world-size 8 --mode both --print-workload
+
+python ring_test/load_balance_bench/benchmark_backward.py \
+  --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 1 \
+  --world-size 8 --mode causal --print-workload
+
+# Runtime smoke tests on an SM90 node.
+torchrun --standalone --nproc_per_node=2 \
+  ring_test/load_balance_bench/benchmark_forward.py \
+  --dataset arxiv --target-tokens 16385 --num-cases 1 \
+  --qhead 32 --kvhead 8 --headdim 128 --mode causal \
+  --sm-configs 100:4 --warmup-iters 1 --num-iters 2 --no-check
+
+torchrun --standalone --nproc_per_node=2 \
+  ring_test/load_balance_bench/benchmark_backward.py \
+  --dataset arxiv --target-tokens 16385 --num-cases 1 \
+  --qhead 32 --kvhead 8 --headdim 128 --mode causal \
+  --sm-configs 100:4 --warmup-iters 1 --num-iters 2 --no-check
+
+GPU_COUNTS=8 DATASETS="arxiv freelaw github pile prolong" \
+  ring_test/load_balance_bench/run.sh
+```
+
+The launcher accepts the same dataset, BR-PBS, shape, SM-sweep, check, and
+logging controls as the dataset benchmark style, but deliberately does not
+expose a `METHODS` selector because the five-result suite is fixed. Its default
+Zepllin threshold is 8192. Set `DIRECTION=backward` only with `MODE=causal`;
+`COLLECT_MEGA_RING_STATS=1` is forward-only.
+
 ## 1/2/4/8-GPU causal sweep
 
 `benchmark_ring_1_2_4_8.sh` runs the all-CP forward and backward varlen

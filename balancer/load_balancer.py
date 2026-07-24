@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
 from .sampler import generate_dataset_length_cases
@@ -52,6 +52,7 @@ class HybridWorkload:
     communication_cost: float
     active_ring_count: int
     repair_moves: int
+    sample_ids: list[int] = field(default_factory=list)
 
     @property
     def compute_deviation(self) -> float:
@@ -1080,6 +1081,7 @@ def assign_hierarchical_rings(
         communication_cost=best_solution.communication_cost,
         active_ring_count=best_solution.active_ring_count,
         repair_moves=best_moves,
+        sample_ids=[placement.original_index for placement in placements],
     )
 
 
