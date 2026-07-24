@@ -30,7 +30,7 @@ from baseline.magi_attention import (
 from baseline.megatron_hybrid_cp import (
     MegatronHybridCPAttention,
     backward_reference as megatron_hybrid_cp_backward_reference,
-    build_hybrid_cp_plan,
+    build_hybrid_cp_plan_for_fa3_ring,
     create_hybrid_cp_process_groups,
     hybrid_cp_incompatibility,
     make_packed_hybrid_cp_inputs,
@@ -49,8 +49,10 @@ from ring_test.utils import (
     MEGA_RING_ALL_CP_ALIGNMENT,
     HybridBenchmarkCase,
     SENTINEL,
+    aligned_length_note,
     align_mega_ring_all_cp_lengths,
     assert_all_ranks,
+    hybrid_cp_saturation_note,
     hierarchical_reference,
     init_distributed,
     local_lengths_for_rank,
@@ -698,7 +700,10 @@ def benchmark_topology(
     allgather_backend: str | None,
     parallel_pools: BackwardParallelPools | None = None,
 ) -> list[BenchmarkResult]:
-    if any(method not in {"zepplin", "magi_attention"} for method in methods):
+    if any(
+        method not in {"zepplin", "magi_attention", "megatron_hybrid_cp"}
+        for method in methods
+    ):
         validate_backward_metadata(global_lengths, ring_sizes, ring_starts, world_size)
     elif "zepplin" in methods and not (
         len(global_lengths) == len(ring_sizes) == len(ring_starts)
@@ -775,9 +780,10 @@ def benchmark_topology(
             raise RuntimeError(
                 "Megatron hybrid-CP baseline requires a block backend"
             )
-        megatron_plan = build_hybrid_cp_plan(
+        megatron_plan = build_hybrid_cp_plan_for_fa3_ring(
             global_lengths,
             world_size,
+            True,
             args.megatron_max_seqlen_per_rank,
         )
         megatron_groups = create_hybrid_cp_process_groups(dist.group.WORLD)
@@ -809,12 +815,21 @@ def benchmark_topology(
             if args.check
             else None
         )
+        megatron_note = (
+            megatron_runner.note
+            + "; complete forward preparation excluded from backward timing"
+        )
+        megatron_saturation = hybrid_cp_saturation_note(
+            global_lengths, megatron_plan
+        )
+        if megatron_saturation:
+            megatron_note = f"{megatron_note}; {megatron_saturation}"
         baseline_runs["megatron_hybrid_cp"] = MethodRun(
             megatron_runner.forward_all,
             megatron_runner.backward_all,
             megatron_reference,
-            megatron_runner.note
-            + "; complete forward preparation excluded from backward timing",
+            megatron_note,
+            tuple(megatron_plan.global_lengths),
         )
     if any(method in BLOCK_ALL_CP_METHODS for method in methods):
         if allgather_backend is None:
@@ -1375,8 +1390,9 @@ def benchmark_topology(
                         timing.max_ms,
                     )
                     note = (
-                        f"{note}; {MEGA_RING_ALL_CP_ALIGNMENT}-aligned "
-                        f"Agg TFLOPS={aligned_aggregate_tflops:.2f}, "
+                        f"{note}; "
+                        f"{aligned_length_note(global_lengths, run.aligned_global_lengths)}; "
+                        f"aligned-length Agg TFLOPS={aligned_aggregate_tflops:.2f}, "
                         f"Avg/GPU={aligned_aggregate_tflops / world_size:.2f}"
                     )
                 results.append(
@@ -1635,7 +1651,8 @@ def main(
 
         for _label, global_lengths, ring_sizes, ring_starts in workloads:
             if any(
-                method not in {"zepplin", "magi_attention"}
+                method
+                not in {"zepplin", "magi_attention", "megatron_hybrid_cp"}
                 for method in requested_methods
             ):
                 validate_backward_metadata(

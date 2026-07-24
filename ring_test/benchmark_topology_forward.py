@@ -27,7 +27,7 @@ from baseline.magi_attention import (
 )
 from baseline.megatron_hybrid_cp import (
     MegatronHybridCPAttention,
-    build_hybrid_cp_plan,
+    build_hybrid_cp_plan_for_fa3_ring,
     create_hybrid_cp_process_groups,
     forward_reference as megatron_hybrid_cp_forward_reference,
     hybrid_cp_incompatibility,
@@ -46,7 +46,9 @@ from hybrid_forward_baselines import (
 from ring_test.utils import (
     MEGA_RING_ALL_CP_ALIGNMENT,
     HybridBenchmarkCase,
+    aligned_length_note,
     align_mega_ring_all_cp_lengths,
+    hybrid_cp_saturation_note,
     hierarchical_reference,
     init_distributed,
     local_lengths_for_rank,
@@ -594,7 +596,11 @@ def _main_single(
         mega_ring_all_cp_global_lengths = align_mega_ring_all_cp_lengths(global_lengths)
         ring_sizes = parse_int_list(args.ring_sizes, "--ring-sizes")
         ring_starts = parse_int_list(args.ring_starts, "--ring-starts")
-        if any(method not in {"zepplin", "magi_attention"} for method in methods):
+        if any(
+            method
+            not in {"zepplin", "magi_attention", "megatron_hybrid_cp"}
+            for method in methods
+        ):
             validate_metadata(
                 global_lengths, ring_sizes, ring_starts, world_size, args.mode
             )
@@ -1098,9 +1104,10 @@ def _main_single(
                     raise RuntimeError(
                         "Megatron hybrid-CP baseline requires a block backend"
                     )
-                megatron_plan = build_hybrid_cp_plan(
+                megatron_plan = build_hybrid_cp_plan_for_fa3_ring(
                     global_lengths,
                     world_size,
+                    is_causal,
                     args.megatron_max_seqlen_per_rank,
                 )
                 megatron_groups = create_hybrid_cp_process_groups(
@@ -1136,12 +1143,19 @@ def _main_single(
                 def launch_megatron_hybrid_cp() -> tuple[torch.Tensor, torch.Tensor]:
                     return megatron_runner.forward_all(), megatron_runner.lse
 
+                megatron_note = megatron_runner.note
+                megatron_saturation = hybrid_cp_saturation_note(
+                    global_lengths, megatron_plan
+                )
+                if megatron_saturation:
+                    megatron_note = f"{megatron_note}; {megatron_saturation}"
                 megatron_hybrid_cp_run = MethodRun(
                     "megatron_hybrid_cp",
                     launch_megatron_hybrid_cp,
                     expected_megatron_out,
                     expected_megatron_lse,
-                    megatron_runner.note,
+                    megatron_note,
+                    tuple(megatron_plan.global_lengths),
                 )
 
             cuda_barrier()
@@ -1338,8 +1352,9 @@ def _main_single(
                                 timing.max_ms,
                             )
                             note = (
-                                f"{note}; {MEGA_RING_ALL_CP_ALIGNMENT}-aligned "
-                                f"Agg TFLOPS={aligned_agg_tflops:.1f}, "
+                                f"{note}; "
+                                f"{aligned_length_note(global_lengths, run.aligned_global_lengths)}; "
+                                f"aligned-length Agg TFLOPS={aligned_agg_tflops:.1f}, "
                                 f"Avg/GPU={aligned_agg_tflops / world_size:.1f}"
                             )
                         results[run.name] = Result(
@@ -1477,7 +1492,11 @@ def main(
             f"kvhead={args.kvhead}"
         )
     for workload_case in workload_cases:
-        if any(method not in {"zepplin", "magi_attention"} for method in methods):
+        if any(
+            method
+            not in {"zepplin", "magi_attention", "megatron_hybrid_cp"}
+            for method in methods
+        ):
             validate_metadata(
                 list(workload_case.global_lengths),
                 list(workload_case.ring_sizes),

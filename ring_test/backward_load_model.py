@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from math import ceil
 from typing import Sequence
 
-from baseline.megatron_hybrid_cp import build_hybrid_cp_plan
+from baseline.megatron_hybrid_cp import build_hybrid_cp_plan_for_fa3_ring
 from ring_test.forward_load_model import (
     AttentionTask,
     BF16_BYTES,
@@ -34,7 +34,10 @@ from ring_test.forward_load_model import (
     iter_global_q_score,
     score_count,
 )
-from ring_test.utils import align_mega_ring_all_cp_lengths
+from ring_test.utils import (
+    align_mega_ring_all_cp_lengths,
+    hybrid_cp_saturation_note,
+)
 from ring_test.zepplin import DEFAULT_ZEPPLIN_THRESHOLD, make_zepplin_plan
 
 
@@ -491,8 +494,8 @@ def analyze_backward_megatron(
     *,
     max_seqlen_per_rank: int = 8192,
 ) -> BackwardMethodLoadResult:
-    plan = build_hybrid_cp_plan(
-        list(global_lengths), world_size, max_seqlen_per_rank
+    plan = build_hybrid_cp_plan_for_fa3_ring(
+        list(global_lengths), world_size, True, max_seqlen_per_rank
     )
     ordered_sample_ids: list[int] = []
     seen_sample_ids: set[int] = set()
@@ -518,10 +521,25 @@ def analyze_backward_megatron(
         head_dim,
         communication="python-ring",
     )
+    for load in loads:
+        load.effective_tokens = 0
+        load.effective_scores = 0
+    for sample_id, original_length in enumerate(global_lengths):
+        assignment = plan.assignment(sample_id)
+        effective_tokens = original_length / assignment.cp_size
+        effective_scores = score_count([original_length], True) / assignment.cp_size
+        for rank in assignment.ranks:
+            loads[rank].effective_tokens += effective_tokens
+            loads[rank].effective_scores += effective_scores
+    padding = sum(plan.global_lengths) - sum(global_lengths)
+    saturation = hybrid_cp_saturation_note(list(global_lengths), plan)
     note = (
-        f"Megatron scheduler backward; {plan.num_execution_groups} execution groups; "
+        f"Megatron scheduler backward with post-schedule FA3 ring padding; "
+        f"{plan.num_execution_groups} execution groups; padding={padding} tokens; "
         f"max_seqlen_per_rank={max_seqlen_per_rank}; CP1 communication is zero"
     )
+    if saturation:
+        note = f"{note}; {saturation}"
     return _finalize("megatron_hybrid_cp", loads, q_heads, head_dim, note)
 
 

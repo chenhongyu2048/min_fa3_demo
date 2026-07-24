@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch.distributed as dist
@@ -12,6 +12,13 @@ from .scheduler import BalancedCPScheduler
 
 SUPPORTED_WORLD_SIZES = (2, 4, 8)
 SUPPORTED_CP_SIZES = (1, 2, 4, 8)
+
+
+class _WorldSizeCappedCPScheduler(BalancedCPScheduler):
+    """Use the copied scheduler with its initial CP demand capped to WORLD."""
+
+    def gpus_needed(self, seq_len: int) -> int:
+        return min(super().gpus_needed(seq_len), self.total_hdp_gpus)
 
 
 def _needs_inter_group_barrier(group_index: int, num_groups: int) -> bool:
@@ -178,17 +185,24 @@ def validate_hybrid_cp_plan(plan: HybridCPPlan) -> None:
             )
 
 
-def build_hybrid_cp_plan(
+def _compile_hybrid_cp_plan(
     global_lengths: list[int] | tuple[int, ...],
     world_size: int,
-    max_seqlen_per_rank: int = 8192,
+    max_seqlen_per_rank: int,
+    *,
+    cap_required_cp_to_world_size: bool,
 ) -> HybridCPPlan:
     lengths = tuple(int(length) for length in global_lengths)
     if world_size not in SUPPORTED_WORLD_SIZES:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLD_SIZES}, got {world_size}"
         )
-    scheduler = BalancedCPScheduler(max_seqlen_per_rank, world_size)
+    scheduler_type = (
+        _WorldSizeCappedCPScheduler
+        if cap_required_cp_to_world_size
+        else BalancedCPScheduler
+    )
+    scheduler = scheduler_type(max_seqlen_per_rank, world_size)
     required = [scheduler.gpus_needed(length) for length in lengths]
     if any(cp_size > world_size for cp_size in required):
         sample_id = next(
@@ -238,6 +252,79 @@ def build_hybrid_cp_plan(
     )
     validate_hybrid_cp_plan(plan)
     return plan
+
+
+def build_hybrid_cp_plan(
+    global_lengths: list[int] | tuple[int, ...],
+    world_size: int,
+    max_seqlen_per_rank: int = 8192,
+) -> HybridCPPlan:
+    return _compile_hybrid_cp_plan(
+        global_lengths,
+        world_size,
+        max_seqlen_per_rank,
+        cap_required_cp_to_world_size=False,
+    )
+
+
+def build_hybrid_cp_plan_for_fa3_ring(
+    global_lengths: list[int] | tuple[int, ...],
+    world_size: int,
+    is_causal: bool,
+    max_seqlen_per_rank: int = 8192,
+) -> HybridCPPlan:
+    """Build a world-capped schedule, then minimally pad FA3 ring lengths.
+
+    CP demand is capped before scheduling. Padding happens afterward, so it
+    cannot change CP sizes, rank ranges, execution groups, or sample order.
+    """
+
+    scheduled_plan = _compile_hybrid_cp_plan(
+        global_lengths,
+        world_size,
+        max_seqlen_per_rank,
+        cap_required_cp_to_world_size=True,
+    )
+    execution_lengths_list: list[int] = []
+    for assignment in scheduled_plan.assignments:
+        alignment = (
+            1
+            if assignment.cp_size == 1
+            else assignment.cp_size * (256 if is_causal else 1)
+        )
+        execution_lengths_list.append(
+            (assignment.global_length + alignment - 1) // alignment * alignment
+        )
+    execution_lengths = tuple(execution_lengths_list)
+    execution_plan = replace(
+        scheduled_plan,
+        global_lengths=execution_lengths,
+        assignments=tuple(
+            replace(
+                assignment,
+                global_length=execution_lengths[assignment.sample_id],
+            )
+            for assignment in scheduled_plan.assignments
+        ),
+    )
+    validate_hybrid_cp_plan(execution_plan)
+    for assignment in execution_plan.assignments:
+        if assignment.global_length % assignment.cp_size:
+            raise ValueError(
+                f"sample {assignment.sample_id} execution length "
+                f"{assignment.global_length} is not divisible by "
+                f"CP{assignment.cp_size}"
+            )
+        local_length = assignment.global_length // assignment.cp_size
+        if is_causal and assignment.cp_size > 1 and (
+            local_length % 2 or (local_length // 2) % 128
+        ):
+            raise ValueError(
+                f"sample {assignment.sample_id} causal CP{assignment.cp_size} "
+                f"execution local half length {local_length // 2} is not "
+                "128-aligned"
+            )
+    return execution_plan
 
 
 @dataclass
@@ -300,25 +387,14 @@ def hybrid_cp_incompatibility(
     max_seqlen_per_rank: int = 8192,
 ) -> Optional[str]:
     try:
-        plan = build_hybrid_cp_plan(
-            global_lengths, world_size, max_seqlen_per_rank
+        build_hybrid_cp_plan_for_fa3_ring(
+            global_lengths,
+            world_size,
+            is_causal,
+            max_seqlen_per_rank,
         )
     except (AssertionError, ValueError) as exc:
         return str(exc)
-    for assignment in plan.assignments:
-        if assignment.global_length % assignment.cp_size:
-            return (
-                f"sample {assignment.sample_id} length {assignment.global_length} "
-                f"is not divisible by CP{assignment.cp_size}"
-            )
-        local_length = assignment.global_length // assignment.cp_size
-        if is_causal and assignment.cp_size > 1 and (
-            local_length % 2 or (local_length // 2) % 128
-        ):
-            return (
-                f"sample {assignment.sample_id} causal CP{assignment.cp_size} "
-                f"local half length {local_length // 2} is not 128-aligned"
-            )
     return None
 
 
@@ -328,6 +404,7 @@ __all__ = [
     "HybridCPProcessGroups",
     "SampleAssignment",
     "build_hybrid_cp_plan",
+    "build_hybrid_cp_plan_for_fa3_ring",
     "create_hybrid_cp_process_groups",
     "hybrid_cp_incompatibility",
     "validate_hybrid_cp_plan",

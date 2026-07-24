@@ -37,9 +37,13 @@ barriers. Backward preparation runs the complete forward outside timing, then
 the timed interval covers the complete backward phase. Use
 `--megatron-max-seqlen-per-rank` (default 8192) to control the initial CP-size
 threshold. `--methods all` skips workloads whose required power-of-two CP size
-exceeds the world or whose actual CP shard violates divisibility/causal
-alignment; explicitly requesting the method reports the incompatibility as an
-error.
+threshold. If that requirement exceeds the physical world, the FA3 plan caps
+it to `world_size`; the threshold remains a CP-sizing target rather than a hard
+local-length limit at maximum CP. After scheduling, CP1 stays unchanged,
+noncausal CP>1 rounds up to a CP multiple, and causal CP>1 rounds up to a
+`256 * CP` multiple. This padding changes no CP size, rank range, execution
+group, or sample order. Result Notes identify capped samples with
+`required_cp(original/capped)` and their physical local length.
 
 `llama3_allgather_attention` is the whole-packed all-CP baseline. Instead of
 zigzag-partitioning every sequence independently, it concatenates the global
@@ -421,9 +425,12 @@ Dataset runs also sum every rank field over cases and recompute ratios from the
 cumulative counters. Shared fields use these definitions:
 
 - Effective tokens/scores describe the original visible full or causal
-  workload. `mega_ring_all_cp` uses the original world-normalized share here.
+  workload. `megatron_hybrid_cp` distributes each original sample evenly over
+  its scheduled CP members; `mega_ring_all_cp` uses the original
+  world-normalized share.
 - Physical tokens/scores describe the baseline's executed workload, including
-  the all-CP mega-ring's 2048-token alignment and Magi padding/slices.
+  Megatron's final-CP-dependent padding, the all-CP mega-ring's 2048-token
+  alignment, and Magi padding/slices.
 - Forward FLOPs are `4 * score_count * QH * D` for QK and PV only. Backward
   FLOPs are `10 * score_count * QH * D`, matching the backward latency
   benchmark. Neither adds mask, softmax, scheduler, atomic, or address FLOPs.
@@ -466,7 +473,8 @@ Backward communication follows each runner's actual boundary:
   excluded.
 - FA3 ring, Megatron CP2/4/8, and Zeppelin Gworld use `p-1` BF16 K/V ring
   steps and `p` FP32 dK/dV owner-return steps. Megatron CP1 and Zeppelin's LPT
-  G1 sequences are local with zero payload. Inter-group and phase barriers are
+  G1 sequences are local with zero payload. Megatron payload sizes use the
+  post-schedule padded execution length. Inter-group and phase barriers are
   excluded.
 - Fused mega-ring fetches remote BF16 K/V with its causal half/full row rule.
   Every remote step store-adds FP32 dK/dV directly to its final owner using the
@@ -604,9 +612,11 @@ world size. The total global token count for `llama3_allgather_attention` must
 also be divisible by `2 * world_size`. `mega_ring_all_cp` is benchmarked on a
 separate workload where every global sequence is rounded upward to a multiple
 of 2048, ensuring that each causal rank-local half is 128-aligned on eight GPUs.
-Its table TFLOPS use the original unaligned lengths; its Note reports aggregate
-and average-per-GPU TFLOPS using the physically executed aligned lengths and
-the same measured latency. Use `--methods` to select a subset or
+`megatron_hybrid_cp` uses its CP-dependent post-schedule alignment described
+above. For both methods, table and cross-case TFLOPS use original lengths; the
+Note reports `tokens(original/aligned)`, padding, and aggregate/average-per-GPU
+TFLOPS for the physically executed lengths using the same measured latency.
+Use `--methods` to select a subset or
 `--methods all` for all eight. Zeppelin only requires sequences at or above its
 threshold to be divisible by `world_size`; causal long shards must also be even
 for the zigzag ring. Short G1 sequences have no all-CP divisibility constraint,
@@ -705,7 +715,11 @@ plan and reports `feasible=False`.
 each causal/noncausal mode and prints a skip reason for an incompatible method.
 The `mega_ring_all_cp` baseline is not skipped for an unaligned generated
 length because it uses its separate 2048-aligned workload in both directions.
-Explicitly requesting another incompatible method remains an error. Use
+Megatron likewise pads after its independent schedule, so historical
+divisibility and causal-alignment skips are eliminated. CP demand larger than
+the physical world is capped to the full world group instead of skipped;
+extreme lengths remain bounded by memory and backend kernel support. Explicitly
+requesting another incompatible method remains an error. Use
 `--print-workload --world-size 8` to inspect generated lengths and ring
 assignments without CUDA. Keep `--no-check` for the full 128K workload because
 the current correctness reference materializes quadratic attention scores.

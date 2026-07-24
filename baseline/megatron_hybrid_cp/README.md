@@ -24,6 +24,36 @@ execution-group id. The compiler rejects samples that need more ranks than the
 physical world and validates sample uniqueness, aligned members, and identical
 relative execution order among each sample's members.
 
+`build_hybrid_cp_plan_for_fa3_ring(global_lengths, world_size, is_causal,
+max_seqlen_per_rank=8192)` uses the same copied scheduler algorithm but caps
+each sample's initial CP demand to the physical world before constructing
+execution groups:
+
+```text
+uncapped_required_cp = max(1, ceil_pow2(length / max_seqlen_per_rank))
+required_cp = min(uncapped_required_cp, world_size)
+```
+
+The 8192 value therefore remains the normal CP-sizing target, but it is not a
+hard local-length limit once a sample reaches the largest physical CP group.
+For samples whose uncapped requirement fits in the world, scheduling is
+identical to `build_hybrid_cp_plan()`. After scheduling, the FA3 builder copies
+the plan and minimally rounds only the copied `global_lengths` and
+`SampleAssignment.global_length` fields for execution:
+
+```text
+CP1:              alignment = 1
+CP>1 noncausal:   alignment = actual_cp
+CP>1 causal:      alignment = 256 * actual_cp
+execution_length = ceil(original_length / alignment) * alignment
+```
+
+Padding is deliberately post-schedule. It does not change the capped
+scheduler's CP sizes, rank starts, execution groups, or per-rank sample order,
+and the base plan API remains unchanged. Causal CP2/CP4/CP8 therefore use
+512/1024/2048-token alignment, while noncausal CP>1 only pads enough to divide
+the sample across its final CP members.
+
 `create_hybrid_cp_process_groups(dist.group.WORLD)` must run on every rank. It
 creates all aligned contiguous CP2 groups, then all CP4 groups, in the same
 global order. CP equal to the physical world reuses `dist.group.WORLD`; CP1
@@ -47,10 +77,12 @@ use this rank's plan-assignment packing order.
 All ranks use external FA3 only when its required entry points are importable
 on every rank. Otherwise all ranks fall back consistently to the in-repo
 `min_fa3` extension. Supported tensors are CUDA BF16 with D=128 and
-`QH % KVH == 0`. A sample length must be divisible by its actual CP size.
-Causal CP>1 additionally requires each local half-sequence to be 128-token
-aligned. A sample for which `ceil_pow2(length / max_seqlen_per_rank)` exceeds
-world size is incompatible.
+`QH % KVH == 0`. The topology and dataset frontends execute the post-schedule
+padded plan, so CP divisibility and causal local-half alignment are satisfied
+without rescheduling. An uncapped CP demand larger than the physical world is
+saturated to the world size. Such a sample can have a local execution length
+larger than `max_seqlen_per_rank`; available memory and backend kernel support
+remain the practical limits for extreme lengths.
 
 Forward timing covers the complete `forward_all()` phase, including FA3, P2P,
 and execution-group barriers. It excludes scheduling, process-group creation,
@@ -63,135 +95,50 @@ The baseline is invoked through the existing topology and dataset frontends
 with `--methods megatron_hybrid_cp`. Use `--check` only for small workloads
 because the dense reference materializes quadratic attention scores.
 
-## Dataset incompatibility cases
+## Reporting and CP saturation
 
-The skipped cases in
-`benchmark_logs/20260721-215504/benchmark_dataset.log` are compatibility
-rejections performed before the runner or an attention kernel is launched.
-They are not kernel failures, NCCL deadlocks, or correctness failures. That log
-contains no traceback, assertion failure, runtime error, CUDA error, or
-`check failed` message, and it was produced with `check=False`. Consequently,
-`Check=skip` on a result row means that the dense correctness check was
-disabled; only entries under `Skipped methods (causal)` were excluded.
+Input allocation, `cu_seqlens`, correctness references, P2P communication,
+forward preparation, and timed forward/backward kernels all use execution
+lengths. Padding is benchmarked as real physical work; no additional mask or
+non-FA3 fallback restores the original per-token numerical semantics.
 
-The cross-case summaries show the following coverage:
+The latency table and cross-case summary continue to calculate effective
+TFLOPS from the original lengths. Each Megatron result Note reports
+`tokens(original/aligned)`, padding tokens, and aligned-length aggregate and
+average-per-GPU TFLOPS using the same measured latency. If CP demand was
+saturated, the Note also reports `required_cp(original/capped)` and the actual
+local execution length. The metadata-only load model similarly assigns
+original effective tokens/scores evenly across the scheduled CP members, while
+physical tokens/scores, tile work, and communication use the padded execution
+plan.
 
-| Dataset | Executed cases | Skipped cases |
-| --- | ---: | --- |
-| Arxiv | 18/20 | 9, 17 |
-| FreeLaw | 17/20 | 9, 12, 19 |
-| GitHub | 19/20 | 17 |
-| Pile | 20/20 | none |
-| ProLong | 9/20 | 2, 6, 7, 8, 9, 10, 14, 15, 17, 18, 19 |
+Historical dataset skips caused only by final-CP divisibility or causal
+half-sequence alignment are eliminated. For example, a 7168-token sample that
+the scheduler expands to CP8 now executes at 8192 tokens rather than being
+rejected because its original 448-token local half is not 128-aligned.
 
-There are 17 skipped cases in total. One is caused by a sample requiring more
-than eight ranks; the other 16 are caused by causal half-sequence alignment
-after the scheduler expands a short sample to a larger actual CP group.
-
-### Required CP exceeds the physical world
-
-The initial CP requirement is:
+The base builder still preserves the original strict behavior:
 
 ```text
 required_cp = max(1, ceil_pow2(length / max_seqlen_per_rank))
 ```
 
-With `max_seqlen_per_rank=8192` and `world_size=8`, the largest directly
-representable sample is `8192 * 8 = 65536` tokens. Arxiv case 17 contains a
-75776-token sample:
+With `max_seqlen_per_rank=8192`, the 75776-token sample has an uncapped CP16
+demand:
 
 ```text
 ceil_pow2(75776 / 8192) = ceil_pow2(9.25) = 16
 ```
 
-It is therefore rejected with:
+`build_hybrid_cp_plan()` therefore rejects it, preserving its existing API
+semantics. The FA3 execution builder caps it to CP8 instead:
 
 ```text
-sample 1 length 75776 requires CP16, which exceeds world_size=8
+actual_cp    = 8
+local_length = 75776 / 8 = 9472
+local_half   = 4736 = 37 * 128
 ```
 
-### Actual CP can exceed the initial CP
-
-The CP derived from the length threshold is only the initial requirement. The
-copied Megatron scheduler's `fill_empty_gpus()` pass recursively expands the
-smallest existing group when ranks would otherwise be idle:
-
-```text
-CP1 -> CP2 -> CP4 -> CP8
-```
-
-The plan records the final member count as the sample's actual CP size. Thus a
-sample shorter than 8192 tokens can start as CP1 and still execute as CP4 or
-CP8. This behavior is intentional and matches the copied Megatron scheduling
-algorithm.
-
-For causal CP>1, the current zigzag FA3 path requires:
-
-```text
-local_half = global_length / actual_cp / 2
-local_half % 128 == 0
-```
-
-Equivalently, the global length must satisfy:
-
-```text
-global_length % (actual_cp * 256) == 0
-```
-
-The resulting alignment requirements are 512 tokens for CP2, 1024 tokens for
-CP4, and 2048 tokens for CP8.
-
-Arxiv case 9 demonstrates the mismatch. Its 7168-token sample initially needs
-only CP1, but the scheduler expands it to CP8:
-
-```text
-global_length = 7168
-actual_cp     = 8
-local_length  = 7168 / 8 = 896
-local_half    = 896 / 2 = 448
-448 % 128     = 64
-```
-
-The frontend therefore reports:
-
-```text
-sample 0 causal CP8 local half length 448 is not 128-aligned
-```
-
-Other representative failures from the same log are:
-
-| Dataset/case | Sample length | Actual CP | Local half | Rejection |
-| --- | ---: | ---: | ---: | --- |
-| Arxiv 9 | 7168 | 8 | 448 | not 128-aligned |
-| FreeLaw 9 | 1536 | 8 | 96 | not 128-aligned |
-| FreeLaw 12 | 256 | 8 | 16 | not 128-aligned |
-| FreeLaw 19 | 1792 | 4 | 224 | not 128-aligned |
-| GitHub 17 | 256 | 8 | 16 | not 128-aligned |
-
-The same mechanism accounts for the eleven skipped ProLong cases: short
-256/512/768/1024-token filler samples are expanded to CP4 or CP8, producing
-16/32/64/96-token local halves.
-
-### Why dataset alignment does not guarantee compatibility
-
-The dataset sampler aligns lengths for the BR-PBS topology that it generates:
-
-```text
-length < 2K:  256-token alignment
-length < 4K:  512-token alignment
-length < 8K:  1024-token alignment
-length >= 8K: 2048-token alignment
-```
-
-`megatron_hybrid_cp` intentionally ignores the BR-PBS ring placement and
-builds a new schedule from the same global lengths. A sample that is valid as
-BR-PBS CP1 or CP4 can therefore become Megatron CP4 or CP8 after idle-rank
-expansion and violate the stronger alignment required by that final CP size.
-For example, BR-PBS assigns the 7168-token sample in Arxiv case 9 to G4, where
-its local half is 896 and is 128-aligned. Megatron expands the same sample to
-CP8, where its local half is 448 and is not aligned.
-
-In short, the failures are caused by a contract mismatch between dataset
-alignment based on the BR-PBS placement and validation based on Megatron's
-independently generated final CP assignment. `--methods all` handles this by
-reporting and skipping the incompatible method before timed execution.
+The length is already a multiple of the causal CP8 alignment, 2048, so it runs
+without padding. A length such as 75777 is capped to CP8 and then padded to
+77824 before execution.

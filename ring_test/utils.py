@@ -12,6 +12,8 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from baseline.megatron_hybrid_cp import BalancedCPScheduler, HybridCPPlan
+
 
 SENTINEL = -123.0
 BASE_SEED = 20260713
@@ -35,6 +37,47 @@ def align_mega_ring_all_cp_lengths(global_lengths: list[int]) -> list[int]:
         ((length + alignment - 1) // alignment) * alignment
         for length in global_lengths
     ]
+
+
+def aligned_length_note(
+    original_lengths: tuple[int, ...] | list[int],
+    aligned_lengths: tuple[int, ...] | list[int],
+) -> str:
+    """Describe effective and physically executed token counts."""
+
+    original_tokens = sum(original_lengths)
+    aligned_tokens = sum(aligned_lengths)
+    return (
+        f"tokens(original/aligned)={original_tokens}/{aligned_tokens}, "
+        f"padding={aligned_tokens - original_tokens} tokens"
+    )
+
+
+def hybrid_cp_saturation_note(
+    original_global_lengths: tuple[int, ...] | list[int],
+    execution_plan: HybridCPPlan,
+) -> str:
+    """Describe samples whose initial CP demand was capped to physical WORLD."""
+
+    original_lengths = tuple(int(length) for length in original_global_lengths)
+    if len(original_lengths) != len(execution_plan.assignments):
+        raise ValueError("original lengths and execution plan must have equal size")
+    scheduler = BalancedCPScheduler(
+        execution_plan.max_seqlen_per_rank, execution_plan.world_size
+    )
+    details: list[str] = []
+    for sample_id, original_length in enumerate(original_lengths):
+        uncapped_cp_size = scheduler.gpus_needed(original_length)
+        if uncapped_cp_size <= execution_plan.world_size:
+            continue
+        assignment = execution_plan.assignment(sample_id)
+        local_length = assignment.global_length // assignment.cp_size
+        details.append(
+            f"sample {sample_id} required_cp(original/capped)="
+            f"{uncapped_cp_size}/{execution_plan.world_size}, "
+            f"local_length={local_length}"
+        )
+    return "CP saturation: " + "; ".join(details) if details else ""
 
 
 def parse_int_list(spec: str, name: str) -> list[int]:

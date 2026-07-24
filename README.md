@@ -322,8 +322,16 @@ Megatron-LM commit `368fa88e382b274c8fc12af851331cc1d30d69cc`. It ignores the
 BR-PBS ring placement and compiles its own CP1/2/4/8 execution groups from the
 same global lengths. Set `MEGATRON_MAX_SEQLEN_PER_RANK` in the shell wrapper or
 pass `--megatron-max-seqlen-per-rank` to either dataset/topology frontend; the
-default is 8192. Oversized or alignment-incompatible samples are skipped by
-`--methods all` and are errors when the method is requested explicitly. See
+default is 8192. After scheduling on original lengths, each sample is minimally
+padded for its final CP group: CP1 is unchanged, noncausal CP>1 aligns to CP,
+and causal CP>1 aligns to `256 * CP`. This removes divisibility/alignment skips
+without changing the post-schedule topology. If the initial CP demand exceeds
+the physical world, the FA3 plan caps it to `world_size`; 8K remains the normal
+CP-sizing target rather than a hard local-length limit at maximum CP. For
+example, 75776 tokens run as CP8 with 9472 tokens per rank. Table and cross-case
+TFLOPS use original lengths; each Note reports original/aligned tokens,
+padding, aligned-length TFLOPS, and any CP saturation from the same measured
+latency. See
 `baseline/megatron_hybrid_cp/README.md` for schedule semantics, frontend
 integration, backend fallback, and the separate forward/backward timing bounds.
 
@@ -425,9 +433,10 @@ MagiAttention metadata construction requires `torchrun`, CUDA, and the Magi
 extensions. Without Magi, the other methods can be analyzed on CPU with ordinary
 Python and `--world-size 2|4|8`; `--methods all` prints a Magi skip reason in
 that mode. Effective fields retain the original workload; physical fields use
-the baseline's actual task area, including all-CP 2048-token alignment and Magi
-metadata. Forward FLOPs remain `4 * visible_scores * QH * D`. Backward FLOPs
-match the latency benchmark at `10 * visible_scores * QH * D`.
+the baseline's actual task area, including Megatron's final-CP-dependent
+padding, all-CP mega-ring's 2048-token alignment, and Magi metadata. Forward
+FLOPs remain `4 * visible_scores * QH * D`. Backward FLOPs match the latency
+benchmark at `10 * visible_scores * QH * D`.
 
 Forward keeps the `KV tiles / QO visit` lower/upper metric. Backward reports the
 single mirrored `Q tiles / K-dKV` ratio: logical 128-token Q tiles read per
