@@ -304,6 +304,8 @@ class ForwardAblationPlan:
         ring_starts: Sequence[int],
         profile: str | int | ProfileSpec,
         *,
+        num_comp_sm: int = NUM_COMP_SM,
+        num_comm_sm: int = NUM_COMM_SM,
         collect_stats: bool = False,
     ) -> None:
         import min_fa3_op
@@ -318,10 +320,22 @@ class ForwardAblationPlan:
         self.global_lengths = tuple(global_lengths)
         self.ring_sizes_host = tuple(ring_sizes)
         self.ring_starts_host = tuple(ring_starts)
+        self.num_comp_sm = int(num_comp_sm)
+        self.num_comm_sm = int(num_comm_sm)
         self.collect_stats = collect_stats
 
         if q.device.type != "cuda" or q.dtype != torch.bfloat16 or q.size(-1) != 128:
             raise ValueError("q must be CUDA BF16 [total_q, QH, 128]")
+        if self.num_comp_sm <= 0:
+            raise ValueError("num_comp_sm must be positive")
+        if self.num_comm_sm < 0:
+            raise ValueError("num_comm_sm must be non-negative")
+        device_sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+        if self.num_comp_sm + self.num_comm_sm > device_sm_count:
+            raise ValueError(
+                "num_comp_sm + num_comm_sm must not exceed the device SM count "
+                f"({device_sm_count})"
+            )
         rank = q.device.index
         if self.profile.id <= 5 and (
             any(size != WORLD_SIZE for size in ring_sizes)
@@ -337,6 +351,11 @@ class ForwardAblationPlan:
             q.size(1),
         )
         self.hierarchy = hierarchy
+        if self.num_comm_sm == 0 and hierarchy["reduction_tiles"] > 0:
+            raise ValueError(
+                "num_comm_sm must be positive when the topology has "
+                "G8/G4/G2 replay work"
+            )
         self.unique_ring_sizes = tuple(sorted(set(ring_sizes), reverse=True))
         self.ring_sizes = torch.tensor(
             ring_sizes, device=q.device, dtype=torch.int32
@@ -389,8 +408,8 @@ class ForwardAblationPlan:
             self.max_seqlen,
             self.max_seqlen,
             self.profile.id,
-            NUM_COMP_SM,
-            NUM_COMM_SM,
+            self.num_comp_sm,
+            self.num_comm_sm,
             self.ring_sizes,
             self.half_cu_seqlens,
             self.hierarchy_host,

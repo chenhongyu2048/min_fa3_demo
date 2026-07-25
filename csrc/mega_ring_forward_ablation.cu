@@ -19,8 +19,14 @@ void run(
     TORCH_CHECK(params.is_causal, "forward ablation supports causal mode only");
     TORCH_CHECK(params.ring_world_size == 8,
                 "forward ablation requires exactly 8 GPUs");
-    TORCH_CHECK(params.num_comp_sm == 116 && params.num_comm_sm == 16,
-                "forward ablation fixes num_comp_sm=116 and num_comm_sm=16");
+    TORCH_CHECK(params.num_comp_sm > 0,
+                "forward ablation requires num_comp_sm > 0");
+    TORCH_CHECK(params.num_comm_sm >= 0,
+                "forward ablation requires num_comm_sm >= 0");
+    TORCH_CHECK(params.num_comm_sm > 0
+                    || params.mega_ring_hierarchy.reduction_tiles == 0,
+                "num_comm_sm must be positive when this rank has "
+                "G8/G4/G2 replay work");
     TORCH_CHECK(params.h_k * params.d == 1024,
                 "forward ablation requires KVH * D == 1024");
     TORCH_CHECK(params.d == 128 && params.dv == 128,

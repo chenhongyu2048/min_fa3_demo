@@ -738,8 +738,13 @@ py::tuple forward_varlen_mega_ring_ablation(
                 "forward ablation requires KVH * D == 1024");
     TORCH_CHECK(profile_id >= 1 && profile_id <= 6,
                 "profile_id must be in [1, 6]");
-    TORCH_CHECK(num_comp_sm == 116 && num_comm_sm == 16,
-                "forward ablation fixes the SM split at 116:16");
+    TORCH_CHECK(num_comp_sm > 0,
+                "num_comp_sm must be positive. Got ", num_comp_sm);
+    TORCH_CHECK(num_comm_sm >= 0,
+                "num_comm_sm must be non-negative. Got ", num_comm_sm);
+    TORCH_CHECK(num_comp_sm <= std::numeric_limits<int>::max()
+                    && num_comm_sm <= std::numeric_limits<int>::max(),
+                "num_comp_sm and num_comm_sm must fit in int32");
     TORCH_CHECK(max_seqlen_q > 0 && max_seqlen_k > 0
                     && max_seqlen_q <= std::numeric_limits<int>::max()
                     && max_seqlen_k <= std::numeric_limits<int>::max(),
@@ -757,6 +762,9 @@ py::tuple forward_varlen_mega_ring_ablation(
                     && hierarchy.reduction_tiles <= std::numeric_limits<int>::max()
                     && hierarchy.remote_tiles <= std::numeric_limits<int>::max(),
                 "hierarchy totals must fit in int32");
+    TORCH_CHECK(num_comm_sm > 0 || hierarchy.reduction_tiles == 0,
+                "num_comm_sm must be positive when this rank has "
+                "G8/G4/G2 replay work");
     check_ablation_int_cuda(ring_sizes, q, batch_size, "ring_sizes");
     check_ablation_int_cuda(
         half_cu_seqlens, q, batch_size + 1, "half_cu_seqlens");
@@ -783,6 +791,10 @@ py::tuple forward_varlen_mega_ring_ablation(
     auto* props = at::cuda::getCurrentDeviceProperties();
     TORCH_CHECK(props->major == 9 && props->minor == 0,
                 "forward ablation requires Hopper SM90");
+    TORCH_CHECK(num_comp_sm + num_comm_sm <= props->multiProcessorCount,
+                "num_comp_sm + num_comm_sm must not exceed the device SM count (",
+                props->multiProcessorCount, "). Got ",
+                num_comp_sm + num_comm_sm);
     TORCH_CHECK(k.size(0) == v.size(0) && k.size(0) % 8 == 0,
                 "K/V arena rows must match and be divisible by 8");
     int64_t const rank_capacity_i64 = k.size(0) / 8;

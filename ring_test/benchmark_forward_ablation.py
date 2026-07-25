@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
-import random
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
@@ -18,24 +18,29 @@ DEMO_DIR = THIS_DIR.parent
 if str(DEMO_DIR) not in sys.path:
     sys.path.insert(0, str(DEMO_DIR))
 
+import balancer
 import min_fa3_op
 from ring_test.forward_ablation import (
     ForwardAblationPlan,
     PROFILES,
-    canonicalize_lengths,
     local_lengths_for_rank,
     make_cu_seqlens,
 )
-from ring_test.load_balance_bench.topology import make_br_pbs_topology
+from ring_test.load_balance_bench.topology import PlannerControls, make_br_pbs_topology
+from ring_test.utils import aligned_length_note, align_mega_ring_all_cp_lengths
 from scripts.test_mega_ring.mega_ring_test_min_fa3_varlen_hybrid_multi_rank import (
     hierarchical_reference,
 )
 
 
-DEFAULT_LENGTHS = "16384,12288,8192,6144,4096,2048,2048,2048"
-Q_HEADS = 16
-KV_HEADS = 8
-HEAD_DIM = 128
+DEFAULT_DATASET = "arxiv"
+DEFAULT_TARGET_TOKENS = 128 * 1024
+DEFAULT_NUM_CASES = 20
+DEFAULT_SM_CONFIGS = "128:4,124:8,120:12,116:16"
+DEFAULT_TOKEN_BALANCE_TOLERANCE = 0.05
+DEFAULT_Q_HEADS = 32
+DEFAULT_KV_HEADS = 8
+DEFAULT_HEAD_DIM = 128
 
 
 @dataclass
@@ -55,6 +60,32 @@ class DistributedInputs:
     sample_ids: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class AblationSummarySample:
+    case_index: int
+    profile: str
+    sm_config: "SmConfig"
+    time_ms: float
+    aggregate_tflops: float
+
+
+@dataclass(frozen=True)
+class TimingResult:
+    local_ms: float
+    max_ms: float
+    rank_times_ms: tuple[float, ...] | None
+
+
+@dataclass(frozen=True)
+class SmConfig:
+    num_comp_sm: int
+    num_comm_sm: int
+
+    @property
+    def label(self) -> str:
+        return f"{self.num_comp_sm}:{self.num_comm_sm}"
+
+
 def parse_lengths(spec: str) -> tuple[int, ...]:
     values = tuple(int(token.strip()) for token in spec.split(",") if token.strip())
     if not values or any(value <= 0 for value in values):
@@ -62,32 +93,124 @@ def parse_lengths(spec: str) -> tuple[int, ...]:
     return values
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
+def parse_sm_configs(spec: str) -> tuple[SmConfig, ...]:
+    configs: list[SmConfig] = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        fields = token.split(":")
+        if len(fields) != 2:
+            raise ValueError(f"invalid SM config {token!r}, expected COMP:COMM")
+        try:
+            num_comp_sm, num_comm_sm = (int(field) for field in fields)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid SM config {token!r}, expected integer COMP:COMM"
+            ) from exc
+        if num_comp_sm <= 0 or num_comm_sm <= 0:
+            raise ValueError(
+                "forward ablation requires positive compute and communication "
+                f"SM counts, got {token!r}"
+            )
+        configs.append(SmConfig(num_comp_sm, num_comm_sm))
+    if not configs:
+        raise ValueError("--sm-configs must provide at least one COMP:COMM pair")
+    return tuple(configs)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--b", type=int, default=8)
-    parser.add_argument("--seqlen", default=DEFAULT_LENGTHS)
-    parser.add_argument("--qhead", type=int, default=Q_HEADS)
-    parser.add_argument("--kvhead", type=int, default=KV_HEADS)
-    parser.add_argument("--headdim", type=int, default=HEAD_DIM)
+    parser.add_argument(
+        "--dataset", choices=(DEFAULT_DATASET,), default=DEFAULT_DATASET
+    )
+    parser.add_argument(
+        "--target-tokens", type=positive_int, default=DEFAULT_TARGET_TOKENS
+    )
+    parser.add_argument("--num-cases", type=positive_int, default=DEFAULT_NUM_CASES)
+    parser.add_argument(
+        "--b",
+        type=positive_int,
+        help="Batch size for the explicit one-case --seqlen override",
+    )
+    parser.add_argument(
+        "--seqlen",
+        help=(
+            "Explicit one-case override retained for focused debugging; "
+            "otherwise ArXiv cases are sampled"
+        ),
+    )
+    parser.add_argument("--qhead", type=positive_int, default=DEFAULT_Q_HEADS)
+    parser.add_argument("--kvhead", type=positive_int, default=DEFAULT_KV_HEADS)
+    parser.add_argument("--headdim", type=positive_int, default=DEFAULT_HEAD_DIM)
     parser.add_argument("--mode", choices=("causal",), default="causal")
-    parser.add_argument("--seed", type=int, default=20260725)
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--iters", type=int, default=40)
-    parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--repeat", type=int, default=5)
-    parser.add_argument("--correctness-only", action="store_true")
-    parser.add_argument("--skip-correctness", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--token-balance-tolerance",
+        type=float,
+        default=DEFAULT_TOKEN_BALANCE_TOLERANCE,
+    )
+    parser.add_argument("--warmup-iters", type=int, default=10)
+    parser.add_argument("--num-iters", type=int, default=40)
+    parser.add_argument(
+        "--sm-configs",
+        default=DEFAULT_SM_CONFIGS,
+        help="Comma-separated compute:communication SM allocations",
+    )
+    parser.add_argument(
+        "--check", action=argparse.BooleanOptionalAction, default=False
+    )
     parser.add_argument("--atol", type=float, default=0.2)
     parser.add_argument("--rtol", type=float, default=0.2)
     args = parser.parse_args()
-    raw_lengths = parse_lengths(args.seqlen)
-    if args.b <= 0 or args.b > len(raw_lengths):
-        parser.error(f"--b must be in [1, {len(raw_lengths)}]")
-    args.raw_lengths = raw_lengths[: args.b]
-    if (args.qhead, args.kvhead, args.headdim) != (Q_HEADS, KV_HEADS, HEAD_DIM):
-        parser.error("strict ablation fixes QH=16, KVH=8, D=128")
-    if args.warmup < 0 or args.iters <= 0 or args.rounds <= 0 or args.repeat != 5:
-        parser.error("warmup must be nonnegative, iters/rounds positive, and repeat=5")
+    try:
+        args.sm_configs = parse_sm_configs(args.sm_configs)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.seqlen is not None:
+        raw_lengths = parse_lengths(args.seqlen)
+        if args.b is None:
+            args.b = len(raw_lengths)
+        if args.b > len(raw_lengths):
+            parser.error(f"--b must be in [1, {len(raw_lengths)}]")
+        args.raw_length_cases = (raw_lengths[: args.b],)
+        args.num_cases = 1
+        args.case_source = "explicit --seqlen"
+    elif args.b is not None:
+        parser.error("--b requires the explicit --seqlen override")
+    else:
+        try:
+            args.raw_length_cases = tuple(
+                tuple(lengths)
+                for lengths in balancer.generate_dataset_length_cases(
+                    args.dataset,
+                    args.target_tokens,
+                    args.seed,
+                    args.num_cases,
+                )
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        args.case_source = f"dataset={args.dataset}"
+    if args.headdim != 128:
+        parser.error("forward ablation requires D=128")
+    if args.kvhead * args.headdim != 1024:
+        parser.error("forward ablation requires KVH * D == 1024")
+    if args.qhead % args.kvhead:
+        parser.error("qhead must be divisible by kvhead")
+    if args.token_balance_tolerance < 0:
+        parser.error("token balance tolerance must be non-negative")
+    if args.warmup_iters < 0 or args.num_iters <= 0:
+        parser.error(
+            "warmup iterations must be non-negative and measured iterations positive"
+        )
     return args
 
 
@@ -106,6 +229,19 @@ def init_distributed() -> tuple[int, int, torch.device]:
         raise SystemExit("strict forward ablation requires Hopper SM90")
     dist.init_process_group("nccl", device_id=device)
     return rank, world_size, device
+
+
+def validate_sm_configs(
+    sm_configs: Sequence[SmConfig], device: torch.device
+) -> None:
+    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    for config in sm_configs:
+        requested = config.num_comp_sm + config.num_comm_sm
+        if requested > device_sm_count:
+            raise SystemExit(
+                f"SM config {config.label} requests {requested} SMs, but "
+                f"device {device.index} has {device_sm_count}"
+            )
 
 
 def cuda_barrier() -> None:
@@ -131,6 +267,9 @@ def make_global_consistent_local_qkv(
     rank: int,
     device: torch.device,
     seed: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     q_parts: list[torch.Tensor] = []
     k_parts: list[torch.Tensor] = []
@@ -142,9 +281,9 @@ def make_global_consistent_local_qkv(
             continue
         local_rank = rank - ring_start
         shapes = (
-            (global_length, Q_HEADS, HEAD_DIM),
-            (global_length, KV_HEADS, HEAD_DIM),
-            (global_length, KV_HEADS, HEAD_DIM),
+            (global_length, q_heads, head_dim),
+            (global_length, kv_heads, head_dim),
+            (global_length, kv_heads, head_dim),
         )
         tensors: list[torch.Tensor] = []
         for kind, shape in enumerate(shapes):
@@ -176,6 +315,9 @@ def make_inputs(
     rank: int,
     device: torch.device,
     seed: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
 ) -> DistributedInputs:
     rank_lengths = tuple(
         local_lengths_for_rank(global_lengths, ring_sizes, ring_starts, source_rank)
@@ -183,14 +325,23 @@ def make_inputs(
     )
     local_lengths = rank_lengths[rank]
     q, local_k, local_v = make_global_consistent_local_qkv(
-        global_lengths, ring_sizes, ring_starts, sample_ids, rank, device, seed
+        global_lengths,
+        ring_sizes,
+        ring_starts,
+        sample_ids,
+        rank,
+        device,
+        seed,
+        q_heads,
+        kv_heads,
+        head_dim,
     )
     if q.size(0) != sum(local_lengths):
         raise RuntimeError("packed local input does not match topology lengths")
     cu, cu_host = make_cu_seqlens(local_lengths, device)
     rank_capacity = max(sum(lengths) for lengths in rank_lengths)
     rank_capacity = (rank_capacity + 127) // 128 * 128
-    arena_shape = (8 * rank_capacity, KV_HEADS, HEAD_DIM)
+    arena_shape = (8 * rank_capacity, kv_heads, head_dim)
     remote_k = min_fa3_op.TKParallelTensor(
         arena_shape, torch.bfloat16, rank, 8, False
     )
@@ -221,7 +372,11 @@ def make_inputs(
 
 
 def make_plan(
-    inputs: DistributedInputs, profile: str, *, collect_stats: bool = False
+    inputs: DistributedInputs,
+    profile: str,
+    sm_config: SmConfig,
+    *,
+    collect_stats: bool = False,
 ) -> ForwardAblationPlan:
     return ForwardAblationPlan(
         inputs.q,
@@ -234,6 +389,8 @@ def make_plan(
         inputs.ring_sizes,
         inputs.ring_starts,
         profile,
+        num_comp_sm=sm_config.num_comp_sm,
+        num_comm_sm=sm_config.num_comm_sm,
         collect_stats=collect_stats,
     )
 
@@ -298,8 +455,16 @@ def reference(inputs: DistributedInputs, rank: int) -> tuple[torch.Tensor, torch
     )
 
 
-def correctness_and_probes(
-    rank: int, device: torch.device, seed: int, repeat: int, atol: float, rtol: float
+def correctness(
+    rank: int,
+    device: torch.device,
+    seed: int,
+    atol: float,
+    rtol: float,
+    sm_configs: Sequence[SmConfig],
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
 ) -> None:
     all_cp_lengths = (8192, 4096)
     all_cp = make_inputs(
@@ -310,38 +475,11 @@ def correctness_and_probes(
         rank,
         device,
         seed,
+        q_heads,
+        kv_heads,
+        head_dim,
     )
     expected_o, expected_lse = reference(all_cp, rank)
-    for profile in PROFILES[:5]:
-        plan = make_plan(all_cp, profile.name)
-        for _ in range(repeat):
-            out, lse = plan.run()
-        torch.cuda.synchronize(device)
-        assert_distributed_close(
-            f"{profile.name} O", out.float(), expected_o.float(), atol, rtol
-        )
-        assert_distributed_close(
-            f"{profile.name} LSE", lse, expected_lse, atol, rtol
-        )
-
-    probe_results: dict[str, dict[str, object]] = {}
-    for profile in PROFILES[:5]:
-        probe_results[profile.name] = make_plan(
-            all_cp, profile.name, collect_stats=True
-        ).probe()
-    if probe_results["step_external_reduce"]["attention_launches"] != 8:
-        raise AssertionError("L1 did not report eight attention launches")
-    if probe_results["step_external_reduce"]["reduction_launches"] != 8:
-        raise AssertionError("L1 did not report eight reduction launches")
-    if probe_results["step_fused_reduce"]["reduction_launches"] != 0:
-        raise AssertionError("L2 unexpectedly reported an external reduction")
-    if probe_results["linear_queue_no_recycle"]["recycled_cta_work"] != 0:
-        raise AssertionError("L3 communication CTAs consumed compute work")
-    if probe_results["linear_queue_recycle"]["segment_span_max"] != 1:
-        raise AssertionError("L4 formed a multi-step segment")
-    if probe_results["dynamic_segment_recycle"]["segment_span_max"] <= 1:
-        raise AssertionError("L5 did not form a multi-step ready segment")
-
     mixed = make_inputs(
         (2048, 1024, 512, 256),
         (8, 4, 2, 1),
@@ -350,194 +488,310 @@ def correctness_and_probes(
         rank,
         device,
         seed + 17,
+        q_heads,
+        kv_heads,
+        head_dim,
     )
     mixed_expected_o, mixed_expected_lse = reference(mixed, rank)
-    mixed_plan = make_plan(mixed, "hybrid_br_pbs")
-    for _ in range(repeat):
+    for sm_config in sm_configs:
+        for profile in PROFILES[:5]:
+            plan = make_plan(all_cp, profile.name, sm_config)
+            out, lse = plan.run()
+            torch.cuda.synchronize(device)
+            assert_distributed_close(
+                f"{profile.name} SM {sm_config.label} O",
+                out.float(),
+                expected_o.float(),
+                atol,
+                rtol,
+            )
+            assert_distributed_close(
+                f"{profile.name} SM {sm_config.label} LSE",
+                lse,
+                expected_lse,
+                atol,
+                rtol,
+            )
+
+        mixed_plan = make_plan(mixed, "hybrid_br_pbs", sm_config)
         mixed_o, mixed_lse = mixed_plan.run()
-    torch.cuda.synchronize(device)
-    assert_distributed_close(
-        "L6 mixed O", mixed_o.float(), mixed_expected_o.float(), atol, rtol
-    )
-    assert_distributed_close(
-        "L6 mixed LSE", mixed_lse, mixed_expected_lse, atol, rtol
-    )
-    mixed_probe = make_plan(mixed, "hybrid_br_pbs", collect_stats=True).probe()
-    if len(mixed_probe["ring_sizes"]) < 2:
-        raise AssertionError("L6 did not consume multiple ring sizes")
-    cuda_barrier()
-    if rank == 0:
-        print("correctness: PASS (L1-L5 all-CP and L6 mixed hierarchy, repeat=5)")
-        for name, counters in probe_results.items():
-            print(f"probe {name}: {counters}")
-        print(f"probe hybrid_br_pbs: {mixed_probe}")
+        torch.cuda.synchronize(device)
+        assert_distributed_close(
+            f"L6 mixed SM {sm_config.label} O",
+            mixed_o.float(),
+            mixed_expected_o.float(),
+            atol,
+            rtol,
+        )
+        assert_distributed_close(
+            f"L6 mixed SM {sm_config.label} LSE",
+            mixed_lse,
+            mixed_expected_lse,
+            atol,
+            rtol,
+        )
+        cuda_barrier()
+        if rank == 0:
+            print(
+                "correctness: PASS "
+                f"(SM={sm_config.label}, L1-L5 all-CP and L6 mixed hierarchy)"
+            )
 
 
-def quantile(values: Sequence[float], q: float) -> float:
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * q
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    fraction = position - lower
-    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
-
-
-def original_tflops(raw_lengths: Sequence[int], latency_ms: float) -> float:
-    scores = sum(length * (length + 1) // 2 for length in raw_lengths)
-    flops = 4 * scores * Q_HEADS * HEAD_DIM
+def causal_tflops(
+    lengths: Sequence[int], q_heads: int, head_dim: int, latency_ms: float
+) -> float:
+    scores = sum(length * (length + 1) // 2 for length in lengths)
+    flops = 4 * scores * q_heads * head_dim
     return flops / (latency_ms * 1e-3) / 1e12
 
 
-def time_profiles(
-    plans: dict[str, ForwardAblationPlan],
-    warmup: int,
-    iterations: int,
-    rounds: int,
-    seed: int,
-) -> dict[str, list[float]]:
-    samples = {profile.name: [] for profile in PROFILES}
-    for round_index in range(rounds):
-        order = [profile.name for profile in PROFILES]
-        random.Random(seed + round_index).shuffle(order)
-        for _ in range(warmup):
-            for name in order:
-                plans[name].run()
-        cuda_barrier()
-        for iteration in range(iterations):
-            iteration_order = list(order)
-            random.Random(seed + round_index * iterations + iteration).shuffle(
-                iteration_order
-            )
-            for name in iteration_order:
-                begin = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                begin.record()
-                plans[name].run()
-                end.record()
-                end.synchronize()
-                local_ms = begin.elapsed_time(end)
-                max_ms = torch.tensor([local_ms], device="cuda", dtype=torch.float64)
-                dist.all_reduce(max_ms, op=dist.ReduceOp.MAX)
-                samples[name].append(float(max_ms.item()))
-        cuda_barrier()
-    return samples
+def measure_distributed_ms(
+    plan: ForwardAblationPlan,
+    warmup_iters: int,
+    num_iters: int,
+    rank: int,
+) -> TimingResult:
+    for _ in range(warmup_iters):
+        plan.run()
+    cuda_barrier()
 
+    local_samples: list[float] = []
+    max_samples: list[float] = []
+    for _ in range(num_iters):
+        begin = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        begin.record()
+        plan.run()
+        end.record()
+        end.synchronize()
+        elapsed_ms = begin.elapsed_time(end)
+        elapsed = torch.tensor([elapsed_ms], device="cuda", dtype=torch.float64)
+        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+        local_samples.append(elapsed_ms)
+        max_samples.append(float(elapsed.item()))
+    cuda_barrier()
 
-def gather_probe(
-    plan: ForwardAblationPlan, rank: int
-) -> tuple[dict[str, object], list[list[int]] | None]:
-    counters = plan.probe()
-    local = torch.tensor(
-        (
-            int(counters["qo_visits"]),
-            int(counters["kv_tile_reads"]),
-            int(counters["recycled_cta_work"]),
-            int(counters["segment_span_max"]),
-            int(counters["segment_claims"]),
-        ),
-        device="cuda",
-        dtype=torch.int64,
+    local_avg = sum(local_samples) / len(local_samples)
+    max_avg = sum(max_samples) / len(max_samples)
+    local_tensor = torch.tensor([local_avg], device="cuda", dtype=torch.float64)
+    gathered = [torch.empty_like(local_tensor) for _ in range(8)]
+    dist.all_gather(gathered, local_tensor)
+    rank_times = (
+        tuple(float(value.item()) for value in gathered) if rank == 0 else None
     )
-    gathered = [torch.empty_like(local) for _ in range(8)]
-    dist.all_gather(gathered, local)
-    rows = [tensor.cpu().tolist() for tensor in gathered] if rank == 0 else None
-    return counters, rows
+    return TimingResult(local_avg, max_avg, rank_times)
 
 
-def performance(
-    args: argparse.Namespace, rank: int, device: torch.device
-) -> None:
-    canonical = canonicalize_lengths(args.raw_lengths)
+def performance_case(
+    args: argparse.Namespace,
+    rank: int,
+    device: torch.device,
+    case_index: int,
+    raw_lengths: tuple[int, ...],
+) -> list[AblationSummarySample]:
+    controls = PlannerControls(
+        token_balance_tolerance=args.token_balance_tolerance
+    )
+    br_pbs = make_br_pbs_topology(raw_lengths, 8, True, controls)
+    if tuple(sorted(br_pbs.sample_ids)) != tuple(range(len(raw_lengths))):
+        raise RuntimeError("BR-PBS did not preserve every sampled ArXiv sequence")
+    workload_lengths = br_pbs.global_lengths
+    all_cp_lengths = tuple(
+        align_mega_ring_all_cp_lengths(list(workload_lengths))
+    )
     all_cp = make_inputs(
-        canonical,
-        (8,) * len(canonical),
-        (0,) * len(canonical),
-        tuple(range(len(canonical))),
+        all_cp_lengths,
+        (8,) * len(all_cp_lengths),
+        (0,) * len(all_cp_lengths),
+        br_pbs.sample_ids,
         rank,
         device,
         args.seed,
+        args.qhead,
+        args.kvhead,
+        args.headdim,
     )
-    br_pbs = make_br_pbs_topology(canonical, 8, True)
-    if br_pbs.padding_tokens != 0 or tuple(sorted(br_pbs.sample_ids)) != tuple(
-        range(len(canonical))
-    ):
-        raise RuntimeError("BR-PBS changed the once-canonicalized workload")
-    if len(set(br_pbs.ring_sizes)) < 2:
-        raise RuntimeError("default performance workload must produce multiple ring sizes")
     hybrid = make_inputs(
-        br_pbs.global_lengths,
+        workload_lengths,
         br_pbs.ring_sizes,
         br_pbs.ring_starts,
         br_pbs.sample_ids,
         rank,
         device,
         args.seed,
+        args.qhead,
+        args.kvhead,
+        args.headdim,
     )
-    plans = {
-        profile.name: make_plan(
-            hybrid if profile.id == 6 else all_cp,
-            profile.name,
+    summary_samples: list[AblationSummarySample] = []
+    if rank == 0:
+        print(
+            f"\nForward ablation case {case_index + 1}/{args.num_cases}: "
+            f"{args.case_source}, B={len(raw_lengths)}, "
+            f"raw_tokens={sum(raw_lengths)}, QH={args.qhead}, "
+            f"KVH={args.kvhead}, D={args.headdim}, raw_lengths={raw_lengths}"
         )
-        for profile in PROFILES
-    }
-    probe_plans = {
-        profile.name: make_plan(
-            hybrid if profile.id == 6 else all_cp,
-            profile.name,
-            collect_stats=True,
+        print(
+            "BR-PBS workload: "
+            f"token_tolerance={args.token_balance_tolerance}, "
+            f"execution_tokens={sum(workload_lengths)}, "
+            f"global_seqlens={workload_lengths}, rings={br_pbs.ring_sizes}, "
+            f"starts={br_pbs.ring_starts}"
         )
-        for profile in PROFILES
-    }
-    cuda_barrier()
-    samples = time_profiles(
-        plans, args.warmup, args.iters, args.rounds, args.seed
-    )
-    probes: dict[str, tuple[dict[str, object], list[list[int]] | None]] = {}
-    for profile in PROFILES:
-        probes[profile.name] = gather_probe(probe_plans[profile.name], rank)
-    cuda_barrier()
+        print(
+            "All-CP L1-L5: "
+            f"alignment=2048, execution_tokens={sum(all_cp_lengths)}, "
+            f"global_seqlens={all_cp_lengths}"
+        )
 
-    if rank != 0:
-        return
+    for sm_config in args.sm_configs:
+        plans = {
+            profile.name: make_plan(
+                hybrid if profile.id == 6 else all_cp,
+                profile.name,
+                sm_config,
+            )
+            for profile in PROFILES
+        }
+        if rank == 0:
+            print(
+                "level\tprofile\tsm_config\tmean_ms\tagg_tflops"
+                "\tavg_gpu_tflops\tcheck\tkernels\tnote"
+            )
+        for profile in PROFILES:
+            timing = measure_distributed_ms(
+                plans[profile.name],
+                args.warmup_iters,
+                args.num_iters,
+                rank,
+            )
+            if rank == 0:
+                aggregate_tflops = causal_tflops(
+                    workload_lengths, args.qhead, args.headdim, timing.max_ms
+                )
+                note = "hierarchical hybrid fused mega-ring"
+                if profile.id <= 5:
+                    aligned_tflops = causal_tflops(
+                        all_cp_lengths, args.qhead, args.headdim, timing.max_ms
+                    )
+                    note = (
+                        f"all-CP G8; "
+                        f"{aligned_length_note(workload_lengths, all_cp_lengths)}; "
+                        f"aligned-length Agg TFLOPS={aligned_tflops:.3f}, "
+                        f"Avg/GPU={aligned_tflops / 8:.3f}"
+                    )
+                check_status = "ok" if args.check else "skip"
+                print(
+                    f"L{profile.id}\t{profile.name}\t{sm_config.label}\t"
+                    f"{timing.max_ms:.6f}\t{aggregate_tflops:.3f}\t"
+                    f"{aggregate_tflops / 8:.3f}\t{check_status}\t"
+                    f"{profile.kernel_launches}\t{note}"
+                )
+                summary_samples.append(
+                    AblationSummarySample(
+                        case_index,
+                        profile.name,
+                        sm_config,
+                        timing.max_ms,
+                        aggregate_tflops,
+                    )
+                )
+                rank_times = ", ".join(
+                    f"t{rank_index}={time_ms:.3f}"
+                    for rank_index, time_ms in enumerate(timing.rank_times_ms or ())
+                )
+                print(
+                    f"rank_time L{profile.id} SM={sm_config.label}: "
+                    f"{rank_times} | max_across_ranks={timing.max_ms:.3f}"
+                )
+        del plans
+    return summary_samples
+
+
+def print_performance_summary(
+    samples: Sequence[AblationSummarySample],
+    total_cases: int,
+    sm_configs: Sequence[SmConfig],
+) -> None:
+    grouped: dict[tuple[str, SmConfig], list[AblationSummarySample]] = defaultdict(list)
+    for sample in samples:
+        grouped[(sample.profile, sample.sm_config)].append(sample)
+
+    print("\nCross-case forward ablation summary")
     print(
-        "performance workload: "
-        f"raw={args.raw_lengths}, canonical={canonical}, "
-        f"br_pbs_lengths={br_pbs.global_lengths}, "
-        f"br_pbs_rings={br_pbs.ring_sizes}, starts={br_pbs.ring_starts}"
+        "Agg TFLOPS uses the original BR-PBS workload lengths; all-CP 2K "
+        "aligned-length TFLOPS are reported in each case Note."
     )
     print(
-        "level\tprofile\tmedian_ms\tp10_ms\tp90_ms\toriginal_token_tflops"
-        "\tkernels\tspan_max\tqo_visits\tkv_tile_reads"
+        f"{'Level':<7} {'Profile':<28} {'SM':>8} {'Cases':>8} "
+        f"{'Min ms':>10} {'Mean ms':>10} {'P50 ms':>10} {'Max ms':>10} "
+        f"{'Mean TFLOPS':>14} {'Weighted TFLOPS':>18} {'Weighted/GPU':>14}"
     )
     for profile in PROFILES:
-        values = samples[profile.name]
-        med = median(values)
-        counters, _ = probes[profile.name]
+        for sm_config in sm_configs:
+            records = grouped[(profile.name, sm_config)]
+            if not records:
+                continue
+            times = [record.time_ms for record in records]
+            weighted_tflops = sum(
+                record.aggregate_tflops * record.time_ms for record in records
+            ) / sum(times)
+            mean_tflops = sum(
+                record.aggregate_tflops for record in records
+            ) / len(records)
+            print(
+                f"L{profile.id:<6} {profile.name:<28} {sm_config.label:>8} "
+                f"{f'{len(records)}/{total_cases}':>8} "
+                f"{min(times):>10.3f} {sum(times) / len(times):>10.3f} "
+                f"{median(times):>10.3f} {max(times):>10.3f} "
+                f"{mean_tflops:>14.1f} {weighted_tflops:>18.1f} "
+                f"{weighted_tflops / 8:>14.1f}"
+            )
+
+
+def performance(
+    args: argparse.Namespace, rank: int, device: torch.device
+) -> None:
+    summary_samples: list[AblationSummarySample] = []
+    if rank == 0:
+        sm_configs = ",".join(config.label for config in args.sm_configs)
         print(
-            f"L{profile.id}\t{profile.name}\t{med:.6f}\t"
-            f"{quantile(values, 0.10):.6f}\t{quantile(values, 0.90):.6f}\t"
-            f"{original_tflops(args.raw_lengths, med):.3f}\t"
-            f"{profile.kernel_launches}\t{counters['segment_span_max']}\t"
-            f"{counters['qo_visits']}\t{counters['kv_tile_reads']}"
+            "Forward ablation config: "
+            f"dataset={args.dataset}, target_tokens={args.target_tokens}, "
+            f"cases={args.num_cases}, seed={args.seed}, "
+            f"token_balance_tolerance={args.token_balance_tolerance}, "
+            f"QH={args.qhead}, KVH={args.kvhead}, D={args.headdim}, "
+            f"mode={args.mode}, sm_configs={sm_configs}, "
+            f"warmup={args.warmup_iters}, iters={args.num_iters}, "
+            f"check={args.check}, stats_probe=False"
         )
-        _, rank_rows = probes[profile.name]
-        print(
-            f"rank_load L{profile.id} "
-            "[rank,qo_visits,kv_tile_reads,recycled_work,span_max,claims]="
-            f"{[[rank_index, *row] for rank_index, row in enumerate(rank_rows or [])]}"
+    for case_index, raw_lengths in enumerate(args.raw_length_cases):
+        summary_samples.extend(
+            performance_case(args, rank, device, case_index, raw_lengths)
         )
+    if rank == 0:
+        print_performance_summary(summary_samples, args.num_cases, args.sm_configs)
 
 
 def main() -> None:
     args = parse_args()
     rank, _, device = init_distributed()
     try:
-        if not args.skip_correctness:
-            correctness_and_probes(
-                rank, device, args.seed, args.repeat, args.atol, args.rtol
+        validate_sm_configs(args.sm_configs, device)
+        if args.check:
+            correctness(
+                rank,
+                device,
+                args.seed,
+                args.atol,
+                args.rtol,
+                args.sm_configs,
+                args.qhead,
+                args.kvhead,
+                args.headdim,
             )
-        if not args.correctness_only:
-            performance(args, rank, device)
+        performance(args, rank, device)
     finally:
         if dist.is_initialized():
             cuda_barrier()
