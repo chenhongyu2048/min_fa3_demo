@@ -35,9 +35,9 @@
 
 给定一个单节点 Hopper world，world size 为
 
-\[
+$$
 W\in\{2,4,8\},
-\]
+$$
 
 以及一个长度异构的 sequence batch，MegaRing 需要为每条序列选择 context-parallel degree，并在不同 CP degree 的序列互相重叠时保持：
 
@@ -47,30 +47,30 @@ W\in\{2,4,8\},
 4. 将 peer K/V 传输与 attention compute 重叠；
 5. 避免传统 ring attention 的逐 step host launch、Q 重载和重复 O/LSE 归并。
 
-一条全局序列 \(i\) 由三元组表示：
+一条全局序列 $1$ 由三元组表示：
 
-\[
+$$
 (L_i,G_i,S_i),
-\]
+$$
 
-其中 \(L_i\) 是 global length，\(G_i\in\{1,2,4,8\}\) 是 buddy ring size，\(S_i\) 是 aligned ring start。合法 buddy ring 的成员集合为
+其中 $L_i$ 是 global length，$G_i\in\{1,2,4,8\}$ 是 buddy ring size，$S_i$ 是 aligned ring start。合法 buddy ring 的成员集合为
 
-\[
+$$
 \mathcal{R}_i=\{S_i,\ldots,S_i+G_i-1\},
-\]
+$$
 
 并要求
 
-\[
+$$
 S_i\bmod G_i=0,\qquad S_i+G_i\le W,\qquad L_i\bmod G_i=0.
-\]
+$$
 
-rank \(r\) 属于该集合时，local shard length 为 \(L_i/G_i\)；否则该 rank 在该 batch slot 的 local packed length 为零。令 \(r_G=r-\lfloor r/G\rfloor G\)，ring step \(s\) 所需的 K/V owner 是
+rank $r$ 属于该集合时，local shard length 为 $L_i/G_i$；否则该 rank 在该 batch slot 的 local packed length 为零。令 $r_G=r-\lfloor r/G\rfloor G$，ring step $s$ 所需的 K/V owner 是
 
-\[
+$$
 owner(G,r,s)=\left\lfloor\frac{r}{G}\right\rfloor G
  +(r_G-s+G)\bmod G.
-\]
+$$
 
 该 owner 公式只依赖 aligned buddy topology、rank 和 step。因此 device 端不需要读取 `ring_starts`；`ring_starts` 只在 host 验证 membership 与合法性。
 
@@ -152,7 +152,7 @@ q, o, dout, dq: [local_total_q, QH, 128]
 k, v: [W * rank_kv_capacity, KVH, 128]
 ```
 
-rank \(r\) 的 owner-local K/V 区域为
+rank $r$ 的 owner-local K/V 区域为
 
 ```text
 [r * rank_kv_capacity, (r + 1) * rank_kv_capacity)
@@ -221,11 +221,11 @@ blockIdx.x in [0, C)   : initial compute CTAs
 blockIdx.x in [C, C+M) : communication CTAs
 ```
 
-这表达的是 persistent CTA 的逻辑资源配额，而不是将物理 SM 永久命名。binding 检查 \(C>0\)、\(M\ge0\) 和 \(C+M\le\) 设备 SM 数。实际共享内存配置为
+这表达的是 persistent CTA 的逻辑资源配额，而不是将物理 SM 永久命名。binding 检查 $C>0$、$M\ge0$ 和 $C+M\le$ 设备 SM 数。实际共享内存配置为
 
-\[
+$$
 S_{launch}=\max(S_{FA3},S_{comm}),
-\]
+$$
 
 并通过 `cudaFuncAttributeMaxDynamicSharedMemorySize` 申请所需动态 shared memory。由此同一个 CTA 可先使用 communication staging，再复用同一 block 执行 FA3 compute。
 
@@ -248,9 +248,9 @@ Forward communication 采用两级粒度：
 
 `BlockN` 决定 logical task 大小，因此 readiness 对应“compute 可消费的一整个 attention K/V tile”，而不是 token row。每个 logical K task 或 V task 由若干 16-row transfer 完成后才发布一次 counter；一个 ready target 等于
 
-\[
+$$
 2\left\lceil\frac{rows}{BlockN}\right\rceil,
-\]
+$$
 
 系数 2 对应 K 和 V 各一份 task。`16 x 1024` BF16 tile 为 32 KiB；当前 12-warp attention CTA 将 warps 成对组织，得到最多 6 个 BF16 staging slots，即约 192 KiB，另留 barrier 空间。FP32 dKV path 使用 3 个 64 KiB slots，也约为 192 KiB。
 
@@ -274,7 +274,7 @@ store warp:
 
 ### 3.6 Causal zigzag 与 per-Q-tile state machine
 
-对 \(G>1\) 的 local shard，causal 路径将 Q/KV 划分为等长 front/back half，要求 local half 为 128-row 对齐。给定 subring-local rank \(r_G\)：
+对 $G>1$ 的 local shard，causal 路径将 Q/KV 划分为等长 front/back half，要求 local half 为 128-row 对齐。给定 subring-local rank $r_G$：
 
 ```text
 step 0:
@@ -287,7 +287,7 @@ step r_G+1 .. G-1:
   local back-half Q x remote full KV, no diagonal mask
 ```
 
-该 zigzag 规则覆盖所有全局 causal pairs，同时将每个 rank 的有效 attention area 尽量均衡。front Q tile 的终止 step 是 \(r_G\)，当 \(r_G=0\) 时只存在 step 0；back Q tile 需要推进至 \(G-1\)。
+该 zigzag 规则覆盖所有全局 causal pairs，同时将每个 rank 的有效 attention area 尽量均衡。front Q tile 的终止 step 是 $r_G$，当 $r_G=0$ 时只存在 step 0；back Q tile 需要推进至 $G-1$。
 
 每个 G8/G4/G2 的 full Q tile 对应一个 `tile_state`：低位为下一个尚未处理 step，最高位 `kTileStateBusy` 为临时 claim lock。其状态转移为
 
@@ -305,7 +305,7 @@ tile state 使用 GPU-scope release store；scheduler 使用 acquire load 与 ac
 
 这是 forward 中最重要的 scheduler 优化。step 0 的所有 local work 先占据 base ticket；并不存在全局 step-0 barrier。某个 tile 的 remote work 只有在它自己的 step 0 epilogue 已将 state 发布为正数后才可能被 claim。
 
-当 scheduler 读到 `next_step=b` 时，它依次检查 \(b,b+1,\ldots,last\_step\) 的 `kv_ready` count，在第一个未 ready step 停止，得到最长连续 ready span \([b,e]\)。只有成功执行
+当 scheduler 读到 `next_step=b` 时，它依次检查 $b,b+1,\ldots,last\_step$ 的 `kv_ready` count，在第一个未 ready step 停止，得到最长连续 ready span $[b,e]$。只有成功执行
 
 ```text
 CAS(tile_state, state, state | BUSY)
@@ -321,22 +321,22 @@ FA3 mainloop 把 span 看作虚拟连续 K/V 序列，按 O(1) 算术恢复
 
 而不 materialize 拼接 K/V。一个 segment 内先遍历适用的 half-KV step，再遍历 full-KV step；最终只执行一次 prologue/mainloop/epilogue 与一次 O/LSE merge。
 
-若 \(s\) 个远端 step 被拆成 \(c\) 个 segments，\(1\le c\le s\)，则该机制不减少注意力矩阵乘的数学 FLOPs，也不减少每个唯一 KV block 的读取；它减少的是 scheduler claim、Q 重载、intermediate O/LSE global-memory merge 等 per-step 固定开销。通信足够领先时 \(c\) 变小；仅当前 step ready 时自然退化为单 step，保持数值语义。
+若 $s$ 个远端 step 被拆成 $c$ 个 segments，$1\le c\le s$，则该机制不减少注意力矩阵乘的数学 FLOPs，也不减少每个唯一 KV block 的读取；它减少的是 scheduler claim、Q 重载、intermediate O/LSE global-memory merge 等 per-step 固定开销。通信足够领先时 $c$ 变小；仅当前 step ready 时自然退化为单 step，保持数值语义。
 
 Noncausal 路径不启用该机制。它采用 `BlockN=176` 和 exact-step replay：全 Q 对全 KV，逻辑 work 为 G8 的 7 个 step、G4 的 3 个 step、G2 的 1 个 step。因此论文不能把 causal segment fusion 泛化为 noncausal 已实现能力。
 
 ### 3.8 在线 O/LSE 合并与空 tile 处理
 
-step 0 初始化每个 Q tile 的 running O/LSE，后续 segment 使用 online softmax 合并。令已有状态为 \((O_p,L_p)\)，当前 segment 为 \((O_b,L_b)\)，则
+step 0 初始化每个 Q tile 的 running O/LSE，后续 segment 使用 online softmax 合并。令已有状态为 $(O_p,L_p)$，当前 segment 为 $(O_b,L_b)$，则
 
-\[
+$$
 L=\log(\exp L_p+\exp L_b),
-\]
+$$
 
-\[
+$$
 \alpha=\frac{\exp L_b}{\exp L_p+\exp L_b},\qquad
 O=O_p+\alpha(O_b-O_p).
-\]
+$$
 
 这不是局部输出的简单相加。row owner 在 FP32 LSE 上计算 `logaddexp` 和 scale，epilogue 通过 shared memory 将 per-row scale 交给持有 coalesced O fragments 的线程。
 
@@ -395,9 +395,9 @@ communication CTA 等待一个 section 的所有 local dKV tile ready 后，将�
 
 ### 4.1 规划器的角色
 
-BR-PBS 是针对 \(W\in\{2,4,8\}\) 的小规模在线 planner。它不求解通用 CP placement，也不建模精确 kernel latency、NVLink congestion、SM allocation 或显存容量。它的任务是：在 kernel 支持的 aligned buddy tree 中，为每条 sequence 选择一个 `(ring_size, ring_start)`，在明确负载容差内尽量保护短序列，并输出 kernel 可以消费的重排 metadata。
+BR-PBS 是针对 $W\in\{2,4,8\}$ 的小规模在线 planner。它不求解通用 CP placement，也不建模精确 kernel latency、NVLink congestion、SM allocation 或显存容量。它的任务是：在 kernel 支持的 aligned buddy tree 中，为每条 sequence 选择一个 `(ring_size, ring_start)`，在明确负载容差内尽量保护短序列，并输出 kernel 可以消费的重排 metadata。
 
-对 \(W=8\)，合法位置恰好构成 buddy tree：
+对 $W=8$，合法位置恰好构成 buddy tree：
 
 ```text
 G8: [0..7]
@@ -406,19 +406,19 @@ G2: [0,1] [2,3] [4,5] [6,7]
 G1: [0] [1] [2] [3] [4] [5] [6] [7]
 ```
 
-一般最多有 \(2W-1\) 个 concrete ring positions，因此 W=8 时最多 15 个候选位置。这是 planner 能采用 beam search 而不是引入大规模整数优化器的关键。
+一般最多有 $2W-1$ 个 concrete ring positions，因此 W=8 时最多 15 个候选位置。这是 planner 能采用 beam search 而不是引入大规模整数优化器的关键。
 
 ### 4.2 两阶段合法性和 sampler 对齐
 
 `eligible_ring_sizes(L,W,is_causal)` 的硬 candidate rule 为：
 
-\[
+$$
 \text{causal: } G=1\ \text{or}\ L\bmod(256G)=0,
-\]
+$$
 
-\[
+$$
 \text{noncausal: } L\bmod G=0.
-\]
+$$
 
 Causal 的更强约束确保每个 local shard 至少 256-aligned，故其 half shard 至少 128-aligned，匹配 zigzag kernel。Noncausal 的规划器规则则故意较弱，只表达 topology 可切分性。
 
@@ -446,39 +446,39 @@ kernel launch validation (local shard/arena/TMA legality)
 
 ### 4.3 双负载模型与通信 proxy
 
-对于长度 \(L_i\)，BR-PBS 使用：
+对于长度 $L_i$，BR-PBS 使用：
 
-\[
+$$
 A_i=\begin{cases}
 L_i(L_i+1)/2,& \text{causal},\\
 L_i^2,& \text{noncausal}.
 \end{cases}
-\]
+$$
 
-将 sequence 放到 size \(G\) ring 后，每个 member rank 获得
+将 sequence 放到 size $G$ ring 后，每个 member rank 获得
 
-\[
+$$
 t_{i,G}=L_i/G,\qquad c_{i,G}=A_i/G.
-\]
+$$
 
-目标均值为 \(\bar T=\sum_iL_i/W\)、\(\bar C=\sum_iA_i/W\)。二次 compute 维度避免了“相同 token 数的一个长序列和多个短序列等价”的错误假设。
+目标均值为 $\bar T=\sum_iL_i/W$、$\bar C=\sum_iA_i/W$。二次 compute 维度避免了“相同 token 数的一个长序列和多个短序列等价”的错误假设。
 
 通信 proxy 为
 
-\[
+$$
 q_{i,G}=\begin{cases}
 0,&G=1,\\
 L_i(G-1)/G,&G>1.
 \end{cases}
-\]
+$$
 
-最终 objective 的 `communication_cost` 为 \(Q=\sum_iq_{i,G_i}\)；与此同时 `rank_communication` 对 ring 的每个成员累加 \(q_{i,G}\)，故
+最终 objective 的 `communication_cost` 为 $Q=\sum_iq_{i,G_i}$；与此同时 `rank_communication` 对 ring 的每个成员累加 $q_{i,G}$，故
 
-\[
+$$
 \text{communication amplification}
 =\frac{\sum_r rank\_communication_r}{\sum_iL_i}
 =\frac{\sum_i(G_i-1)L_i}{\sum_iL_i}.
-\]
+$$
 
 这些都是 token-hop proxy，而非字节、拥塞或 latency 模型。它们只能在高优先级目标相同时做合理的 topology tie-break，不能替代端到端通信测量。
 
@@ -486,33 +486,33 @@ L_i(G-1)/G,&G>1.
 
 定义最大绝对相对偏差：
 
-\[
+$$
 D_T=\max_r|T_r/\bar T-1|,\qquad
 D_C=\max_r|C_r/\bar C-1|.
-\]
+$$
 
-给定 token tolerance \(\epsilon_T\) 和 compute tolerance \(\epsilon_C\)，违反量为
+给定 token tolerance $\epsilon_T$ 和 compute tolerance $\epsilon_C$，违反量为
 
-\[
+$$
 V=\max(0,D_C-\epsilon_C,D_T-\epsilon_T).
-\]
+$$
 
 `V <= 1e-12` 才是 `feasible=True`。默认 tolerance 是 compute 5%、token 10%。
 
 短序列按 `<=2K`、`2K-4K`、`4K-8K`、`8K-16K`、`>16K` 五个右闭 bucket 记录：
 
-\[
+$$
 N_b=\#\{i\in b:G_i>1\},\qquad
 P_b=\sum_{i\in b,G_i>1}\log_2G_i.
-\]
+$$
 
 最终比较键严格按字典序：
 
-\[
+$$
 J=\operatorname{lex}(V,N_0,P_0,N_1,P_1,\ldots,N_4,P_4,Q,H,D_C,D_T),
-\]
+$$
 
-其中 \(H\) 是已使用的 `(ring_size, ring_start)` 数。它表达的优先级是：
+其中 $H$ 是已使用的 `(ring_size, ring_start)` 数。它表达的优先级是：
 
 ```text
 满足容差
@@ -528,16 +528,16 @@ J=\operatorname{lex}(V,N_0,P_0,N_1,P_1,\ldots,N_4,P_4,Q,H,D_C,D_T),
 
 每个 job 计算结构强度：
 
-\[
+$$
 \kappa_i=\max(L_i/\bar T,A_i/\bar C).
-\]
+$$
 
 并计算最小必要 ring size：
 
-\[
+$$
 G_i^{min}=\min\left\{G:\frac{L_i}{G}\le(1+\epsilon_T)\bar T,
 \frac{A_i}{G}\le(1+\epsilon_C)\bar C\right\}.
-\]
+$$
 
 若没有 legal size 满足该上界，取最大 hard-legal size。通常 level 中 structural job 只允许 `G >= G_min`，这是不可逆 overload 的有效剪枝；最后的 `all hard-legal candidates` level 会重新打开所有 hard-legal size，避免该剪枝永久排除低 violation 方案。
 
@@ -564,23 +564,23 @@ descending kappa, descending compute, descending length, ascending original_inde
 
 部分 assignment 不能直接用最终 deviation 判断质量：未放置 workload 可以填补低 load rank，已经超上界的 rank 却不可逆。因此 prefix metric 为
 
-\[
+$$
 O_T=\max\left(0,\frac{\max_rT_r-(1+\epsilon_T)\bar T}{\bar T}\right),
-\]
+$$
 
-\[
+$$
 O_C=\max\left(0,\frac{\max_rC_r-(1+\epsilon_C)\bar C}{\bar C}\right),
-\]
+$$
 
 以及 token/compute spread、split key、communication 和 active-ring count。一个状态在这些维度上全部不差且至少一维严格更好时，支配另一个状态。
 
 在 Pareto 过滤后，按最终平均负载的 2% 做 rank-order-preserving quantization：
 
-\[
+$$
 \Gamma_T(r)=\left\lfloor T_r/(0.02\bar T)\right\rfloor,
 \qquad
 \Gamma_C(r)=\left\lfloor C_r/(0.02\bar C)\right\rfloor.
-\]
+$$
 
 同一 signature 仅保留 split、communication、active ring 与 prefix metric 更优者。此处**保留 rank 顺序**，不能对 load vector 排序；因为 buddy topology 的物理位置和后续 candidate 都依赖 rank identity。
 
@@ -596,17 +596,17 @@ O_C=\max\left(0,\frac{\max_rC_r-(1+\epsilon_C)\bar C}{\bar C}\right),
  rank index)
 ```
 
-其中 smooth max 采用 \(\lambda=8\)：
+其中 smooth max 采用 $\lambda=8$：
 
-\[
+$$
 \operatorname{smax}_8(z)=\frac{1}{8}\log\sum_r\exp(8z_r).
-\]
+$$
 
 这比只查看当前最大 rank 更平滑地考虑所有 rank 的双负载，并以 rank index 作为确定性 tie-break。filler 阶段只使用 G1，不会意外破坏短序列保护。
 
-候选空间不是一开始全部打开。progressive relaxation 从初始保守空间开始，然后按**长 bucket 到短 bucket、每桶 G2 到 G4 到 G8**逐步解锁，最后才进入 all-hard-legal level。每个 level 运行 beam、fill 和 repair；一旦该 level 找到 feasible plan 即停止。这个外层停止规则比最终 \(J\) 更强地保护短序列：不会为了更低通信而无谓打开更短 bucket 的 split option。
+候选空间不是一开始全部打开。progressive relaxation 从初始保守空间开始，然后按**长 bucket 到短 bucket、每桶 G2 到 G4 到 G8**逐步解锁，最后才进入 all-hard-legal level。每个 level 运行 beam、fill 和 repair；一旦该 level 找到 feasible plan 即停止。这个外层停止规则比最终 $J$ 更强地保护短序列：不会为了更低通信而无谓打开更短 bucket 的 split option。
 
-局部 repair 只围绕 token/compute 最重与最轻的各两个 rank，并取相关 rank 上按 \(\kappa\) 排名前四的 jobs。其受限邻域包括：
+局部 repair 只围绕 token/compute 最重与最轻的各两个 rank，并取相关 rank 上按 $\kappa$ 排名前四的 jobs。其受限邻域包括：
 
 ```text
 G1 move / G1 swap
@@ -616,7 +616,7 @@ child demotion
 two-job sibling demotion
 ```
 
-每轮只接受严格减小 \(J\) 的邻居，最大 32 轮；相同 objective 以按原始 index 排列的 `(ring_size, ring_start)` 作确定性 tie-break。有限 beam、2% quantization、greedy fill 与受限邻域意味着 BR-PBS 是可复现启发式，不是 MILP 级全局最优或完备可行性判定器。
+每轮只接受严格减小 $J$ 的邻居，最大 32 轮；相同 objective 以按原始 index 排列的 `(ring_size, ring_start)` 作确定性 tie-break。有限 beam、2% quantization、greedy fill 与受限邻域意味着 BR-PBS 是可复现启发式，不是 MILP 级全局最优或完备可行性判定器。
 
 ### 4.8 输出与复杂度
 
@@ -633,13 +633,13 @@ split diagnostics / communication proxy / active_ring_count / repair_moves
 
 当前 `HybridWorkload` 不公开从规划顺序回到 input order 的 permutation；benchmark 直接在规划后顺序构造 packed input。任何通用训练集成若要求恢复样本顺序，都必须在 planner 外维护该 permutation。
 
-令 \(R\le8\)、最大 concrete ring positions \(G\le2R-1\)、beam width 为 \(B\)、structural/filler jobs 数为 \(N_H,N_F\)，忽略 frontier 比较时的主要工作量为
+令 $R\le8$、最大 concrete ring positions $G\le2R-1$、beam width 为 $B$、structural/filler jobs 数为 $N_H,N_F$，忽略 frontier 比较时的主要工作量为
 
-\[
+$$
 O(BN_HGR)+O(BN_FR).
-\]
+$$
 
-当前 direct Pareto frontier 的最坏单轮代价可达 \(O((BG)^2d)\)，但 `R<=8`、`G<=15`、`B=64` 是该设计成立的重要实际边界。
+当前 direct Pareto frontier 的最坏单轮代价可达 $O((BG)^2d)$，但 `R<=8`、`G<=15`、`B=64` 是该设计成立的重要实际边界。
 
 ## 5. Planner 与 Kernel 的协同契约
 
@@ -679,7 +679,7 @@ O(BN_HGR)+O(BN_FR).
 
 ### 7.1 为什么需要两种负载量
 
-BR-PBS 的 \(A_i/G\) 是低成本解析 proxy，足以在 planner 中搜索；它没有表达：
+BR-PBS 的 $A_i/G$ 是低成本解析 proxy，足以在 planner 中搜索；它没有表达：
 
 ```text
 causal zigzag 的 tile 级边界

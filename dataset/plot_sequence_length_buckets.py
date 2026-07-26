@@ -18,10 +18,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = SCRIPT_DIR / "sequence_length_buckets.json"
 DEFAULT_OUTPUT = SCRIPT_DIR / "sequence_length_buckets_frequency.png"
 COLORS = ("#4C78A8", "#F58518", "#54A24B", "#E45756", "#B279A2")
+DATASET_ORDER = ("prolong", "arxiv", "freelaw", "github", "pile-cc")
+DATASET_ALIASES = {"pile-cc": "pile"}
 DISPLAY_NAMES = {
     "arxiv": "ArXiv",
     "github": "GitHub",
-    "pile": "Pile",
+    "pile": "Pile-CC",
+    "pile-cc": "Pile-CC",
     "freelaw": "FreeLaw",
     "prolong": "ProLong",
 }
@@ -109,7 +112,18 @@ def plot_statistics(
     datasets: dict[str, dict[str, Any]],
     output_path: Path,
 ) -> None:
-    dataset_items = list(datasets.items())
+    normalized_datasets = {
+        name.lower(): (name, dataset) for name, dataset in datasets.items()
+    }
+    dataset_items = [
+        normalized_datasets[DATASET_ALIASES.get(name, name)]
+        for name in DATASET_ORDER
+        if DATASET_ALIASES.get(name, name) in normalized_datasets
+    ]
+    ordered_dataset_names = {name for name, _dataset in dataset_items}
+    dataset_items.extend(
+        item for item in datasets.items() if item[0] not in ordered_dataset_names
+    )
     figure, axes = plt.subplots(
         nrows=len(dataset_items),
         ncols=1,

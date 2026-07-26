@@ -24,6 +24,7 @@ HEADDIM=${HEADDIM:-128}
 SM_CONFIGS=${SM_CONFIGS:-"128:4,124:8,120:12,116:16"}
 WARMUP_ITERS=${WARMUP_ITERS:-10}
 NUM_ITERS=${NUM_ITERS:-40}
+MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE=${MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE:-1}
 DRY_RUN=${DRY_RUN:-0}
 TORCHRUN=${TORCHRUN:-torchrun}
 LOG_ROOT=${LOG_ROOT:-"$SCRIPT_DIR/benchmark_logs/experiment_queue"}
@@ -80,6 +81,10 @@ case "$CHECK" in
     0) ABLATION_CHECK_ARG=--no-check ;;
     1) ABLATION_CHECK_ARG=--check ;;
     *) die "CHECK must be 0 or 1, got '$CHECK'" ;;
+esac
+case "$MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE" in
+    0|1) ;;
+    *) die "MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE must be 0 or 1, got '$MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE'" ;;
 esac
 
 ablation_targets_spec=${ABLATION_TARGET_TOKENS//,/ }
@@ -192,7 +197,13 @@ run_dataset_benchmark() {
     local tokens=$1
     local direction=$2
     local label="dataset_${tokens}_${direction}"
-    run_experiment "$label" env \
+    local -a magi_backward_env=()
+    if [[ "$direction" == backward ]]; then
+        magi_backward_env+=(
+            "MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE=$MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE"
+        )
+    fi
+    run_experiment "$label" env "${magi_backward_env[@]}" \
         GPU_COUNTS=8 DATASETS="$DATASETS" DIRECTION="$direction" \
         TARGET_TOKENS="$tokens" NUM_CASES="$NUM_CASES" MODE="$MODE" \
         SEED="$SEED" TOKEN_BALANCE_TOLERANCE="$TOKEN_BALANCE_TOLERANCE" \
@@ -207,6 +218,7 @@ run_dataset_benchmark() {
 log "Experiment queue created"
 log "Run directory: $RUN_DIR"
 log "Datasets: $DATASETS; num_cases=$NUM_CASES; mode=$MODE; correctness_check=$CHECK"
+log "Magi backward high-precision reduce: $MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE (1=FP32 reduction)"
 log "Forward ablation: dataset=$ABLATION_DATASET; target_tokens=${ABLATION_TARGET_LIST[*]}; cases=$ABLATION_NUM_CASES; seed=$SEED; token_tolerance=$TOKEN_BALANCE_TOLERANCE; sm_configs=$ABLATION_SM_CONFIGS"
 log "Scheduled start delay: ${START_DELAY_SECONDS}s; GPU polling interval: ${CHECK_INTERVAL_SECONDS}s; dry_run=$DRY_RUN"
 if ((DRY_RUN)); then
@@ -240,7 +252,13 @@ run_experiment tile_analysis_131072_forward env \
 # 3b. Metadata-only theoretical load analysis for every registered baseline.
 for direction in forward backward; do
     label="theoretical_load_131072_${direction}"
-    run_experiment "$label" env \
+    magi_backward_env=()
+    if [[ "$direction" == backward ]]; then
+        magi_backward_env+=(
+            "MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE=$MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE"
+        )
+    fi
+    run_experiment "$label" env "${magi_backward_env[@]}" \
         GPU_COUNTS=8 DATASETS="$DATASETS" DIRECTION="$direction" \
         TARGET_TOKENS=131072 NUM_CASES="$NUM_CASES" MODE="$MODE" \
         METHODS=all TORCHRUN="$TORCHRUN" LOG_DIR="$RUN_DIR/$label.results" \
@@ -251,7 +269,13 @@ done
 # 4. Native Megatron/Zeppelin and Mega Ring with three placement algorithms.
 for direction in forward backward; do
     label="load_balance_algorithms_131072_${direction}"
-    run_experiment "$label" env \
+    magi_backward_env=()
+    if [[ "$direction" == backward ]]; then
+        magi_backward_env+=(
+            "MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE=$MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE"
+        )
+    fi
+    run_experiment "$label" env "${magi_backward_env[@]}" \
         GPU_COUNTS=8 DATASETS="$DATASETS" DIRECTION="$direction" \
         TARGET_TOKENS=131072 NUM_CASES="$NUM_CASES" MODE="$MODE" \
         COLLECT_MEGA_RING_STATS=0 CHECK="$CHECK" TORCHRUN="$TORCHRUN" \

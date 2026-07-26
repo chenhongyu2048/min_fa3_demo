@@ -21,6 +21,7 @@ DEFAULT_RUN_DIR = SCRIPT_DIR / "experiment_queue" / "20260726-002324"
 DEFAULT_TOKEN_COUNTS = (65536, 131072, 262144)
 DEFAULT_OUTPUT = DEFAULT_RUN_DIR / "forward_ablation_arxiv.png"
 GPU_COUNT = 8
+TARGET_SM_CONFIG = "124:8"
 
 PROFILE_LABELS = {
     "step_external_reduce": "Step +\nexternal reduce",
@@ -43,7 +44,7 @@ class AblationRecord:
 
 
 def parse_records(path: Path) -> list[AblationRecord]:
-    """Select the best-SM L1-L6 rows from a cross-case ablation summary."""
+    """Select the L1-L6 rows at the fixed target SM configuration."""
 
     if not path.is_file():
         raise FileNotFoundError(f"ablation log does not exist: {path}")
@@ -64,6 +65,8 @@ def parse_records(path: Path) -> list[AblationRecord]:
             continue
         if len(fields) != 11:
             raise ValueError(f"malformed summary row at {path}:{line_number}: {line}")
+        if fields[2] != TARGET_SM_CONFIG:
+            continue
         level = int(fields[0][1:])
         if re.fullmatch(r"\d+:\d+", fields[2]) is None or re.fullmatch(
             r"\d+/\d+", fields[3]
@@ -83,13 +86,12 @@ def parse_records(path: Path) -> list[AblationRecord]:
             mean_gpu_tflops=mean_gpu_tflops,
         )
         current = records_by_level.get(level)
-        if current is not None and current.profile != record.profile:
+        if current is not None:
             raise ValueError(
-                f"inconsistent profile for L{level} at {path}:{line_number}: "
-                f"{current.profile} versus {record.profile}"
+                f"duplicate L{level} row at SM {TARGET_SM_CONFIG} in "
+                f"{path}:{line_number}"
             )
-        if current is None or record.mean_gpu_tflops > current.mean_gpu_tflops:
-            records_by_level[level] = record
+        records_by_level[level] = record
 
     expected_levels = set(range(1, 7))
     found_levels = set(records_by_level)
@@ -97,7 +99,10 @@ def parse_records(path: Path) -> list[AblationRecord]:
         missing = ", ".join(f"L{level}" for level in sorted(expected_levels - found_levels))
         extra = ", ".join(f"L{level}" for level in sorted(found_levels - expected_levels))
         details = ", ".join(part for part in (f"missing {missing}" if missing else "", f"unexpected {extra}" if extra else "") if part)
-        raise ValueError(f"expected exactly L1-L6 performance rows in {path}; {details}")
+        raise ValueError(
+            f"expected exactly L1-L6 performance rows at SM {TARGET_SM_CONFIG} "
+            f"in {path}; {details}"
+        )
     return [records_by_level[level] for level in sorted(records_by_level)]
 
 
@@ -195,7 +200,7 @@ def make_figure(
             axis.set_xlabel("Ablation level")
 
     figure.suptitle(
-        f"{GPU_COUNT}-GPU ArXiv Mega Ring Forward Ablation",
+        f"{GPU_COUNT}-GPU ArXiv Mega Ring Forward Ablation (SM {TARGET_SM_CONFIG})",
         y=0.995,
         fontsize=16,
         fontweight="bold",
@@ -203,7 +208,7 @@ def make_figure(
     figure.text(
         0.5,
         0.01,
-        "Causal BF16, QH=16, KVH=8, D=128. Each level selects its highest mean per-GPU throughput SM configuration.",
+        f"Causal BF16, QH=16, KVH=8, D=128. All ablation levels use SM {TARGET_SM_CONFIG}.",
         ha="center",
         fontsize=9,
         color="#555555",
