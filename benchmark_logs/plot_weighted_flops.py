@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -18,8 +18,8 @@ import matplotlib.pyplot as plt
 
 
 LOG_DIR = Path(__file__).resolve().parent
-DEFAULT_FORWARD_LOG = LOG_DIR / "20260722-005516" / "benchmark_dataset.log"
-DEFAULT_BACKWARD_LOG = (LOG_DIR / "20260722-093016" / "benchmark_dataset_backward.log")
+DEFAULT_RUN_DIR = LOG_DIR / "experiment_queue" / "20260726-002324"
+DEFAULT_TOKEN_COUNTS = (65536, 131072, 262144)
 
 METHODS = (
     "allgather_attention",
@@ -79,6 +79,7 @@ SM_RE = re.compile(r"^(?:-|\d+:\d+)$")
 
 @dataclass(frozen=True)
 class SummaryRecord:
+    token_count: int
     dataset: str
     direction: str
     mode: str
@@ -121,6 +122,7 @@ def parse_summary_row(
         raise ValueError(f"non-numeric summary metric in {source}: {line}") from exc
 
     return SummaryRecord(
+        token_count=0,
         dataset=dataset,
         direction=direction,
         mode=mode,
@@ -186,7 +188,9 @@ def load_records(paths: Iterable[Path]) -> list[SummaryRecord]:
     return records
 
 
-def load_direction_records(path: Path, direction: str) -> list[SummaryRecord]:
+def load_direction_records(
+    path: Path, direction: str, token_count: int
+) -> list[SummaryRecord]:
     if not path.is_file():
         raise FileNotFoundError(f"{direction} log does not exist: {path}")
 
@@ -198,7 +202,7 @@ def load_direction_records(path: Path, direction: str) -> list[SummaryRecord]:
             + ", ".join(unexpected_directions)
             + " summary rows"
         )
-    return records
+    return [replace(record, token_count=token_count) for record in records]
 
 
 def choose_world_size(records: Sequence[SummaryRecord], requested: int | None) -> int:
@@ -220,9 +224,9 @@ def choose_world_size(records: Sequence[SummaryRecord], requested: int | None) -
 
 def select_best(
     records: Sequence[SummaryRecord], *, world_size: int, mode: str
-) -> dict[tuple[str, str, str], SummaryRecord]:
-    grouped: dict[tuple[str, str, str], list[SummaryRecord]] = defaultdict(list)
-    exact_keys: dict[tuple[str, str, str, str, str], SummaryRecord] = {}
+) -> dict[tuple[int, str, str, str], SummaryRecord]:
+    grouped: dict[tuple[int, str, str, str], list[SummaryRecord]] = defaultdict(list)
+    exact_keys: dict[tuple[int, str, str, str, str, str], SummaryRecord] = {}
 
     for record in records:
         if record.world_size != world_size:
@@ -230,6 +234,7 @@ def select_best(
         if record.direction == "forward" and record.mode != mode:
             continue
         key = (
+            record.token_count,
             record.dataset,
             record.direction,
             record.mode,
@@ -245,11 +250,11 @@ def select_best(
                 f"{previous.source} and {record.source}"
             )
         exact_keys[key] = record
-        grouped[(record.dataset, record.direction, record.method)].append(record)
+        grouped[(record.token_count, record.dataset, record.direction, record.method)].append(record)
 
-    selected: dict[tuple[str, str, str], SummaryRecord] = {}
+    selected: dict[tuple[int, str, str, str], SummaryRecord] = {}
     for key, candidates in grouped.items():
-        method = key[2]
+        method = key[3]
         if method in TUNED_METHODS:
             selected[key] = max(candidates, key=lambda item: item.weighted_gpu_tflops)
         elif len(candidates) == 1:
@@ -262,170 +267,188 @@ def select_best(
 
 
 def weighted_gpu_tflops_or_zero(
-    selected: dict[tuple[str, str, str], SummaryRecord],
+    selected: dict[tuple[int, str, str, str], SummaryRecord],
+    token_count: int,
     dataset: str,
     direction: str,
     method: str,
 ) -> float:
-    record = selected.get((dataset, direction, method))
+    record = selected.get((token_count, dataset, direction, method))
     return record.weighted_gpu_tflops if record is not None else 0.0
 
 
 def make_figure(
-    selected: dict[tuple[str, str, str], SummaryRecord], world_size: int
+    selected: dict[tuple[int, str, str, str], SummaryRecord],
+    world_size: int,
+    token_counts: Sequence[int],
 ) -> plt.Figure:
     datasets = sorted(
-        {dataset for dataset, _direction, _method in selected},
+        {dataset for _tokens, dataset, _direction, _method in selected},
         key=lambda name: (DATASET_ORDER.get(name, len(DATASET_ORDER)), name),
     )
-    figure_width = max(14.0, 5.0 + 2.2 * len(datasets))
-    fig, axes = plt.subplots(1, 2, figsize=(figure_width, 6.2), sharey=True)
+    figure_width = max(15.5, 5.0 + 2.4 * len(datasets))
+    fig, axes = plt.subplots(
+        len(token_counts),
+        2,
+        figsize=(figure_width, 4.8 * len(token_counts) + 1.8),
+        sharey="row",
+        squeeze=False,
+    )
 
     group_width = 0.84
     bar_width = group_width / len(METHODS)
     x_positions = list(range(len(datasets)))
-    for ax, direction in zip(axes, ("forward", "backward")):
-        for method_index, method in enumerate(METHODS):
-            offset = (method_index - (len(METHODS) - 1) / 2) * bar_width
-            values = [
-                weighted_gpu_tflops_or_zero(
-                    selected, dataset, direction, method
+    hybrid_method = "mega_ring_hybrid"
+    hybrid_index = METHODS.index(hybrid_method)
+    hybrid_offset = (hybrid_index - (len(METHODS) - 1) / 2) * bar_width
+    for row, token_count in enumerate(token_counts):
+        for column, direction in enumerate(("forward", "backward")):
+            axis = axes[row, column]
+            for method_index, method in enumerate(METHODS):
+                offset = (method_index - (len(METHODS) - 1) / 2) * bar_width
+                values = [
+                    weighted_gpu_tflops_or_zero(
+                        selected, token_count, dataset, direction, method
+                    )
+                    for dataset in datasets
+                ]
+                axis.bar(
+                    [x + offset for x in x_positions],
+                    values,
+                    width=bar_width * 0.92,
+                    color=METHOD_COLORS[method],
+                    edgecolor="white",
+                    linewidth=0.6,
+                    label=METHOD_LABELS[method],
                 )
-                for dataset in datasets
-            ]
-            ax.bar(
-                [x + offset for x in x_positions],
-                values,
-                width=bar_width * 0.92,
-                color=METHOD_COLORS[method],
-                edgecolor="white",
-                linewidth=0.6,
-                label=METHOD_LABELS[method],
-            )
 
-        hybrid_method = "mega_ring_hybrid"
-        hybrid_index = METHODS.index(hybrid_method)
-        hybrid_offset = (
-            hybrid_index - (len(METHODS) - 1) / 2
-        ) * bar_width
-        for x, dataset in zip(x_positions, datasets):
-            hybrid_value = weighted_gpu_tflops_or_zero(
-                selected, dataset, direction, hybrid_method
-            )
-            best_baseline = max(
-                weighted_gpu_tflops_or_zero(
-                    selected, dataset, direction, method
+            for x, dataset in zip(x_positions, datasets):
+                hybrid_value = weighted_gpu_tflops_or_zero(
+                    selected, token_count, dataset, direction, hybrid_method
                 )
-                for method in HYBRID_COMPARISON_METHODS
-            )
-            speedup = (
-                f"{hybrid_value / best_baseline:.2f}x"
-                if best_baseline > 0.0
-                else "N/A"
-            )
-            ax.annotate(
-                speedup,
-                xy=(x + hybrid_offset, hybrid_value),
-                xytext=(0, 4),
-                textcoords="offset points",
-                ha="center",
-                va="bottom",
-                color="#704E6F",
-                fontsize=8.5,
+                best_baseline = max(
+                    weighted_gpu_tflops_or_zero(
+                        selected, token_count, dataset, direction, method
+                    )
+                    for method in HYBRID_COMPARISON_METHODS
+                )
+                speedup = (
+                    f"{hybrid_value / best_baseline:.2f}x"
+                    if best_baseline > 0.0
+                    else "N/A"
+                )
+                axis.annotate(
+                    speedup,
+                    xy=(x + hybrid_offset, hybrid_value),
+                    xytext=(0, 4),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    color="#704E6F",
+                    fontsize=8.5,
+                    fontweight="bold",
+                )
+
+            axis.set_title(
+                f"{token_count // 1024}K {direction.capitalize()}",
+                loc="left",
+                fontsize=13,
                 fontweight="bold",
             )
+            axis.set_xticks(
+                x_positions,
+                [DATASET_LABELS.get(dataset, dataset) for dataset in datasets],
+            )
+            axis.set_xlabel("Dataset")
+            axis.grid(axis="y", color="#D8D8D8", linewidth=0.8, alpha=0.8)
+            axis.set_axisbelow(True)
+            axis.spines[["top", "right"]].set_visible(False)
+            axis.margins(y=0.14)
+        axes[row, 0].set_ylabel("Weighted average TFLOPS per GPU")
 
-        ax.set_title(direction.capitalize(), fontsize=14)
-        ax.set_xticks(
-            x_positions,
-            [DATASET_LABELS.get(dataset, dataset) for dataset in datasets],
-        )
-        ax.set_xlabel("Dataset")
-        ax.grid(axis="y", color="#D8D8D8", linewidth=0.8, alpha=0.8)
-        ax.set_axisbelow(True)
-        ax.spines[["top", "right"]].set_visible(False)
-        ax.margins(y=0.12)
-
-    axes[0].set_ylabel("Weighted aggregate TFLOPS")
-    handles, labels = axes[0].get_legend_handles_labels()
+    handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(
         handles,
         labels,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.995),
-        ncol=3,
+        bbox_to_anchor=(0.5, 0.965),
+        ncol=4,
         frameon=False,
         fontsize=9.5,
     )
     fig.suptitle(
-        f"Dataset-weighted Attention Throughput ({world_size} GPUs)",
-        y=1.055,
+        f"Dataset-weighted Attention Throughput per GPU ({world_size} GPUs)",
+        y=0.995,
         fontsize=16,
     )
+    token_text = ", ".join(f"{token_count // 1024}K" for token_count in token_counts)
     fig.text(
         0.5,
         0.01,
-        "Mega-ring uses the best SM configuration; hybrid labels show speedup over the best baseline excluding mega_ring_all_cp.",
+        f"Rows show {token_text} workloads. Mega-ring uses the best per-GPU SM configuration; hybrid labels show speedup over the best baseline excluding mega_ring_all_cp.",
         ha="center",
         fontsize=9,
         color="#555555",
     )
-    fig.tight_layout(rect=(0, 0.05, 1, 0.89))
+    fig.tight_layout(rect=(0, 0.05, 1, 0.91))
     return fig
 
 
 def print_selection(
-    selected: dict[tuple[str, str, str], SummaryRecord], world_size: int
+    selected: dict[tuple[int, str, str, str], SummaryRecord],
+    world_size: int,
+    token_counts: Sequence[int],
 ) -> None:
     datasets = sorted(
-        {dataset for dataset, _direction, _method in selected},
+        {dataset for _tokens, dataset, _direction, _method in selected},
         key=lambda name: (DATASET_ORDER.get(name, len(DATASET_ORDER)), name),
     )
     print(f"Selected weighted throughput (world_size={world_size})")
     print(
-        f"{'Dataset':<10} {'Direction':<10} {'Method':<29} "
-        f"{'SM':>7} {'Weighted TFLOPS':>17} {'Weighted/GPU':>14}"
+        f"{'Tokens':>8} {'Dataset':<10} {'Direction':<10} {'Method':<29} "
+        f"{'SM':>7} {'Weighted TFLOPS/GPU':>20}"
     )
-    for dataset in datasets:
-        for direction in ("forward", "backward"):
-            for method in METHODS:
-                record = selected.get((dataset, direction, method))
-                if record is None:
+    for token_count in token_counts:
+        for dataset in datasets:
+            for direction in ("forward", "backward"):
+                for method in METHODS:
+                    record = selected.get((token_count, dataset, direction, method))
+                    if record is None:
+                        print(
+                            f"{token_count:>8} {dataset:<10} {direction:<10} "
+                            f"{METHOD_LABELS[method]:<29} {'-':>7} {0.0:>20.2f}"
+                        )
+                        continue
                     print(
-                        f"{dataset:<10} {direction:<10} "
-                        f"{METHOD_LABELS[method]:<29} {'-':>7} "
-                        f"{0.0:>17.2f} {0.0:>14.2f}"
+                        f"{token_count:>8} {dataset:<10} {direction:<10} "
+                        f"{METHOD_LABELS[method]:<29} {record.sm_config:>7} "
+                        f"{record.weighted_gpu_tflops:>20.2f}"
                     )
-                    continue
-                print(
-                    f"{dataset:<10} {direction:<10} {METHOD_LABELS[method]:<29} "
-                    f"{record.sm_config:>7} {record.weighted_gpu_tflops:>17.2f} "
-                    f"{record.weighted_gpu_tflops:>14.2f}"
-                )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Plot weighted forward/backward TFLOPS from the specified benchmark logs"
+            "Plot 64K, 128K, and 256K weighted forward/backward TFLOPS"
         )
     )
     parser.add_argument(
-        "--forward-log",
+        "--run-dir",
         type=Path,
-        default=DEFAULT_FORWARD_LOG,
-        help=f"forward benchmark log (default: {DEFAULT_FORWARD_LOG})",
+        default=DEFAULT_RUN_DIR,
+        help=f"directory containing dataset_<tokens>_<direction>.results.log (default: {DEFAULT_RUN_DIR})",
     )
     parser.add_argument(
-        "--backward-log",
-        type=Path,
-        default=DEFAULT_BACKWARD_LOG,
-        help=f"backward benchmark log (default: {DEFAULT_BACKWARD_LOG})",
+        "--token-count",
+        type=int,
+        action="append",
+        default=None,
+        help="token count to plot; repeat to select several (default: 65536, 131072, 262144)",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=LOG_DIR / "weighted_flops.png",
+        default=DEFAULT_RUN_DIR / "weighted_flops.png",
     )
     parser.add_argument(
         "--world-size",
@@ -443,17 +466,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
-    records = [
-        *load_direction_records(args.forward_log, "forward"),
-        *load_direction_records(args.backward_log, "backward"),
-    ]
+    token_counts = tuple(args.token_count or DEFAULT_TOKEN_COUNTS)
+    if not token_counts or any(token_count <= 0 for token_count in token_counts):
+        raise ValueError("--token-count values must be positive")
+    if len(set(token_counts)) != len(token_counts):
+        raise ValueError("--token-count values must be unique")
+    records: list[SummaryRecord] = []
+    for token_count in token_counts:
+        for direction in ("forward", "backward"):
+            path = args.run_dir / f"dataset_{token_count}_{direction}.results.log"
+            records.extend(load_direction_records(path, direction, token_count))
     world_size = choose_world_size(records, args.world_size)
     selected = select_best(records, world_size=world_size, mode=args.forward_mode)
-    figure = make_figure(selected, world_size)
+    figure = make_figure(selected, world_size, token_counts)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(args.output, dpi=220, bbox_inches="tight")
     plt.close(figure)
-    print_selection(selected, world_size)
+    print_selection(selected, world_size, token_counts)
     print(f"Saved {args.output.resolve()}")
 
 

@@ -1,0 +1,1153 @@
+W0726 10:25:15.134000 3672425 torch/distributed/run.py:852] 
+W0726 10:25:15.134000 3672425 torch/distributed/run.py:852] *****************************************
+W0726 10:25:15.134000 3672425 torch/distributed/run.py:852] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0726 10:25:15.134000 3672425 torch/distributed/run.py:852] *****************************************
+Forward ablation config: dataset=arxiv, target_tokens=262144, cases=20, seed=0, token_balance_tolerance=0.05, QH=32, KVH=8, D=128, mode=causal, sm_configs=128:4,124:8,120:12,116:16, warmup=10, iters=40, check=False, stats_probe=False
+
+Forward ablation case 1/20: dataset=arxiv, B=13, raw_tokens=262656, QH=32, KVH=8, D=128, raw_lengths=(18432, 20480, 2560, 12288, 28672, 26624, 18432, 14336, 24576, 16384, 49152, 10240, 20480)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=262656, global_seqlens=(49152, 18432, 28672, 20480, 12288, 18432, 20480, 10240, 24576, 16384, 26624, 14336, 2560), rings=(8, 4, 4, 4, 2, 2, 2, 2, 2, 2, 2, 2, 1), starts=(0, 0, 0, 4, 0, 0, 2, 2, 4, 4, 6, 6, 6)
+All-CP L1-L5: alignment=2048, execution_tokens=264192, global_seqlens=(49152, 18432, 28672, 20480, 12288, 18432, 20480, 10240, 24576, 16384, 26624, 14336, 4096)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	22.095314	2523.294	315.412	skip	16	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=2527.085, Avg/GPU=315.886
+rank_time L1 SM=128:4: t0=21.965, t1=22.092, t2=21.956, t3=22.038, t4=21.908, t5=21.856, t6=21.858, t7=21.918 | max_across_ranks=22.095
+L2	step_fused_reduce	128:4	17.442589	3196.370	399.546	skip	8	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3201.173, Avg/GPU=400.147
+rank_time L2 SM=128:4: t0=17.130, t1=17.181, t2=17.290, t3=17.167, t4=16.963, t5=17.150, t6=17.020, t7=16.853 | max_across_ranks=17.443
+L3	linear_queue_no_recycle	128:4	15.235366	3659.444	457.431	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3664.942, Avg/GPU=458.118
+rank_time L3 SM=128:4: t0=12.910, t1=13.373, t2=13.609, t3=13.815, t4=13.965, t5=14.398, t6=14.988, t7=15.215 | max_across_ranks=15.235
+L4	linear_queue_recycle	128:4	15.114870	3688.617	461.077	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3694.159, Avg/GPU=461.770
+rank_time L4 SM=128:4: t0=12.896, t1=13.391, t2=13.604, t3=13.924, t4=14.077, t5=14.352, t6=14.836, t7=15.099 | max_across_ranks=15.115
+L5	dynamic_segment_recycle	128:4	14.363652	3881.532	485.192	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3887.364, Avg/GPU=485.920
+rank_time L5 SM=128:4: t0=14.245, t1=13.966, t2=13.699, t3=13.273, t4=13.164, t5=12.935, t6=12.962, t7=12.740 | max_across_ranks=14.364
+L6	hybrid_br_pbs	128:4	13.042744	4274.635	534.329	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=11.880, t1=12.194, t2=12.474, t3=12.312, t4=12.164, t5=11.972, t6=13.039, t7=12.580 | max_across_ranks=13.043
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	21.637302	2576.706	322.088	skip	16	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=2580.578, Avg/GPU=322.572
+rank_time L1 SM=124:8: t0=20.066, t1=20.407, t2=20.507, t3=20.735, t4=20.826, t5=21.115, t6=21.492, t7=21.580 | max_across_ranks=21.637
+L2	step_fused_reduce	124:8	16.653961	3347.731	418.466	skip	8	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3352.760, Avg/GPU=419.095
+rank_time L2 SM=124:8: t0=15.572, t1=16.013, t2=16.178, t3=16.249, t4=16.217, t5=16.305, t6=16.542, t7=16.632 | max_across_ranks=16.654
+L3	linear_queue_no_recycle	124:8	15.675800	3556.627	444.578	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3561.971, Avg/GPU=445.246
+rank_time L3 SM=124:8: t0=13.054, t1=13.589, t2=13.821, t3=14.355, t4=14.460, t5=14.837, t6=15.338, t7=15.675 | max_across_ranks=15.676
+L4	linear_queue_recycle	124:8	15.216062	3664.087	458.011	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3669.592, Avg/GPU=458.699
+rank_time L4 SM=124:8: t0=12.857, t1=13.481, t2=13.607, t3=14.136, t4=14.199, t5=14.546, t6=15.028, t7=15.188 | max_across_ranks=15.216
+L5	dynamic_segment_recycle	124:8	13.930690	4002.169	500.271	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=4008.182, Avg/GPU=501.023
+rank_time L5 SM=124:8: t0=13.523, t1=13.866, t2=13.545, t3=13.604, t4=13.270, t5=13.130, t6=12.858, t7=12.689 | max_across_ranks=13.931
+L6	hybrid_br_pbs	124:8	12.866286	4333.261	541.658	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=11.887, t1=12.160, t2=12.433, t3=12.440, t4=12.329, t5=12.089, t6=12.866, t7=12.522 | max_across_ranks=12.866
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	21.868114	2549.510	318.689	skip	16	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=2553.340, Avg/GPU=319.168
+rank_time L1 SM=120:12: t0=20.433, t1=20.786, t2=20.798, t3=21.073, t4=21.184, t5=21.438, t6=21.631, t7=21.860 | max_across_ranks=21.868
+L2	step_fused_reduce	120:12	16.958909	3287.533	410.942	skip	8	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3292.472, Avg/GPU=411.559
+rank_time L2 SM=120:12: t0=15.857, t1=16.345, t2=16.323, t3=16.602, t4=16.498, t5=16.707, t6=16.711, t7=16.931 | max_across_ranks=16.959
+L3	linear_queue_no_recycle	120:12	15.909598	3504.361	438.045	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3509.626, Avg/GPU=438.703
+rank_time L3 SM=120:12: t0=13.396, t1=13.917, t2=14.139, t3=14.667, t4=14.780, t5=15.298, t6=15.642, t7=15.904 | max_across_ranks=15.910
+L4	linear_queue_recycle	120:12	15.332251	3636.320	454.540	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3641.783, Avg/GPU=455.223
+rank_time L4 SM=120:12: t0=12.963, t1=13.446, t2=13.779, t3=14.266, t4=14.326, t5=14.732, t6=15.044, t7=15.332 | max_across_ranks=15.332
+L5	dynamic_segment_recycle	120:12	13.908840	4008.456	501.057	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=4014.478, Avg/GPU=501.810
+rank_time L5 SM=120:12: t0=13.236, t1=13.726, t2=13.634, t3=13.875, t4=13.512, t5=13.353, t6=13.069, t7=12.812 | max_across_ranks=13.909
+L6	hybrid_br_pbs	120:12	12.989119	4292.283	536.535	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=11.809, t1=12.089, t2=12.571, t3=12.446, t4=12.259, t5=12.041, t6=12.989, t7=12.560 | max_across_ranks=12.989
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	22.160902	2515.826	314.478	skip	16	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=2519.606, Avg/GPU=314.951
+rank_time L1 SM=116:16: t0=20.707, t1=21.020, t2=21.175, t3=21.372, t4=21.524, t5=21.741, t6=21.901, t7=22.142 | max_across_ranks=22.161
+L2	step_fused_reduce	116:16	17.308419	3221.148	402.643	skip	8	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3225.987, Avg/GPU=403.248
+rank_time L2 SM=116:16: t0=16.069, t1=16.546, t2=16.549, t3=16.850, t4=16.765, t5=16.987, t6=17.058, t7=17.308 | max_across_ranks=17.308
+L3	linear_queue_no_recycle	116:16	16.419087	3395.620	424.452	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3400.721, Avg/GPU=425.090
+rank_time L3 SM=116:16: t0=13.637, t1=14.019, t2=14.408, t3=14.976, t4=15.057, t5=15.667, t6=15.938, t7=16.372 | max_across_ranks=16.419
+L4	linear_queue_recycle	116:16	15.331241	3636.560	454.570	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3642.023, Avg/GPU=455.253
+rank_time L4 SM=116:16: t0=12.951, t1=13.610, t2=13.872, t3=14.354, t4=14.360, t5=14.708, t6=14.927, t7=15.318 | max_across_ranks=15.331
+L5	dynamic_segment_recycle	116:16	13.884516	4015.478	501.935	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=4021.511, Avg/GPU=502.689
+rank_time L5 SM=116:16: t0=13.381, t1=13.820, t2=13.723, t3=13.802, t4=13.673, t5=13.422, t6=13.125, t7=12.729 | max_across_ranks=13.885
+L6	hybrid_br_pbs	116:16	13.021341	4281.662	535.208	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=11.945, t1=11.896, t2=12.463, t3=12.478, t4=12.212, t5=12.055, t6=13.014, t7=12.673 | max_across_ranks=13.021
+
+Forward ablation case 2/20: dataset=arxiv, B=14, raw_tokens=262144, QH=32, KVH=8, D=128, raw_lengths=(7168, 12288, 7168, 6144, 12288, 32768, 75776, 7168, 14336, 6144, 5120, 14336, 24576, 36864)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=262144, global_seqlens=(75776, 24576, 14336, 36864, 32768, 12288, 12288, 14336, 7168, 7168, 7168, 6144, 6144, 5120), rings=(8, 8, 4, 4, 4, 2, 2, 2, 1, 1, 1, 1, 1, 1), starts=(0, 0, 0, 0, 4, 0, 4, 6, 2, 3, 4, 5, 6, 7)
+All-CP L1-L5: alignment=2048, execution_tokens=266240, global_seqlens=(75776, 24576, 14336, 36864, 32768, 12288, 12288, 14336, 8192, 8192, 8192, 6144, 6144, 6144)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	26.898422	2968.731	371.091	skip	16	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=2986.616, Avg/GPU=373.327
+rank_time L1 SM=128:4: t0=26.395, t1=26.509, t2=26.318, t3=26.726, t4=26.402, t5=26.584, t6=26.333, t7=26.412 | max_across_ranks=26.898
+L2	step_fused_reduce	128:4	22.542538	3542.377	442.797	skip	8	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3563.718, Avg/GPU=445.465
+rank_time L2 SM=128:4: t0=22.177, t1=22.344, t2=22.202, t3=22.268, t4=21.900, t5=21.859, t6=21.760, t7=21.600 | max_across_ranks=22.543
+L3	linear_queue_no_recycle	128:4	20.356619	3922.762	490.345	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3946.394, Avg/GPU=493.299
+rank_time L3 SM=128:4: t0=17.224, t1=18.068, t2=18.395, t3=18.990, t4=18.867, t5=19.452, t6=19.883, t7=20.043 | max_across_ranks=20.357
+L4	linear_queue_recycle	128:4	20.057258	3981.311	497.664	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4005.296, Avg/GPU=500.662
+rank_time L4 SM=128:4: t0=17.979, t1=18.033, t2=18.441, t3=18.471, t4=18.600, t5=19.424, t6=19.958, t7=19.905 | max_across_ranks=20.057
+L5	dynamic_segment_recycle	128:4	19.054106	4190.917	523.865	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4216.165, Avg/GPU=527.021
+rank_time L5 SM=128:4: t0=18.825, t1=18.725, t2=18.419, t3=18.448, t4=18.406, t5=17.926, t6=18.032, t7=17.366 | max_across_ranks=19.054
+L6	hybrid_br_pbs	128:4	18.300955	4363.389	545.424	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=18.037, t1=18.272, t2=17.520, t3=17.502, t4=16.475, t5=16.040, t6=16.699, t7=16.283 | max_across_ranks=18.301
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	26.470349	3016.741	377.093	skip	16	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3034.915, Avg/GPU=379.364
+rank_time L1 SM=124:8: t0=24.727, t1=25.058, t2=25.253, t3=25.375, t4=25.614, t5=26.015, t6=26.163, t7=26.268 | max_across_ranks=26.470
+L2	step_fused_reduce	124:8	21.578220	3700.684	462.586	skip	8	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3722.979, Avg/GPU=465.372
+rank_time L2 SM=124:8: t0=20.567, t1=20.960, t2=21.091, t3=21.238, t4=21.109, t5=21.308, t6=21.429, t7=21.441 | max_across_ranks=21.578
+L3	linear_queue_no_recycle	124:8	20.568522	3882.349	485.294	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3905.738, Avg/GPU=488.217
+rank_time L3 SM=124:8: t0=18.032, t1=18.571, t2=18.878, t3=19.309, t4=19.496, t5=19.853, t6=20.437, t7=20.388 | max_across_ranks=20.569
+L4	linear_queue_recycle	124:8	20.061493	3980.470	497.559	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4004.450, Avg/GPU=500.556
+rank_time L4 SM=124:8: t0=17.808, t1=18.070, t2=18.353, t3=19.210, t4=19.039, t5=19.512, t6=19.952, t7=19.944 | max_across_ranks=20.061
+L5	dynamic_segment_recycle	124:8	18.771929	4253.914	531.739	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4279.542, Avg/GPU=534.943
+rank_time L5 SM=124:8: t0=17.878, t1=18.638, t2=18.376, t3=18.523, t4=18.253, t5=18.137, t6=18.172, t7=17.470 | max_across_ranks=18.772
+L6	hybrid_br_pbs	124:8	18.346962	4352.447	544.056	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=18.101, t1=18.314, t2=17.500, t3=17.593, t4=16.270, t5=16.270, t6=16.782, t7=16.263 | max_across_ranks=18.347
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	26.804692	2979.112	372.389	skip	16	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=2997.059, Avg/GPU=374.632
+rank_time L1 SM=120:12: t0=25.004, t1=25.463, t2=25.878, t3=26.016, t4=25.744, t5=26.584, t6=26.486, t7=26.476 | max_across_ranks=26.805
+L2	step_fused_reduce	120:12	22.025929	3625.463	453.183	skip	8	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3647.304, Avg/GPU=455.913
+rank_time L2 SM=120:12: t0=21.005, t1=21.319, t2=21.363, t3=21.451, t4=21.247, t5=21.706, t6=21.786, t7=21.559 | max_across_ranks=22.026
+L3	linear_queue_no_recycle	120:12	20.918301	3817.431	477.179	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3840.429, Avg/GPU=480.054
+rank_time L3 SM=120:12: t0=18.426, t1=19.108, t2=19.337, t3=19.781, t4=19.791, t5=20.488, t6=20.806, t7=20.853 | max_across_ranks=20.918
+L4	linear_queue_recycle	120:12	20.039135	3984.911	498.114	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4008.918, Avg/GPU=501.115
+rank_time L4 SM=120:12: t0=17.391, t1=18.621, t2=18.857, t3=19.121, t4=19.109, t5=19.715, t6=19.937, t7=19.921 | max_across_ranks=20.039
+L5	dynamic_segment_recycle	120:12	18.825481	4241.814	530.227	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4267.368, Avg/GPU=533.421
+rank_time L5 SM=120:12: t0=18.121, t1=18.465, t2=18.708, t3=18.601, t4=18.206, t5=18.319, t6=18.133, t7=17.576 | max_across_ranks=18.825
+L6	hybrid_br_pbs	120:12	18.386994	4342.971	542.871	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=18.081, t1=18.337, t2=17.634, t3=17.443, t4=16.381, t5=16.167, t6=16.903, t7=16.166 | max_across_ranks=18.387
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	27.149843	2941.239	367.655	skip	16	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=2958.958, Avg/GPU=369.870
+rank_time L1 SM=116:16: t0=25.457, t1=25.977, t2=26.261, t3=26.258, t4=26.196, t5=26.861, t6=26.994, t7=26.962 | max_across_ranks=27.150
+L2	step_fused_reduce	116:16	22.588011	3535.246	441.906	skip	8	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3556.544, Avg/GPU=444.568
+rank_time L2 SM=116:16: t0=21.387, t1=21.696, t2=21.762, t3=21.795, t4=21.712, t5=22.166, t6=22.210, t7=22.182 | max_across_ranks=22.588
+L3	linear_queue_no_recycle	116:16	21.388514	3733.508	466.688	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3756.000, Avg/GPU=469.500
+rank_time L3 SM=116:16: t0=18.879, t1=19.547, t2=19.882, t3=20.151, t4=20.128, t5=20.983, t6=21.136, t7=21.345 | max_across_ranks=21.389
+L4	linear_queue_recycle	116:16	20.104965	3971.864	496.483	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3995.791, Avg/GPU=499.474
+rank_time L4 SM=116:16: t0=17.567, t1=18.890, t2=19.071, t3=19.217, t4=19.252, t5=19.732, t6=19.888, t7=20.077 | max_across_ranks=20.105
+L5	dynamic_segment_recycle	116:16	18.913232	4222.133	527.767	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4247.569, Avg/GPU=530.946
+rank_time L5 SM=116:16: t0=18.090, t1=18.479, t2=18.661, t3=18.733, t4=18.150, t5=18.407, t6=18.162, t7=17.643 | max_across_ranks=18.913
+L6	hybrid_br_pbs	116:16	18.411510	4337.188	542.149	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=18.221, t1=18.386, t2=17.642, t3=17.588, t4=16.395, t5=16.291, t6=16.801, t7=16.286 | max_across_ranks=18.412
+
+Forward ablation case 3/20: dataset=arxiv, B=17, raw_tokens=262144, QH=32, KVH=8, D=128, raw_lengths=(6144, 16384, 20480, 14336, 10240, 36864, 24576, 22528, 30720, 12288, 5120, 36864, 512, 6144, 18432, 256, 256)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=262144, global_seqlens=(20480, 36864, 30720, 36864, 14336, 5120, 24576, 18432, 16384, 10240, 22528, 12288, 6144, 6144, 512, 256, 256), rings=(4, 4, 4, 4, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1), starts=(0, 0, 0, 4, 0, 0, 4, 4, 6, 6, 6, 2, 3, 3, 4, 5, 5)
+All-CP L1-L5: alignment=2048, execution_tokens=268288, global_seqlens=(20480, 36864, 30720, 36864, 14336, 6144, 24576, 18432, 16384, 10240, 22528, 12288, 6144, 6144, 2048, 2048, 2048)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	21.829349	2388.421	298.553	skip	16	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=2397.327, Avg/GPU=299.666
+rank_time L1 SM=128:4: t0=21.742, t1=21.826, t2=21.734, t3=21.781, t4=21.645, t5=21.655, t6=21.654, t7=21.687 | max_across_ranks=21.829
+L2	step_fused_reduce	128:4	16.957443	3074.619	384.327	skip	8	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3086.083, Avg/GPU=385.760
+rank_time L2 SM=128:4: t0=16.664, t1=16.748, t2=16.671, t3=16.685, t4=16.348, t5=16.690, t6=16.498, t7=16.344 | max_across_ranks=16.957
+L3	linear_queue_no_recycle	128:4	14.755542	3533.430	441.679	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3546.605, Avg/GPU=443.326
+rank_time L3 SM=128:4: t0=12.169, t1=12.720, t2=12.959, t3=13.368, t4=13.539, t5=13.945, t6=14.285, t7=14.715 | max_across_ranks=14.756
+L4	linear_queue_recycle	128:4	14.671485	3553.675	444.209	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3566.925, Avg/GPU=445.866
+rank_time L4 SM=128:4: t0=12.288, t1=12.818, t2=13.167, t3=13.502, t4=13.636, t5=13.928, t6=14.180, t7=14.671 | max_across_ranks=14.671
+L5	dynamic_segment_recycle	128:4	13.809512	3775.491	471.936	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3789.568, Avg/GPU=473.696
+rank_time L5 SM=128:4: t0=13.774, t1=13.559, t2=13.185, t3=12.848, t4=12.412, t5=12.422, t6=12.373, t7=12.101 | max_across_ranks=13.810
+L6	hybrid_br_pbs	128:4	11.926406	4371.617	546.452	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=11.468, t1=11.521, t2=11.810, t3=10.300, t4=11.830, t5=11.784, t6=11.787, t7=11.561 | max_across_ranks=11.926
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	21.201177	2459.188	307.399	skip	16	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=2468.357, Avg/GPU=308.545
+rank_time L1 SM=124:8: t0=19.762, t1=20.097, t2=20.130, t3=20.435, t4=20.498, t5=20.824, t6=20.987, t7=21.170 | max_across_ranks=21.201
+L2	step_fused_reduce	124:8	16.106700	3237.018	404.627	skip	8	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3249.088, Avg/GPU=406.136
+rank_time L2 SM=124:8: t0=14.833, t1=15.308, t2=15.551, t3=15.644, t4=15.615, t5=15.828, t6=15.943, t7=16.079 | max_across_ranks=16.107
+L3	linear_queue_no_recycle	124:8	15.107867	3451.029	431.379	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3463.896, Avg/GPU=432.987
+rank_time L3 SM=124:8: t0=12.444, t1=13.009, t2=13.320, t3=13.619, t4=13.778, t5=14.480, t6=14.710, t7=15.095 | max_across_ranks=15.108
+L4	linear_queue_recycle	124:8	14.727360	3540.192	442.524	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3553.392, Avg/GPU=444.174
+rank_time L4 SM=124:8: t0=12.431, t1=12.897, t2=13.046, t3=13.596, t4=13.547, t5=14.151, t6=14.475, t7=14.727 | max_across_ranks=14.727
+L5	dynamic_segment_recycle	124:8	13.343093	3907.466	488.433	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3922.035, Avg/GPU=490.254
+rank_time L5 SM=124:8: t0=12.931, t1=13.214, t2=13.102, t3=13.133, t4=12.653, t5=12.571, t6=12.337, t7=12.022 | max_across_ranks=13.343
+L6	hybrid_br_pbs	124:8	11.981283	4351.594	543.949	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=11.295, t1=11.600, t2=11.957, t3=10.324, t4=11.775, t5=11.799, t6=11.765, t7=11.622 | max_across_ranks=11.981
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	21.452294	2430.401	303.800	skip	16	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=2439.463, Avg/GPU=304.933
+rank_time L1 SM=120:12: t0=20.081, t1=20.397, t2=20.438, t3=20.658, t4=20.805, t5=21.151, t6=21.277, t7=21.422 | max_across_ranks=21.452
+L2	step_fused_reduce	120:12	16.431323	3173.067	396.633	skip	8	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3184.897, Avg/GPU=398.112
+rank_time L2 SM=120:12: t0=15.168, t1=15.646, t2=15.822, t3=15.832, t4=15.742, t5=16.179, t6=16.259, t7=16.396 | max_across_ranks=16.431
+L3	linear_queue_no_recycle	120:12	15.446328	3375.409	421.926	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3387.995, Avg/GPU=423.499
+rank_time L3 SM=120:12: t0=12.732, t1=13.178, t2=13.559, t3=13.943, t4=14.106, t5=14.714, t6=15.084, t7=15.436 | max_across_ranks=15.446
+L4	linear_queue_recycle	120:12	14.745642	3535.803	441.975	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3548.986, Avg/GPU=443.623
+rank_time L4 SM=120:12: t0=12.529, t1=12.942, t2=13.225, t3=13.529, t4=13.666, t5=14.280, t6=14.511, t7=14.743 | max_across_ranks=14.746
+L5	dynamic_segment_recycle	120:12	13.321558	3913.783	489.223	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3928.375, Avg/GPU=491.047
+rank_time L5 SM=120:12: t0=12.689, t1=13.292, t2=13.192, t3=13.102, t4=12.762, t5=12.812, t6=12.452, t7=12.156 | max_across_ranks=13.322
+L6	hybrid_br_pbs	120:12	11.938717	4367.109	545.889	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=11.514, t1=11.674, t2=11.904, t3=10.373, t4=11.846, t5=11.830, t6=11.795, t7=11.510 | max_across_ranks=11.939
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	21.775046	2394.378	299.297	skip	16	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=2403.305, Avg/GPU=300.413
+rank_time L1 SM=116:16: t0=20.341, t1=20.660, t2=20.755, t3=20.962, t4=21.184, t5=21.359, t6=21.499, t7=21.775 | max_across_ranks=21.775
+L2	step_fused_reduce	116:16	16.743286	3113.946	389.243	skip	8	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3125.556, Avg/GPU=390.695
+rank_time L2 SM=116:16: t0=15.422, t1=15.835, t2=16.009, t3=16.116, t4=16.025, t5=16.507, t6=16.612, t7=16.728 | max_across_ranks=16.743
+L3	linear_queue_no_recycle	116:16	15.773815	3305.331	413.166	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3317.655, Avg/GPU=414.707
+rank_time L3 SM=116:16: t0=13.081, t1=13.555, t2=13.899, t3=14.204, t4=14.387, t5=15.179, t6=15.523, t7=15.754 | max_across_ranks=15.774
+L4	linear_queue_recycle	116:16	14.794014	3524.242	440.530	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3537.382, Avg/GPU=442.173
+rank_time L4 SM=116:16: t0=12.383, t1=13.064, t2=13.374, t3=13.568, t4=13.863, t5=14.327, t6=14.638, t7=14.781 | max_across_ranks=14.794
+L5	dynamic_segment_recycle	116:16	13.390709	3893.571	486.696	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3908.089, Avg/GPU=488.511
+rank_time L5 SM=116:16: t0=12.773, t1=13.204, t2=13.278, t3=13.237, t4=12.851, t5=12.789, t6=12.371, t7=12.133 | max_across_ranks=13.391
+L6	hybrid_br_pbs	116:16	11.997640	4345.661	543.208	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=11.437, t1=11.545, t2=11.911, t3=10.247, t4=11.838, t5=11.843, t6=11.799, t7=11.587 | max_across_ranks=11.998
+
+Forward ablation case 4/20: dataset=arxiv, B=16, raw_tokens=263168, QH=32, KVH=8, D=128, raw_lengths=(14336, 10240, 14336, 5120, 10240, 43008, 10240, 10240, 7168, 34816, 22528, 6144, 5120, 14336, 28672, 26624)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=263168, global_seqlens=(43008, 10240, 34816, 22528, 10240, 14336, 28672, 10240, 14336, 26624, 10240, 14336, 7168, 6144, 5120, 5120), rings=(8, 8, 4, 4, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1), starts=(0, 0, 4, 4, 0, 0, 0, 2, 2, 2, 4, 6, 4, 5, 6, 7)
+All-CP L1-L5: alignment=2048, execution_tokens=266240, global_seqlens=(43008, 10240, 34816, 22528, 10240, 14336, 28672, 10240, 14336, 26624, 10240, 14336, 8192, 6144, 6144, 6144)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	21.677426	2372.519	296.565	skip	16	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=2387.181, Avg/GPU=298.398
+rank_time L1 SM=128:4: t0=21.576, t1=21.677, t2=21.573, t3=21.616, t4=21.509, t5=21.518, t6=21.535, t7=21.572 | max_across_ranks=21.677
+L2	step_fused_reduce	128:4	16.756725	3069.221	383.653	skip	8	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3088.190, Avg/GPU=386.024
+rank_time L2 SM=128:4: t0=16.520, t1=16.583, t2=16.597, t3=16.401, t4=16.292, t5=16.507, t6=16.442, t7=16.269 | max_across_ranks=16.757
+L3	linear_queue_no_recycle	128:4	14.721614	3493.509	436.689	skip	1	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3515.100, Avg/GPU=439.388
+rank_time L3 SM=128:4: t0=11.975, t1=12.674, t2=12.704, t3=13.234, t4=13.261, t5=13.931, t6=14.349, t7=14.599 | max_across_ranks=14.722
+L4	linear_queue_recycle	128:4	14.666666	3506.598	438.325	skip	1	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3528.269, Avg/GPU=441.034
+rank_time L4 SM=128:4: t0=12.233, t1=12.667, t2=13.014, t3=13.209, t4=13.481, t5=13.853, t6=14.272, t7=14.547 | max_across_ranks=14.667
+L5	dynamic_segment_recycle	128:4	13.852182	3712.779	464.097	skip	1	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3735.725, Avg/GPU=466.966
+rank_time L5 SM=128:4: t0=13.727, t1=13.380, t2=12.885, t3=12.476, t4=12.120, t5=12.291, t6=12.187, t7=11.815 | max_across_ranks=13.852
+L6	hybrid_br_pbs	128:4	11.982142	4292.229	536.529	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=11.637, t1=11.861, t2=10.948, t3=10.807, t4=11.090, t5=10.958, t6=11.942, t7=11.757 | max_across_ranks=11.982
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	21.087298	2438.913	304.864	skip	16	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=2453.987, Avg/GPU=306.748
+rank_time L1 SM=124:8: t0=19.540, t1=19.926, t2=20.050, t3=20.228, t4=20.363, t5=20.695, t6=20.829, t7=21.042 | max_across_ranks=21.087
+L2	step_fused_reduce	124:8	16.099424	3194.530	399.316	skip	8	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3214.273, Avg/GPU=401.784
+rank_time L2 SM=124:8: t0=14.656, t1=15.036, t2=15.257, t3=15.402, t4=15.493, t5=15.673, t6=15.827, t7=16.079 | max_across_ranks=16.099
+L3	linear_queue_no_recycle	124:8	15.105674	3404.687	425.586	skip	1	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3425.729, Avg/GPU=428.216
+rank_time L3 SM=124:8: t0=12.295, t1=12.713, t2=13.169, t3=13.471, t4=13.760, t5=14.377, t6=14.582, t7=15.076 | max_across_ranks=15.106
+L4	linear_queue_recycle	124:8	14.699809	3498.691	437.336	skip	1	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3520.314, Avg/GPU=440.039
+rank_time L4 SM=124:8: t0=12.258, t1=12.743, t2=12.940, t3=13.334, t4=13.453, t5=14.027, t6=14.301, t7=14.538 | max_across_ranks=14.700
+L5	dynamic_segment_recycle	124:8	13.193882	3898.026	487.253	skip	1	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3922.117, Avg/GPU=490.265
+rank_time L5 SM=124:8: t0=12.796, t1=13.008, t2=13.059, t3=12.840, t4=12.447, t5=12.559, t6=12.325, t7=11.969 | max_across_ranks=13.194
+L6	hybrid_br_pbs	124:8	11.956517	4301.428	537.678	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=11.668, t1=11.776, t2=11.110, t3=10.905, t4=11.192, t5=10.962, t6=11.863, t7=11.775 | max_across_ranks=11.957
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	21.270191	2417.942	302.243	skip	16	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=2432.886, Avg/GPU=304.111
+rank_time L1 SM=120:12: t0=19.946, t1=20.242, t2=20.248, t3=20.541, t4=20.706, t5=20.957, t6=21.133, t7=21.228 | max_across_ranks=21.270
+L2	step_fused_reduce	120:12	16.283371	3158.443	394.805	skip	8	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3177.963, Avg/GPU=397.245
+rank_time L2 SM=120:12: t0=15.123, t1=15.603, t2=15.674, t3=15.753, t4=15.682, t5=16.083, t6=16.121, t7=16.225 | max_across_ranks=16.283
+L3	linear_queue_no_recycle	120:12	15.383712	3343.152	417.894	skip	1	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3363.814, Avg/GPU=420.477
+rank_time L3 SM=120:12: t0=12.603, t1=13.015, t2=13.449, t3=13.672, t4=13.913, t5=14.687, t6=15.093, t7=15.276 | max_across_ranks=15.384
+L4	linear_queue_recycle	120:12	14.733300	3490.738	436.342	skip	1	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3512.312, Avg/GPU=439.039
+rank_time L4 SM=120:12: t0=12.212, t1=12.839, t2=13.070, t3=13.406, t4=13.528, t5=14.190, t6=14.315, t7=14.534 | max_across_ranks=14.733
+L5	dynamic_segment_recycle	120:12	13.178937	3902.446	487.806	skip	1	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3926.565, Avg/GPU=490.821
+rank_time L5 SM=120:12: t0=12.636, t1=13.033, t2=13.002, t3=13.051, t4=12.793, t5=12.582, t6=12.147, t7=11.824 | max_across_ranks=13.179
+L6	hybrid_br_pbs	120:12	12.069974	4260.994	532.624	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=11.759, t1=11.849, t2=11.136, t3=10.749, t4=11.113, t5=10.981, t6=12.026, t7=11.752 | max_across_ranks=12.070
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	21.654826	2374.995	296.874	skip	16	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=2389.673, Avg/GPU=298.709
+rank_time L1 SM=116:16: t0=20.162, t1=20.440, t2=20.568, t3=20.854, t4=21.006, t5=21.220, t6=21.429, t7=21.626 | max_across_ranks=21.655
+L2	step_fused_reduce	116:16	16.625575	3093.432	386.679	skip	8	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3112.551, Avg/GPU=389.069
+rank_time L2 SM=116:16: t0=15.276, t1=15.638, t2=15.914, t3=15.967, t4=15.848, t5=16.369, t6=16.453, t7=16.545 | max_across_ranks=16.626
+L3	linear_queue_no_recycle	116:16	15.643486	3287.636	410.955	skip	1	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3307.955, Avg/GPU=413.494
+rank_time L3 SM=116:16: t0=12.954, t1=13.472, t2=13.723, t3=14.097, t4=14.348, t5=15.087, t6=15.356, t7=15.458 | max_across_ranks=15.643
+L4	linear_queue_recycle	116:16	14.791286	3477.054	434.632	skip	1	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3498.543, Avg/GPU=437.318
+rank_time L4 SM=116:16: t0=12.362, t1=12.874, t2=13.156, t3=13.519, t4=13.561, t5=14.280, t6=14.371, t7=14.613 | max_across_ranks=14.791
+L5	dynamic_segment_recycle	116:16	13.253908	3880.372	485.047	skip	1	all-CP G8; tokens(original/aligned)=263168/266240, padding=3072 tokens; aligned-length Agg TFLOPS=3904.354, Avg/GPU=488.044
+rank_time L5 SM=116:16: t0=12.494, t1=13.112, t2=13.167, t3=13.115, t4=12.820, t5=12.638, t6=12.286, t7=11.788 | max_across_ranks=13.254
+L6	hybrid_br_pbs	116:16	12.092221	4253.155	531.644	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=11.833, t1=11.771, t2=11.012, t3=10.858, t4=11.213, t5=11.091, t6=12.079, t7=11.751 | max_across_ranks=12.092
+
+Forward ablation case 5/20: dataset=arxiv, B=11, raw_tokens=263168, QH=32, KVH=8, D=128, raw_lengths=(6144, 14336, 36864, 12288, 7168, 36864, 14336, 34816, 10240, 79872, 10240)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=263168, global_seqlens=(34816, 79872, 36864, 10240, 36864, 14336, 14336, 12288, 10240, 7168, 6144), rings=(8, 8, 4, 4, 4, 4, 2, 2, 2, 1, 1), starts=(0, 0, 0, 0, 4, 4, 0, 2, 4, 6, 7)
+All-CP L1-L5: alignment=2048, execution_tokens=264192, global_seqlens=(34816, 79872, 36864, 10240, 36864, 14336, 14336, 12288, 10240, 8192, 6144)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	29.253005	3128.251	391.031	skip	16	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3132.656, Avg/GPU=391.582
+rank_time L1 SM=128:4: t0=28.359, t1=28.857, t2=28.717, t3=28.824, t4=28.426, t5=28.656, t6=28.658, t7=28.629 | max_across_ranks=29.253
+L2	step_fused_reduce	128:4	25.001002	3660.283	457.535	skip	8	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3665.437, Avg/GPU=458.180
+rank_time L2 SM=128:4: t0=24.600, t1=24.731, t2=24.519, t3=24.466, t4=23.875, t5=24.318, t6=24.004, t7=23.820 | max_across_ranks=25.001
+L3	linear_queue_no_recycle	128:4	22.360124	4092.586	511.573	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=4098.349, Avg/GPU=512.294
+rank_time L3 SM=128:4: t0=19.906, t1=20.537, t2=20.883, t3=21.084, t4=21.020, t5=21.725, t6=22.015, t7=22.341 | max_across_ranks=22.360
+L4	linear_queue_recycle	128:4	22.213357	4119.626	514.953	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=4125.427, Avg/GPU=515.678
+rank_time L4 SM=128:4: t0=19.906, t1=20.620, t2=20.925, t3=21.048, t4=20.930, t5=21.600, t6=21.923, t7=22.206 | max_across_ranks=22.213
+L5	dynamic_segment_recycle	128:4	21.312518	4293.755	536.719	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=4299.801, Avg/GPU=537.475
+rank_time L5 SM=128:4: t0=20.867, t1=21.214, t2=21.072, t3=20.730, t4=20.265, t5=20.162, t6=20.107, t7=19.845 | max_across_ranks=21.313
+L6	hybrid_br_pbs	128:4	20.425431	4480.235	560.029	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=20.158, t1=20.400, t2=20.010, t3=19.638, t4=19.539, t5=19.955, t6=19.535, t7=18.960 | max_across_ranks=20.425
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	28.685387	3190.151	398.769	skip	16	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3194.644, Avg/GPU=399.330
+rank_time L1 SM=124:8: t0=26.909, t1=27.462, t2=27.520, t3=27.721, t4=27.627, t5=28.394, t6=28.344, t7=28.236 | max_across_ranks=28.685
+L2	step_fused_reduce	124:8	24.210641	3779.773	472.472	skip	8	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3785.095, Avg/GPU=473.137
+rank_time L2 SM=124:8: t0=22.850, t1=23.323, t2=23.413, t3=23.247, t4=23.181, t5=23.618, t6=23.611, t7=23.418 | max_across_ranks=24.211
+L3	linear_queue_no_recycle	124:8	22.818725	4010.335	501.292	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=4015.982, Avg/GPU=501.998
+rank_time L3 SM=124:8: t0=20.371, t1=21.062, t2=21.312, t3=21.595, t4=21.574, t5=22.210, t6=22.694, t7=22.664 | max_across_ranks=22.819
+L4	linear_queue_recycle	124:8	22.160291	4129.491	516.186	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=4135.306, Avg/GPU=516.913
+rank_time L4 SM=124:8: t0=20.032, t1=20.831, t2=21.006, t3=21.234, t4=21.191, t5=21.842, t6=22.081, t7=22.067 | max_across_ranks=22.160
+L5	dynamic_segment_recycle	124:8	21.048997	4347.510	543.439	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=4353.632, Avg/GPU=544.204
+rank_time L5 SM=124:8: t0=20.375, t1=20.646, t2=20.898, t3=20.861, t4=20.203, t5=20.783, t6=20.350, t7=19.892 | max_across_ranks=21.049
+L6	hybrid_br_pbs	124:8	20.552470	4452.542	556.568	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=20.186, t1=20.474, t2=19.899, t3=19.674, t4=19.663, t5=19.842, t6=19.535, t7=18.919 | max_across_ranks=20.552
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	29.053946	3149.683	393.710	skip	16	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3154.118, Avg/GPU=394.265
+rank_time L1 SM=120:12: t0=27.401, t1=27.971, t2=28.029, t3=28.121, t4=27.995, t5=28.701, t6=28.748, t7=28.575 | max_across_ranks=29.054
+L2	step_fused_reduce	120:12	24.463332	3740.730	467.591	skip	8	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3745.998, Avg/GPU=468.250
+rank_time L2 SM=120:12: t0=23.385, t1=23.921, t2=23.888, t3=23.759, t4=23.640, t5=24.001, t6=23.993, t7=23.954 | max_across_ranks=24.463
+L3	linear_queue_no_recycle	120:12	23.343005	3920.263	490.033	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3925.784, Avg/GPU=490.723
+rank_time L3 SM=120:12: t0=20.854, t1=21.640, t2=21.877, t3=21.944, t4=21.937, t5=22.839, t6=23.146, t7=23.184 | max_across_ranks=23.343
+L4	linear_queue_recycle	120:12	22.269326	4109.273	513.659	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=4115.059, Avg/GPU=514.382
+rank_time L4 SM=120:12: t0=20.064, t1=20.780, t2=21.052, t3=21.286, t4=21.324, t5=21.900, t6=22.079, t7=22.079 | max_across_ranks=22.269
+L5	dynamic_segment_recycle	120:12	21.134141	4329.995	541.249	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=4336.092, Avg/GPU=542.012
+rank_time L5 SM=120:12: t0=20.366, t1=21.050, t2=20.889, t3=20.947, t4=20.277, t5=20.841, t6=20.369, t7=19.883 | max_across_ranks=21.134
+L6	hybrid_br_pbs	120:12	20.633813	4434.989	554.374	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=20.240, t1=20.606, t2=19.953, t3=19.738, t4=19.651, t5=20.037, t6=19.568, t7=18.953 | max_across_ranks=20.634
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	29.410657	3111.482	388.935	skip	16	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3115.863, Avg/GPU=389.483
+rank_time L1 SM=116:16: t0=27.882, t1=28.432, t2=28.482, t3=28.625, t4=28.519, t5=29.212, t6=29.250, t7=29.202 | max_across_ranks=29.411
+L2	step_fused_reduce	116:16	24.923580	3671.653	458.957	skip	8	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3676.823, Avg/GPU=459.603
+rank_time L2 SM=116:16: t0=23.815, t1=24.299, t2=24.226, t3=24.243, t4=24.117, t5=24.603, t6=24.692, t7=24.433 | max_across_ranks=24.924
+L3	linear_queue_no_recycle	116:16	23.824158	3841.090	480.136	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3846.498, Avg/GPU=480.812
+rank_time L3 SM=116:16: t0=21.332, t1=22.122, t2=22.299, t3=22.468, t4=22.589, t5=23.436, t6=23.689, t7=23.711 | max_across_ranks=23.824
+L4	linear_queue_recycle	116:16	22.246979	4113.400	514.175	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=4119.192, Avg/GPU=514.899
+rank_time L4 SM=116:16: t0=20.139, t1=20.949, t2=21.211, t3=21.398, t4=21.387, t5=22.049, t6=22.167, t7=22.073 | max_across_ranks=22.247
+L5	dynamic_segment_recycle	116:16	21.283554	4299.598	537.450	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=4305.652, Avg/GPU=538.207
+rank_time L5 SM=116:16: t0=20.404, t1=21.232, t2=21.006, t3=20.615, t4=20.415, t5=20.664, t6=20.233, t7=19.781 | max_across_ranks=21.284
+L6	hybrid_br_pbs	116:16	20.607062	4440.746	555.093	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=20.217, t1=20.599, t2=20.064, t3=19.811, t4=19.852, t5=20.102, t6=19.616, t7=18.997 | max_across_ranks=20.607
+
+Forward ablation case 6/20: dataset=arxiv, B=11, raw_tokens=262144, QH=32, KVH=8, D=128, raw_lengths=(53248, 12288, 22528, 6144, 63488, 18432, 14336, 45056, 10240, 12288, 4096)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=262144, global_seqlens=(22528, 63488, 10240, 53248, 12288, 45056, 18432, 14336, 12288, 6144, 4096), rings=(4, 4, 4, 4, 4, 4, 2, 2, 2, 1, 1), starts=(0, 0, 0, 4, 4, 4, 0, 2, 6, 4, 5)
+All-CP L1-L5: alignment=2048, execution_tokens=262144, global_seqlens=(22528, 63488, 10240, 53248, 12288, 45056, 18432, 14336, 12288, 6144, 4096)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	28.050013	3040.391	380.049	skip	16	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=3040.391, Avg/GPU=380.049
+rank_time L1 SM=128:4: t0=27.160, t1=27.448, t2=27.408, t3=27.358, t4=27.272, t5=27.701, t6=27.583, t7=27.212 | max_across_ranks=28.050
+L2	step_fused_reduce	128:4	23.664114	3603.896	450.487	skip	8	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=3603.896, Avg/GPU=450.487
+rank_time L2 SM=128:4: t0=23.237, t1=23.474, t2=23.326, t3=23.117, t4=22.864, t5=23.039, t6=22.719, t7=22.472 | max_across_ranks=23.664
+L3	linear_queue_no_recycle	128:4	21.232138	4016.695	502.087	skip	1	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=4016.695, Avg/GPU=502.087
+rank_time L3 SM=128:4: t0=18.528, t1=19.318, t2=19.601, t3=19.783, t4=19.898, t5=20.630, t6=20.964, t7=21.031 | max_across_ranks=21.232
+L4	linear_queue_recycle	128:4	21.024663	4056.332	507.042	skip	1	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=4056.332, Avg/GPU=507.042
+rank_time L4 SM=128:4: t0=18.683, t1=19.369, t2=19.597, t3=19.860, t4=19.747, t5=20.578, t6=20.798, t7=20.747 | max_across_ranks=21.025
+L5	dynamic_segment_recycle	128:4	19.716594	4325.444	540.680	skip	1	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=4325.444, Avg/GPU=540.680
+rank_time L5 SM=128:4: t0=19.475, t1=19.629, t2=19.514, t3=19.328, t4=19.031, t5=19.298, t6=19.163, t7=18.694 | max_across_ranks=19.717
+L6	hybrid_br_pbs	128:4	19.164236	4450.113	556.264	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=18.439, t1=18.865, t2=17.433, t3=17.214, t4=18.173, t5=17.828, t6=19.156, t7=18.831 | max_across_ranks=19.164
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	27.403397	3112.133	389.017	skip	16	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=3112.133, Avg/GPU=389.017
+rank_time L1 SM=124:8: t0=25.593, t1=26.298, t2=26.374, t3=26.401, t4=26.512, t5=27.187, t6=27.202, t7=27.002 | max_across_ranks=27.403
+L2	step_fused_reduce	124:8	22.826066	3736.212	467.026	skip	8	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=3736.212, Avg/GPU=467.026
+rank_time L2 SM=124:8: t0=21.695, t1=22.100, t2=22.207, t3=22.095, t4=21.872, t5=22.560, t6=22.474, t7=22.186 | max_across_ranks=22.826
+L3	linear_queue_no_recycle	124:8	21.527323	3961.617	495.202	skip	1	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=3961.617, Avg/GPU=495.202
+rank_time L3 SM=124:8: t0=19.155, t1=19.939, t2=20.032, t3=20.252, t4=20.252, t5=21.095, t6=21.448, t7=21.449 | max_across_ranks=21.527
+L4	linear_queue_recycle	124:8	20.990052	4063.021	507.878	skip	1	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=4063.021, Avg/GPU=507.878
+rank_time L4 SM=124:8: t0=18.775, t1=19.510, t2=19.777, t3=19.849, t4=19.958, t5=20.691, t6=20.822, t7=20.856 | max_across_ranks=20.990
+L5	dynamic_segment_recycle	124:8	19.700802	4328.911	541.114	skip	1	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=4328.911, Avg/GPU=541.114
+rank_time L5 SM=124:8: t0=18.807, t1=19.539, t2=19.545, t3=19.307, t4=19.003, t5=19.146, t6=19.220, t7=18.312 | max_across_ranks=19.701
+L6	hybrid_br_pbs	124:8	19.115342	4461.496	557.687	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=18.669, t1=18.979, t2=17.496, t3=16.979, t4=17.957, t5=17.701, t6=19.069, t7=18.647 | max_across_ranks=19.115
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	27.697042	3079.138	384.892	skip	16	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=3079.138, Avg/GPU=384.892
+rank_time L1 SM=120:12: t0=26.208, t1=26.617, t2=26.796, t3=26.856, t4=26.896, t5=27.533, t6=27.501, t7=27.470 | max_across_ranks=27.697
+L2	step_fused_reduce	120:12	23.210257	3674.368	459.296	skip	8	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=3674.368, Avg/GPU=459.296
+rank_time L2 SM=120:12: t0=21.944, t1=22.521, t2=22.505, t3=22.418, t4=22.373, t5=22.797, t6=22.956, t7=22.582 | max_across_ranks=23.210
+L3	linear_queue_no_recycle	120:12	22.106563	3857.814	482.227	skip	1	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=3857.814, Avg/GPU=482.227
+rank_time L3 SM=120:12: t0=19.558, t1=20.223, t2=20.454, t3=20.662, t4=20.754, t5=21.436, t6=22.022, t7=21.864 | max_across_ranks=22.107
+L4	linear_queue_recycle	120:12	21.057186	4050.067	506.258	skip	1	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=4050.067, Avg/GPU=506.258
+rank_time L4 SM=120:12: t0=18.820, t1=19.596, t2=19.792, t3=20.044, t4=20.102, t5=20.664, t6=20.973, t7=20.827 | max_across_ranks=21.057
+L5	dynamic_segment_recycle	120:12	19.728380	4322.860	540.357	skip	1	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=4322.860, Avg/GPU=540.357
+rank_time L5 SM=120:12: t0=19.248, t1=19.483, t2=19.566, t3=19.276, t4=18.789, t5=19.069, t6=19.151, t7=18.182 | max_across_ranks=19.728
+L6	hybrid_br_pbs	120:12	19.161383	4450.776	556.347	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=18.705, t1=18.954, t2=17.269, t3=17.152, t4=18.194, t5=17.847, t6=19.147, t7=18.792 | max_across_ranks=19.161
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	28.246139	3019.281	377.410	skip	16	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=3019.281, Avg/GPU=377.410
+rank_time L1 SM=116:16: t0=26.401, t1=26.924, t2=27.133, t3=27.144, t4=27.067, t5=28.012, t6=28.058, t7=27.907 | max_across_ranks=28.246
+L2	step_fused_reduce	116:16	23.796209	3583.891	447.986	skip	8	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=3583.891, Avg/GPU=447.986
+rank_time L2 SM=116:16: t0=22.285, t1=22.865, t2=22.914, t3=22.832, t4=22.774, t5=23.253, t6=23.255, t7=23.090 | max_across_ranks=23.796
+L3	linear_queue_no_recycle	116:16	22.659026	3763.755	470.469	skip	1	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=3763.755, Avg/GPU=470.469
+rank_time L3 SM=116:16: t0=19.867, t1=20.702, t2=21.056, t3=21.079, t4=21.190, t5=22.375, t6=22.294, t7=22.514 | max_across_ranks=22.659
+L4	linear_queue_recycle	116:16	21.160271	4030.337	503.792	skip	1	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=4030.337, Avg/GPU=503.792
+rank_time L4 SM=116:16: t0=18.839, t1=19.547, t2=19.946, t3=20.038, t4=20.134, t5=20.713, t6=20.921, t7=20.934 | max_across_ranks=21.160
+L5	dynamic_segment_recycle	116:16	19.659007	4338.114	542.264	skip	1	all-CP G8; tokens(original/aligned)=262144/262144, padding=0 tokens; aligned-length Agg TFLOPS=4338.114, Avg/GPU=542.264
+rank_time L5 SM=116:16: t0=18.931, t1=19.601, t2=19.466, t3=19.342, t4=18.888, t5=19.307, t6=19.277, t7=18.434 | max_across_ranks=19.659
+L6	hybrid_br_pbs	116:16	19.172702	4448.148	556.019	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=18.720, t1=18.809, t2=17.180, t3=16.952, t4=17.945, t5=17.725, t6=19.152, t7=18.651 | max_across_ranks=19.173
+
+Forward ablation case 7/20: dataset=arxiv, B=19, raw_tokens=262400, QH=32, KVH=8, D=128, raw_lengths=(10240, 8192, 1792, 12288, 24576, 5120, 6144, 7168, 7168, 2560, 5120, 34816, 18432, 30720, 12288, 30720, 10240, 10240, 24576)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=262400, global_seqlens=(34816, 18432, 24576, 24576, 30720, 30720, 10240, 8192, 5120, 6144, 7168, 5120, 7168, 12288, 12288, 10240, 2560, 1792, 10240), rings=(4, 4, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1), starts=(0, 4, 0, 2, 4, 6, 0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 6, 7, 7)
+All-CP L1-L5: alignment=2048, execution_tokens=268288, global_seqlens=(34816, 18432, 24576, 24576, 30720, 30720, 10240, 8192, 6144, 6144, 8192, 6144, 8192, 12288, 12288, 10240, 4096, 2048, 10240)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	20.893573	2169.754	271.219	skip	16	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=2195.529, Avg/GPU=274.441
+rank_time L1 SM=128:4: t0=20.812, t1=20.884, t2=20.788, t3=20.867, t4=20.773, t5=20.721, t6=20.698, t7=20.814 | max_across_ranks=20.894
+L2	step_fused_reduce	128:4	15.728334	2882.309	360.289	skip	8	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=2916.549, Avg/GPU=364.569
+rank_time L2 SM=128:4: t0=15.691, t1=15.665, t2=15.444, t3=15.424, t4=15.248, t5=15.475, t6=15.332, t7=15.021 | max_across_ranks=15.728
+L3	linear_queue_no_recycle	128:4	13.451520	3370.171	421.271	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3410.206, Avg/GPU=426.276
+rank_time L3 SM=128:4: t0=10.979, t1=11.558, t2=11.955, t3=12.230, t4=12.414, t5=12.865, t6=13.225, t7=13.396 | max_across_ranks=13.452
+L4	linear_queue_recycle	128:4	13.470134	3365.514	420.689	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3405.493, Avg/GPU=425.687
+rank_time L4 SM=128:4: t0=10.964, t1=11.559, t2=11.884, t3=12.198, t4=12.335, t5=12.999, t6=13.310, t7=13.460 | max_across_ranks=13.470
+L5	dynamic_segment_recycle	128:4	12.897532	3514.930	439.366	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3556.684, Avg/GPU=444.586
+rank_time L5 SM=128:4: t0=12.882, t1=12.289, t2=11.891, t3=11.633, t4=11.042, t5=11.311, t6=11.015, t7=10.680 | max_across_ranks=12.898
+L6	hybrid_br_pbs	128:4	10.128634	4475.818	559.477	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=9.906, t1=10.037, t2=9.981, t3=9.633, t4=10.037, t5=9.957, t6=9.460, t7=9.158 | max_across_ranks=10.129
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	20.197638	2244.516	280.564	skip	16	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=2271.179, Avg/GPU=283.897
+rank_time L1 SM=124:8: t0=18.760, t1=19.075, t2=19.208, t3=19.497, t4=19.580, t5=19.815, t6=19.982, t7=20.196 | max_across_ranks=20.198
+L2	step_fused_reduce	124:8	15.045818	3013.058	376.632	skip	8	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3048.851, Avg/GPU=381.106
+rank_time L2 SM=124:8: t0=13.767, t1=13.931, t2=14.084, t3=14.244, t4=14.299, t5=14.870, t6=14.941, t7=14.945 | max_across_ranks=15.046
+L3	linear_queue_no_recycle	124:8	13.998946	3238.381	404.798	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3276.850, Avg/GPU=409.606
+rank_time L3 SM=124:8: t0=11.136, t1=11.737, t2=12.092, t3=12.470, t4=12.568, t5=13.241, t6=13.500, t7=13.813 | max_across_ranks=13.999
+L4	linear_queue_recycle	124:8	13.491632	3360.151	420.019	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3400.067, Avg/GPU=425.008
+rank_time L4 SM=124:8: t0=11.189, t1=11.708, t2=12.110, t3=12.458, t4=12.632, t5=13.050, t6=13.272, t7=13.391 | max_across_ranks=13.492
+L5	dynamic_segment_recycle	124:8	12.067991	3756.542	469.568	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3801.167, Avg/GPU=475.146
+rank_time L5 SM=124:8: t0=11.768, t1=11.966, t2=11.980, t3=11.817, t4=11.550, t5=11.447, t6=11.354, t7=10.863 | max_across_ranks=12.068
+L6	hybrid_br_pbs	124:8	10.130750	4474.883	559.360	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=9.964, t1=10.086, t2=9.994, t3=9.592, t4=9.914, t5=9.967, t6=9.199, t7=8.981 | max_across_ranks=10.131
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	20.466714	2215.007	276.876	skip	16	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=2241.320, Avg/GPU=280.165
+rank_time L1 SM=120:12: t0=19.065, t1=19.377, t2=19.505, t3=19.719, t4=19.884, t5=19.999, t6=20.244, t7=20.467 | max_across_ranks=20.467
+L2	step_fused_reduce	120:12	15.184998	2985.441	373.180	skip	8	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3020.906, Avg/GPU=377.613
+rank_time L2 SM=120:12: t0=14.107, t1=14.411, t2=14.410, t3=14.512, t4=14.609, t5=15.056, t6=15.127, t7=14.949 | max_across_ranks=15.185
+L3	linear_queue_no_recycle	120:12	14.184320	3196.059	399.507	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3234.025, Avg/GPU=404.253
+rank_time L3 SM=120:12: t0=11.559, t1=12.015, t2=12.318, t3=12.775, t4=12.779, t5=13.526, t6=13.915, t7=14.019 | max_across_ranks=14.184
+L4	linear_queue_recycle	120:12	13.681782	3313.451	414.181	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3352.813, Avg/GPU=419.102
+rank_time L4 SM=120:12: t0=11.323, t1=11.824, t2=12.213, t3=12.631, t4=12.665, t5=13.165, t6=13.280, t7=13.633 | max_across_ranks=13.682
+L5	dynamic_segment_recycle	120:12	12.090734	3749.476	468.685	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3794.017, Avg/GPU=474.252
+rank_time L5 SM=120:12: t0=11.581, t1=11.927, t2=11.987, t3=11.998, t4=11.571, t5=11.641, t6=11.211, t7=10.805 | max_across_ranks=12.091
+L6	hybrid_br_pbs	120:12	10.114889	4481.900	560.237	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=10.045, t1=10.055, t2=9.966, t3=9.656, t4=9.886, t5=9.903, t6=9.393, t7=8.982 | max_across_ranks=10.115
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	20.815176	2177.926	272.241	skip	16	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=2203.798, Avg/GPU=275.475
+rank_time L1 SM=116:16: t0=19.280, t1=19.587, t2=19.767, t3=20.037, t4=20.180, t5=20.310, t6=20.567, t7=20.815 | max_across_ranks=20.815
+L2	step_fused_reduce	116:16	15.490932	2926.481	365.810	skip	8	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=2961.245, Avg/GPU=370.156
+rank_time L2 SM=116:16: t0=14.287, t1=14.508, t2=14.699, t3=14.800, t4=14.869, t5=15.367, t6=15.349, t7=15.214 | max_across_ranks=15.491
+L3	linear_queue_no_recycle	116:16	14.618717	3101.087	387.636	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3137.926, Avg/GPU=392.241
+rank_time L3 SM=116:16: t0=11.847, t1=12.232, t2=12.472, t3=13.093, t4=13.094, t5=13.816, t6=14.216, t7=14.417 | max_across_ranks=14.619
+L4	linear_queue_recycle	116:16	13.548842	3345.963	418.245	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3385.710, Avg/GPU=423.214
+rank_time L4 SM=116:16: t0=11.250, t1=11.808, t2=12.315, t3=12.687, t4=12.831, t5=13.282, t6=13.231, t7=13.400 | max_across_ranks=13.549
+L5	dynamic_segment_recycle	116:16	12.175198	3723.465	465.433	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3767.696, Avg/GPU=470.962
+rank_time L5 SM=116:16: t0=11.733, t1=12.114, t2=12.003, t3=12.037, t4=11.555, t5=11.601, t6=11.298, t7=10.768 | max_across_ranks=12.175
+L6	hybrid_br_pbs	116:16	10.084914	4495.221	561.903	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=10.008, t1=9.975, t2=9.923, t3=9.749, t4=9.985, t5=10.028, t6=9.402, t7=9.120 | max_across_ranks=10.085
+
+Forward ablation case 8/20: dataset=arxiv, B=12, raw_tokens=263168, QH=32, KVH=8, D=128, raw_lengths=(20480, 47104, 12288, 22528, 26624, 16384, 5120, 14336, 6144, 26624, 53248, 12288)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=263168, global_seqlens=(47104, 53248, 20480, 26624, 12288, 22528, 26624, 16384, 14336, 12288, 6144, 5120), rings=(8, 8, 4, 4, 4, 4, 4, 2, 2, 2, 1, 1), starts=(0, 0, 0, 0, 4, 4, 4, 0, 2, 4, 6, 7)
+All-CP L1-L5: alignment=2048, execution_tokens=264192, global_seqlens=(47104, 53248, 20480, 26624, 12288, 22528, 26624, 16384, 14336, 12288, 6144, 6144)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	24.539330	2750.412	343.802	skip	16	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=2754.263, Avg/GPU=344.283
+rank_time L1 SM=128:4: t0=24.123, t1=24.193, t2=23.987, t3=24.051, t4=23.774, t5=24.006, t6=24.018, t7=24.066 | max_across_ranks=24.539
+L2	step_fused_reduce	128:4	20.078327	3361.499	420.187	skip	8	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3366.205, Avg/GPU=420.776
+rank_time L2 SM=128:4: t0=19.672, t1=19.944, t2=19.693, t3=19.708, t4=19.099, t5=19.112, t6=19.050, t7=18.669 | max_across_ranks=20.078
+L3	linear_queue_no_recycle	128:4	17.544376	3847.003	480.875	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3852.389, Avg/GPU=481.549
+rank_time L3 SM=128:4: t0=15.075, t1=15.738, t2=16.086, t3=16.308, t4=16.304, t5=17.054, t6=17.322, t7=17.531 | max_across_ranks=17.544
+L4	linear_queue_recycle	128:4	17.422510	3873.912	484.239	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3879.336, Avg/GPU=484.917
+rank_time L4 SM=128:4: t0=15.216, t1=15.790, t2=16.106, t3=16.227, t4=16.300, t5=16.971, t6=17.218, t7=17.367 | max_across_ranks=17.423
+L5	dynamic_segment_recycle	128:4	16.424215	4109.376	513.672	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=4115.129, Avg/GPU=514.391
+rank_time L5 SM=128:4: t0=16.328, t1=16.242, t2=16.158, t3=15.739, t4=15.508, t5=15.664, t6=15.545, t7=15.054 | max_across_ranks=16.424
+L6	hybrid_br_pbs	128:4	15.579762	4332.112	541.514	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=15.092, t1=15.398, t2=14.723, t3=14.486, t4=15.422, t5=15.526, t6=14.552, t7=13.975 | max_across_ranks=15.580
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	23.977648	2814.841	351.855	skip	16	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=2818.782, Avg/GPU=352.348
+rank_time L1 SM=124:8: t0=22.187, t1=22.589, t2=22.758, t3=22.881, t4=22.926, t5=23.626, t6=23.771, t7=23.730 | max_across_ranks=23.978
+L2	step_fused_reduce	124:8	19.205702	3514.231	439.279	skip	8	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3519.151, Avg/GPU=439.894
+rank_time L2 SM=124:8: t0=18.093, t1=18.447, t2=18.531, t3=18.396, t4=18.286, t5=19.100, t6=18.806, t7=18.641 | max_across_ranks=19.206
+L3	linear_queue_no_recycle	124:8	17.966050	3756.712	469.589	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3761.972, Avg/GPU=470.246
+rank_time L3 SM=124:8: t0=15.493, t1=16.163, t2=16.567, t3=16.599, t4=16.798, t5=17.574, t6=17.828, t7=17.821 | max_across_ranks=17.966
+L4	linear_queue_recycle	124:8	17.508047	3854.986	481.873	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3860.383, Avg/GPU=482.548
+rank_time L4 SM=124:8: t0=15.478, t1=15.889, t2=16.299, t3=16.474, t4=16.532, t5=17.168, t6=17.421, t7=17.411 | max_across_ranks=17.508
+L5	dynamic_segment_recycle	124:8	16.316434	4136.521	517.065	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=4142.313, Avg/GPU=517.789
+rank_time L5 SM=124:8: t0=15.522, t1=16.233, t2=16.002, t3=15.937, t4=15.640, t5=15.607, t6=15.433, t7=14.994 | max_across_ranks=16.316
+L6	hybrid_br_pbs	124:8	15.560252	4337.544	542.193	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=15.110, t1=15.437, t2=14.682, t3=14.541, t4=15.450, t5=15.503, t6=14.397, t7=14.000 | max_across_ranks=15.560
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	24.110657	2799.313	349.914	skip	16	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=2803.232, Avg/GPU=350.404
+rank_time L1 SM=120:12: t0=22.518, t1=22.971, t2=23.212, t3=23.190, t4=23.352, t5=23.906, t6=24.030, t7=23.901 | max_across_ranks=24.111
+L2	step_fused_reduce	120:12	19.457795	3468.701	433.588	skip	8	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3473.558, Avg/GPU=434.195
+rank_time L2 SM=120:12: t0=18.288, t1=18.916, t2=18.754, t3=18.856, t4=18.771, t5=19.086, t6=19.056, t7=19.079 | max_across_ranks=19.458
+L3	linear_queue_no_recycle	120:12	18.335781	3680.960	460.120	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3686.114, Avg/GPU=460.764
+rank_time L3 SM=120:12: t0=15.937, t1=16.450, t2=16.780, t3=16.953, t4=17.149, t5=17.786, t6=18.076, t7=18.308 | max_across_ranks=18.336
+L4	linear_queue_recycle	120:12	17.553887	3844.919	480.615	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3850.302, Avg/GPU=481.288
+rank_time L4 SM=120:12: t0=15.375, t1=15.970, t2=16.303, t3=16.514, t4=16.626, t5=17.098, t6=17.489, t7=17.320 | max_across_ranks=17.554
+L5	dynamic_segment_recycle	120:12	16.197595	4166.870	520.859	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=4172.704, Avg/GPU=521.588
+rank_time L5 SM=120:12: t0=15.550, t1=16.098, t2=16.025, t3=16.032, t4=15.709, t5=15.649, t6=15.623, t7=15.086 | max_across_ranks=16.198
+L6	hybrid_br_pbs	120:12	15.657825	4310.514	538.814	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=15.123, t1=15.466, t2=14.696, t3=14.529, t4=15.461, t5=15.655, t6=14.471, t7=14.011 | max_across_ranks=15.658
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	24.503802	2754.400	344.300	skip	16	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=2758.256, Avg/GPU=344.782
+rank_time L1 SM=116:16: t0=22.812, t1=23.275, t2=23.513, t3=23.536, t4=23.678, t5=24.280, t6=24.336, t7=24.380 | max_across_ranks=24.504
+L2	step_fused_reduce	116:16	19.826730	3404.155	425.519	skip	8	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3408.922, Avg/GPU=426.115
+rank_time L2 SM=116:16: t0=18.369, t1=19.276, t2=19.255, t3=19.269, t4=19.176, t5=19.638, t6=19.662, t7=19.493 | max_across_ranks=19.827
+L3	linear_queue_no_recycle	116:16	18.750790	3599.490	449.936	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3604.529, Avg/GPU=450.566
+rank_time L3 SM=116:16: t0=16.015, t1=16.875, t2=17.259, t3=17.466, t4=17.530, t5=18.182, t6=18.503, t7=18.681 | max_across_ranks=18.751
+L4	linear_queue_recycle	116:16	17.593790	3836.199	479.525	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=3841.570, Avg/GPU=480.196
+rank_time L4 SM=116:16: t0=15.476, t1=16.061, t2=16.313, t3=16.650, t4=16.674, t5=17.228, t6=17.550, t7=17.440 | max_across_ranks=17.594
+L5	dynamic_segment_recycle	116:16	16.222974	4160.351	520.044	skip	1	all-CP G8; tokens(original/aligned)=263168/264192, padding=1024 tokens; aligned-length Agg TFLOPS=4166.176, Avg/GPU=520.772
+rank_time L5 SM=116:16: t0=15.469, t1=16.035, t2=16.047, t3=16.076, t4=15.833, t5=15.814, t6=15.563, t7=15.143 | max_across_ranks=16.223
+L6	hybrid_br_pbs	116:16	15.667846	4307.757	538.470	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=15.189, t1=15.445, t2=14.876, t3=14.577, t4=15.598, t5=15.606, t6=14.510, t7=13.989 | max_across_ranks=15.668
+
+Forward ablation case 9/20: dataset=arxiv, B=18, raw_tokens=262656, QH=32, KVH=8, D=128, raw_lengths=(10240, 10240, 512, 12288, 6144, 10240, 16384, 8192, 14336, 20480, 4096, 6144, 7168, 10240, 3072, 45056, 32768, 45056)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=262656, global_seqlens=(32768, 20480, 45056, 45056, 12288, 10240, 10240, 10240, 14336, 10240, 16384, 8192, 7168, 6144, 6144, 4096, 512, 3072), rings=(8, 4, 4, 4, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1), starts=(0, 0, 0, 4, 0, 0, 2, 4, 4, 6, 6, 2, 3, 4, 5, 6, 7, 7)
+All-CP L1-L5: alignment=2048, execution_tokens=266240, global_seqlens=(32768, 20480, 45056, 45056, 12288, 10240, 10240, 10240, 14336, 10240, 16384, 8192, 8192, 6144, 6144, 4096, 2048, 4096)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	22.457612	2487.177	310.897	skip	16	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=2497.027, Avg/GPU=312.128
+rank_time L1 SM=128:4: t0=22.346, t1=22.458, t2=22.286, t3=22.371, t4=22.217, t5=22.208, t6=22.142, t7=22.237 | max_across_ranks=22.458
+L2	step_fused_reduce	128:4	17.767197	3143.774	392.972	skip	8	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3156.225, Avg/GPU=394.528
+rank_time L2 SM=128:4: t0=17.371, t1=17.533, t2=17.501, t3=17.450, t4=17.250, t5=17.392, t6=17.119, t7=17.023 | max_across_ranks=17.767
+L3	linear_queue_no_recycle	128:4	15.479088	3608.485	451.061	skip	1	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3622.776, Avg/GPU=452.847
+rank_time L3 SM=128:4: t0=13.074, t1=13.480, t2=13.715, t3=14.106, t4=14.183, t5=14.942, t6=15.262, t7=15.374 | max_across_ranks=15.479
+L4	linear_queue_recycle	128:4	15.358218	3636.884	454.610	skip	1	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3651.288, Avg/GPU=456.411
+rank_time L4 SM=128:4: t0=13.105, t1=13.579, t2=13.785, t3=14.117, t4=14.170, t5=14.735, t6=15.098, t7=15.281 | max_across_ranks=15.358
+L5	dynamic_segment_recycle	128:4	14.490772	3854.595	481.824	skip	1	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3869.861, Avg/GPU=483.733
+rank_time L5 SM=128:4: t0=14.379, t1=14.287, t2=13.999, t3=13.542, t4=13.185, t5=13.142, t6=12.856, t7=12.722 | max_across_ranks=14.491
+L6	hybrid_br_pbs	128:4	12.943710	4315.305	539.413	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=12.834, t1=12.922, t2=12.490, t3=12.094, t4=11.902, t5=12.068, t6=12.458, t7=11.918 | max_across_ranks=12.944
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	21.889995	2551.670	318.959	skip	16	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=2561.776, Avg/GPU=320.222
+rank_time L1 SM=124:8: t0=20.350, t1=20.686, t2=20.756, t3=21.014, t4=21.033, t5=21.597, t6=21.837, t7=21.753 | max_across_ranks=21.890
+L2	step_fused_reduce	124:8	16.872038	3310.570	413.821	skip	8	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3323.681, Avg/GPU=415.460
+rank_time L2 SM=124:8: t0=15.706, t1=16.239, t2=16.381, t3=16.578, t4=16.234, t5=16.706, t6=16.749, t7=16.765 | max_across_ranks=16.872
+L3	linear_queue_no_recycle	124:8	15.893778	3514.334	439.292	skip	1	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3528.253, Avg/GPU=441.032
+rank_time L3 SM=124:8: t0=13.114, t1=13.666, t2=14.145, t3=14.528, t4=14.577, t5=15.099, t6=15.373, t7=15.815 | max_across_ranks=15.894
+L4	linear_queue_recycle	124:8	15.498427	3603.982	450.498	skip	1	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3618.256, Avg/GPU=452.282
+rank_time L4 SM=124:8: t0=13.124, t1=13.626, t2=13.979, t3=14.297, t4=14.285, t5=14.863, t6=15.124, t7=15.402 | max_across_ranks=15.498
+L5	dynamic_segment_recycle	124:8	14.057616	3973.366	496.671	skip	1	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3989.103, Avg/GPU=498.638
+rank_time L5 SM=124:8: t0=13.763, t1=13.993, t2=13.790, t3=13.865, t4=13.374, t5=13.417, t6=13.228, t7=12.632 | max_across_ranks=14.058
+L6	hybrid_br_pbs	124:8	12.869726	4340.112	542.514	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=12.640, t1=12.859, t2=12.606, t3=12.095, t4=11.944, t5=12.040, t6=12.429, t7=11.983 | max_across_ranks=12.870
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	22.200331	2516.001	314.500	skip	16	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=2525.966, Avg/GPU=315.746
+rank_time L1 SM=120:12: t0=20.682, t1=21.036, t2=21.074, t3=21.344, t4=21.354, t5=21.875, t6=22.068, t7=22.035 | max_across_ranks=22.200
+L2	step_fused_reduce	120:12	17.137721	3259.246	407.406	skip	8	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3272.155, Avg/GPU=409.019
+rank_time L2 SM=120:12: t0=16.131, t1=16.553, t2=16.602, t3=16.676, t4=16.587, t5=16.863, t6=17.030, t7=17.075 | max_across_ranks=17.138
+L3	linear_queue_no_recycle	120:12	16.202066	3447.465	430.933	skip	1	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3461.119, Avg/GPU=432.640
+rank_time L3 SM=120:12: t0=13.514, t1=14.052, t2=14.417, t3=14.740, t4=14.868, t5=15.449, t6=15.834, t7=16.130 | max_across_ranks=16.202
+L4	linear_queue_recycle	120:12	15.506621	3602.078	450.260	skip	1	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3616.344, Avg/GPU=452.043
+rank_time L4 SM=120:12: t0=13.155, t1=13.606, t2=14.107, t3=14.269, t4=14.392, t5=14.897, t6=15.221, t7=15.344 | max_across_ranks=15.507
+L5	dynamic_segment_recycle	120:12	14.065907	3971.024	496.378	skip	1	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3986.751, Avg/GPU=498.344
+rank_time L5 SM=120:12: t0=13.440, t1=13.988, t2=13.809, t3=13.880, t4=13.534, t5=13.431, t6=13.304, t7=12.689 | max_across_ranks=14.066
+L6	hybrid_br_pbs	120:12	12.975711	4304.662	538.083	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=12.760, t1=12.964, t2=12.480, t3=12.030, t4=11.953, t5=11.974, t6=12.441, t7=11.964 | max_across_ranks=12.976
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	22.483330	2484.332	310.541	skip	16	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=2494.171, Avg/GPU=311.771
+rank_time L1 SM=116:16: t0=20.894, t1=21.265, t2=21.324, t3=21.550, t4=21.654, t5=22.207, t6=22.362, t7=22.360 | max_across_ranks=22.483
+L2	step_fused_reduce	116:16	17.495128	3192.663	399.083	skip	8	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3205.308, Avg/GPU=400.664
+rank_time L2 SM=116:16: t0=16.317, t1=16.713, t2=16.754, t3=16.904, t4=16.856, t5=17.339, t6=17.414, t7=17.365 | max_across_ranks=17.495
+L3	linear_queue_no_recycle	116:16	16.573910	3370.119	421.265	skip	1	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3383.467, Avg/GPU=422.933
+rank_time L3 SM=116:16: t0=13.838, t1=14.445, t2=14.775, t3=15.143, t4=15.313, t5=16.031, t6=16.248, t7=16.439 | max_across_ranks=16.574
+L4	linear_queue_recycle	116:16	15.415121	3623.459	452.932	skip	1	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3637.810, Avg/GPU=454.726
+rank_time L4 SM=116:16: t0=13.227, t1=13.917, t2=14.229, t3=14.525, t4=14.613, t5=15.178, t6=15.284, t7=15.336 | max_across_ranks=15.415
+L5	dynamic_segment_recycle	116:16	14.112551	3957.899	494.737	skip	1	all-CP G8; tokens(original/aligned)=262656/266240, padding=3584 tokens; aligned-length Agg TFLOPS=3973.575, Avg/GPU=496.697
+rank_time L5 SM=116:16: t0=13.384, t1=14.029, t2=14.030, t3=13.790, t4=13.556, t5=13.631, t6=13.389, t7=12.674 | max_across_ranks=14.113
+L6	hybrid_br_pbs	116:16	12.947458	4314.056	539.257	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=12.846, t1=12.934, t2=12.575, t3=11.998, t4=11.953, t5=12.089, t6=12.461, t7=11.953 | max_across_ranks=12.947
+
+Forward ablation case 10/20: dataset=arxiv, B=13, raw_tokens=263424, QH=32, KVH=8, D=128, raw_lengths=(5120, 768, 7168, 8192, 94208, 45056, 6144, 18432, 6144, 16384, 6144, 2560, 47104)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=263424, global_seqlens=(94208, 45056, 18432, 47104, 16384, 6144, 6144, 6144, 5120, 768, 8192, 7168, 2560), rings=(8, 4, 4, 4, 2, 1, 1, 1, 1, 1, 1, 1, 1), starts=(0, 0, 0, 4, 4, 0, 1, 2, 3, 6, 6, 7, 7)
+All-CP L1-L5: alignment=2048, execution_tokens=268288, global_seqlens=(94208, 45056, 18432, 47104, 16384, 6144, 6144, 6144, 6144, 2048, 8192, 8192, 4096)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	34.088523	3363.818	420.477	skip	16	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=3373.694, Avg/GPU=421.712
+rank_time L1 SM=128:4: t0=33.119, t1=33.585, t2=33.620, t3=33.575, t4=33.179, t5=33.437, t6=33.235, t7=33.058 | max_across_ranks=34.089
+L2	step_fused_reduce	128:4	29.857058	3840.552	480.069	skip	8	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=3851.828, Avg/GPU=481.478
+rank_time L2 SM=128:4: t0=29.132, t1=29.446, t2=29.395, t3=28.869, t4=28.382, t5=28.815, t6=28.679, t7=28.060 | max_across_ranks=29.857
+L3	linear_queue_no_recycle	128:4	26.973846	4251.065	531.383	skip	1	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=4263.546, Avg/GPU=532.943
+rank_time L3 SM=128:4: t0=24.757, t1=25.602, t2=25.740, t3=25.753, t4=25.837, t5=26.552, t6=26.822, t7=26.738 | max_across_ranks=26.974
+L4	linear_queue_recycle	128:4	26.844426	4271.560	533.945	skip	1	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=4284.101, Avg/GPU=535.513
+rank_time L4 SM=128:4: t0=24.795, t1=25.607, t2=25.857, t3=25.759, t4=25.788, t5=26.575, t6=26.801, t7=26.685 | max_across_ranks=26.844
+L5	dynamic_segment_recycle	128:4	25.929995	4422.198	552.775	skip	1	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=4435.182, Avg/GPU=554.398
+rank_time L5 SM=128:4: t0=25.602, t1=25.781, t2=25.641, t3=25.494, t4=24.876, t5=25.504, t6=25.652, t7=24.719 | max_across_ranks=25.930
+L6	hybrid_br_pbs	128:4	25.566409	4485.088	560.636	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=23.964, t1=24.287, t2=24.223, t3=23.671, t4=25.113, t5=25.566, t6=23.874, t7=23.313 | max_across_ranks=25.566
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	33.496108	3423.311	427.914	skip	16	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=3433.361, Avg/GPU=429.170
+rank_time L1 SM=124:8: t0=31.584, t1=32.565, t2=32.513, t3=32.526, t4=32.303, t5=33.091, t6=33.233, t7=33.104 | max_across_ranks=33.496
+L2	step_fused_reduce	124:8	28.686727	3997.235	499.654	skip	8	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=4008.970, Avg/GPU=501.121
+rank_time L2 SM=124:8: t0=27.785, t1=28.268, t2=28.163, t3=28.068, t4=27.869, t5=28.534, t6=28.532, t7=28.115 | max_across_ranks=28.687
+L3	linear_queue_no_recycle	124:8	27.522830	4166.272	520.784	skip	1	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=4178.504, Avg/GPU=522.313
+rank_time L3 SM=124:8: t0=25.378, t1=26.132, t2=26.298, t3=26.370, t4=26.394, t5=27.255, t6=27.388, t7=27.402 | max_across_ranks=27.523
+L4	linear_queue_recycle	124:8	26.885487	4265.037	533.130	skip	1	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=4277.558, Avg/GPU=534.695
+rank_time L4 SM=124:8: t0=24.883, t1=25.724, t2=25.820, t3=25.921, t4=25.861, t5=26.591, t6=26.775, t7=26.739 | max_across_ranks=26.885
+L5	dynamic_segment_recycle	124:8	26.063304	4399.580	549.947	skip	1	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=4412.497, Avg/GPU=551.562
+rank_time L5 SM=124:8: t0=24.914, t1=25.928, t2=25.771, t3=25.365, t4=25.210, t5=25.559, t6=25.094, t7=24.557 | max_across_ranks=26.063
+L6	hybrid_br_pbs	124:8	25.645357	4471.281	558.910	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=23.954, t1=24.290, t2=24.162, t3=23.763, t4=25.163, t5=25.600, t6=23.995, t7=23.253 | max_across_ranks=25.645
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	33.892878	3383.235	422.904	skip	16	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=3393.168, Avg/GPU=424.146
+rank_time L1 SM=120:12: t0=32.425, t1=32.882, t2=33.013, t3=33.012, t4=33.026, t5=33.626, t6=33.723, t7=33.361 | max_across_ranks=33.893
+L2	step_fused_reduce	120:12	29.161095	3932.211	491.526	skip	8	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=3943.756, Avg/GPU=492.969
+rank_time L2 SM=120:12: t0=28.350, t1=28.816, t2=28.819, t3=28.530, t4=28.505, t5=28.919, t6=28.966, t7=28.680 | max_across_ranks=29.161
+L3	linear_queue_no_recycle	120:12	28.180063	4069.103	508.638	skip	1	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=4081.050, Avg/GPU=510.131
+rank_time L3 SM=120:12: t0=25.866, t1=26.611, t2=26.859, t3=27.009, t4=27.029, t5=27.752, t6=28.173, t7=27.882 | max_across_ranks=28.180
+L4	linear_queue_recycle	120:12	26.964521	4252.536	531.567	skip	1	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=4265.021, Avg/GPU=533.128
+rank_time L4 SM=120:12: t0=24.967, t1=25.719, t2=25.986, t3=26.100, t4=26.032, t5=26.759, t6=26.940, t7=26.742 | max_across_ranks=26.965
+L5	dynamic_segment_recycle	120:12	25.950431	4418.716	552.340	skip	1	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=4431.689, Avg/GPU=553.961
+rank_time L5 SM=120:12: t0=25.005, t1=25.663, t2=25.579, t3=25.718, t4=25.517, t5=25.812, t6=25.234, t7=24.776 | max_across_ranks=25.950
+L6	hybrid_br_pbs	120:12	25.657603	4469.146	558.643	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=24.127, t1=24.393, t2=24.255, t3=23.818, t4=25.228, t5=25.653, t6=24.026, t7=23.278 | max_across_ranks=25.658
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	34.471669	3326.430	415.804	skip	16	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=3336.196, Avg/GPU=417.024
+rank_time L1 SM=116:16: t0=32.929, t1=33.555, t2=33.591, t3=33.384, t4=33.395, t5=34.268, t6=34.267, t7=33.956 | max_across_ranks=34.472
+L2	step_fused_reduce	116:16	29.879875	3837.619	479.702	skip	8	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=3848.886, Avg/GPU=481.111
+rank_time L2 SM=116:16: t0=28.831, t1=29.235, t2=29.380, t3=29.070, t4=28.804, t5=29.828, t6=29.621, t7=29.242 | max_across_ranks=29.880
+L3	linear_queue_no_recycle	116:16	28.968542	3958.348	494.794	skip	1	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=3969.970, Avg/GPU=496.246
+rank_time L3 SM=116:16: t0=26.588, t1=27.151, t2=27.422, t3=27.467, t4=27.407, t5=28.969, t6=28.665, t7=28.482 | max_across_ranks=28.969
+L4	linear_queue_recycle	116:16	27.020610	4243.708	530.464	skip	1	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=4256.167, Avg/GPU=532.021
+rank_time L4 SM=116:16: t0=25.005, t1=25.866, t2=25.979, t3=26.160, t4=25.925, t5=26.644, t6=26.906, t7=26.578 | max_across_ranks=27.021
+L5	dynamic_segment_recycle	116:16	26.130717	4388.230	548.529	skip	1	all-CP G8; tokens(original/aligned)=263424/268288, padding=4864 tokens; aligned-length Agg TFLOPS=4401.113, Avg/GPU=550.139
+rank_time L5 SM=116:16: t0=25.009, t1=25.824, t2=25.665, t3=25.770, t4=25.755, t5=25.806, t6=25.323, t7=24.657 | max_across_ranks=26.131
+L6	hybrid_br_pbs	116:16	25.762442	4450.959	556.370	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=24.041, t1=24.340, t2=24.251, t3=23.773, t4=25.289, t5=25.643, t6=23.994, t7=23.314 | max_across_ranks=25.762
+
+Forward ablation case 11/20: dataset=arxiv, B=22, raw_tokens=262144, QH=32, KVH=8, D=128, raw_lengths=(512, 10240, 8192, 7168, 24576, 10240, 4096, 512, 34816, 20480, 6144, 12288, 5120, 10240, 5120, 14336, 16384, 20480, 8192, 4096, 28672, 10240)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=262144, global_seqlens=(34816, 20480, 16384, 28672, 24576, 20480, 10240, 6144, 10240, 5120, 10240, 5120, 4096, 10240, 14336, 4096, 7168, 12288, 512, 8192, 512, 8192), rings=(4, 4, 4, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1), starts=(0, 0, 0, 4, 6, 6, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7)
+All-CP L1-L5: alignment=2048, execution_tokens=268288, global_seqlens=(34816, 20480, 16384, 28672, 24576, 20480, 10240, 6144, 10240, 6144, 10240, 6144, 4096, 10240, 14336, 4096, 8192, 12288, 2048, 8192, 2048, 8192)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	20.046297	1974.443	246.805	skip	16	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=1993.514, Avg/GPU=249.189
+rank_time L1 SM=128:4: t0=19.805, t1=19.911, t2=19.857, t3=19.953, t4=19.950, t5=19.932, t6=19.935, t7=20.046 | max_across_ranks=20.046
+L2	step_fused_reduce	128:4	14.738066	2685.581	335.698	skip	8	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=2711.521, Avg/GPU=338.940
+rank_time L2 SM=128:4: t0=14.733, t1=14.704, t2=14.500, t3=14.419, t4=14.334, t5=14.251, t6=14.093, t7=14.060 | max_across_ranks=14.738
+L3	linear_queue_no_recycle	128:4	12.589652	3143.873	392.984	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3174.240, Avg/GPU=396.780
+rank_time L3 SM=128:4: t0=9.776, t1=10.313, t2=10.767, t3=11.015, t4=11.174, t5=12.044, t6=12.378, t7=12.458 | max_across_ranks=12.590
+L4	linear_queue_recycle	128:4	12.323011	3211.899	401.487	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3242.923, Avg/GPU=405.365
+rank_time L4 SM=128:4: t0=10.057, t1=10.551, t2=10.710, t3=11.079, t4=11.351, t5=11.837, t6=12.099, t7=12.317 | max_across_ranks=12.323
+L5	dynamic_segment_recycle	128:4	11.878214	3332.174	416.522	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3364.359, Avg/GPU=420.545
+rank_time L5 SM=128:4: t0=11.857, t1=11.556, t2=10.991, t3=10.443, t4=10.188, t5=10.061, t6=10.016, t7=9.518 | max_across_ranks=11.878
+L6	hybrid_br_pbs	128:4	8.948181	4423.276	552.909	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=8.937, t1=8.768, t2=8.602, t3=8.455, t4=8.649, t5=8.367, t6=8.320, t7=7.915 | max_across_ranks=8.948
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	19.491063	2030.688	253.836	skip	16	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=2050.302, Avg/GPU=256.288
+rank_time L1 SM=124:8: t0=17.779, t1=18.159, t2=18.329, t3=18.578, t4=18.809, t5=19.021, t6=19.277, t7=19.491 | max_across_ranks=19.491
+L2	step_fused_reduce	124:8	13.878758	2851.860	356.482	skip	8	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=2879.406, Avg/GPU=359.926
+rank_time L2 SM=124:8: t0=12.861, t1=13.044, t2=13.059, t3=13.211, t4=13.272, t5=13.747, t6=13.827, t7=13.659 | max_across_ranks=13.879
+L3	linear_queue_no_recycle	124:8	12.853846	3079.255	384.907	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3108.997, Avg/GPU=388.625
+rank_time L3 SM=124:8: t0=10.052, t1=10.575, t2=11.004, t3=11.245, t4=11.600, t5=12.087, t6=12.543, t7=12.825 | max_across_ranks=12.854
+L4	linear_queue_recycle	124:8	12.549497	3153.933	394.242	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3184.397, Avg/GPU=398.050
+rank_time L4 SM=124:8: t0=10.118, t1=10.502, t2=10.861, t3=11.165, t4=11.344, t5=12.052, t6=12.208, t7=12.492 | max_across_ranks=12.549
+L5	dynamic_segment_recycle	124:8	11.138470	3553.475	444.184	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3587.798, Avg/GPU=448.475
+rank_time L5 SM=124:8: t0=10.464, t1=10.927, t2=10.921, t3=10.576, t4=10.332, t5=10.266, t6=9.928, t7=9.328 | max_across_ranks=11.138
+L6	hybrid_br_pbs	124:8	8.977742	4408.711	551.089	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=8.936, t1=8.792, t2=8.599, t3=8.458, t4=8.685, t5=8.412, t6=8.324, t7=8.193 | max_across_ranks=8.978
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	19.695326	2009.628	251.203	skip	16	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=2029.038, Avg/GPU=253.630
+rank_time L1 SM=120:12: t0=18.088, t1=18.415, t2=18.564, t3=18.807, t4=19.056, t5=19.230, t6=19.505, t7=19.695 | max_across_ranks=19.695
+L2	step_fused_reduce	120:12	14.042482	2818.609	352.326	skip	8	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=2845.834, Avg/GPU=355.729
+rank_time L2 SM=120:12: t0=13.023, t1=13.264, t2=13.295, t3=13.443, t4=13.561, t5=13.887, t6=13.953, t7=13.865 | max_across_ranks=14.042
+L3	linear_queue_no_recycle	120:12	13.104318	3020.399	377.550	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3049.573, Avg/GPU=381.197
+rank_time L3 SM=120:12: t0=10.341, t1=10.889, t2=11.156, t3=11.597, t4=11.844, t5=12.393, t6=12.757, t7=13.071 | max_across_ranks=13.104
+L4	linear_queue_recycle	120:12	12.570369	3148.696	393.587	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3179.109, Avg/GPU=397.389
+rank_time L4 SM=120:12: t0=10.059, t1=10.664, t2=10.940, t3=11.356, t4=11.479, t5=12.138, t6=12.369, t7=12.499 | max_across_ranks=12.570
+L5	dynamic_segment_recycle	120:12	11.054898	3580.338	447.542	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3614.920, Avg/GPU=451.865
+rank_time L5 SM=120:12: t0=10.575, t1=11.022, t2=10.792, t3=10.843, t4=10.414, t5=10.286, t6=9.889, t7=9.394 | max_across_ranks=11.055
+L6	hybrid_br_pbs	120:12	8.998045	4398.763	549.845	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=8.997, t1=8.890, t2=8.846, t3=8.508, t4=8.718, t5=8.615, t6=8.468, t7=8.205 | max_across_ranks=8.998
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	20.002294	1978.787	247.348	skip	16	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=1997.900, Avg/GPU=249.737
+rank_time L1 SM=116:16: t0=18.313, t1=18.590, t2=18.813, t3=19.065, t4=19.340, t5=19.506, t6=19.801, t7=20.002 | max_across_ranks=20.002
+L2	step_fused_reduce	116:16	14.257070	2776.185	347.023	skip	8	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=2803.000, Avg/GPU=350.375
+rank_time L2 SM=116:16: t0=13.278, t1=13.500, t2=13.577, t3=13.669, t4=13.850, t5=14.147, t6=14.238, t7=14.088 | max_across_ranks=14.257
+L3	linear_queue_no_recycle	116:16	13.433501	2946.385	368.298	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=2974.844, Avg/GPU=371.856
+rank_time L3 SM=116:16: t0=10.499, t1=11.049, t2=11.461, t3=11.745, t4=12.098, t5=12.605, t6=13.008, t7=13.400 | max_across_ranks=13.434
+L4	linear_queue_recycle	116:16	12.568012	3149.287	393.661	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3179.705, Avg/GPU=397.463
+rank_time L4 SM=116:16: t0=10.251, t1=10.733, t2=11.121, t3=11.364, t4=11.503, t5=12.249, t6=12.352, t7=12.547 | max_across_ranks=12.568
+L5	dynamic_segment_recycle	116:16	11.048198	3582.509	447.814	skip	1	all-CP G8; tokens(original/aligned)=262144/268288, padding=6144 tokens; aligned-length Agg TFLOPS=3617.112, Avg/GPU=452.139
+rank_time L5 SM=116:16: t0=10.628, t1=10.900, t2=10.915, t3=10.859, t4=10.538, t5=10.365, t6=10.017, t7=9.412 | max_across_ranks=11.048
+L6	hybrid_br_pbs	116:16	9.014285	4390.839	548.855	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=8.967, t1=8.914, t2=8.908, t3=8.465, t4=8.653, t5=8.527, t6=8.395, t7=8.256 | max_across_ranks=9.014
+
+Forward ablation case 12/20: dataset=arxiv, B=16, raw_tokens=262656, QH=32, KVH=8, D=128, raw_lengths=(2560, 63488, 6144, 18432, 10240, 12288, 16384, 24576, 43008, 8192, 10240, 4096, 8192, 8192, 14336, 12288)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=262656, global_seqlens=(63488, 43008, 18432, 24576, 16384, 14336, 8192, 6144, 8192, 8192, 12288, 12288, 10240, 4096, 2560, 10240), rings=(8, 8, 4, 4, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1), starts=(0, 0, 0, 4, 0, 2, 0, 1, 2, 3, 4, 5, 6, 6, 7, 7)
+All-CP L1-L5: alignment=2048, execution_tokens=264192, global_seqlens=(63488, 43008, 18432, 24576, 16384, 14336, 8192, 6144, 8192, 8192, 12288, 12288, 10240, 4096, 4096, 10240)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	24.254942	2726.439	340.805	skip	16	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=2729.892, Avg/GPU=341.237
+rank_time L1 SM=128:4: t0=24.002, t1=24.099, t2=23.933, t3=23.951, t4=23.744, t5=24.092, t6=23.920, t7=23.821 | max_across_ranks=24.255
+L2	step_fused_reduce	128:4	19.807999	3338.531	417.316	skip	8	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3342.760, Avg/GPU=417.845
+rank_time L2 SM=128:4: t0=19.424, t1=19.557, t2=19.594, t3=19.379, t4=19.027, t5=19.420, t6=19.106, t7=18.215 | max_across_ranks=19.808
+L3	linear_queue_no_recycle	128:4	17.331656	3815.539	476.942	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3820.372, Avg/GPU=477.547
+rank_time L3 SM=128:4: t0=15.035, t1=15.574, t2=15.813, t3=16.140, t4=16.263, t5=16.838, t6=17.199, t7=17.235 | max_across_ranks=17.332
+L4	linear_queue_recycle	128:4	17.232630	3837.465	479.683	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3842.326, Avg/GPU=480.291
+rank_time L4 SM=128:4: t0=15.103, t1=15.628, t2=15.896, t3=16.019, t4=16.138, t5=16.661, t6=17.116, t7=17.109 | max_across_ranks=17.233
+L5	dynamic_segment_recycle	128:4	16.189383	4084.752	510.594	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=4089.926, Avg/GPU=511.241
+rank_time L5 SM=128:4: t0=16.020, t1=16.142, t2=15.775, t3=15.640, t4=15.115, t5=15.164, t6=15.215, t7=14.725 | max_across_ranks=16.189
+L6	hybrid_br_pbs	128:4	14.959486	4420.581	552.573	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=14.531, t1=14.254, t2=14.099, t3=13.940, t4=14.552, t5=14.921, t6=14.257, t7=13.904 | max_across_ranks=14.959
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	23.757219	2783.559	347.945	skip	16	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=2787.085, Avg/GPU=348.386
+rank_time L1 SM=124:8: t0=22.023, t1=22.427, t2=22.662, t3=22.653, t4=22.732, t5=23.414, t6=23.617, t7=23.691 | max_across_ranks=23.757
+L2	step_fused_reduce	124:8	18.878841	3502.843	437.855	skip	8	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3507.280, Avg/GPU=438.410
+rank_time L2 SM=124:8: t0=17.736, t1=18.227, t2=18.234, t3=18.252, t4=18.145, t5=18.693, t6=18.723, t7=18.485 | max_across_ranks=18.879
+L3	linear_queue_no_recycle	124:8	17.815434	3711.928	463.991	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3716.630, Avg/GPU=464.579
+rank_time L3 SM=124:8: t0=15.412, t1=15.974, t2=16.245, t3=16.404, t4=16.547, t5=17.224, t6=17.613, t7=17.720 | max_across_ranks=17.815
+L4	linear_queue_recycle	124:8	17.244223	3834.885	479.361	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3839.743, Avg/GPU=479.968
+rank_time L4 SM=124:8: t0=15.082, t1=15.770, t2=16.109, t3=16.294, t4=16.235, t5=16.942, t6=17.179, t7=17.170 | max_across_ranks=17.244
+L5	dynamic_segment_recycle	124:8	15.933107	4150.453	518.807	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=4155.710, Avg/GPU=519.464
+rank_time L5 SM=124:8: t0=15.365, t1=15.802, t2=15.768, t3=15.731, t4=15.407, t5=15.399, t6=15.202, t7=14.763 | max_across_ranks=15.933
+L6	hybrid_br_pbs	124:8	14.913166	4434.311	554.289	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=14.636, t1=14.300, t2=14.130, t3=13.978, t4=14.637, t5=14.912, t6=14.366, t7=13.818 | max_across_ranks=14.913
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	23.998108	2755.618	344.452	skip	16	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=2759.108, Avg/GPU=344.889
+rank_time L1 SM=120:12: t0=22.437, t1=22.784, t2=23.005, t3=23.062, t4=23.187, t5=23.803, t6=23.912, t7=23.880 | max_across_ranks=23.998
+L2	step_fused_reduce	120:12	19.161912	3451.097	431.387	skip	8	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3455.468, Avg/GPU=431.934
+rank_time L2 SM=120:12: t0=18.264, t1=18.583, t2=18.560, t3=18.454, t4=18.463, t5=18.923, t6=19.019, t7=18.876 | max_across_ranks=19.162
+L3	linear_queue_no_recycle	120:12	18.097027	3654.170	456.771	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3658.799, Avg/GPU=457.350
+rank_time L3 SM=120:12: t0=15.709, t1=16.271, t2=16.578, t3=16.759, t4=16.938, t5=17.535, t6=17.976, t7=18.044 | max_across_ranks=18.097
+L4	linear_queue_recycle	120:12	17.295892	3823.429	477.929	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3828.272, Avg/GPU=478.534
+rank_time L4 SM=120:12: t0=15.192, t1=15.817, t2=16.034, t3=16.405, t4=16.406, t5=17.039, t6=17.263, t7=17.160 | max_across_ranks=17.296
+L5	dynamic_segment_recycle	120:12	15.875120	4165.614	520.702	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=4170.890, Avg/GPU=521.361
+rank_time L5 SM=120:12: t0=15.470, t1=15.697, t2=15.672, t3=15.808, t4=15.506, t5=15.542, t6=15.221, t7=14.860 | max_across_ranks=15.875
+L6	hybrid_br_pbs	120:12	14.938195	4426.881	553.360	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=14.504, t1=14.189, t2=14.235, t3=14.173, t4=14.818, t5=14.916, t6=14.342, t7=13.846 | max_across_ranks=14.938
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	24.348044	2716.013	339.502	skip	16	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=2719.454, Avg/GPU=339.932
+rank_time L1 SM=116:16: t0=22.632, t1=23.031, t2=23.345, t3=23.319, t4=23.492, t5=24.121, t6=24.242, t7=24.288 | max_across_ranks=24.348
+L2	step_fused_reduce	116:16	19.518125	3388.113	423.514	skip	8	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3392.405, Avg/GPU=424.051
+rank_time L2 SM=116:16: t0=18.379, t1=18.883, t2=18.920, t3=18.894, t4=19.026, t5=19.242, t6=19.227, t7=19.009 | max_across_ranks=19.518
+L3	linear_queue_no_recycle	116:16	18.545368	3565.829	445.729	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3570.346, Avg/GPU=446.293
+rank_time L3 SM=116:16: t0=15.901, t1=16.798, t2=17.043, t3=17.153, t4=17.346, t5=17.999, t6=18.340, t7=18.476 | max_across_ranks=18.545
+L4	linear_queue_recycle	116:16	17.346800	3812.208	476.526	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=3817.037, Avg/GPU=477.130
+rank_time L4 SM=116:16: t0=15.296, t1=15.989, t2=16.230, t3=16.371, t4=16.423, t5=17.249, t6=17.249, t7=17.210 | max_across_ranks=17.347
+L5	dynamic_segment_recycle	116:16	16.038146	4123.270	515.409	skip	1	all-CP G8; tokens(original/aligned)=262656/264192, padding=1536 tokens; aligned-length Agg TFLOPS=4128.493, Avg/GPU=516.062
+rank_time L5 SM=116:16: t0=15.379, t1=15.960, t2=15.800, t3=15.817, t4=15.489, t5=15.625, t6=15.228, t7=14.826 | max_across_ranks=16.038
+L6	hybrid_br_pbs	116:16	14.942967	4425.467	553.183	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=14.639, t1=14.215, t2=14.198, t3=14.102, t4=14.729, t5=14.932, t6=14.284, t7=13.909 | max_across_ranks=14.943
+
+Forward ablation case 13/20: dataset=arxiv, B=13, raw_tokens=262144, QH=32, KVH=8, D=128, raw_lengths=(12288, 6144, 63488, 22528, 8192, 512, 24576, 18432, 43008, 28672, 14336, 16384, 3584)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=262144, global_seqlens=(63488, 43008, 12288, 18432, 28672, 8192, 22528, 16384, 24576, 14336, 6144, 512, 3584), rings=(8, 8, 4, 4, 4, 2, 2, 2, 2, 2, 1, 1, 1), starts=(0, 0, 0, 0, 0, 0, 4, 4, 6, 6, 2, 3, 3)
+All-CP L1-L5: alignment=2048, execution_tokens=264192, global_seqlens=(63488, 43008, 12288, 18432, 28672, 8192, 22528, 16384, 24576, 14336, 6144, 2048, 4096)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	25.655755	2840.823	355.103	skip	16	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=2843.334, Avg/GPU=355.417
+rank_time L1 SM=128:4: t0=25.051, t1=25.231, t2=24.998, t3=25.114, t4=24.853, t5=25.257, t6=25.038, t7=24.820 | max_across_ranks=25.656
+L2	step_fused_reduce	128:4	21.157169	3444.858	430.607	skip	8	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3447.904, Avg/GPU=430.988
+rank_time L2 SM=128:4: t0=20.631, t1=20.870, t2=20.738, t3=20.766, t4=20.230, t5=20.596, t6=20.240, t7=19.779 | max_across_ranks=21.157
+L3	linear_queue_no_recycle	128:4	18.625323	3913.137	489.142	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3916.597, Avg/GPU=489.575
+rank_time L3 SM=128:4: t0=16.219, t1=16.849, t2=17.069, t3=17.475, t4=17.412, t5=18.224, t6=18.457, t7=18.453 | max_across_ranks=18.625
+L4	linear_queue_recycle	128:4	18.447435	3950.872	493.859	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3954.365, Avg/GPU=494.296
+rank_time L4 SM=128:4: t0=16.250, t1=16.996, t2=17.258, t3=17.443, t4=17.402, t5=18.098, t6=18.336, t7=18.336 | max_across_ranks=18.447
+L5	dynamic_segment_recycle	128:4	17.398222	4189.132	523.641	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4192.836, Avg/GPU=524.104
+rank_time L5 SM=128:4: t0=17.240, t1=17.208, t2=17.074, t3=16.731, t4=16.379, t5=16.805, t6=16.501, t7=16.069 | max_across_ranks=17.398
+L6	hybrid_br_pbs	128:4	16.638232	4380.480	547.560	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=15.782, t1=15.925, t2=15.685, t3=14.985, t4=15.895, t5=15.986, t6=16.632, t7=16.344 | max_across_ranks=16.638
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	24.980096	2917.661	364.708	skip	16	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=2920.241, Avg/GPU=365.030
+rank_time L1 SM=124:8: t0=23.205, t1=23.637, t2=23.928, t3=24.075, t4=24.007, t5=24.692, t6=24.826, t7=24.678 | max_across_ranks=24.980
+L2	step_fused_reduce	124:8	20.220279	3604.473	450.559	skip	8	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3607.660, Avg/GPU=450.957
+rank_time L2 SM=124:8: t0=18.860, t1=19.302, t2=19.481, t3=19.582, t4=19.439, t5=20.069, t6=20.033, t7=19.682 | max_across_ranks=20.220
+L3	linear_queue_no_recycle	124:8	19.046502	3826.605	478.326	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3829.989, Avg/GPU=478.749
+rank_time L3 SM=124:8: t0=16.427, t1=17.384, t2=17.514, t3=17.719, t4=17.801, t5=18.654, t6=18.961, t7=18.947 | max_across_ranks=19.047
+L4	linear_queue_recycle	124:8	18.475964	3944.771	493.096	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3948.259, Avg/GPU=493.532
+rank_time L4 SM=124:8: t0=16.380, t1=17.143, t2=17.284, t3=17.449, t4=17.447, t5=18.231, t6=18.447, t7=18.368 | max_across_ranks=18.476
+L5	dynamic_segment_recycle	124:8	17.237126	4228.283	528.535	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4232.021, Avg/GPU=529.003
+rank_time L5 SM=124:8: t0=16.713, t1=17.161, t2=17.089, t3=16.819, t4=16.606, t5=16.748, t6=16.479, t7=16.081 | max_across_ranks=17.237
+L6	hybrid_br_pbs	124:8	16.757921	4349.194	543.649	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=15.536, t1=15.839, t2=15.692, t3=15.167, t4=15.968, t5=16.072, t6=16.758, t7=16.241 | max_across_ranks=16.758
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	25.248329	2886.664	360.833	skip	16	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=2889.217, Avg/GPU=361.152
+rank_time L1 SM=120:12: t0=23.679, t1=24.078, t2=24.363, t3=24.492, t4=24.432, t5=24.935, t6=25.129, t7=24.825 | max_across_ranks=25.248
+L2	step_fused_reduce	120:12	20.626109	3533.553	441.694	skip	8	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3536.677, Avg/GPU=442.085
+rank_time L2 SM=120:12: t0=19.335, t1=19.827, t2=19.948, t3=19.787, t4=19.913, t5=20.291, t6=20.372, t7=20.055 | max_across_ranks=20.626
+L3	linear_queue_no_recycle	120:12	19.591874	3720.085	465.011	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3723.375, Avg/GPU=465.422
+rank_time L3 SM=120:12: t0=17.246, t1=17.316, t2=17.533, t3=17.869, t4=18.106, t5=18.867, t6=19.395, t7=19.256 | max_across_ranks=19.592
+L4	linear_queue_recycle	120:12	18.692218	3899.133	487.392	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3902.581, Avg/GPU=487.823
+rank_time L4 SM=120:12: t0=16.378, t1=17.156, t2=17.367, t3=17.586, t4=17.652, t5=18.295, t6=18.577, t7=18.612 | max_across_ranks=18.692
+L5	dynamic_segment_recycle	120:12	17.183665	4241.438	530.180	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4245.188, Avg/GPU=530.649
+rank_time L5 SM=120:12: t0=16.622, t1=17.096, t2=17.002, t3=16.981, t4=16.707, t5=16.888, t6=16.566, t7=16.198 | max_across_ranks=17.184
+L6	hybrid_br_pbs	120:12	16.753978	4350.218	543.777	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=15.489, t1=15.961, t2=15.870, t3=15.243, t4=16.086, t5=16.198, t6=16.754, t7=16.228 | max_across_ranks=16.754
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	25.837142	2820.879	352.610	skip	16	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=2823.373, Avg/GPU=352.922
+rank_time L1 SM=116:16: t0=23.936, t1=24.338, t2=24.591, t3=24.510, t4=24.818, t5=25.350, t6=25.372, t7=25.639 | max_across_ranks=25.837
+L2	step_fused_reduce	116:16	20.933497	3481.666	435.208	skip	8	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3484.745, Avg/GPU=435.593
+rank_time L2 SM=116:16: t0=19.724, t1=20.139, t2=20.323, t3=20.276, t4=20.172, t5=20.688, t6=20.800, t7=20.569 | max_across_ranks=20.933
+L3	linear_queue_no_recycle	116:16	19.948126	3653.649	456.706	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3656.879, Avg/GPU=457.110
+rank_time L3 SM=116:16: t0=17.737, t1=17.969, t2=18.397, t3=18.344, t4=18.536, t5=19.534, t6=19.871, t7=19.773 | max_across_ranks=19.948
+L4	linear_queue_recycle	116:16	18.620411	3914.170	489.271	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3917.630, Avg/GPU=489.704
+rank_time L4 SM=116:16: t0=16.601, t1=17.192, t2=17.593, t3=17.638, t4=17.803, t5=18.417, t6=18.575, t7=18.440 | max_across_ranks=18.620
+L5	dynamic_segment_recycle	116:16	17.344254	4202.167	525.271	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4205.882, Avg/GPU=525.735
+rank_time L5 SM=116:16: t0=16.507, t1=17.257, t2=17.097, t3=17.195, t4=16.696, t5=16.800, t6=16.696, t7=16.125 | max_across_ranks=17.344
+L6	hybrid_br_pbs	116:16	16.801199	4337.991	542.249	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=15.690, t1=15.869, t2=15.812, t3=15.182, t4=16.070, t5=16.240, t6=16.801, t7=16.302 | max_across_ranks=16.801
+
+Forward ablation case 14/20: dataset=arxiv, B=15, raw_tokens=262400, QH=32, KVH=8, D=128, raw_lengths=(12288, 7168, 38912, 256, 22528, 5120, 14336, 3072, 34816, 12288, 7168, 10240, 24576, 16384, 53248)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=262400, global_seqlens=(12288, 38912, 34816, 12288, 53248, 14336, 24576, 22528, 10240, 16384, 7168, 7168, 5120, 3072, 256), rings=(8, 8, 8, 8, 8, 4, 4, 4, 4, 4, 2, 2, 2, 1, 1), starts=(0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 0, 2, 4, 6, 7)
+All-CP L1-L5: alignment=2048, execution_tokens=268288, global_seqlens=(12288, 38912, 34816, 12288, 53248, 14336, 24576, 22528, 10240, 16384, 8192, 8192, 6144, 4096, 2048)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	23.968147	2629.258	328.657	skip	16	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=2647.874, Avg/GPU=330.984
+rank_time L1 SM=128:4: t0=23.617, t1=23.773, t2=23.518, t3=23.612, t4=23.432, t5=23.611, t6=23.516, t7=23.689 | max_across_ranks=23.968
+L2	step_fused_reduce	128:4	19.415575	3245.768	405.721	skip	8	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3268.749, Avg/GPU=408.594
+rank_time L2 SM=128:4: t0=19.072, t1=19.009, t2=19.098, t3=18.829, t4=18.691, t5=18.641, t6=18.571, t7=18.176 | max_across_ranks=19.416
+L3	linear_queue_no_recycle	128:4	16.962315	3715.203	464.400	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3741.508, Avg/GPU=467.688
+rank_time L3 SM=128:4: t0=14.259, t1=15.017, t2=15.410, t3=15.572, t4=15.686, t5=16.333, t6=16.692, t7=16.848 | max_across_ranks=16.962
+L4	linear_queue_recycle	128:4	16.776790	3756.288	469.536	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3782.883, Avg/GPU=472.860
+rank_time L4 SM=128:4: t0=14.652, t1=15.088, t2=15.392, t3=15.641, t4=15.773, t5=16.402, t6=16.626, t7=16.713 | max_across_ranks=16.777
+L5	dynamic_segment_recycle	128:4	15.902106	3962.900	495.362	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3990.958, Avg/GPU=498.870
+rank_time L5 SM=128:4: t0=15.806, t1=15.658, t2=15.190, t3=14.847, t4=14.546, t5=14.522, t6=14.572, t7=14.099 | max_across_ranks=15.902
+L6	hybrid_br_pbs	128:4	14.896543	4230.407	528.801	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=14.652, t1=14.858, t2=14.712, t3=14.212, t4=14.458, t5=14.734, t6=14.305, t7=13.761 | max_across_ranks=14.897
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	23.464014	2685.749	335.719	skip	16	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=2704.765, Avg/GPU=338.096
+rank_time L1 SM=124:8: t0=21.648, t1=22.050, t2=22.248, t3=22.306, t4=22.512, t5=23.089, t6=23.357, t7=23.351 | max_across_ranks=23.464
+L2	step_fused_reduce	124:8	18.404837	3424.016	428.002	skip	8	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3448.259, Avg/GPU=431.032
+rank_time L2 SM=124:8: t0=17.248, t1=17.948, t2=17.776, t3=17.877, t4=17.791, t5=18.213, t6=18.277, t7=18.037 | max_across_ranks=18.405
+L3	linear_queue_no_recycle	124:8	17.335016	3635.327	454.416	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3661.066, Avg/GPU=457.633
+rank_time L3 SM=124:8: t0=14.775, t1=15.417, t2=15.634, t3=15.974, t4=16.094, t5=16.799, t6=17.212, t7=17.276 | max_across_ranks=17.335
+L4	linear_queue_recycle	124:8	16.891429	3730.794	466.349	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3757.209, Avg/GPU=469.651
+rank_time L4 SM=124:8: t0=14.617, t1=15.249, t2=15.539, t3=15.756, t4=15.796, t5=16.373, t6=16.778, t7=16.725 | max_across_ranks=16.891
+L5	dynamic_segment_recycle	124:8	15.391439	4094.383	511.798	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=4123.372, Avg/GPU=515.422
+rank_time L5 SM=124:8: t0=14.969, t1=15.176, t2=15.342, t3=15.143, t4=14.820, t5=14.864, t6=14.645, t7=14.311 | max_across_ranks=15.391
+L6	hybrid_br_pbs	124:8	14.678827	4293.153	536.644	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=14.174, t1=14.488, t2=14.535, t3=14.317, t4=14.591, t5=14.539, t6=14.348, t7=13.878 | max_across_ranks=14.679
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	23.703651	2658.597	332.325	skip	16	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=2677.420, Avg/GPU=334.678
+rank_time L1 SM=120:12: t0=22.005, t1=22.403, t2=22.586, t3=22.603, t4=22.797, t5=23.448, t6=23.637, t7=23.544 | max_across_ranks=23.704
+L2	step_fused_reduce	120:12	18.681689	3373.274	421.659	skip	8	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3397.157, Avg/GPU=424.645
+rank_time L2 SM=120:12: t0=17.674, t1=18.009, t2=18.102, t3=18.080, t4=18.201, t5=18.568, t6=18.399, t7=18.460 | max_across_ranks=18.682
+L3	linear_queue_no_recycle	120:12	17.729552	3554.430	444.304	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3579.596, Avg/GPU=447.450
+rank_time L3 SM=120:12: t0=15.079, t1=15.723, t2=15.978, t3=16.270, t4=16.525, t5=17.122, t6=17.493, t7=17.652 | max_across_ranks=17.730
+L4	linear_queue_recycle	120:12	16.943802	3719.262	464.908	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3745.596, Avg/GPU=468.199
+rank_time L4 SM=120:12: t0=14.633, t1=15.325, t2=15.555, t3=15.883, t4=15.957, t5=16.632, t6=16.822, t7=16.829 | max_across_ranks=16.944
+L5	dynamic_segment_recycle	120:12	15.451373	4078.501	509.813	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=4107.378, Avg/GPU=513.422
+rank_time L5 SM=120:12: t0=14.911, t1=15.287, t2=15.235, t3=15.390, t4=14.888, t5=15.054, t6=14.789, t7=14.197 | max_across_ranks=15.451
+L6	hybrid_br_pbs	120:12	14.764699	4268.184	533.523	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=14.154, t1=14.491, t2=14.553, t3=14.449, t4=14.693, t5=14.653, t6=14.427, t7=13.799 | max_across_ranks=14.765
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	24.041498	2621.236	327.655	skip	16	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=2639.795, Avg/GPU=329.974
+rank_time L1 SM=116:16: t0=22.271, t1=22.640, t2=22.781, t3=22.947, t4=23.114, t5=23.849, t6=23.958, t7=23.869 | max_across_ranks=24.041
+L2	step_fused_reduce	116:16	19.067142	3305.081	413.135	skip	8	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3328.482, Avg/GPU=416.060
+rank_time L2 SM=116:16: t0=17.879, t1=18.247, t2=18.369, t3=18.569, t4=18.373, t5=18.845, t6=18.994, t7=18.742 | max_across_ranks=19.067
+L3	linear_queue_no_recycle	116:16	18.075581	3486.386	435.798	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3511.070, Avg/GPU=438.884
+rank_time L3 SM=116:16: t0=15.354, t1=16.182, t2=16.414, t3=16.675, t4=16.967, t5=17.637, t6=17.850, t7=18.059 | max_across_ranks=18.076
+L4	linear_queue_recycle	116:16	16.918654	3724.791	465.599	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=3751.163, Avg/GPU=468.895
+rank_time L4 SM=116:16: t0=14.840, t1=15.364, t2=15.723, t3=15.948, t4=16.182, t5=16.806, t6=16.718, t7=16.783 | max_across_ranks=16.919
+L5	dynamic_segment_recycle	116:16	15.468233	4074.056	509.257	skip	1	all-CP G8; tokens(original/aligned)=262400/268288, padding=5888 tokens; aligned-length Agg TFLOPS=4102.901, Avg/GPU=512.863
+rank_time L5 SM=116:16: t0=14.814, t1=15.219, t2=15.384, t3=15.395, t4=15.198, t5=15.270, t6=14.872, t7=14.280 | max_across_ranks=15.468
+L6	hybrid_br_pbs	116:16	14.774925	4265.230	533.154	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=14.214, t1=14.510, t2=14.540, t3=14.526, t4=14.666, t5=14.736, t6=14.449, t7=13.855 | max_across_ranks=14.775
+
+Forward ablation case 15/20: dataset=arxiv, B=15, raw_tokens=262400, QH=32, KVH=8, D=128, raw_lengths=(12288, 16384, 55296, 7168, 14336, 18432, 20480, 5120, 256, 61440, 10240, 14336, 8192, 10240, 8192)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=262400, global_seqlens=(55296, 61440, 20480, 18432, 10240, 14336, 16384, 10240, 8192, 8192, 7168, 5120, 12288, 256, 14336), rings=(8, 8, 4, 4, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1), starts=(0, 0, 0, 4, 0, 2, 6, 6, 0, 1, 2, 3, 4, 4, 5)
+All-CP L1-L5: alignment=2048, execution_tokens=266240, global_seqlens=(55296, 61440, 20480, 18432, 10240, 14336, 16384, 10240, 8192, 8192, 8192, 6144, 12288, 2048, 14336)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	25.623447	2827.496	353.437	skip	16	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=2837.533, Avg/GPU=354.692
+rank_time L1 SM=128:4: t0=25.073, t1=25.309, t2=25.163, t3=25.119, t4=24.982, t5=25.482, t6=25.188, t7=25.083 | max_across_ranks=25.623
+L2	step_fused_reduce	128:4	21.228246	3412.915	426.614	skip	8	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=3425.030, Avg/GPU=428.129
+rank_time L2 SM=128:4: t0=20.856, t1=21.012, t2=20.874, t3=20.751, t4=20.373, t5=20.590, t6=20.374, t7=20.025 | max_across_ranks=21.228
+L3	linear_queue_no_recycle	128:4	18.762564	3861.423	482.678	skip	1	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=3875.131, Avg/GPU=484.391
+rank_time L3 SM=128:4: t0=16.177, t1=16.893, t2=17.271, t3=17.346, t4=17.485, t5=18.217, t6=18.626, t7=18.652 | max_across_ranks=18.763
+L4	linear_queue_recycle	128:4	18.529341	3910.025	488.753	skip	1	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=3923.906, Avg/GPU=490.488
+rank_time L4 SM=128:4: t0=16.303, t1=17.142, t2=17.278, t3=17.431, t4=17.478, t5=18.183, t6=18.377, t7=18.456 | max_across_ranks=18.529
+L5	dynamic_segment_recycle	128:4	17.459772	4149.550	518.694	skip	1	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=4164.280, Avg/GPU=520.535
+rank_time L5 SM=128:4: t0=17.258, t1=17.390, t2=16.925, t3=16.746, t4=16.360, t5=16.636, t6=16.369, t7=16.088 | max_across_ranks=17.460
+L6	hybrid_br_pbs	128:4	16.473252	4398.051	549.756	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=14.888, t1=15.193, t2=16.125, t3=15.235, t4=14.767, t5=16.213, t6=16.460, t7=16.182 | max_across_ranks=16.473
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	25.100779	2886.372	360.797	skip	16	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=2896.619, Avg/GPU=362.077
+rank_time L1 SM=124:8: t0=23.162, t1=23.686, t2=24.006, t3=24.026, t4=24.074, t5=24.777, t6=24.966, t7=24.914 | max_across_ranks=25.101
+L2	step_fused_reduce	124:8	20.221757	3582.784	447.848	skip	8	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=3595.503, Avg/GPU=449.438
+rank_time L2 SM=124:8: t0=19.018, t1=19.633, t2=19.644, t3=19.741, t4=19.374, t5=20.013, t6=20.109, t7=19.914 | max_across_ranks=20.222
+L3	linear_queue_no_recycle	124:8	19.139759	3785.324	473.166	skip	1	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=3798.762, Avg/GPU=474.845
+rank_time L3 SM=124:8: t0=16.426, t1=17.293, t2=17.727, t3=17.740, t4=17.809, t5=18.509, t6=18.939, t7=19.019 | max_across_ranks=19.140
+L4	linear_queue_recycle	124:8	18.670993	3880.361	485.045	skip	1	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=3894.136, Avg/GPU=486.767
+rank_time L4 SM=124:8: t0=16.318, t1=17.026, t2=17.296, t3=17.502, t4=17.543, t5=18.171, t6=18.558, t7=18.594 | max_across_ranks=18.671
+L5	dynamic_segment_recycle	124:8	17.189454	4214.805	526.851	skip	1	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=4229.767, Avg/GPU=528.721
+rank_time L5 SM=124:8: t0=16.450, t1=17.038, t2=17.064, t3=16.852, t4=16.696, t5=16.842, t6=16.748, t7=16.178 | max_across_ranks=17.189
+L6	hybrid_br_pbs	124:8	16.502714	4390.199	548.775	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=14.815, t1=15.151, t2=16.018, t3=15.354, t4=14.859, t5=16.174, t6=16.502, t7=16.111 | max_across_ranks=16.503
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	25.488854	2842.427	355.303	skip	16	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=2852.517, Avg/GPU=356.565
+rank_time L1 SM=120:12: t0=23.583, t1=24.024, t2=24.378, t3=24.310, t4=24.417, t5=25.078, t6=25.257, t7=25.254 | max_across_ranks=25.489
+L2	step_fused_reduce	120:12	20.530624	3528.884	441.111	skip	8	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=3541.411, Avg/GPU=442.676
+rank_time L2 SM=120:12: t0=19.542, t1=19.877, t2=19.886, t3=19.843, t4=19.726, t5=20.416, t6=20.381, t7=20.292 | max_across_ranks=20.531
+L3	linear_queue_no_recycle	120:12	19.591061	3698.125	462.266	skip	1	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=3711.253, Avg/GPU=463.907
+rank_time L3 SM=120:12: t0=16.569, t1=17.695, t2=18.117, t3=18.104, t4=18.224, t5=19.019, t6=19.528, t7=19.398 | max_across_ranks=19.591
+L4	linear_queue_recycle	120:12	18.703888	3873.537	484.192	skip	1	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=3887.287, Avg/GPU=485.911
+rank_time L4 SM=120:12: t0=16.251, t1=17.073, t2=17.498, t3=17.605, t4=17.634, t5=18.341, t6=18.675, t7=18.503 | max_across_ranks=18.704
+L5	dynamic_segment_recycle	120:12	17.269215	4195.338	524.417	skip	1	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=4210.231, Avg/GPU=526.279
+rank_time L5 SM=120:12: t0=16.415, t1=17.139, t2=17.004, t3=17.172, t4=16.577, t5=16.757, t6=16.856, t7=16.186 | max_across_ranks=17.269
+L6	hybrid_br_pbs	120:12	16.532820	4382.204	547.776	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=14.928, t1=15.282, t2=16.068, t3=15.379, t4=15.040, t5=16.282, t6=16.515, t7=16.128 | max_across_ranks=16.533
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	25.885334	2798.890	349.861	skip	16	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=2808.826, Avg/GPU=351.103
+rank_time L1 SM=116:16: t0=23.926, t1=24.405, t2=24.723, t3=24.787, t4=24.889, t5=25.604, t6=25.542, t7=25.597 | max_across_ranks=25.885
+L2	step_fused_reduce	116:16	21.093752	3434.676	429.334	skip	8	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=3446.868, Avg/GPU=430.859
+rank_time L2 SM=116:16: t0=19.643, t1=20.188, t2=20.354, t3=20.387, t4=20.350, t5=20.942, t6=20.839, t7=20.678 | max_across_ranks=21.094
+L3	linear_queue_no_recycle	116:16	20.047259	3613.970	451.746	skip	1	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=3626.799, Avg/GPU=453.350
+rank_time L3 SM=116:16: t0=16.993, t1=18.079, t2=18.453, t3=18.543, t4=18.632, t5=19.696, t6=19.902, t7=19.876 | max_across_ranks=20.047
+L4	linear_queue_recycle	116:16	18.721657	3869.860	483.733	skip	1	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=3883.598, Avg/GPU=485.450
+rank_time L4 SM=116:16: t0=16.472, t1=17.058, t2=17.440, t3=17.641, t4=17.697, t5=18.401, t6=18.628, t7=18.555 | max_across_ranks=18.722
+L5	dynamic_segment_recycle	116:16	17.324374	4181.980	522.748	skip	1	all-CP G8; tokens(original/aligned)=262400/266240, padding=3840 tokens; aligned-length Agg TFLOPS=4196.826, Avg/GPU=524.603
+rank_time L5 SM=116:16: t0=16.660, t1=17.089, t2=16.996, t3=17.259, t4=16.664, t5=16.844, t6=16.835, t7=16.217 | max_across_ranks=17.324
+L6	hybrid_br_pbs	116:16	16.571201	4372.055	546.507	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=15.115, t1=15.266, t2=16.151, t3=15.445, t4=14.967, t5=16.409, t6=16.542, t7=16.183 | max_across_ranks=16.571
+
+Forward ablation case 16/20: dataset=arxiv, B=15, raw_tokens=262144, QH=32, KVH=8, D=128, raw_lengths=(22528, 16384, 43008, 20480, 1536, 18432, 43008, 20480, 3584, 8192, 22528, 5120, 12288, 8192, 16384)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=262144, global_seqlens=(22528, 43008, 43008, 22528, 20480, 12288, 20480, 18432, 16384, 16384, 5120, 1536, 3584, 8192, 8192), rings=(4, 4, 4, 4, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1), starts=(0, 0, 4, 4, 2, 2, 4, 6, 0, 1, 4, 5, 5, 6, 7)
+All-CP L1-L5: alignment=2048, execution_tokens=264192, global_seqlens=(22528, 43008, 43008, 22528, 20480, 12288, 20480, 18432, 16384, 16384, 6144, 2048, 4096, 8192, 8192)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	22.179546	2495.605	311.951	skip	16	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=2501.996, Avg/GPU=312.750
+rank_time L1 SM=128:4: t0=22.095, t1=22.179, t2=22.018, t3=22.066, t4=21.884, t5=21.902, t6=21.803, t7=21.916 | max_across_ranks=22.180
+L2	step_fused_reduce	128:4	17.568427	3150.617	393.827	skip	8	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3158.686, Avg/GPU=394.836
+rank_time L2 SM=128:4: t0=17.160, t1=17.355, t2=17.373, t3=17.194, t4=16.979, t5=17.117, t6=16.895, t7=16.635 | max_across_ranks=17.568
+L3	linear_queue_no_recycle	128:4	15.192118	3643.428	455.429	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3652.759, Avg/GPU=456.595
+rank_time L3 SM=128:4: t0=12.859, t1=13.326, t2=13.533, t3=13.827, t4=14.012, t5=14.769, t6=15.056, t7=15.181 | max_across_ranks=15.192
+L4	linear_queue_recycle	128:4	15.077338	3671.165	458.896	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3680.566, Avg/GPU=460.071
+rank_time L4 SM=128:4: t0=12.945, t1=13.464, t2=13.676, t3=13.902, t4=13.980, t5=14.671, t6=14.912, t7=15.041 | max_across_ranks=15.077
+L5	dynamic_segment_recycle	128:4	14.303910	3869.668	483.709	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3879.578, Avg/GPU=484.947
+rank_time L5 SM=128:4: t0=14.268, t1=14.184, t2=13.703, t3=13.333, t4=13.005, t5=12.927, t6=12.865, t7=12.576 | max_across_ranks=14.304
+L6	hybrid_br_pbs	128:4	12.836572	4312.007	539.001	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=11.713, t1=11.784, t2=12.821, t3=12.756, t4=11.609, t5=11.435, t6=11.633, t7=11.512 | max_across_ranks=12.837
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	21.619958	2560.199	320.025	skip	16	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=2566.755, Avg/GPU=320.844
+rank_time L1 SM=124:8: t0=20.086, t1=20.441, t2=20.500, t3=20.693, t4=20.732, t5=21.438, t6=21.508, t7=21.529 | max_across_ranks=21.620
+L2	step_fused_reduce	124:8	16.640657	3326.274	415.784	skip	8	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3334.793, Avg/GPU=416.849
+rank_time L2 SM=124:8: t0=15.684, t1=16.067, t2=16.189, t3=16.272, t4=16.114, t5=16.592, t6=16.542, t7=16.505 | max_across_ranks=16.641
+L3	linear_queue_no_recycle	124:8	15.541433	3561.537	445.192	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3570.658, Avg/GPU=446.332
+rank_time L3 SM=124:8: t0=13.115, t1=13.696, t2=14.044, t3=14.226, t4=14.429, t5=15.032, t6=15.371, t7=15.535 | max_across_ranks=15.541
+L4	linear_queue_recycle	124:8	15.090590	3667.941	458.493	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3677.334, Avg/GPU=459.667
+rank_time L4 SM=124:8: t0=12.984, t1=13.431, t2=13.841, t3=14.043, t4=14.202, t5=14.751, t6=15.010, t7=15.036 | max_across_ranks=15.091
+L5	dynamic_segment_recycle	124:8	13.829814	4002.324	500.290	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4012.573, Avg/GPU=501.572
+rank_time L5 SM=124:8: t0=13.454, t1=13.765, t2=13.725, t3=13.614, t4=13.254, t5=13.380, t6=12.879, t7=12.589 | max_across_ranks=13.830
+L6	hybrid_br_pbs	124:8	12.846226	4308.767	538.596	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=11.732, t1=11.843, t2=12.843, t3=12.608, t4=11.577, t5=11.470, t6=11.695, t7=11.475 | max_across_ranks=12.846
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	21.863566	2531.673	316.459	skip	16	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=2538.156, Avg/GPU=317.270
+rank_time L1 SM=120:12: t0=20.439, t1=20.759, t2=20.813, t3=20.992, t4=21.072, t5=21.698, t6=21.814, t7=21.671 | max_across_ranks=21.864
+L2	step_fused_reduce	120:12	16.934255	3268.605	408.576	skip	8	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3276.976, Avg/GPU=409.622
+rank_time L2 SM=120:12: t0=15.851, t1=16.405, t2=16.460, t3=16.563, t4=16.422, t5=16.894, t6=16.875, t7=16.742 | max_across_ranks=16.934
+L3	linear_queue_no_recycle	120:12	15.829748	3496.669	437.084	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3505.624, Avg/GPU=438.203
+rank_time L3 SM=120:12: t0=13.548, t1=13.962, t2=14.376, t3=14.566, t4=14.735, t5=15.369, t6=15.733, t7=15.796 | max_across_ranks=15.830
+L4	linear_queue_recycle	120:12	15.205975	3640.108	455.013	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3649.430, Avg/GPU=456.179
+rank_time L4 SM=120:12: t0=12.976, t1=13.527, t2=13.916, t3=14.069, t4=14.202, t5=14.814, t6=15.098, t7=15.102 | max_across_ranks=15.206
+L5	dynamic_segment_recycle	120:12	13.829454	4002.428	500.303	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4012.678, Avg/GPU=501.585
+rank_time L5 SM=120:12: t0=13.210, t1=13.789, t2=13.569, t3=13.614, t4=13.522, t5=13.375, t6=13.023, t7=12.615 | max_across_ranks=13.829
+L6	hybrid_br_pbs	120:12	12.827450	4315.073	539.384	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=11.766, t1=11.930, t2=12.811, t3=12.613, t4=11.613, t5=11.528, t6=11.703, t7=11.491 | max_across_ranks=12.827
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	22.139312	2500.140	312.518	skip	16	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=2506.543, Avg/GPU=313.318
+rank_time L1 SM=116:16: t0=20.668, t1=20.993, t2=21.110, t3=21.294, t4=21.462, t5=21.864, t6=22.088, t7=21.985 | max_across_ranks=22.139
+L2	step_fused_reduce	116:16	17.246906	3209.352	401.169	skip	8	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3217.571, Avg/GPU=402.196
+rank_time L2 SM=116:16: t0=16.215, t1=16.589, t2=16.753, t3=16.803, t4=16.766, t5=17.042, t6=17.174, t7=17.053 | max_across_ranks=17.247
+L3	linear_queue_no_recycle	116:16	16.233051	3409.796	426.224	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3418.528, Avg/GPU=427.316
+rank_time L3 SM=116:16: t0=13.733, t1=14.277, t2=14.623, t3=14.940, t4=15.136, t5=15.733, t6=15.878, t7=16.233 | max_across_ranks=16.233
+L4	linear_queue_recycle	116:16	15.261095	3626.961	453.370	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3636.249, Avg/GPU=454.531
+rank_time L4 SM=116:16: t0=13.010, t1=13.718, t2=14.061, t3=14.256, t4=14.245, t5=14.827, t6=15.068, t7=15.202 | max_across_ranks=15.261
+L5	dynamic_segment_recycle	116:16	13.871674	3990.246	498.781	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4000.465, Avg/GPU=500.058
+rank_time L5 SM=116:16: t0=13.395, t1=13.762, t2=13.679, t3=13.698, t4=13.472, t5=13.403, t6=13.116, t7=12.692 | max_across_ranks=13.872
+L6	hybrid_br_pbs	116:16	12.856006	4305.489	538.186	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=11.758, t1=11.891, t2=12.854, t3=12.569, t4=11.635, t5=11.493, t6=11.701, t7=11.442 | max_across_ranks=12.856
+
+Forward ablation case 17/20: dataset=arxiv, B=11, raw_tokens=262144, QH=32, KVH=8, D=128, raw_lengths=(30720, 26624, 38912, 81920, 256, 2560, 26624, 14336, 14336, 24576, 1280)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=262144, global_seqlens=(38912, 81920, 24576, 30720, 26624, 26624, 14336, 14336, 2560, 1280, 256), rings=(8, 8, 8, 4, 2, 2, 2, 2, 1, 1, 1), starts=(0, 0, 0, 4, 0, 2, 4, 6, 0, 1, 2)
+All-CP L1-L5: alignment=2048, execution_tokens=266240, global_seqlens=(38912, 81920, 24576, 30720, 26624, 26624, 14336, 14336, 4096, 2048, 2048)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	30.128527	3156.770	394.596	skip	16	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3161.368, Avg/GPU=395.171
+rank_time L1 SM=128:4: t0=29.198, t1=29.649, t2=29.642, t3=29.448, t4=29.187, t5=29.524, t6=29.535, t7=29.155 | max_across_ranks=30.129
+L2	step_fused_reduce	128:4	25.819078	3683.665	460.458	skip	8	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3689.031, Avg/GPU=461.129
+rank_time L2 SM=128:4: t0=25.328, t1=25.441, t2=25.393, t3=24.950, t4=24.684, t5=24.923, t6=24.617, t7=24.307 | max_across_ranks=25.819
+L3	linear_queue_no_recycle	128:4	22.945546	4144.980	518.123	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4151.018, Avg/GPU=518.877
+rank_time L3 SM=128:4: t0=20.689, t1=21.454, t2=21.622, t3=21.850, t4=21.893, t5=22.648, t6=22.727, t7=22.880 | max_across_ranks=22.946
+L4	linear_queue_recycle	128:4	22.784975	4174.191	521.774	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4180.271, Avg/GPU=522.534
+rank_time L4 SM=128:4: t0=20.810, t1=21.523, t2=21.805, t3=21.827, t4=21.810, t5=22.624, t6=22.712, t7=22.685 | max_across_ranks=22.785
+L5	dynamic_segment_recycle	128:4	22.053030	4312.733	539.092	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4319.015, Avg/GPU=539.877
+rank_time L5 SM=128:4: t0=21.376, t1=21.960, t2=21.950, t3=21.415, t4=20.804, t5=21.103, t6=21.120, t7=20.585 | max_across_ranks=22.053
+L6	hybrid_br_pbs	128:4	21.178026	4490.920	561.365	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=20.713, t1=20.922, t2=21.064, t3=20.610, t4=20.346, t5=20.735, t6=20.715, t7=20.265 | max_across_ranks=21.178
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	29.369537	3238.350	404.794	skip	16	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3243.067, Avg/GPU=405.383
+rank_time L1 SM=124:8: t0=27.811, t1=28.311, t2=28.588, t3=28.511, t4=28.383, t5=29.139, t6=29.059, t7=28.986 | max_across_ranks=29.370
+L2	step_fused_reduce	124:8	24.858495	3826.009	478.251	skip	8	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3831.583, Avg/GPU=478.948
+rank_time L2 SM=124:8: t0=23.666, t1=24.223, t2=24.147, t3=24.128, t4=23.789, t5=24.274, t6=24.411, t7=24.351 | max_across_ranks=24.858
+L3	linear_queue_no_recycle	124:8	23.475549	4051.400	506.425	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4057.301, Avg/GPU=507.163
+rank_time L3 SM=124:8: t0=21.109, t1=21.923, t2=22.178, t3=22.330, t4=22.244, t5=22.953, t6=23.341, t7=23.417 | max_across_ranks=23.476
+L4	linear_queue_recycle	124:8	22.823086	4167.220	520.903	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4173.291, Avg/GPU=521.661
+rank_time L4 SM=124:8: t0=20.780, t1=21.616, t2=21.877, t3=21.938, t4=22.012, t5=22.651, t6=22.779, t7=22.669 | max_across_ranks=22.823
+L5	dynamic_segment_recycle	124:8	21.789597	4364.873	545.609	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4371.232, Avg/GPU=546.404
+rank_time L5 SM=124:8: t0=21.371, t1=21.591, t2=21.549, t3=21.645, t4=20.956, t5=21.388, t6=21.167, t7=20.617 | max_across_ranks=21.790
+L6	hybrid_br_pbs	124:8	21.140822	4498.824	562.353	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=20.820, t1=21.071, t2=21.088, t3=20.806, t4=20.303, t5=20.686, t6=20.666, t7=20.345 | max_across_ranks=21.141
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	29.736733	3198.362	399.795	skip	16	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3203.021, Avg/GPU=400.378
+rank_time L1 SM=120:12: t0=28.191, t1=28.766, t2=28.979, t3=28.933, t4=28.889, t5=29.525, t6=29.460, t7=29.348 | max_across_ranks=29.737
+L2	step_fused_reduce	120:12	25.145631	3782.320	472.790	skip	8	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3787.830, Avg/GPU=473.479
+rank_time L2 SM=120:12: t0=24.161, t1=24.600, t2=24.502, t3=24.479, t4=24.266, t5=24.635, t6=24.707, t7=24.458 | max_across_ranks=25.146
+L3	linear_queue_no_recycle	120:12	23.961713	3969.200	496.150	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3974.982, Avg/GPU=496.873
+rank_time L3 SM=120:12: t0=21.686, t1=22.453, t2=22.583, t3=22.681, t4=22.677, t5=23.567, t6=23.875, t7=23.880 | max_across_ranks=23.962
+L4	linear_queue_recycle	120:12	22.861117	4160.288	520.036	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4166.348, Avg/GPU=520.794
+rank_time L4 SM=120:12: t0=20.818, t1=21.747, t2=21.902, t3=22.066, t4=21.988, t5=22.569, t6=22.831, t7=22.681 | max_across_ranks=22.861
+L5	dynamic_segment_recycle	120:12	21.848207	4353.164	544.146	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4359.505, Avg/GPU=544.938
+rank_time L5 SM=120:12: t0=21.309, t1=21.763, t2=21.703, t3=21.547, t4=21.118, t5=21.360, t6=21.136, t7=20.690 | max_across_ranks=21.848
+L6	hybrid_br_pbs	120:12	21.189599	4488.468	561.058	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=20.798, t1=21.089, t2=21.114, t3=20.831, t4=20.462, t5=20.788, t6=20.721, t7=20.324 | max_across_ranks=21.190
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	30.226108	3146.579	393.322	skip	16	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3151.162, Avg/GPU=393.895
+rank_time L1 SM=116:16: t0=28.676, t1=29.188, t2=29.371, t3=29.346, t4=29.318, t5=30.007, t6=29.939, t7=29.814 | max_across_ranks=30.226
+L2	step_fused_reduce	116:16	25.697307	3701.120	462.640	skip	8	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3706.512, Avg/GPU=463.314
+rank_time L2 SM=116:16: t0=24.624, t1=25.185, t2=25.029, t3=24.991, t4=24.724, t5=25.282, t6=25.413, t7=24.992 | max_across_ranks=25.697
+L3	linear_queue_no_recycle	116:16	24.533267	3876.729	484.591	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=3882.376, Avg/GPU=485.297
+rank_time L3 SM=116:16: t0=22.181, t1=22.979, t2=23.208, t3=23.155, t4=23.381, t5=23.995, t6=24.431, t7=24.353 | max_across_ranks=24.533
+L4	linear_queue_recycle	116:16	22.962018	4142.007	517.751	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4148.040, Avg/GPU=518.505
+rank_time L4 SM=116:16: t0=20.962, t1=21.744, t2=21.922, t3=22.137, t4=22.140, t5=22.750, t6=22.872, t7=22.711 | max_across_ranks=22.962
+L5	dynamic_segment_recycle	116:16	21.942742	4334.410	541.801	skip	1	all-CP G8; tokens(original/aligned)=262144/266240, padding=4096 tokens; aligned-length Agg TFLOPS=4340.724, Avg/GPU=542.590
+rank_time L5 SM=116:16: t0=21.301, t1=21.682, t2=21.864, t3=21.533, t4=21.203, t5=21.547, t6=21.148, t7=20.571 | max_across_ranks=21.943
+L6	hybrid_br_pbs	116:16	21.234703	4478.934	559.867	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=20.699, t1=21.108, t2=21.158, t3=20.901, t4=20.677, t5=20.929, t6=20.798, t7=20.323 | max_across_ranks=21.235
+
+Forward ablation case 18/20: dataset=arxiv, B=18, raw_tokens=263680, QH=32, KVH=8, D=128, raw_lengths=(20480, 8192, 36864, 5120, 7168, 512, 18432, 20480, 14336, 256, 10240, 512, 256, 32768, 6144, 10240, 6144, 65536)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=263680, global_seqlens=(65536, 36864, 18432, 32768, 14336, 6144, 20480, 5120, 10240, 20480, 10240, 8192, 512, 256, 512, 256, 7168, 6144), rings=(8, 4, 4, 4, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1), starts=(0, 0, 0, 4, 0, 0, 4, 4, 4, 6, 2, 3, 3, 3, 3, 3, 6, 7)
+All-CP L1-L5: alignment=2048, execution_tokens=272384, global_seqlens=(65536, 36864, 18432, 32768, 14336, 6144, 20480, 6144, 10240, 20480, 10240, 8192, 2048, 2048, 2048, 2048, 8192, 6144)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	25.409154	2754.170	344.271	skip	16	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=2768.160, Avg/GPU=346.020
+rank_time L1 SM=128:4: t0=25.034, t1=25.246, t2=24.982, t3=25.089, t4=24.841, t5=25.124, t6=25.082, t7=25.032 | max_across_ranks=25.409
+L2	step_fused_reduce	128:4	20.747196	3373.041	421.630	skip	8	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=3390.175, Avg/GPU=423.772
+rank_time L2 SM=128:4: t0=20.279, t1=20.584, t2=20.502, t3=20.495, t4=20.274, t5=20.160, t6=19.956, t7=19.764 | max_across_ranks=20.747
+L3	linear_queue_no_recycle	128:4	18.202191	3844.654	480.582	skip	1	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=3864.184, Avg/GPU=483.023
+rank_time L3 SM=128:4: t0=15.895, t1=16.382, t2=16.608, t3=17.101, t4=17.188, t5=17.634, t6=18.046, t7=18.161 | max_across_ranks=18.202
+L4	linear_queue_recycle	128:4	18.115045	3863.150	482.894	skip	1	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=3882.773, Avg/GPU=485.347
+rank_time L4 SM=128:4: t0=15.821, t1=16.471, t2=16.760, t3=17.070, t4=17.131, t5=17.661, t6=17.984, t7=18.081 | max_across_ranks=18.115
+L5	dynamic_segment_recycle	128:4	17.164894	4076.992	509.624	skip	1	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=4097.702, Avg/GPU=512.213
+rank_time L5 SM=128:4: t0=16.854, t1=17.005, t2=16.541, t3=16.400, t4=16.260, t5=15.963, t6=16.069, t7=15.501 | max_across_ranks=17.165
+L6	hybrid_br_pbs	128:4	15.843093	4417.139	552.142	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=15.563, t1=15.716, t2=14.839, t3=14.153, t4=15.797, t5=15.688, t6=15.175, t7=14.663 | max_across_ranks=15.843
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	24.882273	2812.490	351.561	skip	16	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=2826.776, Avg/GPU=353.347
+rank_time L1 SM=124:8: t0=23.115, t1=23.529, t2=23.800, t3=24.069, t4=24.051, t5=24.620, t6=24.762, t7=24.713 | max_across_ranks=24.882
+L2	step_fused_reduce	124:8	19.833740	3528.388	441.049	skip	8	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=3546.311, Avg/GPU=443.289
+rank_time L2 SM=124:8: t0=18.961, t1=19.149, t2=19.306, t3=19.420, t4=19.204, t5=19.569, t6=19.624, t7=19.474 | max_across_ranks=19.834
+L3	linear_queue_no_recycle	124:8	18.607451	3760.920	470.115	skip	1	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=3780.024, Avg/GPU=472.503
+rank_time L3 SM=124:8: t0=16.182, t1=16.766, t2=17.022, t3=17.360, t4=17.561, t5=18.161, t6=18.466, t7=18.484 | max_across_ranks=18.607
+L4	linear_queue_recycle	124:8	18.149836	3855.745	481.968	skip	1	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=3875.331, Avg/GPU=484.416
+rank_time L4 SM=124:8: t0=15.992, t1=16.528, t2=16.820, t3=17.197, t4=17.251, t5=17.834, t6=18.076, t7=18.028 | max_across_ranks=18.150
+L5	dynamic_segment_recycle	124:8	16.829954	4158.130	519.766	skip	1	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=4179.252, Avg/GPU=522.406
+rank_time L5 SM=124:8: t0=16.252, t1=16.693, t2=16.611, t3=16.782, t4=16.375, t5=16.200, t6=15.960, t7=15.604 | max_across_ranks=16.830
+L6	hybrid_br_pbs	124:8	15.809530	4426.516	553.314	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=15.407, t1=15.736, t2=14.951, t3=14.240, t4=15.717, t5=15.706, t6=15.252, t7=14.623 | max_across_ranks=15.810
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	25.245046	2772.074	346.509	skip	16	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=2786.155, Avg/GPU=348.269
+rank_time L1 SM=120:12: t0=23.361, t1=23.859, t2=23.984, t3=24.272, t4=24.260, t5=24.893, t6=25.010, t7=25.008 | max_across_ranks=25.245
+L2	step_fused_reduce	120:12	20.058305	3488.886	436.111	skip	8	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=3506.608, Avg/GPU=438.326
+rank_time L2 SM=120:12: t0=18.877, t1=19.401, t2=19.303, t3=19.757, t4=19.455, t5=19.895, t6=19.919, t7=19.697 | max_across_ranks=20.058
+L3	linear_queue_no_recycle	120:12	19.183520	3647.982	455.998	skip	1	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=3666.512, Avg/GPU=458.314
+rank_time L3 SM=120:12: t0=16.457, t1=17.013, t2=17.261, t3=17.752, t4=17.792, t5=18.449, t6=18.802, t7=18.998 | max_across_ranks=19.184
+L4	linear_queue_recycle	120:12	18.339317	3815.907	476.988	skip	1	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=3835.291, Avg/GPU=479.411
+rank_time L4 SM=120:12: t0=15.924, t1=16.416, t2=16.892, t3=17.227, t4=17.082, t5=17.815, t6=18.015, t7=18.171 | max_across_ranks=18.339
+L5	dynamic_segment_recycle	120:12	16.806441	4163.947	520.493	skip	1	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=4185.099, Avg/GPU=523.137
+rank_time L5 SM=120:12: t0=16.214, t1=16.581, t2=16.626, t3=16.700, t4=16.294, t5=16.484, t6=16.037, t7=15.667 | max_across_ranks=16.806
+L6	hybrid_br_pbs	120:12	15.839212	4418.221	552.278	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=15.524, t1=15.764, t2=15.070, t3=14.211, t4=15.636, t5=15.755, t6=15.306, t7=14.575 | max_across_ranks=15.839
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	25.634807	2729.926	341.241	skip	16	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=2743.793, Avg/GPU=342.974
+rank_time L1 SM=116:16: t0=23.682, t1=24.155, t2=24.360, t3=24.571, t4=24.548, t5=25.284, t6=25.376, t7=25.511 | max_across_ranks=25.635
+L2	step_fused_reduce	116:16	20.479737	3417.092	427.136	skip	8	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=3434.449, Avg/GPU=429.306
+rank_time L2 SM=116:16: t0=19.181, t1=19.785, t2=19.941, t3=20.035, t4=19.648, t5=20.249, t6=20.250, t7=20.201 | max_across_ranks=20.480
+L3	linear_queue_no_recycle	116:16	19.583884	3573.404	446.676	skip	1	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=3591.556, Avg/GPU=448.944
+rank_time L3 SM=116:16: t0=16.822, t1=17.432, t2=17.534, t3=18.225, t4=18.191, t5=18.921, t6=19.105, t7=19.502 | max_across_ranks=19.584
+L4	linear_queue_recycle	116:16	18.283723	3827.510	478.439	skip	1	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=3846.953, Avg/GPU=480.869
+rank_time L4 SM=116:16: t0=15.955, t1=16.735, t2=17.002, t3=17.375, t4=17.324, t5=17.909, t6=18.200, t7=18.225 | max_across_ranks=18.284
+L5	dynamic_segment_recycle	116:16	16.939714	4131.188	516.398	skip	1	all-CP G8; tokens(original/aligned)=263680/272384, padding=8704 tokens; aligned-length Agg TFLOPS=4152.173, Avg/GPU=519.022
+rank_time L5 SM=116:16: t0=16.120, t1=16.544, t2=16.886, t3=16.784, t4=16.382, t5=16.502, t6=16.130, t7=15.591 | max_across_ranks=16.940
+L6	hybrid_br_pbs	116:16	15.914339	4397.364	549.670	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=15.704, t1=15.738, t2=15.054, t3=14.206, t4=15.705, t5=15.789, t6=15.249, t7=14.631 | max_across_ranks=15.914
+
+Forward ablation case 19/20: dataset=arxiv, B=25, raw_tokens=262144, QH=32, KVH=8, D=128, raw_lengths=(10240, 14336, 12288, 8192, 6144, 24576, 18432, 5120, 512, 12288, 22528, 6144, 12288, 7168, 30720, 16384, 6144, 7168, 12288, 512, 3072, 2560, 10240, 12288, 512)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=262144, global_seqlens=(30720, 24576, 16384, 18432, 22528, 14336, 6144, 5120, 12288, 12288, 12288, 12288, 10240, 12288, 2560, 6144, 7168, 6144, 7168, 512, 512, 10240, 8192, 3072, 512), rings=(4, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1), starts=(0, 4, 4, 6, 6, 0, 0, 0, 1, 1, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 6, 6, 7, 7, 7)
+All-CP L1-L5: alignment=2048, execution_tokens=272384, global_seqlens=(30720, 24576, 16384, 18432, 22528, 14336, 6144, 6144, 12288, 12288, 12288, 12288, 10240, 12288, 4096, 6144, 8192, 6144, 8192, 2048, 2048, 10240, 8192, 4096, 2048)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	19.797873	1721.317	215.165	skip	16	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=1751.259, Avg/GPU=218.907
+rank_time L1 SM=128:4: t0=19.241, t1=19.363, t2=19.407, t3=19.504, t4=19.545, t5=19.581, t6=19.677, t7=19.798 | max_across_ranks=19.798
+L2	step_fused_reduce	128:4	14.103539	2416.303	302.038	skip	8	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=2458.334, Avg/GPU=307.292
+rank_time L2 SM=128:4: t0=14.097, t1=14.071, t2=13.993, t3=13.947, t4=13.865, t5=13.725, t6=13.686, t7=13.717 | max_across_ranks=14.104
+L3	linear_queue_no_recycle	128:4	11.510214	2960.711	370.089	skip	1	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=3012.212, Avg/GPU=376.527
+rank_time L3 SM=128:4: t0=8.918, t1=9.325, t2=9.575, t3=9.991, t4=10.208, t5=10.865, t6=11.062, t7=11.509 | max_across_ranks=11.510
+L4	linear_queue_recycle	128:4	11.713014	2909.449	363.681	skip	1	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=2960.058, Avg/GPU=370.007
+rank_time L4 SM=128:4: t0=8.947, t1=9.533, t2=10.011, t3=10.204, t4=10.311, t5=10.926, t6=11.289, t7=11.713 | max_across_ranks=11.713
+L5	dynamic_segment_recycle	128:4	11.160933	3053.366	381.671	skip	1	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=3106.479, Avg/GPU=388.310
+rank_time L5 SM=128:4: t0=11.161, t1=10.717, t2=10.045, t3=9.591, t4=9.184, t5=9.178, t6=8.995, t7=8.678 | max_across_ranks=11.161
+L6	hybrid_br_pbs	128:4	7.749625	4397.428	549.679	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=6.686, t1=7.482, t2=7.701, t3=6.697, t4=7.418, t5=7.440, t6=7.696, t7=6.967 | max_across_ranks=7.750
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	19.078691	1786.203	223.275	skip	16	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=1817.274, Avg/GPU=227.159
+rank_time L1 SM=124:8: t0=17.253, t1=17.576, t2=17.777, t3=18.099, t4=18.300, t5=18.489, t6=18.756, t7=19.079 | max_across_ranks=19.079
+L2	step_fused_reduce	124:8	13.008594	2619.685	327.461	skip	8	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=2665.254, Avg/GPU=333.157
+rank_time L2 SM=124:8: t0=12.145, t1=12.308, t2=12.403, t3=12.558, t4=12.669, t5=12.808, t6=12.917, t7=13.009 | max_across_ranks=13.009
+L3	linear_queue_no_recycle	124:8	11.862425	2872.804	359.100	skip	1	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=2922.776, Avg/GPU=365.347
+rank_time L3 SM=124:8: t0=9.145, t1=9.553, t2=9.954, t3=10.442, t4=10.495, t5=11.107, t6=11.634, t7=11.862 | max_across_ranks=11.862
+L4	linear_queue_recycle	124:8	11.546915	2951.301	368.913	skip	1	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=3002.638, Avg/GPU=375.330
+rank_time L4 SM=124:8: t0=9.182, t1=9.528, t2=9.901, t3=10.297, t4=10.590, t5=11.144, t6=11.296, t7=11.547 | max_across_ranks=11.547
+L5	dynamic_segment_recycle	124:8	10.248671	3325.155	415.644	skip	1	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=3382.995, Avg/GPU=422.874
+rank_time L5 SM=124:8: t0=9.915, t1=10.115, t2=10.082, t3=10.082, t4=9.482, t5=9.339, t6=9.027, t7=8.371 | max_across_ranks=10.249
+L6	hybrid_br_pbs	124:8	7.738195	4403.923	550.490	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=6.809, t1=7.416, t2=7.389, t3=6.606, t4=7.536, t5=7.530, t6=7.646, t7=7.043 | max_across_ranks=7.738
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	19.311290	1764.689	220.586	skip	16	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=1795.385, Avg/GPU=224.423
+rank_time L1 SM=120:12: t0=17.404, t1=17.745, t2=17.926, t3=18.258, t4=18.498, t5=18.678, t6=18.981, t7=19.311 | max_across_ranks=19.311
+L2	step_fused_reduce	120:12	13.244509	2573.022	321.628	skip	8	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=2617.780, Avg/GPU=327.222
+rank_time L2 SM=120:12: t0=12.283, t1=12.499, t2=12.575, t3=12.782, t4=12.856, t5=12.914, t6=13.082, t7=13.245 | max_across_ranks=13.245
+L3	linear_queue_no_recycle	120:12	12.118710	2812.050	351.506	skip	1	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=2860.965, Avg/GPU=357.621
+rank_time L3 SM=120:12: t0=9.412, t1=9.822, t2=10.140, t3=10.495, t4=10.786, t5=11.650, t6=11.968, t7=12.060 | max_across_ranks=12.119
+L4	linear_queue_recycle	120:12	11.615026	2933.994	366.749	skip	1	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=2985.031, Avg/GPU=373.129
+rank_time L4 SM=120:12: t0=9.067, t1=9.625, t2=10.073, t3=10.461, t4=10.602, t5=11.055, t6=11.364, t7=11.587 | max_across_ranks=11.615
+L5	dynamic_segment_recycle	120:12	10.310419	3305.241	413.155	skip	1	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=3362.735, Avg/GPU=420.342
+rank_time L5 SM=120:12: t0=9.620, t1=10.173, t2=10.017, t3=10.042, t4=9.580, t5=9.509, t6=9.171, t7=8.434 | max_across_ranks=10.310
+L6	hybrid_br_pbs	120:12	7.842158	4345.541	543.193	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=6.819, t1=7.562, t2=7.420, t3=6.501, t4=7.369, t5=7.381, t6=7.691, t7=7.067 | max_across_ranks=7.842
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	19.621963	1736.749	217.094	skip	16	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=1766.959, Avg/GPU=220.870
+rank_time L1 SM=116:16: t0=17.533, t1=17.948, t2=18.180, t3=18.481, t4=18.766, t5=18.974, t6=19.243, t7=19.622 | max_across_ranks=19.622
+L2	step_fused_reduce	116:16	13.617709	2502.507	312.813	skip	8	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=2546.038, Avg/GPU=318.255
+rank_time L2 SM=116:16: t0=12.512, t1=12.704, t2=12.816, t3=13.065, t4=13.149, t5=13.244, t6=13.420, t7=13.618 | max_across_ranks=13.618
+L3	linear_queue_no_recycle	116:16	12.308521	2768.685	346.086	skip	1	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=2816.846, Avg/GPU=352.106
+rank_time L3 SM=116:16: t0=9.702, t1=10.074, t2=10.387, t3=10.823, t4=11.114, t5=11.711, t6=12.240, t7=12.206 | max_across_ranks=12.309
+L4	linear_queue_recycle	116:16	11.619554	2932.851	366.606	skip	1	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=2983.867, Avg/GPU=372.983
+rank_time L4 SM=116:16: t0=9.063, t1=9.722, t2=10.244, t3=10.644, t4=10.796, t5=11.174, t6=11.343, t7=11.620 | max_across_ranks=11.620
+L5	dynamic_segment_recycle	116:16	10.288235	3312.368	414.046	skip	1	all-CP G8; tokens(original/aligned)=262144/272384, padding=10240 tokens; aligned-length Agg TFLOPS=3369.986, Avg/GPU=421.248
+rank_time L5 SM=116:16: t0=9.700, t1=10.156, t2=10.074, t3=10.074, t4=9.545, t5=9.472, t6=9.132, t7=8.310 | max_across_ranks=10.288
+L6	hybrid_br_pbs	116:16	7.977875	4271.616	533.952	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=6.647, t1=7.561, t2=7.391, t3=6.603, t4=7.388, t5=7.381, t6=7.777, t7=7.012 | max_across_ranks=7.978
+
+Forward ablation case 20/20: dataset=arxiv, B=9, raw_tokens=262144, QH=32, KVH=8, D=128, raw_lengths=(14336, 16384, 43008, 3072, 108544, 26624, 22528, 20480, 7168)
+BR-PBS workload: token_tolerance=0.05, execution_tokens=262144, global_seqlens=(43008, 108544, 20480, 16384, 22528, 14336, 26624, 7168, 3072), rings=(8, 8, 8, 4, 4, 4, 4, 4, 1), starts=(0, 0, 0, 0, 0, 4, 4, 4, 0)
+All-CP L1-L5: alignment=2048, execution_tokens=264192, global_seqlens=(43008, 108544, 20480, 16384, 22528, 14336, 26624, 8192, 4096)
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	128:4	37.004570	3498.283	437.285	skip	16	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3503.390, Avg/GPU=437.924
+rank_time L1 SM=128:4: t0=36.018, t1=36.116, t2=35.908, t3=36.039, t4=35.706, t5=35.884, t6=35.592, t7=35.714 | max_across_ranks=37.005
+L2	step_fused_reduce	128:4	32.867854	3938.574	492.322	skip	8	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3944.324, Avg/GPU=493.040
+rank_time L2 SM=128:4: t0=32.037, t1=32.441, t2=32.162, t3=32.106, t4=31.172, t5=31.728, t6=31.483, t7=30.917 | max_across_ranks=32.868
+L3	linear_queue_no_recycle	128:4	29.920460	4326.553	540.819	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4332.870, Avg/GPU=541.609
+rank_time L3 SM=128:4: t0=27.548, t1=28.200, t2=28.541, t3=28.515, t4=28.500, t5=29.078, t6=29.432, t7=29.841 | max_across_ranks=29.920
+L4	linear_queue_recycle	128:4	29.710773	4357.088	544.636	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4363.449, Avg/GPU=545.431
+rank_time L4 SM=128:4: t0=27.523, t1=28.370, t2=28.462, t3=28.543, t4=28.333, t5=29.103, t6=29.444, t7=29.535 | max_across_ranks=29.711
+L5	dynamic_segment_recycle	128:4	28.998486	4464.111	558.014	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4470.629, Avg/GPU=558.829
+rank_time L5 SM=128:4: t0=28.038, t1=28.975, t2=28.500, t3=28.421, t4=28.134, t5=28.247, t6=28.432, t7=27.712 | max_across_ranks=28.998
+L6	hybrid_br_pbs	128:4	28.566805	4531.570	566.446	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=128:4: t0=27.744, t1=28.140, t2=28.032, t3=27.225, t4=28.027, t5=28.453, t6=28.361, t7=27.832 | max_across_ranks=28.567
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	124:8	36.071207	3588.803	448.600	skip	16	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3594.043, Avg/GPU=449.255
+rank_time L1 SM=124:8: t0=34.582, t1=35.136, t2=35.126, t3=35.267, t4=35.006, t5=35.579, t6=35.856, t7=35.706 | max_across_ranks=36.071
+L2	step_fused_reduce	124:8	31.758739	4076.121	509.515	skip	8	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4082.072, Avg/GPU=510.259
+rank_time L2 SM=124:8: t0=30.569, t1=31.137, t2=31.269, t3=30.861, t4=30.574, t5=31.050, t6=31.210, t7=30.823 | max_across_ranks=31.759
+L3	linear_queue_no_recycle	124:8	30.418613	4255.699	531.962	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4261.912, Avg/GPU=532.739
+rank_time L3 SM=124:8: t0=28.103, t1=29.063, t2=29.415, t3=29.479, t4=29.282, t5=29.963, t6=30.342, t7=30.243 | max_across_ranks=30.419
+L4	linear_queue_recycle	124:8	29.608749	4372.102	546.513	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4378.485, Avg/GPU=547.311
+rank_time L4 SM=124:8: t0=27.570, t1=28.481, t2=28.826, t3=28.687, t4=28.625, t5=29.261, t6=29.553, t7=29.465 | max_across_ranks=29.609
+L5	dynamic_segment_recycle	124:8	28.953878	4470.989	558.874	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4477.516, Avg/GPU=559.690
+rank_time L5 SM=124:8: t0=28.436, t1=28.879, t2=28.716, t3=28.488, t4=28.189, t5=28.183, t6=28.055, t7=27.593 | max_across_ranks=28.954
+L6	hybrid_br_pbs	124:8	28.641502	4519.751	564.969	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=124:8: t0=27.363, t1=27.540, t2=27.518, t3=27.181, t4=28.091, t5=28.603, t6=28.278, t7=27.833 | max_across_ranks=28.642
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	120:12	36.533091	3543.430	442.929	skip	16	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3548.604, Avg/GPU=443.575
+rank_time L1 SM=120:12: t0=35.279, t1=35.754, t2=35.982, t3=35.947, t4=35.548, t5=36.228, t6=36.416, t7=36.127 | max_across_ranks=36.533
+L2	step_fused_reduce	120:12	32.303153	4007.425	500.928	skip	8	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4013.276, Avg/GPU=501.659
+rank_time L2 SM=120:12: t0=31.130, t1=31.675, t2=31.565, t3=31.506, t4=31.014, t5=31.739, t6=31.874, t7=31.380 | max_across_ranks=32.303
+L3	linear_queue_no_recycle	120:12	31.086134	4164.315	520.539	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4170.395, Avg/GPU=521.299
+rank_time L3 SM=120:12: t0=28.751, t1=29.759, t2=29.997, t3=29.980, t4=29.789, t5=30.684, t6=30.835, t7=30.976 | max_across_ranks=31.086
+L4	linear_queue_recycle	120:12	29.686530	4360.646	545.081	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4367.013, Avg/GPU=545.877
+rank_time L4 SM=120:12: t0=27.701, t1=28.525, t2=28.822, t3=28.913, t4=28.734, t5=29.291, t6=29.597, t7=29.361 | max_across_ranks=29.687
+L5	dynamic_segment_recycle	120:12	29.005442	4463.041	557.880	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4469.556, Avg/GPU=558.695
+rank_time L5 SM=120:12: t0=28.001, t1=28.663, t2=28.834, t3=28.664, t4=28.276, t5=28.267, t6=28.102, t7=27.711 | max_across_ranks=29.005
+L6	hybrid_br_pbs	120:12	28.632122	4521.232	565.154	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=120:12: t0=27.421, t1=27.623, t2=27.630, t3=27.387, t4=28.159, t5=28.584, t6=28.469, t7=27.908 | max_across_ranks=28.632
+level	profile	sm_config	mean_ms	agg_tflops	avg_gpu_tflops	check	kernels	note
+L1	step_external_reduce	116:16	37.202958	3479.628	434.954	skip	16	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3484.708, Avg/GPU=435.589
+rank_time L1 SM=116:16: t0=35.760, t1=36.299, t2=36.505, t3=36.549, t4=36.270, t5=37.076, t6=37.000, t7=36.672 | max_across_ranks=37.203
+L2	step_fused_reduce	116:16	32.886639	3936.324	492.040	skip	8	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=3942.071, Avg/GPU=492.759
+rank_time L2 SM=116:16: t0=31.901, t1=32.370, t2=32.457, t3=32.358, t4=31.881, t5=32.422, t6=32.669, t7=32.203 | max_across_ranks=32.887
+L3	linear_queue_no_recycle	116:16	31.873861	4061.399	507.675	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4067.328, Avg/GPU=508.416
+rank_time L3 SM=116:16: t0=29.395, t1=30.317, t2=30.671, t3=30.599, t4=30.563, t5=31.382, t6=31.855, t7=31.429 | max_across_ranks=31.874
+L4	linear_queue_recycle	116:16	29.831256	4339.491	542.436	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4345.826, Avg/GPU=543.228
+rank_time L4 SM=116:16: t0=27.877, t1=28.768, t2=28.883, t3=28.957, t4=28.850, t5=29.426, t6=29.784, t7=29.408 | max_across_ranks=29.831
+L5	dynamic_segment_recycle	116:16	28.974034	4467.878	558.485	skip	1	all-CP G8; tokens(original/aligned)=262144/264192, padding=2048 tokens; aligned-length Agg TFLOPS=4474.401, Avg/GPU=559.300
+rank_time L5 SM=116:16: t0=27.947, t1=28.630, t2=28.668, t3=28.947, t4=28.545, t5=28.451, t6=28.262, t7=27.722 | max_across_ranks=28.974
+L6	hybrid_br_pbs	116:16	28.792378	4496.067	562.008	skip	1	hierarchical hybrid fused mega-ring
+rank_time L6 SM=116:16: t0=27.497, t1=27.650, t2=27.657, t3=27.347, t4=28.102, t5=28.696, t6=28.496, t7=27.970 | max_across_ranks=28.792
+
+Cross-case forward ablation summary
+Agg TFLOPS uses the original BR-PBS workload lengths; all-CP 2K aligned-length TFLOPS are reported in each case Note.
+Level   Profile                            SM    Cases     Min ms    Mean ms     P50 ms     Max ms    Mean TFLOPS    Weighted TFLOPS   Weighted/GPU
+L1      step_external_reduce            128:4    20/20     19.798     25.293     24.397     37.005         2690.9             2762.4          345.3
+L1      step_external_reduce            124:8    20/20     19.079     24.693     23.867     36.071         2755.9             2829.4          353.7
+L1      step_external_reduce           120:12    20/20     19.311     24.982     24.054     36.533         2724.1             2796.7          349.6
+L1      step_external_reduce           116:16    20/20     19.622     25.381     24.426     37.203         2681.5             2752.8          344.1
+L2      step_fused_reduce               128:4    20/20     14.104     20.662     19.943     32.868         3303.2             3381.4          422.7
+L2      step_fused_reduce               124:8    20/20     13.009     19.749     19.042     31.759         3458.7             3537.7          442.2
+L2      step_fused_reduce              120:12    20/20     13.245     20.052     19.310     32.303         3406.5             3484.3          435.5
+L2      step_fused_reduce              116:16    20/20     13.618     20.474     19.672     32.887         3336.6             3412.5          426.6
+L3      linear_queue_no_recycle         128:4    20/20     11.510     18.208     17.438     29.920         3758.2             3837.3          479.7
+L3      linear_queue_no_recycle         124:8    20/20     11.862     18.614     17.891     30.419         3674.2             3753.5          469.2
+L3      linear_queue_no_recycle        120:12    20/20     12.119     19.015     18.216     31.086         3597.5             3674.3          459.3
+L3      linear_queue_no_recycle        116:16    20/20     12.309     19.460     18.648     31.874         3515.6             3590.3          448.8
+L4      linear_queue_recycle            128:4    20/20     11.713     18.078     17.328     29.711         3784.8             3864.9          483.1
+L4      linear_queue_recycle            124:8    20/20     11.547     18.114     17.376     29.609         3776.0             3857.0          482.1
+L4      linear_queue_recycle           120:12    20/20     11.615     18.190     17.425     29.687         3759.8             3841.0          480.1
+L4      linear_queue_recycle           116:16    20/20     11.620     18.207     17.470     29.831         3757.1             3837.4          479.7
+L5      dynamic_segment_recycle         128:4    20/20     11.161     17.218     16.307     28.998         3978.8             4057.8          507.2
+L5      dynamic_segment_recycle         124:8    20/20     10.249     16.852     16.125     28.954         4078.3             4146.0          518.3
+L5      dynamic_segment_recycle        120:12    20/20     10.310     16.852     16.036     29.005         4078.7             4146.0          518.3
+L5      dynamic_segment_recycle        116:16    20/20     10.288     16.913     16.131     28.974         4064.0             4130.9          516.4
+L6      hybrid_br_pbs                   128:4    20/20      7.750     15.858     15.270     28.567         4392.1             4406.0          550.7
+L6      hybrid_br_pbs                   124:8    20/20      7.738     15.852     15.237     28.642         4395.5             4407.6          551.0
+L6      hybrid_br_pbs                  120:12    20/20      7.842     15.895     15.298     28.632         4381.5             4395.5          549.4
+L6      hybrid_br_pbs                  116:16    20/20      7.978     15.932     15.305     28.792         4370.8             4385.3          548.2

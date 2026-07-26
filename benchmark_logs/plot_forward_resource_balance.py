@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Plot static forward resource pressure and mega-ring KV/QO probe results.
 
-The load-balance log provides a static model for every baseline.  Each bar in
-the token, FLOP, and communication panels is the mean, over all selected
-workload cases for one dataset, of the maximum physical load on one rank.
+The load-balance log provides a static model for every baseline.  The token
+and communication panels show the mean, over all selected workload cases for
+one dataset, of the maximum physical load on one rank.  The FLOP panel uses
+the corresponding mean physical work per rank.
 
 The Global KV/QO panel shows the static model for all methods.  Causal
 mega-ring methods have a lower/upper scheduler range, shown as a shaded
@@ -31,9 +32,10 @@ import matplotlib.pyplot as plt
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_LOAD_BALANCE_LOG = (SCRIPT_DIR / "20260724-160353" / "benchmark_load_balance_forward.log")
-DEFAULT_DATASET_LOG = SCRIPT_DIR / "20260724-153149" / "benchmark_dataset.log"
-DEFAULT_OUTPUT = SCRIPT_DIR / "forward_resource_balance.png"
+DEFAULT_RUN_DIR = SCRIPT_DIR / "experiment_queue" / "20260726-002324"
+DEFAULT_LOAD_BALANCE_LOG = DEFAULT_RUN_DIR / "theoretical_load_131072_forward.results.log"
+DEFAULT_DATASET_LOG = DEFAULT_RUN_DIR / "tile_analysis_131072_forward.results.log"
+DEFAULT_OUTPUT = DEFAULT_RUN_DIR / "forward_resource_balance.png"
 
 METHOD_ORDER = (
     "allgather_attention",
@@ -67,11 +69,11 @@ METHOD_COLORS = {
 }
 MEGA_RING_METHODS = frozenset(("mega_ring_all_cp", "mega_ring_hybrid"))
 DATASET_LABELS = {
+    "prolong": "ProLong",
     "arxiv": "ArXiv",
     "freelaw": "FreeLaw",
     "github": "GitHub",
     "pile": "Pile",
-    "prolong": "ProLong",
 }
 DATASET_ORDER = {dataset: index for index, dataset in enumerate(DATASET_LABELS)}
 
@@ -461,11 +463,14 @@ def plot_resource_metric(
     value_scale: float,
     title: str,
     ylabel: str,
+    range_attribute: str = "maximum",
 ) -> None:
     values_by_dataset_method: dict[tuple[str, str], list[float]] = defaultdict(list)
     for record in records:
         metric = getattr(record, value_name)
-        values_by_dataset_method[(record.dataset, record.method)].append(metric.maximum)
+        values_by_dataset_method[(record.dataset, record.method)].append(
+            getattr(metric, range_attribute)
+        )
 
     bar_width = 0.84 / len(methods)
     x_positions = list(range(len(datasets)))
@@ -630,8 +635,9 @@ def make_figure(
         records=static_records,
         value_name="physical_flops",
         value_scale=1e12,
-        title="Mean Peak Physical Attention Work",
-        ylabel="Mean peak rank FLOPs (T)",
+        title="Mean Per-GPU Physical Attention Work",
+        ylabel="Mean per-GPU attention FLOPs (T)",
+        range_attribute="average",
     )
     plot_resource_metric(
         flat_axes[2],

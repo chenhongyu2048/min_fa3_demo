@@ -259,15 +259,45 @@ Strict six-level forward ablation on eight H100s:
 ```bash
 torchrun --standalone --nproc_per_node=8 \
   ring_test/benchmark_forward_ablation.py \
-  --b 8 --seqlen 16384,12288,8192,6144,4096,2048,2048,2048 \
-  --qhead 16 --kvhead 8 --headdim 128 --mode causal
+  --dataset arxiv --target-tokens 131072 --num-cases 20 \
+  --sm-configs 128:4,124:8,120:12,116:16 \
+  --qhead 32 --kvhead 8 --headdim 128 --mode causal
 ```
 
-The driver fixes the SM split at `116:16`, canonicalizes every input length to
-2048 exactly once, runs L1-L5 as all-CP G8, and maps L6 to BR-PBS metadata on
-the same canonical lengths. Defaults are 10 warmups, 40 measured iterations,
-and 3 interleaved rounds. Use `--correctness-only` for the representative
-five-repeat all-CP and mixed-hierarchy checks without the latency experiment.
+The driver accepts the same comma-separated `--sm-configs COMP:COMM` sweep
+style and default `128:4,124:8,120:12,116:16` sweep as the normal Mega Ring
+benchmark. Head configuration follows the normal fused Mega Ring constraints:
+`D=128`, `KVH * D = 1024`, and `QH % KVH == 0`; the default is
+`QH=32, KVH=8, D=128`. It samples deterministic ArXiv cases with seed `0` and
+uses the dataset wrapper's `0.05` token-balance tolerance. L1-L5 run on each
+case after independent 2K all-CP alignment. L6 receives the BR-PBS workload
+lengths and hybrid metadata, including only the padding required by its
+selected ring groups.
+
+Timing matches the normal dataset benchmark: each profile runs 10 warmups and
+40 measured iterations, each measured iteration first takes the maximum
+latency across ranks, and the case latency is the arithmetic mean of those 40
+maxima. The primary `Agg TFLOPS` and `Avg/GPU` columns use the BR-PBS workload
+lengths for all six levels. For L1-L5, the Note also reports original/aligned
+token counts, padding, and the same-latency TFLOPS calculated from the 2K
+aligned execution lengths. A final cross-case table groups results by level
+and SM config and reports minimum/mean/P50/maximum latency, arithmetic-mean
+TFLOPS, and workload-weighted aggregate/per-GPU TFLOPS.
+
+Correctness is controlled by `--check`/`--no-check` and defaults to disabled,
+as in the normal benchmark. When enabled, it runs the representative L1-L5
+all-CP and L6 mixed-hierarchy output checks; the ablation driver does not run a
+stats probe. `--b --seqlen ...` remains available as an explicit one-case
+debugging override.
+
+`run_experiments_when_idle.sh` reserves its experiment-queue lock immediately
+but, by default, waits `START_DELAY_SECONDS=28800` (eight hours) before it
+starts polling GPU availability and launches the matrix. Its ablation queue
+runs 20 ArXiv cases at 64K, 128K, and 256K with the same seed, token tolerance,
+head configuration, SM sweep, warmup/iteration counts, and correctness flag as
+the normal dataset runs. `DRY_RUN=1` skips the delay so it can still print the
+queue immediately; set `START_DELAY_SECONDS=0` only when an immediate real
+launch is intentional.
 
 Hierarchical mega-ring notes:
 
