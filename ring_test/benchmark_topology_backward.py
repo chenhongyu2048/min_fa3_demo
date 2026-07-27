@@ -146,6 +146,7 @@ class BackwardMegaPool:
         self.remote_k.data_[owner_begin:owner_end].copy_(local_k)
         self.remote_v.data_[owner_begin:owner_end].copy_(local_v)
 
+
 @dataclass
 class BackwardParallelPools:
     all_cp: BackwardMegaPool | None
@@ -799,8 +800,10 @@ def benchmark_topology(
                 f"physical_rank_token_loads={list(zeppelin_plan.rank_token_loads)}"
             )
         print(
-            "Timing excludes forward preparation, owner-accumulator reset, and the "
-            "pre-launch distributed barrier; method-internal phase barriers are included; "
+            "Timing excludes forward preparation, opaque-workspace construction, "
+            "owner-accumulator reset, and the pre-launch distributed barrier; "
+            "reused step-workspace reset and "
+            "method-internal phase barriers are included; "
             "reported time is the average of the per-iteration max-rank end-to-end "
             "backward op times.",
             flush=True,
@@ -1136,6 +1139,14 @@ def benchmark_topology(
             mega_all_cp_remote_dk = mega_all_cp_pool.remote_dk
             mega_all_cp_remote_dv = mega_all_cp_pool.remote_dv
             mega_all_cp_completion = mega_all_cp_pool.completion
+        mega_all_cp_workspace = min_fa3_op._create_backward_varlen_mega_ring_workspace(
+            mega_all_cp_q,
+            mega_all_cp_cu_host,
+            mega_all_cp_cu_host,
+            world_size,
+            args.kvhead,
+            mega_all_cp_total,
+        )
 
         def prepare_all_cp_mega() -> None:
             mega_all_cp_remote_dk.data_.zero_()
@@ -1169,6 +1180,7 @@ def benchmark_topology(
                     global_seqlens_host=mega_all_cp_global_host,
                     ring_sizes_host=mega_all_cp_ring_sizes_host,
                     ring_starts_host=mega_all_cp_ring_starts_host,
+                    workspace=mega_all_cp_workspace,
                 )
 
             all_cp_mega_runs[config] = MethodRun(
@@ -1177,7 +1189,8 @@ def benchmark_topology(
                 None
                 if mega_all_cp_reference is None
                 else mega_all_cp_reference[2:],
-                "all-CP fused mega-ring; remote reset excluded",
+                "all-CP fused mega-ring; remote reset excluded; "
+                "workspace=reused, reset=timed, aux_grid=exact",
                 tuple(mega_ring_all_cp_global_lengths),
             )
 
@@ -1344,6 +1357,14 @@ def benchmark_topology(
             remote_dk = hybrid_pool.remote_dk
             remote_dv = hybrid_pool.remote_dv
             completion = hybrid_pool.completion
+        hybrid_workspace = min_fa3_op._create_backward_varlen_mega_ring_workspace(
+            q,
+            cu_host,
+            cu_host,
+            world_size,
+            args.kvhead,
+            rank_capacity,
+        )
 
         def prepare_hybrid() -> None:
             remote_dk.data_.zero_()
@@ -1377,13 +1398,15 @@ def benchmark_topology(
                     global_seqlens_host=global_host,
                     ring_sizes_host=ring_sizes_host,
                     ring_starts_host=ring_starts_host,
+                    workspace=hybrid_workspace,
                 )
 
             hybrid_runs[config] = MethodRun(
                 prepare_hybrid,
                 launch_hybrid,
                 None if hybrid_reference is None else hybrid_reference[2:],
-                "hierarchical hybrid fused mega-ring; remote reset excluded",
+                "hierarchical hybrid fused mega-ring; remote reset excluded; "
+                "workspace=reused, reset=timed, aux_grid=exact",
             )
 
     results: list[BenchmarkResult] = []

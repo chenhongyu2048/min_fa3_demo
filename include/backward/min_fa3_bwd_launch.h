@@ -452,12 +452,21 @@ void run_flash_bwd(
         params.b,
         params.dq_semaphore,
         params.cu_seqlens_q,
-        params.seqused_q
+        params.seqused_q,
+        MegaRing ? params.q_tile_map : nullptr,
+        MegaRing ? params.q_tile_count : 0
     };
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
     int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
-    dim3 grid_m(num_m_block, params.h, params.b);
-    CHECK_CUTLASS(cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/));
+    dim3 grid_m(
+        MegaRing ? params.q_tile_count : num_m_block,
+        params.h,
+        MegaRing ? 1 : params.b);
+    if constexpr (!MegaRing) {
+        CHECK_CUTLASS(cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/));
+    } else if (params.q_tile_count > 0) {
+        CHECK_CUTLASS(cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/));
+    }
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<_1, Int<1>, _1>;  // Currently doesn't not support cluster
@@ -707,11 +716,16 @@ void run_flash_bwd(
         {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
         params.scale_softmax,
         params.cu_seqlens_q,
-        params.seqused_q
+        params.seqused_q,
+        MegaRing ? params.q_tile_map : nullptr,
+        MegaRing ? params.q_tile_count : 0
     };
     typename PostprocessKernel::Params postprocess_params = PostprocessKernel::to_underlying_arguments(postprocess_args);
     int num_m_block_postprocess = cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
-    dim3 grid_m_postprocess(num_m_block_postprocess, params.h, params.b);
+    dim3 grid_m_postprocess(
+        MegaRing ? params.q_tile_count : num_m_block_postprocess,
+        params.h,
+        MegaRing ? 1 : params.b);
     int smem_size_postprocess = PostprocessKernel::SharedStorageSize;
     if (smem_size_postprocess >= 48 * 1024) {
         CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
@@ -721,10 +735,12 @@ void run_flash_bwd(
         // mega-ring translation units instantiate the same weak CUTLASS launch
         // helper for dQ, which can otherwise resolve to an invalid launch after
         // they are linked into the same extension.
-        cutlass::device_kernel<PostprocessKernel><<<
-            grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock,
-            smem_size_postprocess, stream>>>(postprocess_params);
-        CHECK_CUDA_KERNEL_LAUNCH();
+        if (params.q_tile_count > 0) {
+            cutlass::device_kernel<PostprocessKernel><<<
+                grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock,
+                smem_size_postprocess, stream>>>(postprocess_params);
+            CHECK_CUDA_KERNEL_LAUNCH();
+        }
     } else {
         CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKernel>(
             grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock,
@@ -748,7 +764,9 @@ void run_flash_bwd(
             {params.dk_row_stride, _1{}, params.dk_head_stride, params.dk_batch_stride},  // stride_dK
             1.f,
             params.cu_seqlens_k,
-            params.seqused_k
+            params.seqused_k,
+            MegaRing ? params.k_tile_map : nullptr,
+            MegaRing ? params.k_tile_count : 0
         };
         typename PostprocessKerneldKV::Params postprocess_dK_params = PostprocessKerneldKV::to_underlying_arguments(postprocess_dK_args);
         typename PostprocessKerneldKV::Arguments postprocess_dV_args {
@@ -760,17 +778,27 @@ void run_flash_bwd(
             {params.dv_row_stride, _1{}, params.dv_head_stride, params.dv_batch_stride},  // stride_dV
             1.f,
             params.cu_seqlens_k,
-            params.seqused_k
+            params.seqused_k,
+            MegaRing ? params.k_tile_map : nullptr,
+            MegaRing ? params.k_tile_count : 0
         };
         typename PostprocessKerneldKV::Params postprocess_dV_params = PostprocessKerneldKV::to_underlying_arguments(postprocess_dV_args);
         int num_n_block_postprocess = cute::ceil_div(params.seqlen_k, get<0>(TileShape_NK{}));
-        dim3 grid_n_postprocess(num_n_block_postprocess, params.h_k, params.b);
+        dim3 grid_n_postprocess(
+            MegaRing ? params.k_tile_count : num_n_block_postprocess,
+            params.h_k,
+            MegaRing ? 1 : params.b);
         int smem_size_postprocess = PostprocessKerneldKV::SharedStorageSize;
         if (smem_size_postprocess >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKerneldKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
         }
-        CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/));
-        CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dV_params, false /*launch_with_pdl*/));
+        if constexpr (!MegaRing) {
+            CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/));
+            CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dV_params, false /*launch_with_pdl*/));
+        } else if (params.k_tile_count > 0) {
+            CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/));
+            CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dV_params, false /*launch_with_pdl*/));
+        }
     }
 
 }

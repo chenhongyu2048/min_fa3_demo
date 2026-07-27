@@ -7,6 +7,8 @@ import torch
 import torch.distributed as dist
 
 from _min_fa3_op import (
+    _BackwardVarlenMegaRingWorkspace,
+    _create_backward_varlen_mega_ring_workspace as _create_backward_varlen_mega_ring_workspace_cuda,
     TKParallelTensor,
     backward as _backward_cuda,
     backward_varlen as _backward_varlen_cuda,
@@ -113,6 +115,7 @@ def backward_varlen_mega_ring(
     global_seqlens_host: torch.Tensor,
     ring_sizes_host: torch.Tensor,
     ring_starts_host: torch.Tensor,
+    workspace: Optional[_BackwardVarlenMegaRingWorkspace] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _backward_varlen_mega_ring_cuda(
         dout,
@@ -137,6 +140,26 @@ def backward_varlen_mega_ring(
         global_seqlens_host,
         ring_sizes_host,
         ring_starts_host,
+        workspace=workspace,
+    )
+
+
+def _create_backward_varlen_mega_ring_workspace(
+    q: torch.Tensor,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
+    world_size: int,
+    kv_heads: int,
+    rank_capacity: int,
+) -> _BackwardVarlenMegaRingWorkspace:
+    """Internal preallocated workspace used by backward topology benchmarks."""
+    return _create_backward_varlen_mega_ring_workspace_cuda(
+        q,
+        cu_seqlens_q_host,
+        cu_seqlens_k_host,
+        int(world_size),
+        int(kv_heads),
+        int(rank_capacity),
     )
 
 # Resolve the local rank metadata used by the TK parallel IPC path.

@@ -86,6 +86,8 @@ public:
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        int const* tile_map = nullptr;
+        int tile_count = 0;
     };
 
     // Kernel entry point API
@@ -109,6 +111,8 @@ public:
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        int const* tile_map = nullptr;
+        int tile_count = 0;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -134,7 +138,9 @@ public:
             args.num_batch,
             args.dq_semaphore,
             args.cu_seqlens,
-            args.seqused
+            args.seqused,
+            args.tile_map,
+            args.tile_count
         };
     }
 
@@ -145,9 +151,15 @@ public:
         static constexpr int kBlockM = get<0>(TileShape_MK{});
 
         int const thread_idx = threadIdx.x;
-        int const m_block = blockIdx.x;
+        if (params.tile_map != nullptr && int(blockIdx.x) >= params.tile_count) { return; }
+        int const tile_idx = int(blockIdx.x);
+        int const m_block = params.tile_map != nullptr
+            ? params.tile_map[2 * tile_idx + 1]
+            : tile_idx;
         int const bidh = blockIdx.y;
-        int const bidb = blockIdx.z;
+        int const bidb = params.tile_map != nullptr
+            ? params.tile_map[2 * tile_idx]
+            : int(blockIdx.z);
 
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info(bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused);
         bool const is_varlen = Varlen && params.cu_seqlens;

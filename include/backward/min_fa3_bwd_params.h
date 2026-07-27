@@ -98,6 +98,13 @@ struct Flash_bwd_params : public Flash_fwd_params {
     int* __restrict__ dv_semaphore;
     int* __restrict__ tile_count_semaphore;
 
+    // Optional compact (batch_idx, block_idx) maps for exact-size auxiliary
+    // kernel grids. These are only populated by the mega-ring path.
+    int const* __restrict__ q_tile_map;
+    int const* __restrict__ k_tile_map;
+    int q_tile_count;
+    int k_tile_count;
+
     // MEGA_RING_BWD: explicit causal-zigzag persistent launch metadata.
     int ring_rank;
     int ring_world_size;

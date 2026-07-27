@@ -321,8 +321,14 @@ public:
     static constexpr bool EnableMegaRing = true;
     static constexpr int NumSchedulerThreads =
         NumMmaThreads + 2 * cutlass::NumThreadsPerWarp;
-    using SharedStorage = int;
-    SharedStorage* const tile_idx_smem;
+
+    struct alignas(16) SharedStorage {
+        alignas(16) int4 block_head_batch_ticket;
+        alignas(16) int4 step_level_valid_reserved;
+    };
+    static_assert(sizeof(SharedStorage) == 2 * sizeof(int4));
+    static_assert(alignof(SharedStorage) >= alignof(int4));
+    SharedStorage* const work_smem;
 
     struct Params {
         int total_blocks;
@@ -371,12 +377,20 @@ public:
     }
 
     CUTLASS_DEVICE MegaRingSingleTileBwdLPTScheduler(SharedStorage* smem_scheduler)
-        : tile_idx_smem(smem_scheduler) {}
+        : work_smem(smem_scheduler) {}
 
-    CUTLASS_DEVICE WorkTileInfo decode_work(Params const& params, int tile_idx) const {
+    struct SectionInfo {
+        int ring_level;
+        int ring_step;
+        int rem;
+        bool use_half;
+        bool valid;
+    };
+
+    CUTLASS_DEVICE SectionInfo decode_section(Params const& params, int tile_idx) const {
         if (tile_idx >= params.total_blocks) {
-            return {0, 0, -1, tile_idx, params.ring_world_size,
-                    min_fa3_varlen_demo::kMegaRingNumLevels};
+            return {min_fa3_varlen_demo::kMegaRingNumLevels,
+                    params.ring_world_size, 0, false, false};
         }
 
         int rem = tile_idx;
@@ -398,7 +412,9 @@ public:
         } else {
             rem -= params.mega_ring_hierarchy.base_work_tiles;
             #pragma unroll
-            for (int level_idx = 0; level_idx < 3 && target_level < 0; ++level_idx) {
+            for (int level_idx = 0;
+                 level_idx < min_fa3_varlen_demo::kMegaRingNumLevels && target_level < 0;
+                 ++level_idx) {
                 auto const& level = params.mega_ring_hierarchy.levels[level_idx];
                 int const ring_local_rank = params.ring_rank % level.ring_size;
                 for (int step = 1; step < level.ring_size; ++step) {
@@ -415,85 +431,182 @@ public:
             }
         }
         if (target_level < 0) {
+            return {min_fa3_varlen_demo::kMegaRingNumLevels,
+                    params.ring_world_size, 0, false, false};
+        }
+        return {target_level, ring_step, rem, use_half, true};
+    }
+
+    CUTLASS_DEVICE WorkTileInfo decode_work(
+            Params const& params,
+            int tile_idx,
+            WorkTileInfo const& hint) const {
+        SectionInfo const section = decode_section(params, tile_idx);
+        if (!section.valid) {
             return {0, 0, -1, tile_idx, params.ring_world_size,
                     min_fa3_varlen_demo::kMegaRingNumLevels};
         }
 
-        auto const& level = params.mega_ring_hierarchy.levels[target_level];
-        for (int bidb = level.batch_begin; bidb < level.batch_end; ++bidb) {
-            if (params.ring_sizes[bidb] != level.ring_size) { continue; }
-            int const rows = use_half
-                ? params.half_cu_seqlens[bidb + 1] - params.half_cu_seqlens[bidb]
-                : params.cu_seqlens[bidb + 1] - params.cu_seqlens[bidb];
-            int const num_blocks = cute::ceil_div(rows, kBlock);
-            int const batch_tiles = num_blocks * params.num_head;
-            if (rem < batch_tiles) {
-                int const bidh = rem / num_blocks;
-                int const block = rem - bidh * num_blocks;
-                return {block, bidh, bidb, tile_idx, ring_step, target_level};
+        auto const& level = params.mega_ring_hierarchy.levels[section.ring_level];
+        int scan_begin = level.batch_begin;
+        int rem = section.rem;
+        bool hint_matches = hint.bidb >= level.batch_begin &&
+                            hint.bidb < level.batch_end &&
+                            hint.tile_idx >= 0 && tile_idx > hint.tile_idx &&
+                            hint.ring_level == section.ring_level &&
+                            hint.ring_step == section.ring_step &&
+                            params.ring_sizes[hint.bidb] == level.ring_size;
+        if (hint_matches) {
+            int const hint_rows = section.use_half
+                ? params.half_cu_seqlens[hint.bidb + 1] - params.half_cu_seqlens[hint.bidb]
+                : params.cu_seqlens[hint.bidb + 1] - params.cu_seqlens[hint.bidb];
+            int const hint_num_blocks = cute::ceil_div(hint_rows, kBlock);
+            hint_matches = hint_num_blocks > 0 && hint.bidh >= 0 &&
+                           hint.bidh < params.num_head && hint.block >= 0 &&
+                           hint.block < hint_num_blocks;
+            if (hint_matches) {
+                scan_begin = hint.bidb;
+                int const old_in_batch = hint.bidh * hint_num_blocks + hint.block;
+                rem = old_in_batch + tile_idx - hint.tile_idx;
             }
-            rem -= batch_tiles;
         }
-        return {0, 0, -1, tile_idx, ring_step, target_level};
+
+        int const lane = int(threadIdx.x) % cutlass::NumThreadsPerWarp;
+        constexpr unsigned kWarpMask = 0xffffffffu;
+        for (int group_begin = scan_begin;
+             group_begin < level.batch_end;
+             group_begin += cutlass::NumThreadsPerWarp) {
+            int const bidb = group_begin + lane;
+            int num_blocks = 0;
+            int batch_tiles = 0;
+            if (bidb < level.batch_end && params.ring_sizes[bidb] == level.ring_size) {
+                int const rows = section.use_half
+                    ? params.half_cu_seqlens[bidb + 1] - params.half_cu_seqlens[bidb]
+                    : params.cu_seqlens[bidb + 1] - params.cu_seqlens[bidb];
+                num_blocks = cute::ceil_div(rows, kBlock);
+                batch_tiles = num_blocks * params.num_head;
+            }
+
+            int inclusive_tiles = batch_tiles;
+            #pragma unroll
+            for (int offset = 1; offset < cutlass::NumThreadsPerWarp; offset *= 2) {
+                int const preceding = __shfl_up_sync(
+                    kWarpMask, inclusive_tiles, offset);
+                if (lane >= offset) { inclusive_tiles += preceding; }
+            }
+            int const exclusive_tiles = inclusive_tiles - batch_tiles;
+            unsigned const winners = __ballot_sync(
+                kWarpMask,
+                batch_tiles > 0 && rem >= exclusive_tiles && rem < inclusive_tiles);
+            if (winners != 0) {
+                int const winner = __ffs(winners) - 1;
+                int const winner_bidb = __shfl_sync(kWarpMask, bidb, winner);
+                int const winner_num_blocks = __shfl_sync(kWarpMask, num_blocks, winner);
+                int const winner_exclusive = __shfl_sync(
+                    kWarpMask, exclusive_tiles, winner);
+                int const in_batch = rem - winner_exclusive;
+                int const bidh = in_batch / winner_num_blocks;
+                int const block = in_batch - bidh * winner_num_blocks;
+                return {block, bidh, winner_bidb, tile_idx,
+                        section.ring_step, section.ring_level};
+            }
+            int const group_tiles = __shfl_sync(
+                kWarpMask, inclusive_tiles, cutlass::NumThreadsPerWarp - 1);
+            rem -= group_tiles;
+        }
+        return {0, 0, -1, tile_idx, section.ring_step, section.ring_level};
     }
 
-    CUTLASS_DEVICE int claim_dynamic_tile(Params const& params, int tile_idx) const {
-        WorkTileInfo work = decode_work(params, tile_idx);
+    CUTLASS_DEVICE WorkTileInfo decode_work(Params const& params, int tile_idx) const {
+        WorkTileInfo const invalid_hint{
+            0, 0, -1, -1, params.ring_world_size,
+            min_fa3_varlen_demo::kMegaRingNumLevels};
+        return decode_work(params, tile_idx, invalid_hint);
+    }
+
+    CUTLASS_DEVICE WorkTileInfo claim_dynamic_tile(
+            Params const& params,
+            int tile_idx,
+            WorkTileInfo const& hint) const {
+        WorkTileInfo work = decode_work(params, tile_idx, hint);
         while (tile_idx < params.total_blocks && !work.is_valid(params)) {
-            tile_idx = atomicAdd(params.tile_count_semaphore, 1) + params.num_comp_sm;
-            work = decode_work(params, tile_idx);
+            if (int(threadIdx.x) % cutlass::NumThreadsPerWarp == 0) {
+                tile_idx = atomicAdd(params.tile_count_semaphore, 1) + params.num_comp_sm;
+            }
+            tile_idx = __shfl_sync(0xffffffff, tile_idx, 0);
+            work = decode_work(params, tile_idx, hint);
         }
-        return tile_idx;
+        return work;
+    }
+
+    CUTLASS_DEVICE void publish_work(WorkTileInfo const& work) const {
+        if (int(threadIdx.x) % cutlass::NumThreadsPerWarp == 0) {
+            work_smem->block_head_batch_ticket =
+                make_int4(work.block, work.bidh, work.bidb, work.tile_idx);
+            work_smem->step_level_valid_reserved =
+                make_int4(work.ring_step, work.ring_level,
+                          work.bidb >= 0 ? 1 : 0, 0);
+        }
+    }
+
+    CUTLASS_DEVICE WorkTileInfo load_published_work() const {
+        int4 const coords = work_smem->block_head_batch_ticket;
+        int4 const state = work_smem->step_level_valid_reserved;
+        return {coords.x, coords.y, state.z != 0 ? coords.z : -1, coords.w,
+                state.x, state.y};
     }
 
     template <bool IsProducerWarp = false>
     CUTLASS_DEVICE WorkTileInfo get_initial_work(Params const& params) const {
         if constexpr (IsProducerWarp) {
-            int tile_idx = int(blockIdx.x);
-            if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
-                tile_idx = claim_dynamic_tile(params, tile_idx);
-            }
-            tile_idx = __shfl_sync(0xffffffff, tile_idx, 0);
-            if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) { *tile_idx_smem = tile_idx; }
+            WorkTileInfo const invalid_hint{
+                0, 0, -1, -1, params.ring_world_size,
+                min_fa3_varlen_demo::kMegaRingNumLevels};
+            WorkTileInfo const work = claim_dynamic_tile(
+                params, int(blockIdx.x), invalid_hint);
+            publish_work(work);
             flash::named_barrier_arrive(
                 NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);
-            return decode_work(params, tile_idx);
+            return work;
         } else {
             flash::named_barrier_sync(
                 NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);
-            int const tile_idx = *tile_idx_smem;
+            WorkTileInfo const work = load_published_work();
             flash::named_barrier_arrive(
                 NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);
-            return decode_work(params, tile_idx);
+            return work;
         }
     }
 
     CUTLASS_DEVICE void init_consumer() const {}
 
     CUTLASS_DEVICE void prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {
-        if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
-            int tile_idx = atomicAdd(params.tile_count_semaphore, 1) + params.num_comp_sm;
-            current_work.tile_idx = claim_dynamic_tile(params, tile_idx);
+        int tile_idx = 0;
+        if (int(threadIdx.x) % cutlass::NumThreadsPerWarp == 0) {
+            tile_idx = atomicAdd(params.tile_count_semaphore, 1) + params.num_comp_sm;
         }
+        tile_idx = __shfl_sync(0xffffffff, tile_idx, 0);
+        current_work = claim_dynamic_tile(params, tile_idx, current_work);
     }
 
     template <bool IsProducerWarp = false>
-    CUTLASS_DEVICE WorkTileInfo get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+    CUTLASS_DEVICE WorkTileInfo get_next_work(
+            Params const&,
+            WorkTileInfo const& current_work) const {
         if constexpr (IsProducerWarp) {
-            int const tile_idx = __shfl_sync(0xffffffff, current_work.tile_idx, 0);
             flash::named_barrier_sync(
                 NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);
-            if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) { *tile_idx_smem = tile_idx; }
+            publish_work(current_work);
             flash::named_barrier_arrive(
                 NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);
-            return decode_work(params, tile_idx);
+            return current_work;
         } else {
             flash::named_barrier_sync(
                 NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);
-            int const tile_idx = *tile_idx_smem;
+            WorkTileInfo const work = load_published_work();
             flash::named_barrier_arrive(
                 NumSchedulerThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);
-            return decode_work(params, tile_idx);
+            return work;
         }
     }
 };

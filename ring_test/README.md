@@ -220,7 +220,11 @@ include the average of the per-iteration maximum end-to-end wall times and
 each rank's average time, aggregate/average-per-GPU causal backward TFLOP/s,
 and the fused compute/communication SM split. Forward preparation is outside
 every method's timed interval. The fused owner-accumulator reset and
-distributed barrier are also outside its timed interval. Zeppelin's timed
+distributed barrier are also outside its timed interval. Each fused method
+creates one opaque backward workspace per case before timing; that workspace
+owns the reusable step buffers and canonical compact Q/K tile maps. Workspace
+construction is excluded, while the per-call step-buffer reset remains inside
+the measured backward interval. Zeppelin's timed
 backward runs one all-rank phase barrier first, followed by all G>1 member-group
 queues in deterministic registry order and then the rank-local G1 queue. That internal barrier is
 included in its result;

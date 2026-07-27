@@ -11,6 +11,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -23,6 +24,19 @@ namespace py = pybind11;
 namespace {
 
 using min_fa3_backward::Flash_bwd_params;
+
+struct BackwardVarlenMegaRingWorkspace {
+    torch::Tensor dk_steps;
+    torch::Tensor dv_steps;
+    torch::Tensor q_tile_map;
+    torch::Tensor k_tile_map;
+    std::vector<int> cu_seqlens_q_host;
+    std::vector<int> cu_seqlens_k_host;
+    int world_size;
+    int64_t step_stride;
+    int64_t q_tile_count;
+    int64_t k_tile_count;
+};
 
 int round_multiple(int x, int m) {
     return (x + m - 1) / m * m;
@@ -63,6 +77,15 @@ void check_cu_seqlens(const torch::Tensor& tensor, const torch::Tensor& q, const
     TORCH_CHECK(tensor.dim() == 1 && tensor.numel() >= 2, name, " must have shape [B + 1]");
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
     check_same_device(q, tensor, name);
+}
+
+void check_cu_seqlens_host(const torch::Tensor& tensor, const char* name) {
+    TORCH_CHECK(!tensor.is_cuda(), name, " must be a CPU tensor");
+    TORCH_CHECK(tensor.scalar_type() == torch::kInt32,
+                name, " must have dtype torch.int32");
+    TORCH_CHECK(tensor.dim() == 1 && tensor.numel() >= 2,
+                name, " must have shape [B + 1]");
+    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
 torch::Tensor get_grad_output(
@@ -372,6 +395,154 @@ void check_parallel_tensor_identity(
     TORCH_CHECK(static_cast<int>(tensor.raw_ptrs_.size()) == world_size, name, " must expose one pointer per rank");
 }
 
+void check_step_workspace(
+    torch::Tensor const& tensor,
+    torch::Tensor const& q,
+    int world_size,
+    int64_t step_stride,
+    char const* name) {
+    TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
+    TORCH_CHECK(tensor.scalar_type() == torch::kFloat32,
+                name, " must have dtype torch.float32");
+    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(tensor.sizes() == torch::IntArrayRef({world_size, step_stride}),
+                name, " must have shape [", world_size, ", ", step_stride, "]");
+    check_same_device(q, tensor, name);
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 64 == 0,
+                name, " must be 64-byte aligned");
+}
+
+void check_tile_map(
+    torch::Tensor const& tensor,
+    torch::Tensor const& q,
+    int64_t tile_count,
+    char const* name) {
+    TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
+    TORCH_CHECK(tensor.scalar_type() == torch::kInt32,
+                name, " must have dtype torch.int32");
+    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(tensor.sizes() == torch::IntArrayRef({tile_count, 2}),
+                name, " must have shape [", tile_count, ", 2]");
+    check_same_device(q, tensor, name);
+}
+
+int64_t count_compact_tiles(torch::Tensor const& cu_seqlens_host, int block_size) {
+    auto const* cu = cu_seqlens_host.data_ptr<int>();
+    int const batch_size = cu_seqlens_host.numel() - 1;
+    int64_t tile_count = 0;
+    for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        int const seqlen = cu[batch_idx + 1] - cu[batch_idx];
+        tile_count += (seqlen + block_size - 1) / block_size;
+    }
+    return tile_count;
+}
+
+torch::Tensor make_compact_tile_map(
+    torch::Tensor const& cu_seqlens_host,
+    torch::Tensor const& q,
+    int block_size,
+    int64_t tile_count) {
+    auto map_host = torch::empty(
+        {tile_count, 2}, torch::TensorOptions().dtype(torch::kInt32));
+    auto const* cu = cu_seqlens_host.data_ptr<int>();
+    auto* map = map_host.data_ptr<int>();
+    int const batch_size = cu_seqlens_host.numel() - 1;
+    int64_t tile_idx = 0;
+    for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        int const seqlen = cu[batch_idx + 1] - cu[batch_idx];
+        int const num_blocks = (seqlen + block_size - 1) / block_size;
+        for (int block_idx = 0; block_idx < num_blocks; ++block_idx, ++tile_idx) {
+            map[2 * tile_idx] = batch_idx;
+            map[2 * tile_idx + 1] = block_idx;
+        }
+    }
+    TORCH_CHECK(tile_idx == tile_count, "internal compact tile-map size mismatch");
+    auto map_device = torch::empty(
+        {tile_count, 2}, q.options().dtype(torch::kInt32));
+    map_device.copy_(map_host, false);
+    return map_device;
+}
+
+std::shared_ptr<BackwardVarlenMegaRingWorkspace>
+create_backward_varlen_mega_ring_workspace(
+    torch::Tensor q,
+    torch::Tensor cu_seqlens_q_host,
+    torch::Tensor cu_seqlens_k_host,
+    int64_t world_size,
+    int64_t kv_heads,
+    int64_t rank_capacity) {
+    check_bf16_cuda(q, "q", 3);
+    check_cu_seqlens_host(cu_seqlens_q_host, "cu_seqlens_q_host");
+    check_cu_seqlens_host(cu_seqlens_k_host, "cu_seqlens_k_host");
+    TORCH_CHECK(cu_seqlens_q_host.numel() == cu_seqlens_k_host.numel(),
+                "workspace q/k host cu_seqlens must have the same B");
+    TORCH_CHECK(world_size == 1 || world_size == 2 || world_size == 4 || world_size == 8,
+                "workspace world_size must be 1, 2, 4, or 8");
+    TORCH_CHECK(kv_heads > 0 && kv_heads <= std::numeric_limits<int>::max(),
+                "workspace kv_heads must be a positive int32 value");
+    TORCH_CHECK(kv_heads * q.size(2) == 1024,
+                "workspace requires KVH * D == 1024");
+    TORCH_CHECK(q.size(1) % kv_heads == 0,
+                "workspace qhead must be divisible by kvhead");
+    TORCH_CHECK(rank_capacity > 0 &&
+                rank_capacity <= std::numeric_limits<int>::max() &&
+                rank_capacity % 128 == 0,
+                "workspace rank_capacity must be a positive 128-row-aligned int32 value");
+
+    auto const* q_cu = cu_seqlens_q_host.data_ptr<int>();
+    auto const* k_cu = cu_seqlens_k_host.data_ptr<int>();
+    int64_t const batch_size = cu_seqlens_q_host.numel() - 1;
+    TORCH_CHECK(q_cu[0] == 0 && k_cu[0] == 0,
+                "workspace host cu_seqlens must start at zero");
+    for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        int const q_len = q_cu[batch_idx + 1] - q_cu[batch_idx];
+        int const k_len = k_cu[batch_idx + 1] - k_cu[batch_idx];
+        TORCH_CHECK(q_len >= 0 && k_len >= 0,
+                    "workspace host cu_seqlens must be nondecreasing at batch=",
+                    batch_idx);
+        TORCH_CHECK(q_len == k_len,
+                    "workspace mega-ring backward requires self-attention q_len == k_len at batch=",
+                    batch_idx);
+    }
+    TORCH_CHECK(q_cu[batch_size] == q.size(0),
+                "workspace cu_seqlens_q_host[-1] must equal q.size(0)");
+    TORCH_CHECK(k_cu[batch_size] <= rank_capacity,
+                "workspace local_total_k must fit in rank_capacity");
+    TORCH_CHECK(batch_size <=
+                (std::numeric_limits<int>::max() - rank_capacity) / 128,
+                "workspace padded rank capacity must fit in int32");
+
+    c10::cuda::CUDAGuard device_guard(q.device());
+    check_sm90();
+    int const padded_rank_capacity = round_multiple(
+        static_cast<int>(rank_capacity + batch_size * 128), 128);
+    TORCH_CHECK(kv_heads <= std::numeric_limits<int64_t>::max() /
+                padded_rank_capacity / q.size(2),
+                "workspace step stride must fit in int64");
+    int64_t const step_stride = kv_heads * padded_rank_capacity * q.size(2);
+    int64_t const q_tile_count = count_compact_tiles(cu_seqlens_q_host, 64);
+    int64_t const k_tile_count = count_compact_tiles(cu_seqlens_k_host, 128);
+    TORCH_CHECK(q_tile_count <= std::numeric_limits<int>::max() &&
+                k_tile_count <= std::numeric_limits<int>::max(),
+                "workspace compact tile counts must fit in int32");
+
+    auto workspace = std::make_shared<BackwardVarlenMegaRingWorkspace>();
+    auto float_options = q.options().dtype(torch::kFloat32);
+    workspace->dk_steps = torch::empty({world_size, step_stride}, float_options);
+    workspace->dv_steps = torch::empty_like(workspace->dk_steps);
+    workspace->q_tile_map = make_compact_tile_map(
+        cu_seqlens_q_host, q, 64, q_tile_count);
+    workspace->k_tile_map = make_compact_tile_map(
+        cu_seqlens_k_host, q, 128, k_tile_count);
+    workspace->cu_seqlens_q_host.assign(q_cu, q_cu + batch_size + 1);
+    workspace->cu_seqlens_k_host.assign(k_cu, k_cu + batch_size + 1);
+    workspace->world_size = static_cast<int>(world_size);
+    workspace->step_stride = step_stride;
+    workspace->q_tile_count = q_tile_count;
+    workspace->k_tile_count = k_tile_count;
+    return workspace;
+}
+
 py::tuple backward_varlen_mega_ring(
     torch::Tensor dout,
     torch::Tensor q,
@@ -394,7 +565,8 @@ py::tuple backward_varlen_mega_ring(
     int64_t num_comm_sm,
     torch::Tensor global_seqlens_host,
     torch::Tensor ring_sizes_host,
-    torch::Tensor ring_starts_host) {
+    torch::Tensor ring_starts_host,
+    std::shared_ptr<BackwardVarlenMegaRingWorkspace> workspace) {
     check_bf16_cuda(q, "q", 3);
     check_bf16_cuda(k, "k", 3);
     check_bf16_cuda(v, "v", 3);
@@ -403,13 +575,8 @@ py::tuple backward_varlen_mega_ring(
     check_lse(softmax_lse, q);
     check_cu_seqlens(cu_seqlens_q, q, "cu_seqlens_q");
     check_cu_seqlens(cu_seqlens_k, q, "cu_seqlens_k");
-    TORCH_CHECK(!cu_seqlens_q_host.is_cuda() && !cu_seqlens_k_host.is_cuda(),
-                "host cu_seqlens tensors must be on CPU");
-    TORCH_CHECK(cu_seqlens_q_host.scalar_type() == torch::kInt32 &&
-                cu_seqlens_k_host.scalar_type() == torch::kInt32,
-                "host cu_seqlens tensors must have dtype int32");
-    TORCH_CHECK(cu_seqlens_q_host.is_contiguous() && cu_seqlens_k_host.is_contiguous(),
-                "host cu_seqlens tensors must be contiguous");
+    check_cu_seqlens_host(cu_seqlens_q_host, "cu_seqlens_q_host");
+    check_cu_seqlens_host(cu_seqlens_k_host, "cu_seqlens_k_host");
     TORCH_CHECK(cu_seqlens_q_host.numel() == cu_seqlens_q.numel() &&
                 cu_seqlens_k_host.numel() == cu_seqlens_k.numel(),
                 "host and device cu_seqlens lengths must match");
@@ -477,6 +644,17 @@ py::tuple backward_varlen_mega_ring(
     auto const* ring_start_host = ring_starts_host.data_ptr<int>();
     TORCH_CHECK(q_host[0] == 0 && k_host[0] == 0,
                 "cu_seqlens must start at zero");
+    if (workspace) {
+        TORCH_CHECK(workspace->cu_seqlens_q_host.size() ==
+                    static_cast<size_t>(batch_size + 1) &&
+                    workspace->cu_seqlens_k_host.size() ==
+                    static_cast<size_t>(batch_size + 1),
+                    "workspace batch size does not match host cu_seqlens");
+        TORCH_CHECK(workspace->cu_seqlens_q_host[0] == q_host[0] &&
+                    workspace->cu_seqlens_k_host[0] == k_host[0],
+                    "workspace host cu_seqlens mismatch at index=0; "
+                    "recreate the workspace for this batch layout");
+    }
     int const local_total_k = k_host[batch_size];
     TORCH_CHECK(k.size(0) == v.size(0) && k.size(0) % world_size == 0,
                 "k/v arena rows must match and be divisible by world_size");
@@ -499,6 +677,12 @@ py::tuple backward_varlen_mega_ring(
     int max_local_k = 0;
     std::array<int64_t, 8> logical_rank_rows{};
     for (int b = 0; b < batch_size; ++b) {
+        if (workspace) {
+            TORCH_CHECK(workspace->cu_seqlens_q_host[b + 1] == q_host[b + 1] &&
+                        workspace->cu_seqlens_k_host[b + 1] == k_host[b + 1],
+                        "workspace host cu_seqlens mismatch at index=", b + 1,
+                        "; recreate the workspace for this batch layout");
+        }
         int const q_len = q_host[b + 1] - q_host[b];
         int const k_len = k_host[b + 1] - k_host[b];
         TORCH_CHECK(q_len >= 0 && k_len >= 0, "cu_seqlens must be nondecreasing at batch=", b);
@@ -641,14 +825,44 @@ py::tuple backward_varlen_mega_ring(
 
     auto float_options = q.options().dtype(torch::kFloat32);
     auto int_options = q.options().dtype(torch::kInt32);
+    int64_t const q_tile_count = count_compact_tiles(cu_seqlens_q_host, block_m);
+    int64_t const k_tile_count = count_compact_tiles(cu_seqlens_k_host, block_n);
+    TORCH_CHECK(q_tile_count <= std::numeric_limits<int>::max() &&
+                k_tile_count <= std::numeric_limits<int>::max(),
+                "compact auxiliary tile counts must fit in int32");
+    if (workspace) {
+        TORCH_CHECK(workspace->world_size == world_size,
+                    "workspace world size mismatch");
+        TORCH_CHECK(workspace->step_stride == step_stride,
+                    "workspace step stride mismatch; recreate it for this topology");
+        TORCH_CHECK(workspace->q_tile_count == q_tile_count &&
+                    workspace->k_tile_count == k_tile_count,
+                    "workspace compact tile counts do not match host cu_seqlens");
+    }
+    auto q_tile_map = workspace
+        ? workspace->q_tile_map
+        : make_compact_tile_map(cu_seqlens_q_host, q, block_m, q_tile_count);
+    auto k_tile_map = workspace
+        ? workspace->k_tile_map
+        : make_compact_tile_map(cu_seqlens_k_host, q, block_n, k_tile_count);
+    check_tile_map(q_tile_map, q, q_tile_count, "q_tile_map");
+    check_tile_map(k_tile_map, q, k_tile_count, "k_tile_map");
+
     auto dq = torch::empty_like(q);
     auto dk = torch::empty({local_total_k, k.size(1), 128}, q.options());
     auto dv = torch::empty_like(dk);
     auto softmax_d = torch::empty({q.size(1), total_q_padded}, float_options);
     auto softmax_lse_log2 = torch::empty_like(softmax_d);
     auto dq_accum = torch::empty({q.size(1), total_q_padded * 128}, float_options);
-    auto dk_steps = torch::zeros({world_size, step_stride}, float_options);
-    auto dv_steps = torch::zeros_like(dk_steps);
+    auto dk_steps = workspace
+        ? workspace->dk_steps
+        : torch::zeros({world_size, step_stride}, float_options);
+    auto dv_steps = workspace
+        ? workspace->dv_steps
+        : torch::zeros({world_size, step_stride}, float_options);
+    check_step_workspace(dk_steps, q, world_size, step_stride, "dk_steps");
+    check_step_workspace(dv_steps, q, world_size, step_stride, "dv_steps");
+    TORCH_CHECK(!dk_steps.is_alias_of(dv_steps), "dk_steps and dv_steps must not alias");
     auto dq_semaphore = torch::empty(
         {(max_seqlen_q + block_m - 1) / block_m, batch_size, q.size(1)}, int_options);
     auto tile_count = torch::zeros({1}, int_options);
@@ -715,6 +929,16 @@ py::tuple backward_varlen_mega_ring(
     }
 
     auto stream = at::cuda::getCurrentCUDAStream(q.get_device()).stream();
+    if (workspace) {
+        C10_CUDA_CHECK(cudaMemsetAsync(
+            dk_steps.data_ptr(), 0, dk_steps.nbytes(), stream));
+        C10_CUDA_CHECK(cudaMemsetAsync(
+            dv_steps.data_ptr(), 0, dv_steps.nbytes(), stream));
+    }
+    params.q_tile_map = q_tile_count > 0 ? q_tile_map.data_ptr<int>() : nullptr;
+    params.k_tile_map = k_tile_count > 0 ? k_tile_map.data_ptr<int>() : nullptr;
+    params.q_tile_count = static_cast<int>(q_tile_count);
+    params.k_tile_count = static_cast<int>(k_tile_count);
     min_fa3_backward::run_min_fa3_bwd_mega_ring(
         params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -724,6 +948,19 @@ py::tuple backward_varlen_mega_ring(
 }  // namespace
 
 void bind_min_fa3_backward(py::module_& module) {
+    using WorkspaceHolder = std::shared_ptr<BackwardVarlenMegaRingWorkspace>;
+    py::class_<BackwardVarlenMegaRingWorkspace, WorkspaceHolder> workspace_class(
+        module, "_BackwardVarlenMegaRingWorkspace");
+    module.def(
+        "_create_backward_varlen_mega_ring_workspace",
+        &create_backward_varlen_mega_ring_workspace,
+        py::arg("q"),
+        py::arg("cu_seqlens_q_host"),
+        py::arg("cu_seqlens_k_host"),
+        py::arg("world_size"),
+        py::arg("kv_heads"),
+        py::arg("rank_capacity"),
+        "Create an opaque reusable workspace for mega-ring varlen backward.");
     module.def(
         "backward",
         &backward,
@@ -772,5 +1009,7 @@ void bind_min_fa3_backward(py::module_& module) {
         py::arg("num_comp_sm"), py::arg("num_comm_sm"),
         py::arg("global_seqlens_host"), py::arg("ring_sizes_host"),
         py::arg("ring_starts_host"),
+        py::kw_only(),
+        py::arg("workspace") = py::none(),
         "Hierarchical causal zigzag mega-ring varlen backward with persistent compute and communication CTAs.");
 }
