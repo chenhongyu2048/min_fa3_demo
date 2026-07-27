@@ -37,9 +37,9 @@ from ring_test.forward_load_model import (
     magi_result_from_records,
 )
 from ring_test.utils import parse_int_list
-from ring_test.zepplin import (
-    DEFAULT_ZEPPLIN_THRESHOLD,
-    zepplin_incompatibility,
+from ring_test.zeppelin import (
+    DEFAULT_ZEPPELIN_THRESHOLD,
+    zeppelin_incompatibility,
 )
 
 
@@ -140,9 +140,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=4,
     )
     parser.add_argument(
-        "--zepplin-threshold",
+        "--zeppelin-threshold",
         type=_positive_int,
-        default=DEFAULT_ZEPPLIN_THRESHOLD,
+        default=DEFAULT_ZEPPELIN_THRESHOLD,
     )
     parser.add_argument(
         "--megatron-max-seqlen-per-rank", type=_positive_int, default=8192
@@ -260,9 +260,9 @@ def method_incompatibility(
             is_causal,
             max_seqlen_per_rank=args.megatron_max_seqlen_per_rank,
         )
-    if method == "zepplin":
-        return zepplin_incompatibility(
-            list(lengths), world_size, is_causal, args.zepplin_threshold
+    if method == "zeppelin":
+        return zeppelin_incompatibility(
+            list(lengths), world_size, is_causal, args.zeppelin_threshold
         )
     if method == "mega_ring_hybrid":
         return _mega_hybrid_incompatibility(case, world_size, is_causal)
@@ -573,8 +573,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "(metadata only, BF16, logical tiles=128x128)"
                 )
                 print(
-                    "Aligned-method token and communication counters use original "
-                    "sequence lengths; FLOPs retain execution padding"
+                    "Effective counters use raw sequence lengths; physical FLOPs "
+                    "and Zeppelin ring communication retain execution padding"
                 )
                 print(
                     f"Config: source={source}, world_size={world_size}, "
@@ -686,7 +686,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                                 args.headdim,
                                 is_causal,
                                 heads_k_stride=args.allgather_overlapping_heads_k_stride,
-                                zepplin_threshold=args.zepplin_threshold,
+                                zeppelin_threshold=args.zeppelin_threshold,
                                 megatron_max_seqlen_per_rank=args.megatron_max_seqlen_per_rank,
                             )
                         else:
@@ -700,7 +700,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                                 args.kvhead,
                                 args.headdim,
                                 heads_k_stride=args.allgather_overlapping_heads_k_stride,
-                                zepplin_threshold=args.zepplin_threshold,
+                                zeppelin_threshold=args.zeppelin_threshold,
                                 megatron_max_seqlen_per_rank=args.megatron_max_seqlen_per_rank,
                             )
                     else:

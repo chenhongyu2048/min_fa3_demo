@@ -208,7 +208,7 @@ divisible by 256, and the current fused backward requires causal mode,
 - `fa3_ring`: NCCL zigzag K/V and FP32 dKV ring using FA3 block backward
 - `megatron_hybrid_cp`: Megatron length schedule with CP1/2/4/8 FA3 P2P phases
 - `magi_attention`: full-WORLD MagiAttention dynamic packing/dispatch baseline
-- `zepplin`: short-sequence G1 attention plus long-sequence all-rank FA3 ring
+- `zeppelin`: single-node Algorithm 2 with raw arbitrary-G FA3/NCCL ring queues
 - `mega_ring_all_cp`: fused backward with every sequence split across all ranks
 - `mega_ring_hybrid`: fused G8/G4/G2/G1 hierarchical backward
 
@@ -221,8 +221,8 @@ each rank's average time, aggregate/average-per-GPU causal backward TFLOP/s,
 and the fused compute/communication SM split. Forward preparation is outside
 every method's timed interval. The fused owner-accumulator reset and
 distributed barrier are also outside its timed interval. Zeppelin's timed
-backward runs one all-rank phase barrier first, followed by the all-rank ring
-backward and then the rank-local G1 backward. That internal phase barrier is
+backward runs one all-rank phase barrier first, followed by all G>1 member-group
+queues in deterministic registry order and then the rank-local G1 queue. That internal barrier is
 included in its result;
 there is no barrier after either work phase.
 
@@ -238,7 +238,7 @@ torchrun --standalone --nproc_per_node=8 \
   --b 1,4 --seqlen 256,256 \
   --ring-sizes 8,4,2,1 --ring-starts 0,4,2,7 \
   --qhead 16 --kvhead 8 --headdim 128 \
-  --methods all --zepplin-threshold 4096 \
+  --methods all --zeppelin-threshold 4096 \
   --num-comp-sm 100 --num-comm-sm 16 \
   --warmup-iters 5 --num-iters 20
 ```
@@ -306,19 +306,19 @@ fused kernels together with the per-sequence all-gather, Llama3 all-gather,
 FA3/NCCL ring, MagiAttention, and Zeppelin baselines. The dataset planner's
 hierarchical ring metadata is forwarded unchanged; MagiAttention ignores that
 metadata and dynamically dispatches the same global lengths over WORLD, while
-Zeppelin independently rebuilds its G1/Gworld placement.
+Zeppelin independently rebuilds its single-node Algorithm 2 placement.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
   ring_test/benchmark_dataset_backward.py \
   --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 4 \
   --qhead 32 --kvhead 8 --headdim 128 \
-  --methods all --zepplin-threshold 4096 \
+  --methods all --zeppelin-threshold 4096 \
   --sm-configs 128:4,124:8,120:12,116:16 \
   --warmup-iters 10 --num-iters 40 --no-check
 
 DATASETS="arxiv github pile freelaw prolong" GPU_COUNTS="2 4 8" NUM_CASES=4 DIRECTION=backward \
-  ZEPPLIN_THRESHOLD=4096 ./benchmark_dataset.sh
+  ZEPPELIN_THRESHOLD=4096 ./benchmark_dataset.sh
 ```
 
 Planner-only inspection does not import or initialize CUDA:
@@ -332,7 +332,7 @@ python ring_test/benchmark_dataset_backward.py \
 Use `--check` only for small token budgets because the dense backward reference
 has quadratic score memory. The shell wrapper shares the forward wrapper's
 `DATASETS`, `GPU_COUNTS`, balancing controls, `SM_CONFIGS`, logging, `CHECK`,
-and `DRY_RUN` environment variables. `ZEPPLIN_THRESHOLD` controls the shared
+and `DRY_RUN` environment variables. `ZEPPELIN_THRESHOLD` controls the shared
 forward/backward threshold and defaults to `4096`.
 
 ## Forward/backward load-balance metadata benchmark
@@ -346,7 +346,7 @@ eight baselines in `benchmark_topology_forward.py` and
 - `fa3_ring`
 - `megatron_hybrid_cp`
 - `magi_attention`
-- `zepplin`
+- `zeppelin`
 - `mega_ring_all_cp`
 - `mega_ring_hybrid`
 
@@ -472,9 +472,9 @@ Backward communication follows each runner's actual boundary:
 - All-gather and Llama3 repeat the BF16 K/V all-gather and perform FP32 dK/dV
   reduce-scatter. Setup repartition and untimed forward preparation are
   excluded.
-- FA3 ring, Megatron CP2/4/8, and Zeppelin Gworld use `p-1` BF16 K/V ring
-  steps and `p` FP32 dK/dV owner-return steps. Megatron CP1 and Zeppelin's LPT
-  G1 sequences are local with zero payload. Megatron payload sizes use the
+- FA3 ring, Megatron CP2/4/8, and Zeppelin G>1 queues use `G-1` BF16 K/V ring
+  steps and `G` FP32 dK/dV owner-return steps. Megatron CP1 and Zeppelin G1
+  sequences are local with zero payload. Megatron payload sizes use the
   post-schedule padded execution length. Inter-group and phase barriers are
   excluded.
 - Fused mega-ring fetches remote BF16 K/V with its causal half/full row rule.
@@ -502,7 +502,7 @@ methods:
 - `fa3_ring`: all-CP Python ring using FA3 blocks plus NCCL P2P
 - `megatron_hybrid_cp`: independently scheduled Megatron CP1/2/4/8 groups
 - `magi_attention`: full-WORLD dynamic packing/dispatch through MagiAttention
-- `zepplin`: LPT-placed rank-local attention for short sequences and an all-rank ring for long sequences
+- `zeppelin`: Algorithm 2 arbitrary-G member queues followed by rank-local G1 attention
 - `mega_ring_all_cp`: fused mega-ring with every sequence split across all ranks
 - `mega_ring_hybrid`: fused mega-ring using the requested per-batch ring hierarchy
 
@@ -582,22 +582,25 @@ through `--methods all` reports the incompatibility and skips UltraAttn. See
 `baseline/UltraAttnREADME.md` for planner installation, correctness commands,
 solver status, and formal five-case results.
 
-Zeppelin uses `--zepplin-threshold` (default `4096`) independently of the
-hierarchical metadata. A sequence with `global_length < threshold` is placed
-whole on one rank (G1); equality belongs to the long side, so length `4096`
-uses Gworld at the default threshold. Short sequences are assigned by
-deterministic longest-processing-time-first placement. Causal weight is
-`L * (L + 1) / 2`, noncausal weight is `L * L`; equal weights retain original
-batch-index order, and equal rank loads choose the smaller rank id. Long
-sequences add the same distributed load to every rank and do not affect the
-G1 choice.
+Zeppelin uses `--zeppelin-threshold` (default `4096`) as Algorithm 2's initial
+per-GPU token capacity `L`, with initial `s0=L`. Each round sorts by descending
+raw length and sample id, places `|s| < s0` sequences into least-token buckets,
+and assigns larger sequences `G=ceil(P*|s|^2/sum(|s|^2))` ordered round-robin
+members. Capacity failure sets `s0` to the largest current short sequence and
+restarts the entire round. Equality belongs to the distributed side. The
+round-robin cursor advances across sequences instead of restarting per sample;
+ties retain sample-id order and least-load bucket ties choose the smaller rank.
+After G and members are fixed from raw lengths, native execution is minimally
+padded without replanning: noncausal aligns to G and causal aligns to `2*G`.
+Thus G is still an Algorithm 2 raw-length decision, while every causal local
+shard is even. Static metrics retain raw effective work and separately report
+the padded physical work, tokens, communication, and padding.
 
-Each rank packs its owned short sequences first and every long sequence's
-local shard second; each part retains original batch order. Forward timing
-includes one all-rank phase barrier, the long `fa3_ring`, and then local varlen
-attention. There is no barrier after the ring or local phase. Ranks with no
-short work and workloads with no long work still participate in the initial
-barrier, while empty kernel launches are skipped.
+All ranks create the unique G>1 process groups in the same deterministic order;
+G=P reuses WORLD and G1 uses local varlen attention. Each rank packs its member
+shards in G>1 queue order followed by its local G1 samples. Forward and backward
+include one WORLD barrier, execute all G>1 queues, and finish with the local G1
+queue. Empty queues skip their kernel launch.
 
 Forward selection requires the external FA3 varlen forward entry point on
 every rank. Backward selection requires both its forward and backward entry
@@ -627,11 +630,11 @@ KV work, and a KV read is one attention mainloop KV tile. It excludes the
 and collection are outside event timing and TFLOPS. Causal ready-segment timing
 can make the observed Q/O visit count and ratio fall anywhere in the static
 `benchmark_load_balance.py` lower/upper range, while KV reads remain stable.
-Use `--methods` to select a subset or
-`--methods all` for all eight. Zeppelin only requires sequences at or above its
-threshold to be divisible by `world_size`; causal long shards must also be even
-for the zigzag ring. Short G1 sequences have no all-CP divisibility constraint,
-and the threshold must be a positive integer.
+Use `--methods` to select a subset or `--methods all` for all eight. Native
+Zeppelin does not skip non-divisible raw lengths: after planning, noncausal
+execution length is rounded up to a multiple of G and causal execution length
+to a multiple of `2*G`. This padding does not quantize or recompute G. The
+threshold must be a positive integer.
 
 Example:
 
@@ -640,7 +643,7 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_topology_forward.py
   --global-seqlens 8192,1024,1024 \
   --ring-sizes 2,1,1 --ring-starts 0,0,1 \
   --qhead 16 --kvhead 8 --headdim 128 --methods all \
-  --zepplin-threshold 4096 \
+  --zeppelin-threshold 4096 \
   --sm-configs 128:4,116:16 --mode both \
   --warmup-iters 5 --num-iters 20 --collect-mega-ring-stats
 ```
@@ -686,10 +689,10 @@ torchrun --standalone --nproc_per_node=8 \
   ring_test/benchmark_dataset_forward.py \
   --dataset arxiv --target-tokens 131072 --seed 0 --num-cases 4 \
   --qhead 32 --kvhead 8 --headdim 128 \
-  --mode causal --methods all --zepplin-threshold 4096 \
+  --mode causal --methods all --zeppelin-threshold 4096 \
   --collect-mega-ring-stats --no-check
 
-DATASETS="arxiv github pile freelaw prolong" GPU_COUNTS="2 4 8" NUM_CASES=4 ZEPPLIN_THRESHOLD=4096 \
+DATASETS="arxiv github pile freelaw prolong" GPU_COUNTS="2 4 8" NUM_CASES=4 ZEPPELIN_THRESHOLD=4096 \
   ./benchmark_dataset.sh
 ```
 
@@ -719,7 +722,7 @@ The shell wrapper exposes the same settings as `COMPUTE_BALANCE_TOLERANCE`,
 `TOKEN_BALANCE_TOLERANCE`, `BEAM_WIDTH`, `FINALIST_COUNT`,
 `STRUCTURE_THRESHOLD`, and `MAX_REPAIR_ITERATIONS`. The load quantization step
 is fixed at 2% of the corresponding average and the residual-fill smooth-max
-lambda is fixed at 8. `ZEPPLIN_THRESHOLD` defaults to `4096`, and
+lambda is fixed at 8. `ZEPPELIN_THRESHOLD` defaults to `4096`, and
 `MAGI_OVERLAP_DEGREE` defaults to `2`; both are forwarded to both dataset
 directions. `--print-workload` reports absolute deviations,
 feasibility and violation, the relaxation level, split counts and penalties,
@@ -748,34 +751,42 @@ the following five labels in this order:
 
 - `native_megatron_hybrid_cp`: the existing Megatron Hybrid-CP baseline with
   its own execution-group schedule.
-- `native_zepplin`: the existing Zepllin G1/Gworld two-phase baseline with its
-  own LPT placement of short sequences.
+- `native_zeppelin`: single-node Algorithm 2 with raw-length G decisions,
+  minimal post-plan execution padding, explicit ordered members, arbitrary-G
+  queues, and a final local G1 queue.
 - `mega_ring_hybrid_br_pbs`: one fused Mega Ring Hybrid launch using BR-PBS
   Buddy-ring metadata.
 - `mega_ring_hybrid_megatron_cp`: one fused Mega Ring Hybrid launch using only
   the final FA3-aligned Megatron CP placement.
-- `mega_ring_hybrid_zepplin`: one fused Mega Ring Hybrid launch using only the
-  Zepllin G1 owner/Gworld placement.
+- `mega_ring_hybrid_zeppelin`: one fused Mega Ring Hybrid launch derived from
+  native Zeppelin G, with pow2 mapping, `256 * mapped_G` alignment, and greedy
+  Buddy-group placement.
 
 Forward accepts `--mode noncausal`, `causal`, or `both`; `both` emits all five
 rows for each mode. Backward is always causal and rejects another mode. The
 native rows consume the un-reordered raw lengths. The fused rows consume a
 planner-specific metadata order, but each entry retains its original sample id
-as a deterministic tie-breaker. BR-PBS and Zepllin rows are never silently
-padded: if their effective local sequence does not meet the fused 128-row
-alignment, or causal G2/G4/G8 half-row alignment, the run fails with the
+as a deterministic tie-breaker. The Zeppelin-derived row deliberately pads
+each mapped execution length to `256 * mapped_G`; it records raw length,
+execution length, native G, mapped G, Buddy start, and padding. BR-PBS retains
+its existing validation behavior; invalid fused metadata fails with the
 planner, mode, and sample id. Megatron is the sole exception because its own
 `build_hybrid_cp_plan_for_fa3_ring()` already explicitly pads its final CP
 assignments; its diagnostics show original/executed tokens and padding.
 
 The native and mapped-fused rows are intentionally not identical schedule
 semantics. Native Megatron times its serial execution groups and their barriers.
-Native Zepllin times its Gworld phase barrier, distributed long phase, and
-rank-local short phase. The Megatron- and Zepllin-derived fused rows reuse only
+Native Zeppelin times its phase barrier, deterministic G>1 queues, and final
+rank-local G1 queue. The Megatron- and Zeppelin-derived fused rows reuse only
 their placement metadata and run one fused Mega Ring launch; they do not replay
 the native groups or phases. Interpret the comparison as native end-to-end
 runtime versus fused-kernel runtime under the same source placement, not as two
 implementations of one execution schedule.
+
+Plot parsers accept only the new `zeppelin`, `native_zeppelin`, and
+`mega_ring_hybrid_zeppelin` keys. Historical logs using a retired spelling must
+be migrated before plotting; the repository does not retain a compatibility
+parser.
 
 The existing runner timing boundaries remain in force: planner construction,
 input creation/packing, IPC allocation, pre-timing synchronization, scheduler
@@ -818,7 +829,7 @@ GPU_COUNTS=8 DATASETS="arxiv freelaw github pile prolong" \
 The launcher accepts the same dataset, BR-PBS, shape, SM-sweep, check, and
 logging controls as the dataset benchmark style, but deliberately does not
 expose a `METHODS` selector because the five-result suite is fixed. Its default
-Zepllin threshold is 8192. Set `DIRECTION=backward` only with `MODE=causal`;
+Zeppelin threshold is 4096. Set `DIRECTION=backward` only with `MODE=causal`;
 `COLLECT_MEGA_RING_STATS=1` is forward-only.
 
 ## 1/2/4/8-GPU causal sweep

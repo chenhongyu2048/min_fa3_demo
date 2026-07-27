@@ -43,7 +43,7 @@ from allgather_attention import (
 from hybrid_backward_baselines import (
     VarlenAllGatherBackward,
     VarlenFa3RingBackward,
-    ZepplinBackward,
+    ZeppelinBackward,
 )
 from ring_test.utils import (
     MEGA_RING_ALL_CP_ALIGNMENT,
@@ -59,11 +59,13 @@ from ring_test.utils import (
     make_cu_seqlens,
     make_local_qkv,
     parse_int_list,
+    zeppelin_reference,
 )
-from zepplin import (
-    DEFAULT_ZEPPLIN_THRESHOLD,
-    make_zepplin_plan,
-    zepplin_incompatibility,
+from zeppelin import (
+    DEFAULT_ZEPPELIN_THRESHOLD,
+    ZeppelinPlan,
+    make_zeppelin_plan,
+    zeppelin_incompatibility,
 )
 
 
@@ -73,7 +75,7 @@ METHOD_ORDER = [
     "fa3_ring",
     "megatron_hybrid_cp",
     "magi_attention",
-    "zepplin",
+    "zeppelin",
     "mega_ring_all_cp",
     "mega_ring_hybrid",
 ]
@@ -81,9 +83,9 @@ BLOCK_BASELINE_METHODS = {
     "allgather_attention",
     "llama3_allgather_attention",
     "fa3_ring",
-    "zepplin",
+    "zeppelin",
 }
-ALL_CP_METHODS = BLOCK_BASELINE_METHODS - {"zepplin"} | {"mega_ring_all_cp"}
+ALL_CP_METHODS = BLOCK_BASELINE_METHODS - {"zeppelin"} | {"mega_ring_all_cp"}
 BLOCK_ALL_CP_METHODS = ALL_CP_METHODS - {"mega_ring_all_cp"}
 SM_SWEEP_METHODS = {"mega_ring_all_cp", "mega_ring_hybrid"}
 FUSED_MEGA_RING_METHODS = {"mega_ring_all_cp", "mega_ring_hybrid"}
@@ -208,7 +210,7 @@ def method_incompatibility(
     method: str,
     global_lengths: list[int],
     world_size: int,
-    zepplin_threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
+    zeppelin_threshold: int = DEFAULT_ZEPPELIN_THRESHOLD,
     megatron_max_seqlen_per_rank: int = 8192,
 ) -> str | None:
     if method == "megatron_hybrid_cp":
@@ -218,9 +220,9 @@ def method_incompatibility(
             True,
             max_seqlen_per_rank=megatron_max_seqlen_per_rank,
         )
-    if method == "zepplin":
-        return zepplin_incompatibility(
-            global_lengths, world_size, True, zepplin_threshold
+    if method == "zeppelin":
+        return zeppelin_incompatibility(
+            global_lengths, world_size, True, zeppelin_threshold
         )
     if method == "mega_ring_all_cp":
         return None
@@ -253,7 +255,7 @@ def compatible_methods(
     world_size: int,
     *,
     skip_incompatible: bool,
-    zepplin_threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
+    zeppelin_threshold: int = DEFAULT_ZEPPELIN_THRESHOLD,
     megatron_max_seqlen_per_rank: int = 8192,
 ) -> tuple[list[str], list[tuple[str, str]]]:
     active: list[str] = []
@@ -263,7 +265,7 @@ def compatible_methods(
             method,
             global_lengths,
             world_size,
-            zepplin_threshold,
+            zeppelin_threshold,
             megatron_max_seqlen_per_rank,
         )
         if reason is None:
@@ -563,6 +565,43 @@ def make_reference(
     )
 
 
+def make_zeppelin_reference(
+    q: torch.Tensor,
+    local_k: torch.Tensor,
+    local_v: torch.Tensor,
+    dout: torch.Tensor,
+    plan: ZeppelinPlan,
+    rank_capacity: int,
+    rank: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    gathered_k = gather_padded_rank_tensor(local_k, rank_capacity)
+    gathered_v = gather_padded_rank_tensor(local_v, rank_capacity)
+    q_ref = q.detach().clone().requires_grad_(True)
+    gathered_k_ref = gathered_k.detach().clone().requires_grad_(True)
+    gathered_v_ref = gathered_v.detach().clone().requires_grad_(True)
+    out_ref, lse_ref = zeppelin_reference(
+        q_ref, gathered_k_ref, gathered_v_ref, plan, rank, True
+    )
+    if q.size(0) > 0:
+        dq_ref, dk_ref_all, dv_ref_all = torch.autograd.grad(
+            out_ref, (q_ref, gathered_k_ref, gathered_v_ref), dout
+        )
+    else:
+        dq_ref = torch.zeros_like(q_ref)
+        dk_ref_all = torch.zeros_like(gathered_k_ref)
+        dv_ref_all = torch.zeros_like(gathered_v_ref)
+    dist.all_reduce(dk_ref_all)
+    dist.all_reduce(dv_ref_all)
+    local_total = local_k.size(0)
+    return (
+        out_ref.detach(),
+        lse_ref.detach(),
+        dq_ref.detach(),
+        dk_ref_all[rank, :local_total].detach(),
+        dv_ref_all[rank, :local_total].detach(),
+    )
+
+
 def measure_backward_ms(
     prepare: Callable[[], None],
     launch: Callable[[], tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
@@ -699,13 +738,25 @@ def benchmark_topology(
     methods: list[str],
     allgather_backend: str | None,
     parallel_pools: BackwardParallelPools | None = None,
+    metric_global_lengths: Sequence[int] | None = None,
 ) -> list[BenchmarkResult]:
+    raw_metric_lengths = (
+        list(metric_global_lengths)
+        if metric_global_lengths is not None
+        else global_lengths
+    )
+    if len(raw_metric_lengths) != len(global_lengths) or any(
+        length <= 0 for length in raw_metric_lengths
+    ):
+        raise ValueError(
+            "metric_global_lengths must contain one positive raw length per sample"
+        )
     if any(
-        method not in {"zepplin", "magi_attention", "megatron_hybrid_cp"}
+        method not in {"zeppelin", "magi_attention", "megatron_hybrid_cp"}
         for method in methods
     ):
         validate_backward_metadata(global_lengths, ring_sizes, ring_starts, world_size)
-    elif "zepplin" in methods and not (
+    elif "zeppelin" in methods and not (
         len(global_lengths) == len(ring_sizes) == len(ring_starts)
     ):
         raise SystemExit(
@@ -713,14 +764,14 @@ def benchmark_topology(
         )
     device = torch.device("cuda", rank)
     mega_ring_all_cp_global_lengths = align_mega_ring_all_cp_lengths(global_lengths)
-    zepplin_plan = (
-        make_zepplin_plan(
+    zeppelin_plan = (
+        make_zeppelin_plan(
             global_lengths,
             world_size,
             True,
-            args.zepplin_threshold,
+            args.zeppelin_threshold,
         )
-        if "zepplin" in methods
+        if "zeppelin" in methods
         else None
     )
     if rank == 0:
@@ -736,12 +787,16 @@ def benchmark_topology(
                 f"global_seqlens={mega_ring_all_cp_global_lengths}"
             )
         print(f"Hybrid rings: sizes={ring_sizes}, starts={ring_starts}")
-        if zepplin_plan is not None:
+        if zeppelin_plan is not None:
             print(
-                f"Zepplin placement: threshold={zepplin_plan.threshold}, "
-                f"G1={len(zepplin_plan.short_indices)}, "
-                f"Gworld={len(zepplin_plan.long_indices)}, "
-                f"G1_rank_loads={list(zepplin_plan.short_loads)}"
+                f"Zeppelin placement: L={zeppelin_plan.threshold}, "
+                f"final_s0={zeppelin_plan.effective_threshold}, "
+                f"iterations={zeppelin_plan.iterations}, "
+                "groups="
+                f"{[assignment.group_size for assignment in zeppelin_plan.assignments]}, "
+                f"execution_lengths={list(zeppelin_plan.execution_lengths)}, "
+                f"padding={zeppelin_plan.padding_tokens}, "
+                f"physical_rank_token_loads={list(zeppelin_plan.rank_token_loads)}"
             )
         print(
             "Timing excludes forward preparation, owner-accumulator reset, and the "
@@ -1126,17 +1181,13 @@ def benchmark_topology(
                 tuple(mega_ring_all_cp_global_lengths),
             )
 
-    if zepplin_plan is not None:
+    if zeppelin_plan is not None:
         if allgather_backend is None:
-            raise RuntimeError("zepplin baseline requires a selected block backend")
-        zepplin_rank_lengths = [
-            zepplin_plan.topology_lengths_for_rank(source_rank)
-            for source_rank in range(world_size)
-        ]
-        zepplin_local_lengths = zepplin_plan.packed_lengths_for_rank(rank)
-        zepplin_local_total = sum(zepplin_local_lengths)
-        zepplin_q, zepplin_k, zepplin_v = make_local_qkv(
-            zepplin_local_total,
+            raise RuntimeError("zeppelin baseline requires a selected block backend")
+        zeppelin_local_lengths = zeppelin_plan.packed_lengths_for_rank(rank)
+        zeppelin_local_total = sum(zeppelin_local_lengths)
+        zeppelin_q, zeppelin_k, zeppelin_v = make_local_qkv(
+            zeppelin_local_total,
             args.qhead,
             args.kvhead,
             args.headdim,
@@ -1147,45 +1198,39 @@ def benchmark_topology(
         )
         generator = torch.Generator(device=device)
         generator.manual_seed(args.seed + 20_260_917 + rank)
-        zepplin_dout = torch.randn(
-            zepplin_q.shape, device=device, generator=generator
+        zeppelin_dout = torch.randn(
+            zeppelin_q.shape, device=device, generator=generator
         ).to(torch.bfloat16)
-        zepplin_reference = None
+        zeppelin_reference = None
         if args.check:
-            zepplin_cu_host = torch.tensor(
-                [0, *accumulate(zepplin_plan.topology_lengths_for_rank(rank))],
-                dtype=torch.int32,
+            zeppelin_rank_capacity = max(
+                sum(zeppelin_plan.packed_lengths_for_rank(source_rank))
+                for source_rank in range(world_size)
             )
-            zepplin_rank_capacity = max(
-                sum(lengths) for lengths in zepplin_rank_lengths
-            )
-            zepplin_reference = make_reference(
-                zepplin_q,
-                zepplin_k,
-                zepplin_v,
-                zepplin_dout,
-                zepplin_rank_lengths,
-                zepplin_cu_host,
-                zepplin_plan.packed_global_lengths,
-                zepplin_plan.ring_sizes,
-                zepplin_plan.ring_starts,
-                zepplin_rank_capacity,
+            zeppelin_reference = make_zeppelin_reference(
+                zeppelin_q,
+                zeppelin_k,
+                zeppelin_v,
+                zeppelin_dout,
+                zeppelin_plan,
+                zeppelin_rank_capacity,
                 rank,
             )
-        zepplin_runner = ZepplinBackward(
+        zeppelin_runner = ZeppelinBackward(
             dist.group.WORLD,
-            zepplin_q,
-            zepplin_k,
-            zepplin_v,
-            zepplin_dout,
-            zepplin_plan,
+            zeppelin_q,
+            zeppelin_k,
+            zeppelin_v,
+            zeppelin_dout,
+            zeppelin_plan,
             allgather_backend,
         )
-        baseline_runs["zepplin"] = MethodRun(
-            zepplin_runner.forward,
-            zepplin_runner.backward,
-            None if zepplin_reference is None else zepplin_reference[2:],
-            zepplin_runner.note,
+        baseline_runs["zeppelin"] = MethodRun(
+            zeppelin_runner.forward,
+            zeppelin_runner.backward,
+            None if zeppelin_reference is None else zeppelin_reference[2:],
+            zeppelin_runner.note,
+            zeppelin_plan.execution_lengths,
         )
 
     hybrid_runs: dict[SmConfig, MethodRun] = {}
@@ -1378,10 +1423,39 @@ def benchmark_topology(
                 )
                 check_status = "ok"
             aggregate_tflops = aggregate_backward_tflops(
-                global_lengths, args.qhead, args.headdim, timing.max_ms
+                raw_metric_lengths, args.qhead, args.headdim, timing.max_ms
             )
             if rank == 0:
                 note = run.note
+                if raw_metric_lengths != global_lengths:
+                    raw_scores = sum(
+                        length * (length + 1) // 2
+                        for length in raw_metric_lengths
+                    )
+                    aligned_scores = sum(
+                        length * (length + 1) // 2 for length in global_lengths
+                    )
+                    raw_flops = 10 * raw_scores * args.qhead * args.headdim
+                    aligned_flops = (
+                        10 * aligned_scores * args.qhead * args.headdim
+                    )
+                    aligned_aggregate_tflops = aggregate_backward_tflops(
+                        global_lengths,
+                        args.qhead,
+                        args.headdim,
+                        timing.max_ms,
+                    )
+                    note = (
+                        f"{note}; raw_tokens={sum(raw_metric_lengths)}; "
+                        f"aligned_tokens={sum(global_lengths)}; "
+                        f"padding={sum(global_lengths) - sum(raw_metric_lengths)}; "
+                        f"raw_flops={raw_flops}; "
+                        f"aligned_physical_flops={aligned_flops}; "
+                        f"raw Agg TFLOPS={aggregate_tflops:.2f}; "
+                        "aligned physical Agg TFLOPS="
+                        f"{aligned_aggregate_tflops:.2f}, "
+                        f"Avg/GPU={aligned_aggregate_tflops / world_size:.2f}"
+                    )
                 if run.aligned_global_lengths is not None:
                     aligned_aggregate_tflops = aggregate_backward_tflops(
                         run.aligned_global_lengths,
@@ -1492,9 +1566,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--sm-configs")
     parser.add_argument(
-        "--zepplin-threshold",
+        "--zeppelin-threshold",
         type=positive_int,
-        default=DEFAULT_ZEPPLIN_THRESHOLD,
+        default=DEFAULT_ZEPPELIN_THRESHOLD,
     )
     parser.add_argument(
         "--megatron-max-seqlen-per-rank",
@@ -1591,7 +1665,7 @@ def main(
                 "allgather_overlapping_heads_k_stride="
                 f"{args.allgather_overlapping_heads_k_stride}, "
                 f"sm_configs={configs}, "
-                f"zepplin_threshold={args.zepplin_threshold}, "
+                f"zeppelin_threshold={args.zeppelin_threshold}, "
                 "megatron_max_seqlen_per_rank="
                 f"{args.megatron_max_seqlen_per_rank}, "
                 f"magi_overlap_degree={args.magi_overlap_degree}, "
@@ -1652,13 +1726,13 @@ def main(
         for _label, global_lengths, ring_sizes, ring_starts in workloads:
             if any(
                 method
-                not in {"zepplin", "magi_attention", "megatron_hybrid_cp"}
+                not in {"zeppelin", "magi_attention", "megatron_hybrid_cp"}
                 for method in requested_methods
             ):
                 validate_backward_metadata(
                     global_lengths, ring_sizes, ring_starts, world_size
                 )
-            elif "zepplin" in requested_methods and not (
+            elif "zeppelin" in requested_methods and not (
                 len(global_lengths) == len(ring_sizes) == len(ring_starts)
             ):
                 raise SystemExit(
@@ -1698,7 +1772,7 @@ def main(
                 global_lengths,
                 world_size,
                 skip_incompatible=skip_incompatible_methods,
-                zepplin_threshold=args.zepplin_threshold,
+                zeppelin_threshold=args.zeppelin_threshold,
                 megatron_max_seqlen_per_rank=args.megatron_max_seqlen_per_rank,
             )
             if rank == 0 and skipped_methods:

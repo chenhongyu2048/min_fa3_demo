@@ -1,8 +1,8 @@
 """CPU-only adapters from existing planners to fused Mega Ring metadata.
 
-The planners remain authoritative.  This module only records their placement
-decisions in a common immutable form, orders records for the fused kernel, and
-rejects metadata that would require unrequested padding.
+The planners remain authoritative. This module records their placement decisions
+in a common immutable form, applies the explicitly requested Zeppelin pow2
+mapping, orders records for the fused kernel, and validates the result.
 """
 
 from __future__ import annotations
@@ -13,10 +13,10 @@ from typing import Iterable, Literal, Sequence
 
 import balancer
 from baseline.megatron_hybrid_cp import build_hybrid_cp_plan_for_fa3_ring
-from ring_test.zepplin import DEFAULT_ZEPPLIN_THRESHOLD, make_zepplin_plan
+from ring_test.zeppelin import DEFAULT_ZEPPELIN_THRESHOLD, make_zeppelin_plan
 
 
-PlannerName = Literal["br_pbs", "megatron_cp", "zepplin"]
+PlannerName = Literal["br_pbs", "megatron_cp", "zeppelin"]
 
 
 @dataclass(frozen=True)
@@ -40,10 +40,15 @@ class TopologySample:
     execution_length: int
     ring_size: int
     ring_start: int
+    native_group_size: int | None = None
 
     @property
     def padding(self) -> int:
         return self.execution_length - self.raw_length
+
+    @property
+    def mapped_group_size(self) -> int:
+        return self.ring_size
 
 
 @dataclass(frozen=True)
@@ -112,6 +117,21 @@ def _kernel_order(samples: Iterable[TopologySample]) -> tuple[TopologySample, ..
             ),
         )
     )
+
+
+def _attention_work_per_member(
+    execution_length: int, group_size: int, is_causal: bool
+) -> int:
+    total_work = (
+        execution_length * (execution_length + 1) // 2
+        if is_causal
+        else execution_length * execution_length
+    )
+    return total_work // group_size
+
+
+def _next_power_of_two(value: int) -> int:
+    return 1 << (value - 1).bit_length()
 
 
 def validate_fused_metadata(topology: PlannerTopology) -> None:
@@ -297,31 +317,86 @@ def make_megatron_cp_topology(
     return topology
 
 
-def make_zepplin_topology(
+def make_zeppelin_topology(
     raw_lengths: Sequence[int],
     world_size: int,
     is_causal: bool,
-    threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
+    threshold: int = DEFAULT_ZEPPELIN_THRESHOLD,
 ) -> PlannerTopology:
-    """Map Zepllin's LPT G1/Gworld placement to sorted Mega Ring metadata."""
+    """Map native arbitrary-G Zeppelin decisions to aligned Buddy groups."""
 
     lengths = _validate_raw_lengths(raw_lengths, world_size)
     begin = perf_counter()
-    plan = make_zepplin_plan(list(lengths), world_size, is_causal, threshold)
+    plan = make_zeppelin_plan(list(lengths), world_size, is_causal, threshold)
     elapsed_ms = (perf_counter() - begin) * 1_000.0
-    short_owners = dict(zip(plan.short_indices, plan.short_owners))
-    samples = _kernel_order(
-        TopologySample(
-            sample_id,
-            length,
-            length,
-            1 if sample_id in short_owners else world_size,
-            short_owners.get(sample_id, 0),
+
+    jobs: list[tuple[int, int, int, int, int]] = []
+    for assignment in plan.assignments:
+        mapped_group_size = _next_power_of_two(assignment.group_size)
+        if mapped_group_size > world_size:
+            raise ValueError(
+                f"Zeppelin mapped G{mapped_group_size} exceeds world_size={world_size}"
+            )
+        alignment = 256 * mapped_group_size
+        execution_length = (
+            (assignment.raw_length + alignment - 1) // alignment * alignment
         )
-        for sample_id, length in enumerate(lengths)
+        work = _attention_work_per_member(
+            execution_length, mapped_group_size, is_causal
+        )
+        jobs.append(
+            (
+                assignment.sample_id,
+                assignment.group_size,
+                mapped_group_size,
+                execution_length,
+                work,
+            )
+        )
+
+    compute_loads = [0] * world_size
+    token_loads = [0] * world_size
+    placed: dict[int, TopologySample] = {}
+    for sample_id, native_group_size, mapped_group_size, execution_length, work in sorted(
+        jobs, key=lambda job: (-job[4], -job[2], job[0])
+    ):
+        tokens = execution_length // mapped_group_size
+        candidates: list[tuple[tuple[int, int, int, int], int]] = []
+        for ring_start in range(0, world_size, mapped_group_size):
+            member_range = range(ring_start, ring_start + mapped_group_size)
+            candidate_compute = [
+                load + (work if rank in member_range else 0)
+                for rank, load in enumerate(compute_loads)
+            ]
+            candidate_tokens = [
+                load + (tokens if rank in member_range else 0)
+                for rank, load in enumerate(token_loads)
+            ]
+            objective = (
+                max(candidate_compute),
+                max(candidate_tokens),
+                sum(load * load for load in candidate_compute),
+                ring_start,
+            )
+            candidates.append((objective, ring_start))
+        _, ring_start = min(candidates)
+        for rank in range(ring_start, ring_start + mapped_group_size):
+            compute_loads[rank] += work
+            token_loads[rank] += tokens
+        placed[sample_id] = TopologySample(
+            sample_id=sample_id,
+            raw_length=lengths[sample_id],
+            execution_length=execution_length,
+            ring_size=mapped_group_size,
+            ring_start=ring_start,
+            native_group_size=native_group_size,
+        )
+
+    samples = _kernel_order(
+        placed[sample_id] for sample_id in range(len(lengths))
     )
     topology = PlannerTopology(
-        "zepplin",
+        "zeppelin",
         is_causal,
         world_size,
         lengths,
@@ -329,9 +404,36 @@ def make_zepplin_topology(
         elapsed_ms,
         (
             ("threshold", str(plan.threshold)),
-            ("short_g1", str(len(plan.short_indices))),
-            ("long_gworld", str(len(plan.long_indices))),
-            ("short_loads", ",".join(str(load) for load in plan.short_loads)),
+            ("effective_threshold", str(plan.effective_threshold)),
+            ("iterations", str(plan.iterations)),
+            (
+                "native_execution_lengths",
+                ",".join(str(length) for length in plan.execution_lengths),
+            ),
+            ("native_padding", str(plan.padding_tokens)),
+            (
+                "group_mapping",
+                ",".join(
+                    f"{sample.sample_id}:G{sample.native_group_size}->G{sample.ring_size}"
+                    for sample in sorted(samples, key=lambda sample: sample.sample_id)
+                ),
+            ),
+            (
+                "alignments",
+                ",".join(
+                    f"{sample.sample_id}:{256 * sample.ring_size}"
+                    for sample in sorted(samples, key=lambda sample: sample.sample_id)
+                ),
+            ),
+            (
+                "greedy_ring_starts",
+                ",".join(
+                    f"{sample.sample_id}:{sample.ring_start}"
+                    for sample in sorted(samples, key=lambda sample: sample.sample_id)
+                ),
+            ),
+            ("compute_loads", ",".join(str(load) for load in compute_loads)),
+            ("token_loads", ",".join(str(load) for load in token_loads)),
         ),
     )
     validate_fused_metadata(topology)
@@ -344,10 +446,10 @@ def make_planner_topologies(
     is_causal: bool,
     *,
     controls: PlannerControls = PlannerControls(),
-    zepplin_threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
+    zeppelin_threshold: int = DEFAULT_ZEPPELIN_THRESHOLD,
     megatron_max_seqlen_per_rank: int = 8192,
 ) -> tuple[PlannerTopology, PlannerTopology, PlannerTopology]:
-    """Build BR-PBS, Megatron CP, and Zepllin views of one raw batch."""
+    """Build BR-PBS, Megatron CP, and Zeppelin views of one raw batch."""
 
     return (
         make_br_pbs_topology(raw_lengths, world_size, is_causal, controls),
@@ -357,7 +459,7 @@ def make_planner_topologies(
             is_causal,
             megatron_max_seqlen_per_rank,
         ),
-        make_zepplin_topology(raw_lengths, world_size, is_causal, zepplin_threshold),
+        make_zeppelin_topology(raw_lengths, world_size, is_causal, zeppelin_threshold),
     )
 
 
@@ -369,7 +471,7 @@ __all__ = [
     "make_br_pbs_topology",
     "make_megatron_cp_topology",
     "make_planner_topologies",
-    "make_zepplin_topology",
+    "make_zeppelin_topology",
     "validate_fused_metadata",
     "validate_with_runner",
 ]

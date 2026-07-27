@@ -40,7 +40,7 @@ from allgather_attention import (
 )
 from hybrid_forward_baselines import (
     VarlenAllGatherForward,
-    ZepplinForward,
+    ZeppelinForward,
     fa3_ring_forward,
 )
 from ring_test.utils import (
@@ -55,12 +55,13 @@ from ring_test.utils import (
     make_cu_seqlens,
     make_local_qkv,
     parse_int_list,
+    zeppelin_reference,
 )
-from zepplin import (
-    DEFAULT_ZEPPLIN_THRESHOLD,
-    ZepplinPlan,
-    make_zepplin_plan,
-    zepplin_incompatibility,
+from zeppelin import (
+    DEFAULT_ZEPPELIN_THRESHOLD,
+    ZeppelinPlan,
+    make_zeppelin_plan,
+    zeppelin_incompatibility,
 )
 
 
@@ -70,7 +71,7 @@ METHOD_ORDER = [
     "fa3_ring",
     "megatron_hybrid_cp",
     "magi_attention",
-    "zepplin",
+    "zeppelin",
     "mega_ring_all_cp",
     "mega_ring_hybrid",
 ]
@@ -256,7 +257,7 @@ def method_incompatibility(
     global_lengths: list[int],
     world_size: int,
     is_causal: bool,
-    zepplin_threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
+    zeppelin_threshold: int = DEFAULT_ZEPPELIN_THRESHOLD,
     megatron_max_seqlen_per_rank: int = 8192,
 ) -> str | None:
     if method == "megatron_hybrid_cp":
@@ -266,9 +267,9 @@ def method_incompatibility(
             is_causal,
             max_seqlen_per_rank=megatron_max_seqlen_per_rank,
         )
-    if method == "zepplin":
-        return zepplin_incompatibility(
-            global_lengths, world_size, is_causal, zepplin_threshold
+    if method == "zeppelin":
+        return zeppelin_incompatibility(
+            global_lengths, world_size, is_causal, zeppelin_threshold
         )
     if method == "mega_ring_all_cp":
         # This baseline benchmarks separately padded lengths, which are valid
@@ -303,7 +304,7 @@ def compatible_methods_for_mode(
     is_causal: bool,
     *,
     skip_incompatible: bool,
-    zepplin_threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
+    zeppelin_threshold: int = DEFAULT_ZEPPELIN_THRESHOLD,
     megatron_max_seqlen_per_rank: int = 8192,
 ) -> tuple[list[str], list[tuple[str, str]]]:
     compatible: list[str] = []
@@ -314,7 +315,7 @@ def compatible_methods_for_mode(
             global_lengths,
             world_size,
             is_causal,
-            zepplin_threshold,
+            zeppelin_threshold,
             megatron_max_seqlen_per_rank,
         )
         if reason is None:
@@ -569,9 +570,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--sm-configs", default="128:4,124:8,120:12,116:16")
     parser.add_argument(
-        "--zepplin-threshold",
+        "--zeppelin-threshold",
         type=positive_int,
-        default=DEFAULT_ZEPPLIN_THRESHOLD,
+        default=DEFAULT_ZEPPELIN_THRESHOLD,
     )
     parser.add_argument(
         "--megatron-max-seqlen-per-rank",
@@ -606,6 +607,7 @@ def _main_single(
     case_label: str | None = None,
     case_index: int = 0,
     manage_process_group: bool = True,
+    metric_global_lengths: Sequence[int] | None = None,
 ) -> list[ForwardSummarySample]:
     args = parse_args(argv)
     methods = parse_methods(args.methods)
@@ -640,18 +642,29 @@ def _main_single(
             methods, args.methods
         )
         global_lengths = parse_int_list(args.global_seqlens, "--global-seqlens")
+        raw_metric_lengths = (
+            list(metric_global_lengths)
+            if metric_global_lengths is not None
+            else global_lengths
+        )
+        if len(raw_metric_lengths) != len(global_lengths) or any(
+            length <= 0 for length in raw_metric_lengths
+        ):
+            raise ValueError(
+                "metric_global_lengths must contain one positive raw length per sample"
+            )
         mega_ring_all_cp_global_lengths = align_mega_ring_all_cp_lengths(global_lengths)
         ring_sizes = parse_int_list(args.ring_sizes, "--ring-sizes")
         ring_starts = parse_int_list(args.ring_starts, "--ring-starts")
         if any(
             method
-            not in {"zepplin", "magi_attention", "megatron_hybrid_cp"}
+            not in {"zeppelin", "magi_attention", "megatron_hybrid_cp"}
             for method in methods
         ):
             validate_metadata(
                 global_lengths, ring_sizes, ring_starts, world_size, args.mode
             )
-        elif "zepplin" in methods and not (
+        elif "zeppelin" in methods and not (
             len(global_lengths) == len(ring_sizes) == len(ring_starts)
         ):
             raise SystemExit(
@@ -682,7 +695,7 @@ def _main_single(
                 world_size,
                 is_causal,
                 skip_incompatible=skip_incompatible_methods,
-                zepplin_threshold=args.zepplin_threshold,
+                zeppelin_threshold=args.zeppelin_threshold,
                 megatron_max_seqlen_per_rank=args.megatron_max_seqlen_per_rank,
             )
             methods_by_mode[is_causal] = active_methods
@@ -690,14 +703,14 @@ def _main_single(
             if magi_skip_reason is not None:
                 skipped_methods.append(("magi_attention", magi_skip_reason))
 
-        zepplin_plans: dict[bool, ZepplinPlan] = {}
+        zeppelin_plans: dict[bool, ZeppelinPlan] = {}
         for is_causal in modes:
-            if "zepplin" in methods_by_mode[is_causal]:
-                zepplin_plans[is_causal] = make_zepplin_plan(
+            if "zeppelin" in methods_by_mode[is_causal]:
+                zeppelin_plans[is_causal] = make_zeppelin_plan(
                     global_lengths,
                     world_size,
                     is_causal,
-                    args.zepplin_threshold,
+                    args.zeppelin_threshold,
                 )
 
         block_backend = (
@@ -710,7 +723,7 @@ def _main_single(
                         "llama3_allgather_attention",
                         "fa3_ring",
                         "megatron_hybrid_cp",
-                        "zepplin",
+                        "zeppelin",
                     )
                 )
                 for active_methods in methods_by_mode.values()
@@ -737,7 +750,7 @@ def _main_single(
                 "allgather_overlapping_heads_k_stride="
                 f"{args.allgather_overlapping_heads_k_stride}, "
                 f"mode={args.mode}, sm_configs={sm_configs_s}, "
-                f"zepplin_threshold={args.zepplin_threshold}, "
+                f"zeppelin_threshold={args.zeppelin_threshold}, "
                 "megatron_max_seqlen_per_rank="
                 f"{args.megatron_max_seqlen_per_rank}, "
                 f"magi_overlap_degree={args.magi_overlap_degree}, "
@@ -766,13 +779,16 @@ def _main_single(
                 f"FA backend: {backend_note}",
                 flush=True,
             )
-            for is_causal, plan in zepplin_plans.items():
+            for is_causal, plan in zeppelin_plans.items():
                 mode = "causal" if is_causal else "noncausal"
                 print(
-                    f"Zepplin placement ({mode}): threshold={plan.threshold}, "
-                    f"G1={len(plan.short_indices)}, "
-                    f"Gworld={len(plan.long_indices)}, "
-                    f"G1_rank_loads={list(plan.short_loads)}"
+                    f"Zeppelin placement ({mode}): L={plan.threshold}, "
+                    f"final_s0={plan.effective_threshold}, "
+                    f"iterations={plan.iterations}, "
+                    f"groups={[assignment.group_size for assignment in plan.assignments]}, "
+                    f"execution_lengths={list(plan.execution_lengths)}, "
+                    f"padding={plan.padding_tokens}, "
+                    f"physical_rank_token_loads={list(plan.rank_token_loads)}"
                 )
             print(
                 "Agg TFLOPS uses the original workload lengths and sums visible "
@@ -1007,15 +1023,15 @@ def _main_single(
                     expected_mega_ring_all_cp_lse,
                 )
 
-            zepplin_run = None
-            if "zepplin" in active_methods:
+            zeppelin_run = None
+            if "zeppelin" in active_methods:
                 if block_backend is None:
-                    raise RuntimeError("zepplin baseline requires a block backend")
-                zepplin_plan = zepplin_plans[is_causal]
-                zepplin_local_lengths = zepplin_plan.packed_lengths_for_rank(rank)
-                zepplin_local_total = sum(zepplin_local_lengths)
-                zepplin_q, zepplin_k, zepplin_v = make_local_qkv(
-                    zepplin_local_total,
+                    raise RuntimeError("zeppelin baseline requires a block backend")
+                zeppelin_plan = zeppelin_plans[is_causal]
+                zeppelin_local_lengths = zeppelin_plan.packed_lengths_for_rank(rank)
+                zeppelin_local_total = sum(zeppelin_local_lengths)
+                zeppelin_q, zeppelin_k, zeppelin_v = make_local_qkv(
+                    zeppelin_local_total,
                     args.qhead,
                     args.kvhead,
                     args.headdim,
@@ -1024,50 +1040,41 @@ def _main_single(
                     device,
                     base_seed=args.seed + 37,
                 )
-                zepplin_runner = ZepplinForward(
+                zeppelin_runner = ZeppelinForward(
                     dist.group.WORLD,
-                    zepplin_q,
-                    zepplin_k,
-                    zepplin_v,
-                    zepplin_plan,
+                    zeppelin_q,
+                    zeppelin_k,
+                    zeppelin_v,
+                    zeppelin_plan,
                     block_backend,
                 )
-                expected_zepplin_out = None
+                expected_zeppelin_out = None
                 if args.check:
-                    zepplin_rank_lengths = [
-                        zepplin_plan.topology_lengths_for_rank(source_rank)
+                    zeppelin_rank_capacity = max(
+                        sum(zeppelin_plan.packed_lengths_for_rank(source_rank))
                         for source_rank in range(world_size)
-                    ]
-                    zepplin_rank_capacity = max(
-                        sum(lengths) for lengths in zepplin_rank_lengths
                     )
-                    gathered_zepplin_k = gather_padded_rank_tensor(
-                        zepplin_k, zepplin_rank_capacity
+                    gathered_zeppelin_k = gather_padded_rank_tensor(
+                        zeppelin_k, zeppelin_rank_capacity
                     )
-                    gathered_zepplin_v = gather_padded_rank_tensor(
-                        zepplin_v, zepplin_rank_capacity
+                    gathered_zeppelin_v = gather_padded_rank_tensor(
+                        zeppelin_v, zeppelin_rank_capacity
                     )
-                    _, zepplin_cu_host = make_cu_seqlens(
-                        zepplin_plan.topology_lengths_for_rank(rank), device
-                    )
-                    expected_zepplin_out, _ = hierarchical_reference(
-                        zepplin_q,
-                        gathered_zepplin_k,
-                        gathered_zepplin_v,
-                        zepplin_rank_lengths,
-                        zepplin_cu_host,
-                        zepplin_plan.packed_global_lengths,
-                        zepplin_plan.ring_sizes,
-                        zepplin_plan.ring_starts,
+                    expected_zeppelin_out, _ = zeppelin_reference(
+                        zeppelin_q,
+                        gathered_zeppelin_k,
+                        gathered_zeppelin_v,
+                        zeppelin_plan,
                         rank,
                         is_causal,
                     )
-                zepplin_run = MethodRun(
-                    "zepplin",
-                    zepplin_runner.forward,
-                    expected_zepplin_out,
+                zeppelin_run = MethodRun(
+                    "zeppelin",
+                    zeppelin_runner.forward,
+                    expected_zeppelin_out,
                     None,
-                    zepplin_runner.note,
+                    zeppelin_runner.note,
+                    zeppelin_plan.execution_lengths,
                 )
 
             hybrid_run_data = None
@@ -1222,10 +1229,10 @@ def _main_single(
                     )
                 runs: list[MethodRun] = []
                 for method in config_methods:
-                    if method == "zepplin":
-                        if zepplin_run is None:
-                            raise RuntimeError("zepplin run was not prepared")
-                        runs.append(zepplin_run)
+                    if method == "zeppelin":
+                        if zeppelin_run is None:
+                            raise RuntimeError("zeppelin run was not prepared")
+                        runs.append(zeppelin_run)
                     elif method == "megatron_hybrid_cp":
                         if megatron_hybrid_cp_run is None:
                             raise RuntimeError(
@@ -1366,7 +1373,7 @@ def _main_single(
                     if args.collect_mega_ring_stats and run.stats_probe is not None:
                         collect_mega_ring_stats(run.name, run.stats_probe, rank)
                     agg_tflops = aggregate_tflops(
-                        global_lengths,
+                        raw_metric_lengths,
                         args.qhead,
                         args.headdim,
                         is_causal,
@@ -1400,6 +1407,38 @@ def _main_single(
 
                     if rank == 0:
                         note = run.note
+                        if raw_metric_lengths != global_lengths:
+                            raw_flops = (
+                                4
+                                * aggregate_score_count(
+                                    raw_metric_lengths, is_causal
+                                )
+                                * args.qhead
+                                * args.headdim
+                            )
+                            aligned_flops = (
+                                4
+                                * aggregate_score_count(global_lengths, is_causal)
+                                * args.qhead
+                                * args.headdim
+                            )
+                            aligned_agg_tflops = aggregate_tflops(
+                                global_lengths,
+                                args.qhead,
+                                args.headdim,
+                                is_causal,
+                                timing.max_ms,
+                            )
+                            note = (
+                                f"{note}; raw_tokens={sum(raw_metric_lengths)}; "
+                                f"aligned_tokens={sum(global_lengths)}; "
+                                f"padding={sum(global_lengths) - sum(raw_metric_lengths)}; "
+                                f"raw_flops={raw_flops}; "
+                                f"aligned_physical_flops={aligned_flops}; "
+                                f"raw Agg TFLOPS={agg_tflops:.1f}; "
+                                f"aligned physical Agg TFLOPS={aligned_agg_tflops:.1f}, "
+                                f"Avg/GPU={aligned_agg_tflops / world_size:.1f}"
+                            )
                         if run.aligned_global_lengths is not None:
                             aligned_agg_tflops = aggregate_tflops(
                                 run.aligned_global_lengths,
@@ -1551,7 +1590,7 @@ def main(
     for workload_case in workload_cases:
         if any(
             method
-            not in {"zepplin", "magi_attention", "megatron_hybrid_cp"}
+            not in {"zeppelin", "magi_attention", "megatron_hybrid_cp"}
             for method in methods
         ):
             validate_metadata(
@@ -1561,7 +1600,7 @@ def main(
                 int(os.environ["LOCAL_WORLD_SIZE"]),
                 args.mode,
             )
-        elif "zepplin" in methods and not (
+        elif "zeppelin" in methods and not (
             len(workload_case.global_lengths)
             == len(workload_case.ring_sizes)
             == len(workload_case.ring_starts)

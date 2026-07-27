@@ -29,7 +29,7 @@ from ring_test.load_balance_bench.topology import validate_with_runner
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run native Megatron/Zepllin and three fused Mega Ring placements "
+            "Run native Megatron/Zeppelin and three fused Mega Ring placements "
             "on the same dataset-shaped causal backward workload"
         )
     )
@@ -162,13 +162,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                     list(case.raw_lengths),
                     raw_sizes,
                     raw_starts,
+                    None,
                 ),
                 (
                     RESULT_LABELS[1],
-                    "zepplin",
+                    "zeppelin",
                     list(case.raw_lengths),
                     raw_sizes,
                     raw_starts,
+                    None,
                 ),
                 (
                     RESULT_LABELS[2],
@@ -176,6 +178,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     list(case.br_pbs.global_lengths),
                     list(case.br_pbs.ring_sizes),
                     list(case.br_pbs.ring_starts),
+                    case.raw_lengths,
                 ),
                 (
                     RESULT_LABELS[3],
@@ -183,16 +186,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                     list(case.megatron_cp.global_lengths),
                     list(case.megatron_cp.ring_sizes),
                     list(case.megatron_cp.ring_starts),
+                    case.raw_lengths,
                 ),
                 (
                     RESULT_LABELS[4],
                     "mega_ring_hybrid",
-                    list(case.zepplin.global_lengths),
-                    list(case.zepplin.ring_sizes),
-                    list(case.zepplin.ring_starts),
+                    list(case.zeppelin.global_lengths),
+                    list(case.zeppelin.ring_sizes),
+                    list(case.zeppelin.ring_starts),
+                    case.raw_lengths,
                 ),
             )
-            for label, method, lengths, ring_sizes, ring_starts in requests:
+            for label, method, lengths, ring_sizes, ring_starts, metric_lengths in requests:
                 if rank == 0:
                     print(
                         f"\nFive-method result: {label}; "
@@ -215,6 +220,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     [method],
                     allgather_backend,
                     pools,
+                    metric_global_lengths=metric_lengths,
                 )
                 if rank == 0:
                     summary_samples.extend(

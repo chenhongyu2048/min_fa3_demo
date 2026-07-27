@@ -18,7 +18,7 @@ for path in (THIS_DIR, DEMO_DIR):
 
 import balancer
 from ring_test.utils import HybridBenchmarkCase
-from zepplin import DEFAULT_ZEPPLIN_THRESHOLD
+from zeppelin import DEFAULT_ZEPPELIN_THRESHOLD
 
 
 def _format_int_list(values: Sequence[int]) -> str:
@@ -235,9 +235,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mode", choices=("noncausal", "causal", "both"), default="causal")
     parser.add_argument("--methods", default="all")
     parser.add_argument(
-        "--zepplin-threshold",
+        "--zeppelin-threshold",
         type=_positive_int,
-        default=DEFAULT_ZEPPLIN_THRESHOLD,
+        default=DEFAULT_ZEPPELIN_THRESHOLD,
     )
     parser.add_argument(
         "--megatron-max-seqlen-per-rank",
@@ -304,8 +304,8 @@ def _benchmark_argv(
         args.mode,
         "--methods",
         args.methods,
-        "--zepplin-threshold",
-        str(args.zepplin_threshold),
+        "--zeppelin-threshold",
+        str(args.zeppelin_threshold),
         "--megatron-max-seqlen-per-rank",
         str(args.megatron_max_seqlen_per_rank),
         "--magi-overlap-degree",

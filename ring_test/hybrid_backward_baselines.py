@@ -13,8 +13,9 @@ from allgather_attention import (
     _local_backward,
     _local_forward,
 )
+from hybrid_forward_baselines import create_zeppelin_process_groups
 from ring_common import RingComm, get_half_index, zigzag_ring_varlen_forward
-from zepplin import ZepplinPlan, zepplin_note
+from zeppelin import ZeppelinPlan, zeppelin_note
 
 
 def make_cu_seqlens(
@@ -571,6 +572,7 @@ class VarlenFa3RingBackward(_BlockBackend):
         dout: torch.Tensor,
         local_lengths: list[int],
         backend: str,
+        ring_members: tuple[int, ...] | None = None,
     ) -> None:
         super().__init__(backend)
         if not local_lengths or any(length <= 0 or length % 2 for length in local_lengths):
@@ -580,6 +582,7 @@ class VarlenFa3RingBackward(_BlockBackend):
         self.k = k
         self.v = v
         self.dout = dout
+        self.ring_members = ring_members
         self.max_local = max(local_lengths)
         self.cu, self.cu_host = make_cu_seqlens(local_lengths, q.device)
         self.half_cu = self.cu // 2
@@ -616,6 +619,7 @@ class VarlenFa3RingBackward(_BlockBackend):
             self.max_local,
             self.forward_block,
             return_lse=True,
+            ring_members=self.ring_members,
         )
         if not isinstance(result, tuple):
             raise RuntimeError("zigzag forward did not return output and LSE")
@@ -659,8 +663,8 @@ class VarlenFa3RingBackward(_BlockBackend):
             raise RuntimeError("FA3 ring backward requires a prepared forward")
         if self.out_back is None or self.lse_back is None:
             raise RuntimeError("FA3 ring backward is missing back-half state")
-        kv_comm = RingComm(self.process_group)
-        dkv_comm = RingComm(self.process_group)
+        kv_comm = RingComm(self.process_group, self.ring_members)
+        dkv_comm = RingComm(self.process_group, self.ring_members)
         cur_k, cur_v = self.k, self.v
         cur_dk, cur_dv = self.dk_ring[0], self.dv_ring[0]
         next_dk = next_dv = None
@@ -757,8 +761,8 @@ class VarlenFa3RingBackward(_BlockBackend):
         )
 
 
-class ZepplinBackward(_BlockBackend):
-    """Synchronize, run the Gworld ring, then run rank-local G1 work."""
+class ZeppelinBackward(_BlockBackend):
+    """Run arbitrary-G queues in registry order, then rank-local G1 work."""
 
     def __init__(
         self,
@@ -767,7 +771,7 @@ class ZepplinBackward(_BlockBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         dout: torch.Tensor,
-        plan: ZepplinPlan,
+        plan: ZeppelinPlan,
         backend: str,
     ) -> None:
         super().__init__(backend)
@@ -779,106 +783,120 @@ class ZepplinBackward(_BlockBackend):
         self.plan = plan
         self.rank = dist.get_rank(process_group)
         if not plan.is_causal:
-            raise ValueError("zepplin backward currently supports causal mode only")
+            raise ValueError("zeppelin backward currently supports causal mode only")
         if dist.get_world_size(process_group) != plan.world_size:
-            raise ValueError("zepplin plan world size does not match process group")
+            raise ValueError("zeppelin plan world size does not match process group")
+        self.groups = create_zeppelin_process_groups(process_group, plan)
 
-        self.short_lengths = plan.short_lengths_for_rank(self.rank)
-        self.long_lengths = plan.long_local_lengths()
-        self.short_total = sum(self.short_lengths)
-        expected_total = self.short_total + sum(self.long_lengths)
-        if q.size(0) != expected_total or k.size(0) != expected_total:
-            raise ValueError("Q/K do not match the zepplin rank-local packed layout")
+        self.ring_runners: list[tuple[int, int, VarlenFa3RingBackward]] = []
+        offset = 0
+        for members, assignments in plan.distributed_queues:
+            if self.rank not in members:
+                continue
+            lengths = [assignment.local_length for assignment in assignments]
+            end = offset + sum(lengths)
+            self.ring_runners.append(
+                (
+                    offset,
+                    end,
+                    VarlenFa3RingBackward(
+                        self.groups[members],  # type: ignore[arg-type]
+                        q[offset:end],
+                        k[offset:end],
+                        v[offset:end],
+                        dout[offset:end],
+                        lengths,
+                        backend,
+                        members,
+                    ),
+                )
+            )
+            offset = end
+
+        self.local_assignments = plan.local_assignments_for_rank(self.rank)
+        self.local_lengths = [
+            assignment.local_length for assignment in self.local_assignments
+        ]
+        self.local_begin = offset
+        self.local_end = offset + sum(self.local_lengths)
+        if q.size(0) != self.local_end or k.size(0) != self.local_end:
+            raise ValueError("Q/K do not match the zeppelin rank-local packed layout")
         if v.shape != k.shape or dout.shape != q.shape:
-            raise ValueError("zepplin V/dout shapes do not match K/Q")
+            raise ValueError("zeppelin V/dout shapes do not match K/Q")
 
         self.out = torch.empty_like(q)
         self.dq = torch.empty_like(q)
         self.dk = torch.empty_like(k)
         self.dv = torch.empty_like(v)
-        self.short_out: torch.Tensor | None = None
-        self.short_lse: torch.Tensor | None = None
-        if self.short_lengths:
-            self.short_cu, self.short_cu_host = make_cu_seqlens(
-                self.short_lengths, q.device
+        self.local_out: torch.Tensor | None = None
+        self.local_lse: torch.Tensor | None = None
+        if self.local_lengths:
+            self.local_cu, self.local_cu_host = make_cu_seqlens(
+                self.local_lengths, q.device
             )
-        self.ring_runner = (
-            VarlenFa3RingBackward(
-                process_group,
-                q[self.short_total :],
-                k[self.short_total :],
-                v[self.short_total :],
-                dout[self.short_total :],
-                self.long_lengths,
-                backend,
-            )
-            if self.long_lengths
-            else None
-        )
 
     @property
     def note(self) -> str:
-        return zepplin_note(self.plan, self.backend_name)
+        return zeppelin_note(self.plan, self.backend_name)
 
     def forward(self) -> torch.Tensor:
         dist.barrier(group=self.process_group)
 
-        if self.ring_runner is not None:
-            long_out = self.ring_runner.forward()
-            self.out[self.short_total :].copy_(long_out)
+        for begin, end, runner in self.ring_runners:
+            self.out[begin:end].copy_(runner.forward())
 
-        if self.short_lengths:
-            self.short_out, self.short_lse = self.forward_block(
-                self.q[: self.short_total],
-                self.k[: self.short_total],
-                self.v[: self.short_total],
-                self.short_cu,
-                self.short_cu,
-                self.short_cu_host,
-                self.short_cu_host,
-                max(self.short_lengths),
-                max(self.short_lengths),
+        if self.local_lengths:
+            self.local_out, self.local_lse = self.forward_block(
+                self.q[self.local_begin : self.local_end],
+                self.k[self.local_begin : self.local_end],
+                self.v[self.local_begin : self.local_end],
+                self.local_cu,
+                self.local_cu,
+                self.local_cu_host,
+                self.local_cu_host,
+                max(self.local_lengths),
+                max(self.local_lengths),
                 True,
             )
-            self.out[: self.short_total].copy_(self.short_out)
+            self.out[self.local_begin : self.local_end].copy_(self.local_out)
         return self.out
 
     def backward(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         dist.barrier(group=self.process_group)
 
-        if self.ring_runner is not None:
-            long_dq, long_dk, long_dv = self.ring_runner.backward()
-            self.dq[self.short_total :].copy_(long_dq)
-            self.dk[self.short_total :].copy_(long_dk)
-            self.dv[self.short_total :].copy_(long_dv)
+        for begin, end, runner in self.ring_runners:
+            queue_dq, queue_dk, queue_dv = runner.backward()
+            self.dq[begin:end].copy_(queue_dq)
+            self.dk[begin:end].copy_(queue_dk)
+            self.dv[begin:end].copy_(queue_dv)
 
-        if self.short_lengths:
-            if self.short_out is None or self.short_lse is None:
-                raise RuntimeError("zepplin backward requires a prepared forward")
-            short_dq, short_dk, short_dv = self.backward_block(
-                self.dout[: self.short_total],
-                self.q[: self.short_total],
-                self.k[: self.short_total],
-                self.v[: self.short_total],
-                self.short_out,
-                self.short_lse,
-                self.short_cu,
-                self.short_cu,
-                max(self.short_lengths),
-                max(self.short_lengths),
+        if self.local_lengths:
+            if self.local_out is None or self.local_lse is None:
+                raise RuntimeError("zeppelin backward requires a prepared forward")
+            local_dq, local_dk, local_dv = self.backward_block(
+                self.dout[self.local_begin : self.local_end],
+                self.q[self.local_begin : self.local_end],
+                self.k[self.local_begin : self.local_end],
+                self.v[self.local_begin : self.local_end],
+                self.local_out,
+                self.local_lse,
+                self.local_cu,
+                self.local_cu,
+                max(self.local_lengths),
+                max(self.local_lengths),
                 True,
-                self.dq[: self.short_total],
-                self.dk[: self.short_total],
-                self.dv[: self.short_total],
+                self.dq[self.local_begin : self.local_end],
+                self.dk[self.local_begin : self.local_end],
+                self.dv[self.local_begin : self.local_end],
             )
-            self.dq[: self.short_total].copy_(short_dq)
-            self.dk[: self.short_total].copy_(short_dk)
-            self.dv[: self.short_total].copy_(short_dv)
+            self.dq[self.local_begin : self.local_end].copy_(local_dq)
+            self.dk[self.local_begin : self.local_end].copy_(local_dk)
+            self.dv[self.local_begin : self.local_end].copy_(local_dv)
         return self.dq, self.dk, self.dv
 
 
 __all__ = [
     "VarlenAllGatherBackward",
     "VarlenFa3RingBackward",
-    "ZepplinBackward",
+    "ZeppelinBackward",
 ]

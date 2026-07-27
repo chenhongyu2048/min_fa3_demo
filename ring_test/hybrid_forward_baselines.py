@@ -9,7 +9,10 @@ import torch.distributed as dist
 
 from allgather_attention import _external_forward, _local_forward
 from ring_common import ring_varlen_forward, zigzag_ring_varlen_forward
-from zepplin import ZepplinPlan, zepplin_note
+from zeppelin import ZeppelinPlan, zeppelin_note
+
+
+_ZEPPELIN_GROUP_REGISTRY: dict[tuple[int, ...], object] = {}
 
 
 def make_cu_seqlens(
@@ -380,6 +383,7 @@ def fa3_ring_forward(
     local_lengths: list[int],
     is_causal: bool,
     backend: str,
+    ring_members: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     block_backend = _BlockBackend(backend)
     max_local_len = max(local_lengths)
@@ -393,6 +397,7 @@ def fa3_ring_forward(
             cu_seqlens_host,
             max_local_len,
             block_backend.forward_block,
+            ring_members=ring_members,
         )
     return ring_varlen_forward(
         process_group,
@@ -412,11 +417,32 @@ def fa3_ring_forward(
             max_local_len,
             causal_,
         ),
+        ring_members=ring_members,
     )
 
 
-class ZepplinForward(_BlockBackend):
-    """Synchronize, run the all-rank Gworld ring, then rank-local G1 attention."""
+def create_zeppelin_process_groups(
+    world_group: Optional[dist.ProcessGroup], plan: ZeppelinPlan
+) -> dict[tuple[int, ...], object]:
+    """Create every unique member group in the same order on every rank."""
+
+    world_members = tuple(range(plan.world_size))
+    groups: dict[tuple[int, ...], object] = {}
+    for members in plan.distributed_group_members:
+        if members == world_members:
+            groups[members] = world_group
+        else:
+            canonical_members = tuple(sorted(members))
+            if canonical_members not in _ZEPPELIN_GROUP_REGISTRY:
+                _ZEPPELIN_GROUP_REGISTRY[canonical_members] = dist.new_group(
+                    ranks=list(canonical_members)
+                )
+            groups[members] = _ZEPPELIN_GROUP_REGISTRY[canonical_members]
+    return groups
+
+
+class ZeppelinForward(_BlockBackend):
+    """Run arbitrary-G queues in registry order, then rank-local G1 attention."""
 
     def __init__(
         self,
@@ -424,7 +450,7 @@ class ZepplinForward(_BlockBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        plan: ZepplinPlan,
+        plan: ZeppelinPlan,
         backend: str,
     ) -> None:
         super().__init__(backend)
@@ -435,63 +461,99 @@ class ZepplinForward(_BlockBackend):
         self.plan = plan
         self.rank = dist.get_rank(process_group)
         if dist.get_world_size(process_group) != plan.world_size:
-            raise ValueError("zepplin plan world size does not match process group")
+            raise ValueError("zeppelin plan world size does not match process group")
+        self.groups = create_zeppelin_process_groups(process_group, plan)
 
-        self.short_lengths = plan.short_lengths_for_rank(self.rank)
-        self.long_lengths = plan.long_local_lengths()
-        self.short_total = sum(self.short_lengths)
-        expected_total = self.short_total + sum(self.long_lengths)
-        if q.size(0) != expected_total or k.size(0) != expected_total:
-            raise ValueError("Q/K do not match the zepplin rank-local packed layout")
+        self.distributed_queues: list[
+            tuple[
+                tuple[int, ...],
+                object,
+                int,
+                int,
+                torch.Tensor,
+                torch.Tensor,
+                list[int],
+            ]
+        ] = []
+        offset = 0
+        for members, assignments in plan.distributed_queues:
+            if self.rank not in members:
+                continue
+            lengths = [assignment.local_length for assignment in assignments]
+            end = offset + sum(lengths)
+            cu, cu_host = make_cu_seqlens(lengths, q.device)
+            self.distributed_queues.append(
+                (members, self.groups[members], offset, end, cu, cu_host, lengths)
+            )
+            offset = end
+
+        self.local_assignments = plan.local_assignments_for_rank(self.rank)
+        self.local_lengths = [
+            assignment.local_length for assignment in self.local_assignments
+        ]
+        self.local_begin = offset
+        self.local_end = offset + sum(self.local_lengths)
+        if q.size(0) != self.local_end or k.size(0) != self.local_end:
+            raise ValueError("Q/K do not match the zeppelin rank-local packed layout")
         if v.shape != k.shape:
-            raise ValueError("zepplin K/V shapes must match")
+            raise ValueError("zeppelin K/V shapes must match")
 
         self.out = torch.empty_like(q)
-        if self.short_lengths:
-            self.short_cu, self.short_cu_host = make_cu_seqlens(
-                self.short_lengths, q.device
-            )
-        if self.long_lengths:
-            self.long_cu, self.long_cu_host = make_cu_seqlens(
-                self.long_lengths, q.device
+        if self.local_lengths:
+            self.local_cu, self.local_cu_host = make_cu_seqlens(
+                self.local_lengths, q.device
             )
 
     @property
     def note(self) -> str:
-        return zepplin_note(self.plan, self.backend_name)
+        return zeppelin_note(self.plan, self.backend_name)
 
     def forward(self) -> torch.Tensor:
         dist.barrier(group=self.process_group)
 
-        if self.long_lengths:
-            long_out = fa3_ring_forward(
-                self.process_group,
-                self.q[self.short_total :],
-                self.k[self.short_total :],
-                self.v[self.short_total :],
-                self.long_cu,
-                self.long_cu_host,
-                self.long_lengths,
+        for (
+            members,
+            group,
+            begin,
+            end,
+            cu,
+            cu_host,
+            lengths,
+        ) in self.distributed_queues:
+            queue_out = fa3_ring_forward(
+                group,  # type: ignore[arg-type]
+                self.q[begin:end],
+                self.k[begin:end],
+                self.v[begin:end],
+                cu,
+                cu_host,
+                lengths,
                 self.plan.is_causal,
                 self.backend,
+                members,
             )
-            self.out[self.short_total :].copy_(long_out)
+            self.out[begin:end].copy_(queue_out)
 
-        if self.short_lengths:
-            short_out, _ = self.forward_block(
-                self.q[: self.short_total],
-                self.k[: self.short_total],
-                self.v[: self.short_total],
-                self.short_cu,
-                self.short_cu,
-                self.short_cu_host,
-                self.short_cu_host,
-                max(self.short_lengths),
-                max(self.short_lengths),
+        if self.local_lengths:
+            local_out, _ = self.forward_block(
+                self.q[self.local_begin : self.local_end],
+                self.k[self.local_begin : self.local_end],
+                self.v[self.local_begin : self.local_end],
+                self.local_cu,
+                self.local_cu,
+                self.local_cu_host,
+                self.local_cu_host,
+                max(self.local_lengths),
+                max(self.local_lengths),
                 self.plan.is_causal,
             )
-            self.out[: self.short_total].copy_(short_out)
+            self.out[self.local_begin : self.local_end].copy_(local_out)
         return self.out
 
 
-__all__ = ["VarlenAllGatherForward", "ZepplinForward", "fa3_ring_forward"]
+__all__ = [
+    "VarlenAllGatherForward",
+    "ZeppelinForward",
+    "create_zeppelin_process_groups",
+    "fa3_ring_forward",
+]

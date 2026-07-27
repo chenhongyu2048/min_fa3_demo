@@ -26,7 +26,7 @@ MAX_REPAIR_ITERATIONS=${MAX_REPAIR_ITERATIONS:-32}
 SEED=${SEED:-0}
 NUM_CASES=${NUM_CASES:-1}
 METHODS=${METHODS:-all}
-ZEPPLIN_THRESHOLD=${ZEPPLIN_THRESHOLD:-8192}
+ZEPPELIN_THRESHOLD=${ZEPPELIN_THRESHOLD:-4096}
 MEGATRON_MAX_SEQLEN_PER_RANK=${MEGATRON_MAX_SEQLEN_PER_RANK:-8192}
 MAGI_OVERLAP_DEGREE=${MAGI_OVERLAP_DEGREE:-2}
 MODE=${MODE:-causal}
@@ -91,8 +91,8 @@ fi
 
 [[ "$TARGET_TOKENS" =~ ^[1-9][0-9]*$ ]] || \
     die "TARGET_TOKENS must be a positive integer, got '$TARGET_TOKENS'"
-[[ "$ZEPPLIN_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || \
-    die "ZEPPLIN_THRESHOLD must be a positive integer, got '$ZEPPLIN_THRESHOLD'"
+[[ "$ZEPPELIN_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || \
+    die "ZEPPELIN_THRESHOLD must be a positive integer, got '$ZEPPELIN_THRESHOLD'"
 [[ "$MEGATRON_MAX_SEQLEN_PER_RANK" =~ ^[1-9][0-9]*$ ]] || \
     die "MEGATRON_MAX_SEQLEN_PER_RANK must be a positive integer, got '$MEGATRON_MAX_SEQLEN_PER_RANK'"
 [[ "$MAGI_OVERLAP_DEGREE" =~ ^[1-8]$ ]] || \
@@ -181,7 +181,7 @@ run_benchmark() {
         --num-cases "$NUM_CASES"
         --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM"
         --allgather-overlapping-heads-k-stride "$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE"
-        --zepplin-threshold "$ZEPPLIN_THRESHOLD"
+        --zeppelin-threshold "$ZEPPELIN_THRESHOLD"
         --megatron-max-seqlen-per-rank "$MEGATRON_MAX_SEQLEN_PER_RANK"
         --magi-overlap-degree "$MAGI_OVERLAP_DEGREE"
         --sm-configs "$SM_CONFIGS"
@@ -223,7 +223,7 @@ fi
 
 echo "Log: $LOG_FILE"
 echo "Datasets: ${DATASET_LIST[*]}"
-echo "Config: direction=$DIRECTION, target_tokens=$TARGET_TOKENS, compute_tolerance=$COMPUTE_BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, beam_width=$BEAM_WIDTH, finalist_count=$FINALIST_COUNT, structure_threshold=$STRUCTURE_THRESHOLD, max_repair_iterations=$MAX_REPAIR_ITERATIONS, seed=$SEED, num_cases=$NUM_CASES, mode=$MODE, zepplin_threshold=$ZEPPLIN_THRESHOLD, megatron_max_seqlen_per_rank=$MEGATRON_MAX_SEQLEN_PER_RANK, magi_overlap_degree=$MAGI_OVERLAP_DEGREE, collect_mega_ring_stats=$COLLECT_MEGA_RING_STATS"
+echo "Config: direction=$DIRECTION, target_tokens=$TARGET_TOKENS, compute_tolerance=$COMPUTE_BALANCE_TOLERANCE, token_tolerance=$TOKEN_BALANCE_TOLERANCE, beam_width=$BEAM_WIDTH, finalist_count=$FINALIST_COUNT, structure_threshold=$STRUCTURE_THRESHOLD, max_repair_iterations=$MAX_REPAIR_ITERATIONS, seed=$SEED, num_cases=$NUM_CASES, mode=$MODE, zeppelin_threshold=$ZEPPELIN_THRESHOLD, megatron_max_seqlen_per_rank=$MEGATRON_MAX_SEQLEN_PER_RANK, magi_overlap_degree=$MAGI_OVERLAP_DEGREE, collect_mega_ring_stats=$COLLECT_MEGA_RING_STATS"
 echo "Methods: $METHODS; allgather_overlapping_heads_k_stride=$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE"
 
 for world_size in "${GPU_COUNT_LIST[@]}"; do

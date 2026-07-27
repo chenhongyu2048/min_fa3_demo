@@ -38,7 +38,7 @@ from ring_test.utils import (
     align_mega_ring_all_cp_lengths,
     hybrid_cp_saturation_note,
 )
-from ring_test.zepplin import DEFAULT_ZEPPLIN_THRESHOLD, make_zepplin_plan
+from ring_test.zeppelin import DEFAULT_ZEPPELIN_THRESHOLD, make_zeppelin_plan
 
 
 BACKWARD_FLOPS_PER_SCORE = 10
@@ -543,38 +543,58 @@ def analyze_backward_megatron(
     return _finalize("megatron_hybrid_cp", loads, q_heads, head_dim, note)
 
 
-def analyze_backward_zepplin(
+def analyze_backward_zeppelin(
     global_lengths: Sequence[int],
     world_size: int,
     q_heads: int,
     kv_heads: int,
     head_dim: int,
     *,
-    threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
+    threshold: int = DEFAULT_ZEPPELIN_THRESHOLD,
 ) -> BackwardMethodLoadResult:
-    plan = make_zepplin_plan(list(global_lengths), world_size, True, threshold)
-    owner_by_index = dict(zip(plan.short_indices, plan.short_owners))
-    placements = [
-        Placement(
-            length,
-            1 if index in owner_by_index else world_size,
-            owner_by_index.get(index, 0),
-        )
-        for index, length in enumerate(global_lengths)
-    ]
-    loads = _placements_backward_loads(
-        placements,
-        world_size,
-        q_heads,
-        kv_heads,
-        head_dim,
-        communication="python-ring",
-    )
+    plan = make_zeppelin_plan(list(global_lengths), world_size, True, threshold)
+    loads = [_MutableBackwardRankLoad() for _ in range(world_size)]
+    for assignment in plan.assignments:
+        local_length = assignment.local_length
+        raw_scores = assignment.raw_length * (assignment.raw_length + 1) // 2
+        for group_rank, rank in enumerate(assignment.group_members):
+            load = loads[rank]
+            load.effective_tokens += assignment.raw_length / assignment.group_size
+            load.physical_tokens += local_length
+            load.effective_scores += raw_scores / assignment.group_size
+            for task in _ring_tasks(
+                local_length, assignment.group_size, group_rank, True
+            ):
+                load.physical_scores += attention_area(task)
+                _add_task(load, task, q_heads)
+        if assignment.group_size > 1:
+            kv_bytes = (
+                (assignment.group_size - 1)
+                * local_length
+                * kv_heads
+                * head_dim
+                * 2
+                * BF16_BYTES
+            )
+            dkv_bytes = (
+                assignment.group_size
+                * local_length
+                * kv_heads
+                * head_dim
+                * 2
+                * FP32_BYTES
+            )
+            for rank in assignment.group_members:
+                loads[rank].comm_tx_bytes += kv_bytes + dkv_bytes
+                loads[rank].comm_rx_bytes += kv_bytes + dkv_bytes
     note = (
-        f"Zeppelin backward; threshold={threshold}; G1={len(plan.short_indices)}, "
-        f"Gworld={len(plan.long_indices)}; LPT G1 communication is zero"
+        f"Zeppelin Algorithm 2 backward; L={threshold}; "
+        f"final_s0={plan.effective_threshold}; iterations={plan.iterations}; "
+        f"post-plan padding={plan.padding_tokens}; "
+        f"group sizes={[assignment.group_size for assignment in plan.assignments]}; "
+        f"execution lengths={list(plan.execution_lengths)}"
     )
-    return _finalize("zepplin", loads, q_heads, head_dim, note)
+    return _finalize("zeppelin", loads, q_heads, head_dim, note)
 
 
 def analyze_backward_mega_ring_hybrid(
@@ -661,7 +681,7 @@ def analyze_backward_method(
     head_dim: int,
     *,
     heads_k_stride: int = 4,
-    zepplin_threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
+    zeppelin_threshold: int = DEFAULT_ZEPPELIN_THRESHOLD,
     megatron_max_seqlen_per_rank: int = 8192,
 ) -> BackwardMethodLoadResult:
     if method == "allgather_attention":
@@ -696,14 +716,14 @@ def analyze_backward_method(
             head_dim,
             max_seqlen_per_rank=megatron_max_seqlen_per_rank,
         )
-    if method == "zepplin":
-        return analyze_backward_zepplin(
+    if method == "zeppelin":
+        return analyze_backward_zeppelin(
             global_lengths,
             world_size,
             q_heads,
             kv_heads,
             head_dim,
-            threshold=zepplin_threshold,
+            threshold=zeppelin_threshold,
         )
     if method == "mega_ring_all_cp":
         return analyze_backward_mega_ring_all_cp(
@@ -927,7 +947,7 @@ def cumulative_backward_result(
     stable_notes = {
         "megatron_hybrid_cp": "Megatron backward plans vary by case",
         "magi_attention": "metadata-only Magi backward plans vary by case",
-        "zepplin": "Zeppelin backward placement varies by case",
+        "zeppelin": "Zeppelin backward placement varies by case",
         "mega_ring_all_cp": "per-case 2048-token alignment and dKV padding",
     }
     note = (
@@ -986,7 +1006,7 @@ __all__ = [
     "analyze_backward_mega_ring_hybrid",
     "analyze_backward_megatron",
     "analyze_backward_method",
-    "analyze_backward_zepplin",
+    "analyze_backward_zeppelin",
     "backward_magi_result_from_records",
     "backward_task_tile_counters",
     "cumulative_backward_result",

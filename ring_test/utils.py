@@ -273,6 +273,92 @@ def hierarchical_reference(
     return torch.cat(outputs), torch.cat(lses, dim=1)
 
 
+def zeppelin_reference(
+    q: torch.Tensor,
+    gathered_k: torch.Tensor,
+    gathered_v: torch.Tensor,
+    plan: object,
+    rank: int,
+    is_causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Restore raw sequences using explicit ordered Zeppelin group members."""
+
+    packed_by_rank = [
+        plan.packed_assignments_for_rank(source_rank)  # type: ignore[attr-defined]
+        for source_rank in range(plan.world_size)  # type: ignore[attr-defined]
+    ]
+    source_offsets: list[dict[int, int]] = []
+    for assignments in packed_by_rank:
+        offset = 0
+        offsets: dict[int, int] = {}
+        for assignment in assignments:
+            offsets[assignment.sample_id] = offset
+            offset += assignment.local_length
+        source_offsets.append(offsets)
+
+    outputs: list[torch.Tensor] = []
+    lses: list[torch.Tensor] = []
+    q_offset = 0
+    for assignment in packed_by_rank[rank]:
+        local_length = assignment.local_length
+        q_batch = q[q_offset : q_offset + local_length]
+        q_offset += local_length
+        k_parts: list[torch.Tensor] = []
+        v_parts: list[torch.Tensor] = []
+        key_positions: list[torch.Tensor] = []
+        half_length = local_length // 2
+        for group_rank, source_rank in enumerate(assignment.group_members):
+            source_begin = source_offsets[source_rank][assignment.sample_id]
+            source_end = source_begin + local_length
+            k_parts.append(gathered_k[source_rank, source_begin:source_end])
+            v_parts.append(gathered_v[source_rank, source_begin:source_end])
+            if is_causal and assignment.group_size > 1:
+                front = (
+                    torch.arange(half_length, device=q.device)
+                    + group_rank * half_length
+                )
+                back = (
+                    torch.arange(half_length, device=q.device)
+                    + (2 * assignment.group_size - 1 - group_rank) * half_length
+                )
+                key_positions.append(torch.cat((front, back)))
+
+        if is_causal and assignment.group_size > 1:
+            local_group_rank = assignment.group_members.index(rank)
+            query_front = (
+                torch.arange(half_length, device=q.device)
+                + local_group_rank * half_length
+            )
+            query_back = (
+                torch.arange(half_length, device=q.device)
+                + (2 * assignment.group_size - 1 - local_group_rank) * half_length
+            )
+            query_positions = torch.cat((query_front, query_back))
+            key_position_tensor = torch.cat(key_positions)
+        elif is_causal:
+            query_positions = torch.arange(local_length, device=q.device)
+            key_position_tensor = query_positions
+        else:
+            query_positions = None
+            key_position_tensor = None
+
+        out, lse = attention_reference(
+            q_batch,
+            torch.cat(k_parts),
+            torch.cat(v_parts),
+            query_positions,
+            key_position_tensor,
+        )
+        outputs.append(out)
+        lses.append(lse)
+
+    if not outputs:
+        return q.new_empty(q.shape), torch.empty(
+            (q.size(1), 0), device=q.device, dtype=torch.float32
+        )
+    return torch.cat(outputs), torch.cat(lses, dim=1)
+
+
 def assert_all_ranks(local_error: str | None) -> None:
     failed = torch.tensor(
         [local_error is not None], device="cuda", dtype=torch.int32

@@ -25,24 +25,24 @@ DEFAULT_OUTPUT = DEFAULT_RUN_DIR / "load_balance_algorithms_131072.png"
 
 METHOD_ORDER = (
     "native_megatron_hybrid_cp",
-    "native_zepplin",
+    "native_zeppelin",
     "mega_ring_hybrid_br_pbs",
     "mega_ring_hybrid_megatron_cp",
-    "mega_ring_hybrid_zepplin",
+    "mega_ring_hybrid_zeppelin",
 )
 METHOD_LABELS = {
     "native_megatron_hybrid_cp": "Megatron",
-    "native_zepplin": "Zeppelin",
+    "native_zeppelin": "Zeppelin",
     "mega_ring_hybrid_br_pbs": "Mega Ring\nBR-PBS",
     "mega_ring_hybrid_megatron_cp": "Mega Ring\nMegatron-CP",
-    "mega_ring_hybrid_zepplin": "Mega Ring\nZeppelin",
+    "mega_ring_hybrid_zeppelin": "Mega Ring\nZeppelin",
 }
 METHOD_COLORS = {
     "native_megatron_hybrid_cp": "#4C78A8",
-    "native_zepplin": "#F28E2B",
+    "native_zeppelin": "#F28E2B",
     "mega_ring_hybrid_br_pbs": "#54A24B",
     "mega_ring_hybrid_megatron_cp": "#E15759",
-    "mega_ring_hybrid_zepplin": "#B279A2",
+    "mega_ring_hybrid_zeppelin": "#B279A2",
 }
 DATASET_LABELS = {
     "prolong": "ProLong",

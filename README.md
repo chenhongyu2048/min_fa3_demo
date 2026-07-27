@@ -154,7 +154,7 @@ the import path.
 | `benchmark_load_balance.sh` | Dataset/GPU matrix wrapper for the metadata-only forward/backward load-balance benchmark |
 | `ring_test/load_balance_bench/run.sh` | Dataset/GPU wrapper for the fixed five-method runtime load-balance suite |
 | `ring_test/benchmark_dataset_{forward,backward}.py` | Dataset sampling, BR-PBS placement, and topology benchmark frontend |
-| `ring_test/load_balance_bench/benchmark_{forward,backward}.py` | Native Megatron/Zepllin versus three placement-mapped fused Mega Ring runtime frontends |
+| `ring_test/load_balance_bench/benchmark_{forward,backward}.py` | Native Megatron/Zeppelin versus three placement-mapped fused Mega Ring runtime frontends |
 | `ring_test/benchmark_forward_ablation.py` | Strict causal W8 six-level forward accumulation ablation with preallocated plans |
 | `ring_test/benchmark_topology_{forward,backward}.py` | Explicit global-length and Buddy-ring topology benchmark |
 | `ring_test/benchmark_load_balance.py` | Metadata-only forward/backward token, FLOP, communication, and logical-tile load analysis |
@@ -329,14 +329,14 @@ experiments. It runs forward by default; set `DIRECTION=backward` for causal
 backward. `DRY_RUN=1` prints commands without launching CUDA work.
 
 ```bash
-DATASETS="arxiv github pile freelaw prolong" GPU_COUNTS=8 NUM_CASES=4 ZEPPLIN_THRESHOLD=4096 \
+DATASETS="arxiv github pile freelaw prolong" GPU_COUNTS=8 NUM_CASES=4 ZEPPELIN_THRESHOLD=4096 \
   ./benchmark_dataset.sh
 
 GPU_COUNTS=8 DATASETS=arxiv NUM_CASES=1 METHODS=mega_ring_all_cp,mega_ring_hybrid \
   COLLECT_MEGA_RING_STATS=1 CHECK=0 ./benchmark_dataset.sh
 
 DATASETS="arxiv github pile freelaw prolong" GPU_COUNTS=8 NUM_CASES=4 DIRECTION=backward \
-  ZEPPLIN_THRESHOLD=4096 ./benchmark_dataset.sh
+  ZEPPELIN_THRESHOLD=4096 ./benchmark_dataset.sh
 
 DRY_RUN=1 GPU_COUNTS="2 4 8" DATASETS=arxiv ./benchmark_dataset.sh
 ```
@@ -596,9 +596,9 @@ which source distribution to sample before rebuilding the shared JSON.
 
 `ring_test/load_balance_bench/` is a separate fixed comparison suite. It uses
 the same un-reordered dataset sample lengths for every result and always emits:
-`native_megatron_hybrid_cp`, `native_zepplin`,
+`native_megatron_hybrid_cp`, `native_zeppelin`,
 `mega_ring_hybrid_br_pbs`, `mega_ring_hybrid_megatron_cp`, and
-`mega_ring_hybrid_zepplin`. The forward entry point accepts `noncausal`,
+`mega_ring_hybrid_zeppelin`. The forward entry point accepts `noncausal`,
 `causal`, or `both`; backward is causal-only. It does not modify the CUDA
 kernel or public `min_fa3_op` API.
 
@@ -621,13 +621,17 @@ GPU_COUNTS=8 DATASETS="arxiv freelaw github pile prolong" \
 ```
 
 Megatron's mapped fused result uses its final padded FA3-ring CP placement,
-but it does not replay Megatron execution groups. Zepllin's mapped fused
-result retains its LPT G1 owners and Gworld placement, then orders those
-metadata rows as G8/G4/G2/G1 for the fused kernel, but it does not replay the
-native two-phase execution. BR-PBS and Zepllin never receive implicit padding:
-an incompatible 128-row or causal half-row fused layout fails with the planner,
-mode, and sample id. Megatron alone retains the padding already explicit in its
-FA3-ring planner. Planner construction, input packing, IPC pool allocation,
+but it does not replay Megatron execution groups. Native Zeppelin implements
+single-node Algorithm 2 with arbitrary `G=1..P` and explicit ordered group
+members. G is computed from raw lengths; native execution then minimally aligns
+noncausal samples to G and causal samples to `2*G`, without replanning. Its
+mapped fused row preserves each native G, rounds G
+up to a power of two, aligns execution length to `256 * mapped_G`, greedily
+places the aligned job on a legal Buddy group, and finally orders metadata by
+descending G. The primary suite TFLOPS metric uses raw work for fairness; mapped
+rows additionally report aligned physical work, tokens, and padding. Megatron
+retains the padding already explicit in its FA3-ring planner. Planner
+construction, input packing, IPC pool allocation,
 scheduler preparation, and optional statistics probes are reported separately
 or run outside the existing CUDA-event timing boundaries.
 

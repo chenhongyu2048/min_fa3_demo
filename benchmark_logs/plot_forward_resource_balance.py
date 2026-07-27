@@ -43,7 +43,7 @@ METHOD_ORDER = (
     "fa3_ring",
     "megatron_hybrid_cp",
     "magi_attention",
-    "zepplin",
+    "zeppelin",
     "mega_ring_all_cp",
     "mega_ring_hybrid",
 )
@@ -53,7 +53,7 @@ METHOD_LABELS = {
     "fa3_ring": "FA3 Ring",
     "megatron_hybrid_cp": "Megatron Hybrid CP",
     "magi_attention": "MagiAttention",
-    "zepplin": "Zeppelin",
+    "zeppelin": "Zeppelin",
     "mega_ring_all_cp": "Mega-Ring All-CP",
     "mega_ring_hybrid": "Mega-Ring Hybrid",
 }
@@ -63,7 +63,7 @@ METHOD_COLORS = {
     "fa3_ring": "#9C755F",
     "megatron_hybrid_cp": "#F28E2B",
     "magi_attention": "#17A2B8",
-    "zepplin": "#ECA82C",
+    "zeppelin": "#ECA82C",
     "mega_ring_all_cp": "#E15759",
     "mega_ring_hybrid": "#B07AA1",
 }

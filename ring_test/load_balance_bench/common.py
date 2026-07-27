@@ -13,17 +13,17 @@ from ring_test.load_balance_bench.topology import (
     PlannerTopology,
     make_br_pbs_topology,
     make_megatron_cp_topology,
-    make_zepplin_topology,
+    make_zeppelin_topology,
 )
-from ring_test.zepplin import DEFAULT_ZEPPLIN_THRESHOLD
+from ring_test.zeppelin import DEFAULT_ZEPPELIN_THRESHOLD
 
 
 RESULT_LABELS = (
     "native_megatron_hybrid_cp",
-    "native_zepplin",
+    "native_zeppelin",
     "mega_ring_hybrid_br_pbs",
     "mega_ring_hybrid_megatron_cp",
-    "mega_ring_hybrid_zepplin",
+    "mega_ring_hybrid_zeppelin",
 )
 
 
@@ -34,11 +34,11 @@ class LoadBalanceCase:
     raw_lengths: tuple[int, ...]
     br_pbs: PlannerTopology
     megatron_cp: PlannerTopology
-    zepplin: PlannerTopology
+    zeppelin: PlannerTopology
 
     @property
     def topologies(self) -> tuple[PlannerTopology, PlannerTopology, PlannerTopology]:
-        return self.br_pbs, self.megatron_cp, self.zepplin
+        return self.br_pbs, self.megatron_cp, self.zeppelin
 
 
 def positive_int(value: str) -> int:
@@ -78,7 +78,7 @@ def add_shared_arguments(parser: argparse.ArgumentParser) -> None:
         help="KV heads per all-gather/attention overlap pipeline chunk",
     )
     parser.add_argument(
-        "--zepplin-threshold", type=positive_int, default=DEFAULT_ZEPPLIN_THRESHOLD
+        "--zeppelin-threshold", type=positive_int, default=DEFAULT_ZEPPELIN_THRESHOLD
     )
     parser.add_argument(
         "--megatron-max-seqlen-per-rank", type=positive_int, default=8192
@@ -168,16 +168,16 @@ def build_cases(
                 f"Megatron CP planner failed for {mode} case {case_index + 1}: {exc}"
             ) from exc
         try:
-            zepplin = make_zepplin_topology(
-                lengths, world_size, is_causal, args.zepplin_threshold
+            zeppelin = make_zeppelin_topology(
+                lengths, world_size, is_causal, args.zeppelin_threshold
             )
         except (RuntimeError, ValueError) as exc:
             raise SystemExit(
-                f"Zepllin planner failed for {mode} case {case_index + 1}: {exc}"
+                f"Zeppelin planner failed for {mode} case {case_index + 1}: {exc}"
             ) from exc
         cases.append(
             LoadBalanceCase(
-                case_index, args.num_cases, lengths, br_pbs, megatron_cp, zepplin
+                case_index, args.num_cases, lengths, br_pbs, megatron_cp, zeppelin
             )
         )
     return tuple(cases)

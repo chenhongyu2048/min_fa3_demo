@@ -26,7 +26,7 @@ STRUCTURE_THRESHOLD=${STRUCTURE_THRESHOLD:-0.5}
 MAX_REPAIR_ITERATIONS=${MAX_REPAIR_ITERATIONS:-32}
 SEED=${SEED:-0}
 NUM_CASES=${NUM_CASES:-1}
-ZEPPLIN_THRESHOLD=${ZEPPLIN_THRESHOLD:-8192}
+ZEPPELIN_THRESHOLD=${ZEPPELIN_THRESHOLD:-4096}
 MEGATRON_MAX_SEQLEN_PER_RANK=${MEGATRON_MAX_SEQLEN_PER_RANK:-8192}
 MODE=${MODE:-causal}
 QHEAD=${QHEAD:-32}
@@ -77,14 +77,14 @@ case "$DRY_RUN" in
 esac
 
 for variable in TARGET_TOKENS BEAM_WIDTH FINALIST_COUNT MAX_REPAIR_ITERATIONS NUM_CASES \
-    ZEPPLIN_THRESHOLD MEGATRON_MAX_SEQLEN_PER_RANK QHEAD KVHEAD HEADDIM \
+    ZEPPELIN_THRESHOLD MEGATRON_MAX_SEQLEN_PER_RANK QHEAD KVHEAD HEADDIM \
     ALLGATHER_OVERLAPPING_HEADS_K_STRIDE WARMUP_ITERS NUM_ITERS; do
     value=${!variable}
     [[ "$value" =~ ^[0-9]+$ ]] || die "$variable must be an integer, got '$value'"
 done
 ((TARGET_TOKENS > 0 && BEAM_WIDTH > 0 && FINALIST_COUNT > 0 && NUM_CASES > 0)) || \
     die "TARGET_TOKENS, BEAM_WIDTH, FINALIST_COUNT, and NUM_CASES must be positive"
-((ZEPPLIN_THRESHOLD > 0 && MEGATRON_MAX_SEQLEN_PER_RANK > 0)) || \
+((ZEPPELIN_THRESHOLD > 0 && MEGATRON_MAX_SEQLEN_PER_RANK > 0)) || \
     die "planner thresholds must be positive"
 ((QHEAD > 0 && KVHEAD > 0 && HEADDIM > 0 && NUM_ITERS > 0)) || \
     die "attention dimensions and NUM_ITERS must be positive"
@@ -162,7 +162,7 @@ run_benchmark() {
         --seed "$SEED" --num-cases "$NUM_CASES"
         --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM"
         --allgather-overlapping-heads-k-stride "$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE"
-        --zepplin-threshold "$ZEPPLIN_THRESHOLD"
+        --zeppelin-threshold "$ZEPPELIN_THRESHOLD"
         --megatron-max-seqlen-per-rank "$MEGATRON_MAX_SEQLEN_PER_RANK"
         --sm-configs "$SM_CONFIGS" --warmup-iters "$WARMUP_ITERS" --num-iters "$NUM_ITERS"
         --mode "$MODE" "${CHECK_ARGS[@]}"
@@ -195,7 +195,7 @@ if ((DRY_RUN == 0)); then
 fi
 
 echo "Log: $LOG_FILE"
-echo "Fixed results: native_megatron_hybrid_cp, native_zepplin, mega_ring_hybrid_br_pbs, mega_ring_hybrid_megatron_cp, mega_ring_hybrid_zepplin"
+echo "Fixed results: native_megatron_hybrid_cp, native_zeppelin, mega_ring_hybrid_br_pbs, mega_ring_hybrid_megatron_cp, mega_ring_hybrid_zeppelin"
 for world_size in "${GPU_COUNT_LIST[@]}"; do
     select_devices "$world_size"
     for dataset in "${DATASET_LIST[@]}"; do

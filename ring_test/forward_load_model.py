@@ -16,7 +16,7 @@ from ring_test.utils import (
     align_mega_ring_all_cp_lengths,
     hybrid_cp_saturation_note,
 )
-from ring_test.zepplin import DEFAULT_ZEPPLIN_THRESHOLD, make_zepplin_plan
+from ring_test.zeppelin import DEFAULT_ZEPPELIN_THRESHOLD, make_zeppelin_plan
 
 
 METHOD_ORDER = (
@@ -25,7 +25,7 @@ METHOD_ORDER = (
     "fa3_ring",
     "megatron_hybrid_cp",
     "magi_attention",
-    "zepplin",
+    "zeppelin",
     "mega_ring_all_cp",
     "mega_ring_hybrid",
 )
@@ -642,7 +642,7 @@ def analyze_megatron(
     )
 
 
-def analyze_zepplin(
+def analyze_zeppelin(
     global_lengths: Sequence[int],
     world_size: int,
     q_heads: int,
@@ -650,45 +650,51 @@ def analyze_zepplin(
     head_dim: int,
     is_causal: bool,
     *,
-    threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
+    threshold: int = DEFAULT_ZEPPELIN_THRESHOLD,
 ) -> MethodLoadResult:
-    plan = make_zepplin_plan(
+    plan = make_zeppelin_plan(
         list(global_lengths), world_size, is_causal, threshold
     )
-    owner_by_index = dict(zip(plan.short_indices, plan.short_owners))
-    placements = [
-        Placement(
-            length,
-            1 if index in owner_by_index else world_size,
-            owner_by_index.get(index, 0),
+    loads = [_MutableRankLoad() for _ in range(world_size)]
+    row_bytes = kv_heads * head_dim * BF16_BYTES * 2
+    for assignment in plan.assignments:
+        local_length = assignment.local_length
+        raw_scores = (
+            assignment.raw_length * (assignment.raw_length + 1) // 2
+            if is_causal
+            else assignment.raw_length * assignment.raw_length
         )
-        for index, length in enumerate(global_lengths)
-    ]
-    loads = _placements_loads(
-        placements,
-        world_size,
-        q_heads,
-        kv_heads,
-        head_dim,
-        is_causal,
-        communication="python-ring",
-    )
-    _replace_token_and_communication_with_original_lengths(
-        loads,
-        placements,
-        global_lengths,
-        world_size,
-        kv_heads,
-        head_dim,
-        is_causal,
-        communication="python-ring",
-    )
+        for group_rank, rank in enumerate(assignment.group_members):
+            load = loads[rank]
+            load.effective_tokens += assignment.raw_length / assignment.group_size
+            load.physical_tokens += local_length
+            load.effective_scores += raw_scores / assignment.group_size
+            sequence_visits = 0
+            for task in _ring_tasks(
+                local_length, assignment.group_size, group_rank, is_causal
+            ):
+                area = attention_area(task)
+                load.physical_scores += area
+                reads, visits = task_tile_counters(task, q_heads)
+                load.kv_tile_reads += reads
+                sequence_visits += visits
+            load.qo_visits_worst += sequence_visits
+            load.qo_visits_best += sequence_visits
+        if assignment.group_size > 1:
+            per_rank_bytes = (
+                (assignment.group_size - 1) * local_length * row_bytes
+            )
+            for rank in assignment.group_members:
+                loads[rank].comm_tx_bytes += per_rank_bytes
+                loads[rank].comm_rx_bytes += per_rank_bytes
     note = (
-        f"threshold={threshold}; G1={len(plan.short_indices)}, "
-        f"Gworld={len(plan.long_indices)}; LPT short-sequence owners; token and "
-        "communication counters use original sequence lengths"
+        f"Algorithm 2 L={threshold}; final_s0={plan.effective_threshold}; "
+        f"iterations={plan.iterations}; arbitrary-G post-plan padding="
+        f"{plan.padding_tokens}; group sizes="
+        f"{[assignment.group_size for assignment in plan.assignments]}; "
+        f"execution lengths={list(plan.execution_lengths)}"
     )
-    return _finalize("zepplin", is_causal, loads, q_heads, head_dim, note)
+    return _finalize("zeppelin", is_causal, loads, q_heads, head_dim, note)
 
 
 def analyze_mega_ring_hybrid(
@@ -801,7 +807,7 @@ def analyze_method(
     is_causal: bool,
     *,
     heads_k_stride: int = 4,
-    zepplin_threshold: int = DEFAULT_ZEPPLIN_THRESHOLD,
+    zeppelin_threshold: int = DEFAULT_ZEPPELIN_THRESHOLD,
     megatron_max_seqlen_per_rank: int = 8192,
 ) -> MethodLoadResult:
     if method == "allgather_attention":
@@ -844,15 +850,15 @@ def analyze_method(
             is_causal,
             max_seqlen_per_rank=megatron_max_seqlen_per_rank,
         )
-    if method == "zepplin":
-        return analyze_zepplin(
+    if method == "zeppelin":
+        return analyze_zeppelin(
             global_lengths,
             world_size,
             q_heads,
             kv_heads,
             head_dim,
             is_causal,
-            threshold=zepplin_threshold,
+            threshold=zeppelin_threshold,
         )
     if method == "mega_ring_all_cp":
         return analyze_mega_ring_all_cp(
@@ -1110,10 +1116,7 @@ def cumulative_result(results: Sequence[MethodLoadResult]) -> MethodLoadResult:
             "execution lengths"
         ),
         "magi_attention": "metadata-only Magi plans; dispatch excluded; chunking/padding vary by case",
-        "zepplin": (
-            "Zeppelin LPT G1/Gworld placement varies by case; token and "
-            "communication counters use original sequence lengths"
-        ),
+        "zeppelin": "Zeppelin Algorithm 2 arbitrary-G placement varies by case",
         "mega_ring_all_cp": (
             "all-CP fused mega-ring; per-case 2048-token alignment; token and "
             "communication counters use original sequence lengths; FLOPs use "
@@ -1230,7 +1233,7 @@ __all__ = [
     "analyze_magi_rank",
     "analyze_megatron",
     "analyze_method",
-    "analyze_zepplin",
+    "analyze_zeppelin",
     "attention_area",
     "cumulative_result",
     "global_ratio",

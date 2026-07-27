@@ -152,12 +152,33 @@ class RingComm:
     the next block consumed by local attention.
     """
 
-    def __init__(self, process_group: Optional[dist.ProcessGroup]):
+    def __init__(
+        self,
+        process_group: Optional[dist.ProcessGroup],
+        ring_members: tuple[int, ...] | None = None,
+    ):
         self._process_group = process_group
         self._ops: list[dist.P2POp] = []
+        self._reqs = None
+
+        if ring_members is not None:
+            global_rank = dist.get_rank()
+            if global_rank not in ring_members:
+                raise ValueError(
+                    f"global rank {global_rank} is not in ordered ring {ring_members}"
+                )
+            if len(ring_members) != dist.get_world_size(self._process_group):
+                raise ValueError(
+                    "ordered ring member count does not match process-group size"
+                )
+            self.rank = ring_members.index(global_rank)
+            self.world_size = len(ring_members)
+            self.send_rank = ring_members[(self.rank + 1) % self.world_size]
+            self.recv_rank = ring_members[(self.rank - 1) % self.world_size]
+            return
+
         self.rank = dist.get_rank(self._process_group)
         self.world_size = dist.get_world_size(self._process_group)
-        self._reqs = None
 
         self.send_rank = (self.rank + 1) % self.world_size
         self.recv_rank = (self.rank - 1) % self.world_size
@@ -213,6 +234,7 @@ def ring_varlen_forward(
     block_attention: BlockAttention,
     *,
     return_lse: bool = False,
+    ring_members: tuple[int, ...] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run a full Python-side ring attention forward for one backend.
 
@@ -221,7 +243,7 @@ def ring_varlen_forward(
     consumes only local/history blocks (`step <= r`); step 0 is the local block
     and uses the causal mask, while history blocks are noncausal.
     """
-    comm = RingComm(process_group)
+    comm = RingComm(process_group, ring_members)
     out = None
     lse = None
     cur_k = k.contiguous()
@@ -265,6 +287,7 @@ def zigzag_ring_varlen_forward(
     block_attention: ZigzagBlockAttention,
     *,
     return_lse: bool = False,
+    ring_members: tuple[int, ...] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run load-balanced causal zigzag ring attention for one backend.
 
@@ -276,7 +299,7 @@ def zigzag_ring_varlen_forward(
     if max_seqlen % 2 != 0:
         raise RuntimeError(f"zigzag causal ring requires an even max_seqlen, got {max_seqlen}")
 
-    comm = RingComm(process_group)
+    comm = RingComm(process_group, ring_members)
     half_index0 = get_half_index(cu_seqlens, front=True)
     half_index1 = get_half_index(cu_seqlens, front=False)
     half_cu_seqlens = cu_seqlens // 2

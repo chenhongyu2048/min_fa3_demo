@@ -13,10 +13,8 @@ from ring_test.load_balance_bench.topology import (
     make_br_pbs_topology,
     make_megatron_cp_topology,
     make_planner_topologies,
-    make_zepplin_topology,
     validate_fused_metadata,
 )
-from ring_test.zepplin import make_zepplin_plan
 
 
 class PlannerTopologyTest(unittest.TestCase):
@@ -45,7 +43,7 @@ class PlannerTopologyTest(unittest.TestCase):
             self.world_size,
             True,
             controls=self.controls,
-            zepplin_threshold=4096,
+            zeppelin_threshold=4096,
             megatron_max_seqlen_per_rank=4096,
         )
         second = make_planner_topologies(
@@ -53,7 +51,7 @@ class PlannerTopologyTest(unittest.TestCase):
             self.world_size,
             True,
             controls=self.controls,
-            zepplin_threshold=4096,
+            zeppelin_threshold=4096,
             megatron_max_seqlen_per_rank=4096,
         )
         for left, right in zip(first, second):
@@ -106,29 +104,13 @@ class PlannerTopologyTest(unittest.TestCase):
             self.assertEqual(sample.ring_start, assignment.rank_start)
         validate_fused_metadata(topology)
 
-    def test_zepplin_keeps_g1_owner_and_gworld_placement_after_ordering(self) -> None:
-        topology = make_zepplin_topology(
-            self.lengths, self.world_size, True, threshold=4096
-        )
-        plan = make_zepplin_plan(list(self.lengths), self.world_size, True, 4096)
-        owners = dict(zip(plan.short_indices, plan.short_owners))
-        for sample in topology.samples:
-            if sample.sample_id in owners:
-                self.assertEqual(sample.ring_size, 1)
-                self.assertEqual(sample.ring_start, owners[sample.sample_id])
-            else:
-                self.assertEqual(sample.ring_size, self.world_size)
-                self.assertEqual(sample.ring_start, 0)
-        self.assertEqual(topology.ring_sizes, tuple(sorted(topology.ring_sizes, reverse=True)))
-        validate_fused_metadata(topology)
-
     def test_causal_and_noncausal_topologies_are_separate(self) -> None:
         causal = make_planner_topologies(
             self.lengths,
             self.world_size,
             True,
             controls=self.controls,
-            zepplin_threshold=4096,
+            zeppelin_threshold=4096,
             megatron_max_seqlen_per_rank=4096,
         )
         noncausal = make_planner_topologies(
@@ -136,7 +118,7 @@ class PlannerTopologyTest(unittest.TestCase):
             self.world_size,
             False,
             controls=self.controls,
-            zepplin_threshold=4096,
+            zeppelin_threshold=4096,
             megatron_max_seqlen_per_rank=4096,
         )
         self.assertTrue(all(topology.is_causal for topology in causal))
@@ -145,8 +127,6 @@ class PlannerTopologyTest(unittest.TestCase):
             validate_fused_metadata(topology)
 
     def test_invalid_alignment_fails_without_silent_padding(self) -> None:
-        with self.assertRaisesRegex(ValueError, r"zepplin.*128-row"):
-            make_zepplin_topology((130,), self.world_size, False, threshold=4096)
         malformed = PlannerTopology(
             "br_pbs",
             True,

@@ -31,7 +31,7 @@ from ring_test.load_balance_bench.topology import PlannerTopology, validate_with
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run native Megatron/Zepllin and three fused Mega Ring placements "
+            "Run native Megatron/Zeppelin and three fused Mega Ring placements "
             "on the same dataset-shaped raw workload"
         )
     )
@@ -69,8 +69,8 @@ def _runner_argv(
         mode_name(is_causal),
         "--methods",
         method,
-        "--zepplin-threshold",
-        str(args.zepplin_threshold),
+        "--zeppelin-threshold",
+        str(args.zeppelin_threshold),
         "--megatron-max-seqlen-per-rank",
         str(args.megatron_max_seqlen_per_rank),
         "--sm-configs",
@@ -189,19 +189,36 @@ def main(argv: Sequence[str] | None = None) -> None:
                         case.raw_lengths,
                         raw_sizes,
                         raw_starts,
+                        None,
                     ),
                     (
                         RESULT_LABELS[1],
-                        "zepplin",
+                        "zeppelin",
                         case.raw_lengths,
                         raw_sizes,
                         raw_starts,
+                        None,
                     ),
-                    (RESULT_LABELS[2], "mega_ring_hybrid", *_mapped_metadata(case.br_pbs)),
-                    (RESULT_LABELS[3], "mega_ring_hybrid", *_mapped_metadata(case.megatron_cp)),
-                    (RESULT_LABELS[4], "mega_ring_hybrid", *_mapped_metadata(case.zepplin)),
+                    (
+                        RESULT_LABELS[2],
+                        "mega_ring_hybrid",
+                        *_mapped_metadata(case.br_pbs),
+                        case.raw_lengths,
+                    ),
+                    (
+                        RESULT_LABELS[3],
+                        "mega_ring_hybrid",
+                        *_mapped_metadata(case.megatron_cp),
+                        case.raw_lengths,
+                    ),
+                    (
+                        RESULT_LABELS[4],
+                        "mega_ring_hybrid",
+                        *_mapped_metadata(case.zeppelin),
+                        case.raw_lengths,
+                    ),
                 )
-                for label, method, lengths, ring_sizes, ring_starts in requests:
+                for label, method, lengths, ring_sizes, ring_starts, metric_lengths in requests:
                     if rank == 0:
                         print(
                             f"\nFive-method result: {label}; "
@@ -225,6 +242,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                         ),
                         case_index=case.case_index,
                         manage_process_group=False,
+                        metric_global_lengths=metric_lengths,
                     )
                     if rank == 0:
                         summary_samples.extend(

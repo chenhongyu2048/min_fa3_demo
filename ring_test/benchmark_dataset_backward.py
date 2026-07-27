@@ -27,7 +27,7 @@ from benchmark_dataset_forward import (
     print_workload,
 )
 from ring_test.utils import HybridBenchmarkCase
-from zepplin import DEFAULT_ZEPPLIN_THRESHOLD
+from zeppelin import DEFAULT_ZEPPELIN_THRESHOLD
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -87,9 +87,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--methods", default="all")
     parser.add_argument(
-        "--zepplin-threshold",
+        "--zeppelin-threshold",
         type=_positive_int,
-        default=DEFAULT_ZEPPLIN_THRESHOLD,
+        default=DEFAULT_ZEPPELIN_THRESHOLD,
     )
     parser.add_argument(
         "--megatron-max-seqlen-per-rank",
@@ -132,8 +132,8 @@ def _benchmark_argv(
         str(args.allgather_overlapping_heads_k_stride),
         "--methods",
         args.methods,
-        "--zepplin-threshold",
-        str(args.zepplin_threshold),
+        "--zeppelin-threshold",
+        str(args.zeppelin_threshold),
         "--megatron-max-seqlen-per-rank",
         str(args.megatron_max_seqlen_per_rank),
         "--magi-overlap-degree",
