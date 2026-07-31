@@ -145,5 +145,5 @@ setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension.with_options(no_python_abi_suffix=True)},
     packages=[],
-    py_modules=["min_fa3_op"],
+    py_modules=["min_fa3_op", "min_fa3_dcp"],
 )

@@ -445,6 +445,7 @@ __all__ = [
     "backward_varlen_mega_ring",
     "create_parallel_tensor",
     "forward",
+    "forward_kvcache",
     "forward_varlen",
     "forward_varlen_mega_ring",
     "forward_varlen_ring",

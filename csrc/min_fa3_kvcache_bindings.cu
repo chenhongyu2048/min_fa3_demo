@@ -81,7 +81,8 @@ Flash_fwd_params make_kvcache_params(
     torch::Tensor& scheduler_metadata,
     torch::Tensor& out_accum,
     torch::Tensor& softmax_lse_accum,
-    int requested_num_splits) {
+    int requested_num_splits,
+    bool is_causal) {
     Flash_fwd_params params{};
 
     params.is_bf16 = true;
@@ -130,9 +131,7 @@ Flash_fwd_params make_kvcache_params(
     params.seqused_q = nullptr;
     params.seqused_k = cache_seqlens.data_ptr<int>();
 
-    // Dense single-token causal decode is equivalent to noncausal attention.
-    // This preserves the official D=128 128x176 decode tile selection.
-    params.is_causal = params.seqlen_q != 1;
+    params.is_causal = is_causal;
     params.is_local = false;
     params.window_size_left = params.seqlen_k - 1;
     params.window_size_right = 0;
@@ -183,7 +182,8 @@ py::object forward_kvcache(
     torch::Tensor v_cache,
     torch::Tensor cache_seqlens,
     int64_t num_splits,
-    bool return_lse) {
+    bool return_lse,
+    py::object is_causal_obj) {
     check_bshd(q, "q");
     check_bshd(k_cache, "k_cache");
     check_bshd(v_cache, "v_cache");
@@ -205,8 +205,14 @@ py::object forward_kvcache(
     TORCH_CHECK(q.size(2) % k_cache.size(2) == 0,
                 "QH must be divisible by KVH. Got QH=", q.size(2), ", KVH=", k_cache.size(2));
     TORCH_CHECK(cache_seqlens.numel() == q.size(0), "cache_seqlens must have shape [B]");
-    TORCH_CHECK(q.size(1) <= k_cache.size(1),
-                "Sq must not exceed the KV-cache capacity. Got Sq=", q.size(1), ", capacity=", k_cache.size(1));
+    // None preserves the original KV-cache behavior: single-token decode uses
+    // the equivalent noncausal 128x176 tile and chunks use bottom-right causal.
+    bool const is_causal = is_causal_obj.is_none()
+        ? q.size(1) != 1
+        : is_causal_obj.cast<bool>();
+    TORCH_CHECK(!is_causal || q.size(1) <= k_cache.size(1),
+                "Causal Sq must not exceed the KV-cache capacity. Got Sq=", q.size(1),
+                ", capacity=", k_cache.size(1));
     TORCH_CHECK(num_splits >= 0 && num_splits <= 128,
                 "num_splits must be 0 (auto), 1 (NoSplit), or in [2, 128]. Got ", num_splits);
 
@@ -237,14 +243,14 @@ py::object forward_kvcache(
     heuristic_params.h_k = static_cast<int>(k_cache.size(2));
     heuristic_params.d = kHeadDim;
     heuristic_params.dv = kHeadDim;
-    heuristic_params.is_causal = q.size(1) != 1;
+    heuristic_params.is_causal = is_causal;
     heuristic_params.num_sm = properties->multiProcessorCount;
     int const effective_num_splits = num_splits == 0
         ? choose_num_splits(heuristic_params)
         : static_cast<int>(num_splits);
 
     int const b_rounded = round_multiple(static_cast<int>(q.size(0)), 4);
-    int const num_prepare_batch_vectors = 3 + (q.size(1) != 1 ? 1 : 0);
+    int const num_prepare_batch_vectors = 3 + (is_causal ? 1 : 0);
     auto scheduler_metadata = torch::empty(
         {1 + b_rounded * num_prepare_batch_vectors},
         q.options().dtype(torch::kInt32));
@@ -270,7 +276,8 @@ py::object forward_kvcache(
         scheduler_metadata,
         out_accum,
         softmax_lse_accum,
-        effective_num_splits);
+        effective_num_splits,
+        is_causal);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(q.get_device()).stream();
     min_fa3_varlen_demo::run_min_fa3_kvcache_fwd(params, stream);
@@ -298,6 +305,8 @@ void bind_min_fa3_kvcache(py::module_& module) {
         py::kw_only(),
         py::arg("num_splits") = 0,
         py::arg("return_lse") = false,
+        py::arg("is_causal") = py::none(),
         "Minimal Hopper FA3 dense KV-cache decode/chunk-prefill forward. "
-        "cache_seqlens values must be in [Sq, Sk_capacity].");
+        "is_causal=None preserves the Sq-dependent legacy behavior; explicit false "
+        "allows noncausal context attention with Sq > Sk_capacity.");
 }
