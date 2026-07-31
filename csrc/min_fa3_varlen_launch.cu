@@ -10,9 +10,9 @@ void run_min_fa3_varlen_fwd(
     cudaStream_t stream,
     std::optional<int> manual_block_count) {
     if (params.is_causal) {
-        run_min_fa3_varlen_sm90<true>(params, stream, manual_block_count);
+        run_min_fa3_varlen_sm90<true, false, false>(params, stream, manual_block_count);
     } else {
-        run_min_fa3_varlen_sm90<false>(params, stream, manual_block_count);
+        run_min_fa3_varlen_sm90<false, false, false>(params, stream, manual_block_count);
     }
 }
 

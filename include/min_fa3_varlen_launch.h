@@ -26,7 +26,7 @@ namespace min_fa3_varlen_demo {
 
 using namespace cute;
 
-template <bool IsCausal>
+template <bool IsCausal, bool PackGQA = false, bool Split = false>
 void run_min_fa3_varlen_sm90(
     Flash_fwd_params& params,
     cudaStream_t stream,
@@ -53,8 +53,8 @@ void run_min_fa3_varlen_sm90(
         kHasQv,
         Config::MmaPV_is_RS,
         Config::IntraWGOverlap,
-        kPackGQA,
-        kSplit,
+        PackGQA,
+        Split,
         kVColMajor>;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<
         TileShape_MNK_PV,
@@ -63,8 +63,8 @@ void run_min_fa3_varlen_sm90(
         ArchTag,
         CollectiveMainloop::NumMmaThreads,
         kVarlen,
-        kPackGQA,
-        kSplit,
+        PackGQA,
+        Split,
         false,
         false>;
     using Scheduler = flash::VarlenDynamicPersistentTileScheduler<
@@ -72,28 +72,39 @@ void run_min_fa3_varlen_sm90(
         Config::kBlockN,
         CollectiveMainloop::NumMmaThreads,
         CollectiveMainloop::NumProducerThreads,
-        false,
-        false,
+        Split,
+        PackGQA,
         true,
         IsCausal,
         true,
         true>;
     using AttnKernel = flash::enable_sm90<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
 
-    int const seqlen_q = params.total_q;
-    int const batch_q = 1;
-    int const batch_k = 1;
+    bool const is_varlen_q = params.cu_seqlens_q != nullptr;
+    bool const is_varlen_k = params.cu_seqlens_k != nullptr;
+    int const seqlen_q = !is_varlen_q ? params.seqlen_q : params.total_q;
+    int const batch_q = !is_varlen_q ? params.b : 1;
+    int const batch_k = !is_varlen_k ? params.b : 1;
     using Index = typename Flash_fwd_params::index_t;
 
     typename CollectiveMainloop::StrideV v_strides = make_stride(
-        params.v_row_stride, _1{}, params.v_head_stride, Index{0});
+        params.v_row_stride,
+        _1{},
+        params.v_head_stride,
+        !is_varlen_k ? params.v_batch_stride : Index{0});
     typename CollectiveMainloop::Arguments mainloop_args{
         static_cast<Element const*>(params.q_ptr),
         {seqlen_q, params.d, params.h, batch_q},
-        {params.q_row_stride, _1{}, params.q_head_stride, Index{0}},
+        {params.q_row_stride,
+         _1{},
+         params.q_head_stride,
+         !is_varlen_q ? params.q_batch_stride : Index{0}},
         static_cast<Element*>(params.k_ptr),
-        {params.total_k, params.d, params.h_k, batch_k},
-        {params.k_row_stride, _1{}, params.k_head_stride, Index{0}},
+        {!is_varlen_k ? params.seqlen_k : params.total_k, params.d, params.h_k, batch_k},
+        {params.k_row_stride,
+         _1{},
+         params.k_head_stride,
+         !is_varlen_k ? params.k_batch_stride : Index{0}},
         static_cast<Element*>(params.v_ptr),
         params.dv,
         v_strides,
@@ -134,22 +145,34 @@ void run_min_fa3_varlen_sm90(
 
     typename CollectiveEpilogue::Arguments epilogue_args{
         static_cast<ElementOut*>(params.o_ptr),
-        {seqlen_q, params.dv, params.h, batch_q, 1},
-        {params.o_row_stride, _1{}, params.o_head_stride, Index{0}, Index{0}},
-        static_cast<float*>(nullptr),
-        {Index{0}, _1{}, Index{0}, Index{0}, Index{0}},
+        {seqlen_q, params.dv, params.h, batch_q, params.num_splits},
+        {params.o_row_stride,
+         _1{},
+         params.o_head_stride,
+         !is_varlen_q ? params.o_batch_stride : Index{0},
+         Index{0}},
+        static_cast<float*>(params.oaccum_ptr),
+        {params.oaccum_row_stride,
+         _1{},
+         params.oaccum_head_stride,
+         !is_varlen_q ? params.oaccum_batch_stride : Index{0},
+         params.oaccum_split_stride},
         static_cast<float*>(params.softmax_lse_ptr),
-        {_1{}, seqlen_q, Index{0}, Index{0}},
-        static_cast<float*>(nullptr),
-        {_1{}, Index{0}, Index{0}, Index{0}},
+        {_1{}, seqlen_q, !is_varlen_q ? params.h * seqlen_q : Index{0}, Index{0}},
+        static_cast<float*>(params.softmax_lseaccum_ptr),
+        {_1{},
+         params.lseaccum_head_stride,
+         !is_varlen_q ? params.lseaccum_batch_stride : Index{0},
+         params.lseaccum_split_stride},
         params.h_k,
         params.cu_seqlens_q,
         params.seqused_q};
 
-    int num_blocks_m = cutlass::ceil_div(params.seqlen_q, Config::kBlockM);
+    int const qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);
+    int num_blocks_m = cutlass::ceil_div(params.seqlen_q * qhead_per_khead, Config::kBlockM);
     typename flash::TileSchedulerArguments scheduler_args{
         num_blocks_m,
-        params.h,
+        !PackGQA ? params.h : params.h_k,
         params.b,
         params.num_splits,
         params.h / params.h_k,
@@ -167,7 +190,13 @@ void run_min_fa3_varlen_sm90(
         params.num_nheads_in_l2_ptr};
 
     if (!params.skip_scheduler_metadata_computation) {
-        prepare_varlen_num_blocks(params, stream, kPackGQA, Config::kBlockM, Config::kBlockN, params.prepare_varlen_pdl);
+        prepare_varlen_num_blocks(
+            params,
+            stream,
+            PackGQA,
+            Config::kBlockM,
+            Config::kBlockN,
+            params.prepare_varlen_pdl);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
 
@@ -198,3 +227,16 @@ void run_min_fa3_varlen_sm90(
 }
 
 }  // namespace min_fa3_varlen_demo
+
+extern template void min_fa3_varlen_demo::run_min_fa3_varlen_sm90<false, false, false>(
+    min_fa3_varlen_demo::Flash_fwd_params&, cudaStream_t, std::optional<int>);
+extern template void min_fa3_varlen_demo::run_min_fa3_varlen_sm90<true, false, false>(
+    min_fa3_varlen_demo::Flash_fwd_params&, cudaStream_t, std::optional<int>);
+extern template void min_fa3_varlen_demo::run_min_fa3_varlen_sm90<false, true, false>(
+    min_fa3_varlen_demo::Flash_fwd_params&, cudaStream_t, std::optional<int>);
+extern template void min_fa3_varlen_demo::run_min_fa3_varlen_sm90<true, true, false>(
+    min_fa3_varlen_demo::Flash_fwd_params&, cudaStream_t, std::optional<int>);
+extern template void min_fa3_varlen_demo::run_min_fa3_varlen_sm90<false, true, true>(
+    min_fa3_varlen_demo::Flash_fwd_params&, cudaStream_t, std::optional<int>);
+extern template void min_fa3_varlen_demo::run_min_fa3_varlen_sm90<true, true, true>(
+    min_fa3_varlen_demo::Flash_fwd_params&, cudaStream_t, std::optional<int>);

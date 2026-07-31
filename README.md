@@ -11,6 +11,13 @@ paths while trimming them to the fixed configuration documented below.
 
 The params structures are copied from the original Hopper forward/backward params paths and trimmed, not rewritten from scratch.
 
+The dense KV-cache decode/chunk-prefill sibling is pinned to:
+
+- FlashAttention commit `c75d019dea9d910312974417bc28f190dfdda6d9`
+- CUTLASS commit `7127592069c2fe01b041e174ba4345ef9b279671`
+
+The vendored `third_party/cutlass` checkout matches the CUTLASS commit above.
+
 ## Main copied sources
 
 - `hopper/flash.h`
@@ -23,6 +30,10 @@ The params structures are copied from the original Hopper forward/backward param
 - `hopper/tile_size.h`
 - `hopper/named_barrier.hpp`
 - `hopper/instantiations/flash_fwd_hdim128_bf16_sm90.cu`
+- `hopper/instantiations/flash_fwd_hdim128_bf16_packgqa_sm90.cu`
+- `hopper/instantiations/flash_fwd_hdim128_bf16_split_sm90.cu`
+- `hopper/flash_fwd_combine_launch_template.h`
+- `hopper/flash_fwd_combine_kernel.h`
 - `hopper/flash_bwd_launch_template.h`
 - `hopper/flash_bwd_preprocess_kernel.h`
 - `hopper/flash_bwd_postprocess_kernel.h`
@@ -48,6 +59,8 @@ The params structures are copied from the original Hopper forward/backward param
 - `hopper/flash_fwd_launch_template.h` -> `include/min_fa3_varlen_launch.h`
 - `hopper/flash_prepare_scheduler.cu` -> `csrc/min_fa3_varlen_prepare_scheduler.cu`
 - `hopper/instantiations/flash_fwd_hdim128_bf16_sm90.cu` -> `csrc/min_fa3_varlen_kernel.cu`
+- Hopper PackGQA/Split instantiations -> `csrc/min_fa3_kvcache_*_kernel.cu`
+- Hopper Split combine path -> `include/hopper_compat/min_fa3_fwd_combine_kernel.h`
 - Hopper backward params and launch layers -> `include/backward/`
 - Hopper backward instantiation and host bindings -> `csrc/backward/`
 
@@ -99,6 +112,25 @@ Varlen fixed configuration:
 - Scheduler barrier logic from the copied SM90 mainloop
 - Separate copied prologue, mainloop, epilogue, kernel wrapper, and launch layers
 
+## Dense KV-cache decode / chunk-prefill sibling
+
+`min_fa3_op.forward_kvcache` is a causal-only, read-only dense KV-cache path:
+
+- H100-class Hopper, compiled for `sm_90a`
+- `q: [B, Sq, QH, 128]`
+- `k_cache/v_cache: [B, Sk_capacity, KVH, 128]`
+- `cache_seqlens: [B]`, CUDA contiguous `torch.int32`
+- `o: [B, Sq, QH, 128]`; optional FP32 `lse: [B, QH, Sq]`
+- `num_splits=0` uses the official automatic heuristic, `1` forces NoSplit,
+  and `2..128` forces Split with the official FP32 partial/combine path
+
+The caller must provide `Sq <= cache_seqlens[b] <= Sk_capacity`; the cache
+already contains the K/V rows corresponding to the current decode token or
+chunk. This API does not append or mutate the cache. Dense `Sq=1` causal decode
+uses the official equivalent noncausal `128x176` instance; larger chunks use
+bottom-right causal `128x128`. NoSplit retains both PackGQA variants and Split
+uses PackGQA, matching the official Hopper dispatch.
+
 ## What was trimmed away
 
 - Paged KV
@@ -106,8 +138,7 @@ Varlen fixed configuration:
 - Rotary
 - Qv path
 - FP8
-- Split-KV
-- PackGQA
+- Split-KV and PackGQA outside the dense KV-cache sibling
 - Softcap
 - Local attention
 - Non-128 head dims
@@ -186,6 +217,9 @@ python -m scripts.test_min_fa3.test_min_fa3 \
   --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --mode both
 python -m scripts.test_min_fa3.test_min_fa3_varlen \
   --b 2 --seqlen 128,256 --qhead 16 --kvhead 8 --headdim 128 --mode both
+python -m scripts.test_min_fa3.test_min_fa3_kvcache \
+  --b 3 --seqlen 129,1024,3131 --sq 1,8,32,120,128 \
+  --qhead 8 --kvhead 2 --headdim 128 --mode all
 ```
 
 Backward tests:
@@ -564,6 +598,9 @@ python -m scripts.legacy_benchmark.benchmark \
 python -m scripts.legacy_benchmark.benchmark_varlen \
   --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 \
   --headdim 128 --mode both
+python -m scripts.legacy_benchmark.benchmark_kvcache \
+  --b 4 --seqlen 1024,4096,16384 --sq 1,32,128 \
+  --qhead 32 --kvhead 8 --headdim 128 --mode all --profile-kernels
 python -m scripts.legacy_benchmark.benchmark_backward \
   --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 \
   --headdim 128 --mode both --deterministic
@@ -571,6 +608,16 @@ python -m scripts.legacy_benchmark.benchmark_varlen_ring_local \
   --b 4 --seqlen 512,1024 --qhead 32 --kvhead 8 --headdim 128 \
   --num-comp-sm 116 --num-comm-sm 16 --mode causal
 ```
+
+The KV-cache benchmark reports causal QK+PV model FLOPs and minimum logical
+tensor I/O in addition to latency. For bottom-right causal attention it uses
+`valid_pairs = Sq * Sk - Sq * (Sq - 1) / 2` and
+`FLOPs = 2 * B * QH * valid_pairs * (D + Dv)`. Logical I/O is the BF16
+`Q + K + V + O` traffic plus the FP32 LSE write. `TFLOP/s` and
+`effective_GB/s` use the end-to-end CUDA-event median and decimal units.
+The bandwidth is an algorithmic effective rate, not a hardware DRAM counter;
+scheduler metadata and Split's internal FP32 partial O/LSE traffic are not
+included.
 
 Remote-load microbenchmark:
 
@@ -695,6 +742,22 @@ o = min_fa3_op.forward_varlen(
     cu_seqlens_k_host=cu_seqlens_k_host,
 )
 print(o.shape)
+```
+
+Dense KV-cache decode / chunk-prefill usage:
+
+```python
+import torch
+import min_fa3_op
+
+q = torch.randn(3, 32, 16, 128, device="cuda", dtype=torch.bfloat16)
+k_cache = torch.randn(3, 4096, 8, 128, device="cuda", dtype=torch.bfloat16)
+v_cache = torch.randn_like(k_cache)
+cache_seqlens = torch.tensor([1024, 2048, 4096], device="cuda", dtype=torch.int32)
+
+o, lse = min_fa3_op.forward_kvcache(
+    q, k_cache, v_cache, cache_seqlens, num_splits=0, return_lse=True
+)
 ```
 
 Ring varlen usage:

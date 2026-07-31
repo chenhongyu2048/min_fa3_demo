@@ -497,12 +497,14 @@ public:
                 // very tile, while the consumer is waiting for the producer.
                 if constexpr (!TileScheduler::EnableChunkedSegments) {
                     work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info);
+                    // Copied from the official Hopper Split+Varlen path. The
+                    // combine grid waits on this signal before reading partials.
+                    if constexpr (Split && Varlen) {
+                        if (!work_tile_info.is_valid(params.scheduler)) {  // Last tile
+                            cutlass::arch::launch_dependent_grids();
+                        }
+                    }
                 }
-                // if constexpr (Split && Varlen) {
-                //     if (!work_tile_info.is_valid(params.scheduler)) {  // Last tile
-                //         cutlass::arch::launch_dependent_grids();
-                //     }
-                // }
                 if (tile_valid) {
                     // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
                     if constexpr (TileScheduler::EnableMegaRing && !TileScheduler::EnableChunkedSegments) {

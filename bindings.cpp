@@ -19,6 +19,7 @@ void bind_parallel_remote_load(py::module_& m);
 void bind_varlen_ring(py::module_& m);
 void bind_varlen_mega_ring(py::module_& m);
 void bind_min_fa3_backward(py::module_& m);
+void bind_min_fa3_kvcache(py::module_& m);
 
 namespace {
 
@@ -423,6 +424,7 @@ PYBIND11_MODULE(_min_fa3_op, m) {
         "Internal CPU-side helper for testing launch-grid override resolution.");
     bind_parallel_remote_load(m);
     bind_min_fa3_backward(m);
+    bind_min_fa3_kvcache(m);
     bind_varlen_ring(m);
     // MEGA_RING: explicit default-off multi-step fused ring-attention entry.
     bind_varlen_mega_ring(m);

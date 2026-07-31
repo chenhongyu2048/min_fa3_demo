@@ -41,16 +41,18 @@ struct Qkv_params {
 struct Flash_fwd_params : public Qkv_params {
     using index_t = int64_t;
 
-    // The O matrix (output).
+    // The O matrix (output) and the FP32 partial output used by Split-KV.
     void* __restrict__ o_ptr;
+    void* __restrict__ oaccum_ptr;
 
     // The stride between rows of O.
     index_t o_batch_stride;
     index_t o_row_stride;
     index_t o_head_stride;
 
-    // The pointer to the softmax sum.
+    // The softmax LSE output and the FP32 partial LSE used by Split-KV.
     void* __restrict__ softmax_lse_ptr;
+    void* __restrict__ softmax_lseaccum_ptr;
 
     // The dimensions.
     int b, seqlen_q, seqlen_k, d;
@@ -71,6 +73,17 @@ struct Flash_fwd_params : public Qkv_params {
     int* __restrict__ seqused_q;
     int* __restrict__ seqused_k;
 
+    // The stride between rows of Oaccum.
+    index_t oaccum_split_stride;
+    index_t oaccum_batch_stride;
+    index_t oaccum_row_stride;
+    index_t oaccum_head_stride;
+
+    // The stride between rows of LSEaccum.
+    index_t lseaccum_split_stride;
+    index_t lseaccum_batch_stride;
+    index_t lseaccum_head_stride;
+
     // Local window size. This demo only uses the causal special case or full attention.
     int window_size_left, window_size_right;
     int attention_chunk;
@@ -82,6 +95,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_local;
 
     int num_splits;
+    bool pack_gqa;
 
     int* __restrict__ tile_count_semaphore;
     int* __restrict__ num_m_blocks_ptr;

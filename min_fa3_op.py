@@ -16,6 +16,7 @@ from _min_fa3_op import (
     parallel_remote_load_out as _parallel_remote_load_out_cuda,
     parallel_remote_load_vec_out as _parallel_remote_load_vec_out_cuda,
     forward,
+    forward_kvcache,
     forward_varlen as _forward_varlen_cuda,
     forward_varlen_mega_ring as _forward_varlen_mega_ring_cuda,
     forward_varlen_mega_ring_ablation as _forward_varlen_mega_ring_ablation_cuda,
