@@ -11,7 +11,7 @@ paths while trimming them to the fixed configuration documented below.
 
 The params structures are copied from the original Hopper forward/backward params paths and trimmed, not rewritten from scratch.
 
-The dense KV-cache decode/chunk-prefill sibling is pinned to:
+The dense and packed-varlen KV-cache decode/chunk-prefill siblings are pinned to:
 
 - FlashAttention commit `c75d019dea9d910312974417bc28f190dfdda6d9`
 - CUTLASS commit `7127592069c2fe01b041e174ba4345ef9b279671`
@@ -67,6 +67,7 @@ The vendored `third_party/cutlass` checkout matches the CUTLASS commit above.
 - `hopper/flash_prepare_scheduler.cu` -> `csrc/min_fa3_varlen_prepare_scheduler.cu`
 - `hopper/instantiations/flash_fwd_hdim128_bf16_sm90.cu` -> `csrc/min_fa3_varlen_kernel.cu`
 - Hopper PackGQA/Split instantiations -> `csrc/min_fa3_kvcache_*_kernel.cu`
+- `hopper/flash_fwd_combine_launch_template.h` -> `include/min_fa3_kvcache_combine_launch.h`
 - Hopper Split combine path -> `include/hopper_compat/min_fa3_fwd_combine_kernel.h`
 - Hopper backward params and launch layers -> `include/backward/`
 - Hopper backward instantiation and host bindings -> `csrc/backward/`
@@ -143,10 +144,43 @@ above. Explicit `is_causal=False` selects noncausal context attention and
 permits `Sq > Sk_capacity`; explicit `True` selects bottom-right causal
 attention.
 
+## Packed-varlen KV-cache decode / chunk-prefill sibling
+
+`min_fa3_op.forward_kvcache_varlen` is the packed-Q/K/V sibling of the dense
+KV-cache entry point:
+
+- `q: [total_q, QH, 128]`
+- `k_cache/v_cache: [total_k, KVH, 128]`
+- CUDA contiguous `torch.int32` `cu_seqlens_q/cu_seqlens_k: [B + 1]`
+- matching CPU contiguous `torch.int32` `cu_seqlens_q_host/cu_seqlens_k_host`
+- `o: [total_q, QH, 128]`; optional FP32 natural-log
+  `lse: [QH, total_q]`
+- `num_splits=0` uses the upstream automatic heuristic, `1` forces NoSplit,
+  and `2..128` forces Split
+
+Every sequence length must be positive. The two maximum sequence length
+arguments must exactly match the largest adjacent difference in the respective
+CPU cumulative-length mirror. The host mirrors allow shape, boundary, and
+causal checks without synchronizing CUDA cumulative lengths back to the host;
+the caller is responsible for keeping each CUDA tensor equal to its CPU mirror.
+
+`is_causal=None` selects noncausal attention when `max_seqlen_q == 1` and
+bottom-right causal attention otherwise. Explicit `True` requires
+`q_len <= k_len` for every sequence. Explicit `False` supports noncausal
+context attention, including sequences where `q_len > k_len`.
+
+K/V are tightly packed effective rows: `cu_seqlens_k[-1] == total_k`; there is
+no per-sequence spare capacity. For causal decode or chunk prefill the packed
+K/V input must already include the current token or current chunk. This entry
+point only reads K/V and never appends to or modifies it. Split uses the copied
+dynamic varlen scheduler and allocates FP32 partials as
+`[num_splits, QH, total_q, 128]` and `[num_splits, QH, total_q]`, so ragged Q
+does not allocate a dense `B * max_seqlen_q` workspace.
+
 ## Head-sharded decode context parallel attention
 
 `min_fa3_dcp` provides three standalone Python/Triton DCP runners on top of
-the same dense KV-cache sibling. `DCPAttentionRunner` is the local overlapped
+the same dense and packed-varlen KV-cache siblings. `DCPAttentionRunner` is the local overlapped
 implementation. `VLLMDCPAttentionRunner` copies and trims vLLM's default
 `ag_rs` path at commit `a89015c6df8eeb37a843b717c97a5be1355de83d`.
 `SGLangDCPAttentionRunner` copies and trims SGLang's MHA DCP path at commit
@@ -169,6 +203,23 @@ out = runner.forward_chunk_prefill(
     q_local, k_history_local, v_history_local, history_seqlens_local,
     k_chunk, v_chunk, num_splits=0, return_lse=False,
     overlap_q_allgather=True,
+)
+
+out = runner.forward_decode_varlen(
+    q_local, k_cache_local, v_cache_local,
+    cu_seqlens_q, cu_seqlens_k_local,
+    max_seqlen_q, max_seqlen_k_local,
+    cu_seqlens_q_host=cu_seqlens_q_host,
+    cu_seqlens_k_local_host=cu_seqlens_k_local_host,
+    num_splits=0, return_lse=False,
+)
+out = runner.forward_chunk_prefill_varlen(
+    q_local, k_history_local, v_history_local, k_chunk, v_chunk,
+    cu_seqlens_q, cu_seqlens_history_local,
+    max_seqlen_q, max_seqlen_history_local,
+    cu_seqlens_q_host=cu_seqlens_q_host,
+    cu_seqlens_history_local_host=cu_seqlens_history_local_host,
+    num_splits=0, return_lse=False, overlap_q_allgather=True,
 )
 ```
 
@@ -207,6 +258,25 @@ SGLang MHA path uses natural-log Torch `logsumexp`, FP32 scaling and full-head
 all-reduce, slices local heads, and merges chunk states in FP32 Torch before
 converting output to BF16. All methods return BF16 `[B, Sq, Hq_local, 128]`
 and optional FP32 LSE `[B, Hq_local, Sq]`.
+
+The packed siblings use `q_local: [total_q, Hq_local, 128]`, tightly packed
+local K/V `[total_k_local, Hkv_group, 128]`, and CUDA plus CPU-mirror
+`int32` cumulative lengths. They return BF16 `[total_q, Hq_local, 128]` and,
+when requested, natural-log FP32 LSE `[Hq_local, total_q]`. Every sequence
+must have positive Q and local-K length, both max-length arguments must equal
+the exact maximum adjacent difference in the corresponding host mirror, and
+`num_splits` supports `0`, `1`, and every value in `[2, 128]` independently
+for each local packed attention call. CUDA cumulative lengths must equal their
+CPU mirrors.
+
+Packed decode requires every `q_len == 1`; its local cache already contains
+the current token on the position-owner DCP rank. Packed chunk history excludes
+the current chunk, while replicated `k_chunk/v_chunk` has exactly `total_q`
+rows and uses the Q cumulative lengths. Q lengths and chunk values must agree
+inside a DCP group. Local history lengths may differ by rank but may not be
+empty. vLLM and SGLang runners retain their pinned `Hkv_group == 1` topology.
+The packed Q all-gather is rank-major `[DCP, total_q, Hq_local, 128]` before
+head reordering; no `B * max_seqlen_q` padding is introduced.
 
 The local `DCPAttentionRunner` owns one persistent communication stream,
 reusable CUDA events, grow-only collective/layout buffers, and outstanding
@@ -309,6 +379,9 @@ python -m scripts.test_min_fa3.test_min_fa3_varlen \
 python -m scripts.test_min_fa3.test_min_fa3_kvcache \
   --b 3 --seqlen 129,1024,3131 --sq 1,8,32,120,128 \
   --qhead 8 --kvhead 2 --headdim 128 --mode all
+python -m scripts.test_min_fa3.test_min_fa3_kvcache_varlen \
+  --b 3 --sq 1,8,32 --seqlen 129,1024,3131 \
+  --qhead 8 --kvhead 2 --headdim 128 --mode all
 ```
 
 The DCP correctness suite models global TP rank, global KV-head ownership, KV
@@ -324,6 +397,22 @@ torchrun --standalone --nproc_per_node=8 --module \
   scripts.test_min_fa3.test_min_fa3_dcp \
   --qhead 32,64 --kvhead 2,4 --tp-size 8 \
   --dcp-sizes 2,4,8 --sq 2,8,32,128 --num-splits 0,1,2
+```
+
+The packed DCP sibling suite uses a full-KV
+`forward_kvcache_varlen` call as each TP rank's reference. Its default matrix
+covers decode, mixed chunk lengths `[1,8,32]`, ragged history, GQA and MQA,
+DCP `2/4/8`, `num_splits=0/1/2/8`, both ours overlap modes, pinned
+vLLM/SGLang orchestration, returned LSE, repeated calls on alternating caller
+streams, grow-only workspace reuse, uniform packed-vs-dense parity, and input
+contract failures:
+
+```bash
+torchrun --standalone --nproc_per_node=8 --module \
+  scripts.test_min_fa3.test_min_fa3_dcp_varlen \
+  --b 3 --sq 1,8,32 --seqlen 129,258,515 \
+  --qhead 32 --kvhead 1,2 --headdim 128 --tp-size 8 \
+  --dcp-sizes 2,4,8 --num-splits 0,1,2,8
 ```
 
 Backward tests:
@@ -705,6 +794,9 @@ python -m scripts.legacy_benchmark.benchmark_varlen \
 python -m scripts.legacy_benchmark.benchmark_kvcache \
   --b 4 --seqlen 1024,4096,16384 --sq 1,32,128 \
   --qhead 32 --kvhead 8 --headdim 128 --mode all --profile-kernels
+python -m scripts.legacy_benchmark.benchmark_kvcache_varlen \
+  --b 3 --sq 1,8,32 --seqlen 129,1024,3131 \
+  --qhead 32 --kvhead 8 --headdim 128 --mode all --profile-kernels
 python -m scripts.legacy_benchmark.benchmark_backward \
   --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 \
   --headdim 128 --mode both --deterministic
@@ -722,6 +814,12 @@ tensor I/O in addition to latency. For bottom-right causal attention it uses
 The bandwidth is an algorithmic effective rate, not a hardware DRAM counter;
 scheduler metadata and Split's internal FP32 partial O/LSE traffic are not
 included.
+
+The packed-varlen KV-cache benchmark accepts either one broadcast value or
+exactly `B` comma-separated values for both `--sq` and `--seqlen`. It reports
+one fused packed call against a loop of `B` calls to the dense
+`forward_kvcache`, using the same split and mask selection. Optional profiling
+reports the packed call's prepare, attention, and combine CUDA kernel time.
 
 The DCP attention-only benchmark compares five method labels while holding the
 local attention kernel fixed: `ours_overlap`, chunk-only `ours_no_overlap`,
@@ -790,6 +888,46 @@ torchrun --standalone --nproc_per_node=8 --module \
   --workload both --decode-b 1 --chunk-b 1 \
   --seqlen 4096 --sq 8 --warmup 1 --iters 3 --no-mqa-control
 ```
+
+The independent packed-varlen DCP benchmark uses the sibling method labels
+`ours_overlap_varlen`, chunk-only `ours_no_overlap_varlen`,
+`vllm_ag_rs_min_fa3_varlen`, `sglang_mha_ag_ar_min_fa3_varlen`, and
+`full_kv_min_fa3_varlen`. `--sq` and `--seqlen` each accept one broadcast
+value or exactly `B` comma-separated values. Decode requires `--sq 1`, and
+its cache lengths include the current token. Chunk `--seqlen` values are
+history lengths and exclude the supplied chunk.
+
+Packing, host cumulative-length construction, and interleaved DCP sharding
+occur before timing. Each latency sample is the maximum across every TP rank.
+Useful FLOPs, KV bytes, collective payload, and throughput use `sum(q_len)`,
+actual packed local K tokens, and per-sequence effective decode/causal pairs.
+JSON records global and rank-local lengths, packed token counts, stage p50/p90,
+speedup, effective TFLOP/s, memory reduction, and both pinned source commits.
+
+Mixed chunk and ragged decode smoke runs:
+
+```bash
+torchrun --standalone --nproc_per_node=8 --module \
+  scripts.legacy_benchmark.benchmark_dcp_varlen \
+  --b 3 --sq 1,8,32 --seqlen 129,1024,3131 \
+  --qhead 32 --kvhead 1 --headdim 128 --tp-size 8 --dcp-size 8 \
+  --workload chunk --implementations ours,vllm,sglang,full \
+  --num-splits 0 --warmup 2 --iters 5
+
+torchrun --standalone --nproc_per_node=8 --module \
+  scripts.legacy_benchmark.benchmark_dcp_varlen \
+  --b 3 --sq 1 --seqlen 129,1024,3131 \
+  --qhead 32 --kvhead 1 --headdim 128 --tp-size 8 --dcp-size 8 \
+  --workload decode --implementations ours,vllm,sglang,full \
+  --num-splits 2 --warmup 2 --iters 5
+```
+
+An NVTX/kernel-stage smoke can wrap the first command with `nsys profile -t
+cuda,nvtx`. The trace exposes Q all-gather/reorder, packed prepare and attention,
+optional Split combine, LSE correction/collective, output collective, and final
+state merge. These vLLM and SGLang entries are copied-and-trimmed same-kernel
+orchestration baselines; they do not measure native serving runtimes or backend
+integration.
 
 Remote-load microbenchmark:
 
@@ -932,6 +1070,36 @@ o, lse = min_fa3_op.forward_kvcache(
 )
 ```
 
+Packed-varlen KV-cache decode / chunk-prefill usage:
+
+```python
+import torch
+import min_fa3_op
+
+cu_seqlens_q_host = torch.tensor([0, 1, 9, 41], dtype=torch.int32)
+cu_seqlens_k_host = torch.tensor([0, 129, 1153, 4284], dtype=torch.int32)
+cu_seqlens_q = cu_seqlens_q_host.cuda()
+cu_seqlens_k = cu_seqlens_k_host.cuda()
+
+q = torch.randn(41, 16, 128, device="cuda", dtype=torch.bfloat16)
+k_cache = torch.randn(4284, 8, 128, device="cuda", dtype=torch.bfloat16)
+v_cache = torch.randn_like(k_cache)
+
+o, lse = min_fa3_op.forward_kvcache_varlen(
+    q,
+    k_cache,
+    v_cache,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q=32,
+    max_seqlen_k=3131,
+    cu_seqlens_q_host=cu_seqlens_q_host,
+    cu_seqlens_k_host=cu_seqlens_k_host,
+    num_splits=0,
+    return_lse=True,
+)
+```
+
 Ring varlen usage:
 
 ```python
@@ -995,6 +1163,8 @@ Behavior:
 - BSHD uses `[B, S, H, 128]`; varlen uses flattened
   `[total_tokens, H, 128]` tensors, CUDA `int32` `cu_seqlens`, and matching CPU
   `int32` host copies.
+- Packed-varlen KV-cache K/V has no spare per-sequence capacity and is read-only;
+  paged KV, append KV, rotary, local attention, and softcap are not supported.
 - Distributed ring and mega-ring paths are single-node because their parallel
   tensors use local CUDA IPC. Hierarchical BR-PBS placement supports physical
   world sizes `2`, `4`, and `8`.

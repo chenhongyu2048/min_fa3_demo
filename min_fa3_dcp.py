@@ -12,15 +12,20 @@ by SGLang commit ``8d6549bc4039d33635844495d86684677a4f0df8``.  The runner is
 not CUDA-graph capturable and its workspace must not be used concurrently.
 
 The module also contains standalone, copied-and-trimmed vLLM ``ag_rs`` and
-SGLang MHA runners.  All three runners invoke the same local
-``min_fa3_op.forward_kvcache`` kernel; only orchestration differs.
+SGLang MHA runners.  All three runners invoke the same local dense or packed
+KV-cache kernel; only orchestration differs.
+
+The TP/DCP topology validation is copied and trimmed from the GQA/MQA
+constraints in the pinned vLLM commit and the contiguous DCP group
+construction in the pinned SGLang commit.
 """
 
 from __future__ import annotations
 
 import threading
 from contextlib import nullcontext
-from typing import Optional, Tuple, Union
+from dataclasses import asdict, dataclass
+from typing import Iterable, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -28,6 +33,223 @@ import triton
 import triton.language as tl
 
 import min_fa3_op
+
+
+@dataclass(frozen=True)
+class TopologyIssue:
+    code: str
+    detail: str
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class DCPTopology:
+    q_heads: int
+    kv_heads: int
+    tp_size: int
+    dcp_size: int
+
+    @property
+    def q_heads_local(self) -> int:
+        return self.q_heads // self.tp_size
+
+    @property
+    def q_heads_per_kv(self) -> int:
+        return self.q_heads // self.kv_heads
+
+    @property
+    def kv_replicas(self) -> int:
+        return self.tp_size // self.kv_heads
+
+    def kv_head_for_rank(self, tp_rank: int) -> int:
+        self._check_rank(tp_rank)
+        return tp_rank // self.kv_replicas
+
+    def kv_replica_ranks(self, tp_rank: int) -> tuple[int, ...]:
+        kv_head = self.kv_head_for_rank(tp_rank)
+        start = kv_head * self.kv_replicas
+        return tuple(range(start, start + self.kv_replicas))
+
+    def dcp_group_ranks(self, tp_rank: int) -> tuple[int, ...]:
+        replica_ranks = self.kv_replica_ranks(tp_rank)
+        offset = tp_rank - replica_ranks[0]
+        start = replica_ranks[0] + (offset // self.dcp_size) * self.dcp_size
+        return tuple(range(start, start + self.dcp_size))
+
+    def dcp_rank(self, tp_rank: int) -> int:
+        group = self.dcp_group_ranks(tp_rank)
+        return tp_rank - group[0]
+
+    def q_head_range(self, tp_rank: int) -> tuple[int, int]:
+        self._check_rank(tp_rank)
+        start = tp_rank * self.q_heads_local
+        return start, start + self.q_heads_local
+
+    def all_dcp_groups(self) -> tuple[tuple[int, ...], ...]:
+        groups: list[tuple[int, ...]] = []
+        for rank in range(self.tp_size):
+            group = self.dcp_group_ranks(rank)
+            if not groups or groups[-1] != group:
+                groups.append(group)
+        return tuple(groups)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "q_heads": self.q_heads,
+            "kv_heads": self.kv_heads,
+            "tp_size": self.tp_size,
+            "dcp_size": self.dcp_size,
+            "q_heads_local": self.q_heads_local,
+            "q_heads_per_kv": self.q_heads_per_kv,
+            "kv_replicas": self.kv_replicas,
+            "dcp_groups": [list(group) for group in self.all_dcp_groups()],
+        }
+
+    def _check_rank(self, tp_rank: int) -> None:
+        if not 0 <= tp_rank < self.tp_size:
+            raise ValueError(
+                f"tp_rank must be in [0, {self.tp_size}), got {tp_rank}"
+            )
+
+
+def validate_topology(
+    q_heads: int,
+    kv_heads: int,
+    tp_size: int,
+    dcp_size: int,
+) -> tuple[TopologyIssue, ...]:
+    issues: list[TopologyIssue] = []
+    values = {
+        "q_heads": q_heads,
+        "kv_heads": kv_heads,
+        "tp_size": tp_size,
+        "dcp_size": dcp_size,
+    }
+    for name, value in values.items():
+        if value <= 0:
+            issues.append(
+                TopologyIssue("nonpositive_value", f"{name} must be positive, got {value}")
+            )
+    if issues:
+        return tuple(issues)
+
+    if q_heads % tp_size:
+        issues.append(
+            TopologyIssue(
+                "q_heads_not_divisible_by_tp",
+                f"global Q heads {q_heads} must be divisible by TP size {tp_size}",
+            )
+        )
+    if q_heads % kv_heads:
+        issues.append(
+            TopologyIssue(
+                "q_heads_not_divisible_by_kv_heads",
+                f"global Q heads {q_heads} must be divisible by global KV heads {kv_heads}",
+            )
+        )
+    if tp_size <= kv_heads:
+        issues.append(
+            TopologyIssue(
+                "tp_not_greater_than_kv_heads",
+                f"DCP GQA/MQA requires TP size {tp_size} > global KV heads {kv_heads}",
+            )
+        )
+    if tp_size % kv_heads:
+        issues.append(
+            TopologyIssue(
+                "kv_heads_not_divisible_into_tp",
+                f"TP size {tp_size} must be divisible by global KV heads {kv_heads}",
+            )
+        )
+    if tp_size % dcp_size:
+        issues.append(
+            TopologyIssue(
+                "dcp_not_divisible_into_tp",
+                f"DCP size {dcp_size} must divide TP size {tp_size}",
+            )
+        )
+
+    if tp_size % kv_heads == 0:
+        replicas = tp_size // kv_heads
+        if dcp_size > replicas:
+            issues.append(
+                TopologyIssue(
+                    "dcp_exceeds_kv_replicas",
+                    f"DCP size {dcp_size} exceeds KV replica count {replicas}",
+                )
+            )
+        if replicas % dcp_size:
+            issues.append(
+                TopologyIssue(
+                    "kv_replicas_not_divisible_by_dcp",
+                    f"KV replica count {replicas} must be divisible by DCP size {dcp_size}",
+                )
+            )
+
+    if q_heads % kv_heads == 0:
+        q_per_kv = q_heads // kv_heads
+        if q_per_kv % dcp_size:
+            issues.append(
+                TopologyIssue(
+                    "q_per_kv_not_divisible_by_dcp",
+                    f"Q heads per KV head {q_per_kv} must be divisible by DCP size {dcp_size}",
+                )
+            )
+    return tuple(issues)
+
+
+def make_topology(
+    q_heads: int,
+    kv_heads: int,
+    tp_size: int,
+    dcp_size: int,
+) -> DCPTopology:
+    issues = validate_topology(q_heads, kv_heads, tp_size, dcp_size)
+    if issues:
+        details = "; ".join(issue.detail for issue in issues)
+        raise ValueError(f"invalid DCP topology: {details}")
+    return DCPTopology(q_heads, kv_heads, tp_size, dcp_size)
+
+
+def validate_group_ranks(
+    topology: DCPTopology,
+    ranks: Iterable[int],
+) -> tuple[TopologyIssue, ...]:
+    group = tuple(ranks)
+    issues: list[TopologyIssue] = []
+    if len(group) != topology.dcp_size:
+        issues.append(
+            TopologyIssue(
+                "dcp_group_wrong_size",
+                f"DCP group has {len(group)} ranks, expected {topology.dcp_size}",
+            )
+        )
+    if any(rank < 0 or rank >= topology.tp_size for rank in group):
+        issues.append(
+            TopologyIssue(
+                "dcp_group_rank_out_of_range",
+                f"DCP group ranks must be in [0, {topology.tp_size}), got {group}",
+            )
+        )
+        return tuple(issues)
+    kv_heads = {topology.kv_head_for_rank(rank) for rank in group}
+    if len(kv_heads) != 1:
+        issues.append(
+            TopologyIssue(
+                "dcp_group_crosses_kv_replica_boundary",
+                f"DCP group {group} spans global KV heads {sorted(kv_heads)}",
+            )
+        )
+    if group and group != tuple(range(group[0], group[0] + len(group))):
+        issues.append(
+            TopologyIssue(
+                "dcp_group_not_contiguous",
+                f"DCP group must contain contiguous TP ranks, got {group}",
+            )
+        )
+    return tuple(issues)
 
 
 _DCPResult = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -276,6 +498,8 @@ class DCPAttentionRunner:
     """
 
     method_name = "ours_overlap"
+    varlen_method_name = "ours_overlap_varlen"
+    varlen_no_overlap_method_name = "ours_no_overlap_varlen"
     output_collective_kind = "bf16_reduce_scatter"
     workspace_policy = "persistent_grow_only"
 
@@ -431,6 +655,165 @@ class DCPAttentionRunner:
             raise ValueError("local sequence lengths must be contiguous CUDA int32 with shape [B]")
         return b, sq, h_local, d
 
+    @staticmethod
+    def _check_num_splits(num_splits: int) -> None:
+        if not isinstance(num_splits, int) or not 0 <= num_splits <= 128:
+            raise ValueError(
+                "num_splits must be 0 (auto), 1 (NoSplit), or in [2, 128]"
+            )
+
+    @staticmethod
+    def _validate_host_cu_seqlens(
+        cu_seqlens_host: torch.Tensor,
+        total_tokens: int,
+        max_seqlen: int,
+        name: str,
+    ) -> list[int]:
+        values = cu_seqlens_host.tolist()
+        if values[0] != 0:
+            raise ValueError(f"{name} must start with 0")
+        lengths = [end - start for start, end in zip(values, values[1:])]
+        if any(length <= 0 for length in lengths):
+            raise ValueError(f"{name} must be strictly increasing")
+        if values[-1] != total_tokens:
+            raise ValueError(
+                f"{name}[-1] must equal total token count {total_tokens}, "
+                f"got {values[-1]}"
+            )
+        actual_max = max(lengths)
+        if max_seqlen != actual_max:
+            raise ValueError(
+                f"max length for {name} must equal {actual_max}, got {max_seqlen}"
+            )
+        return lengths
+
+    def _check_packed_common(
+        self,
+        q_local: torch.Tensor,
+        k_local: torch.Tensor,
+        v_local: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k_local: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k_local: int,
+        cu_seqlens_q_host: torch.Tensor,
+        cu_seqlens_k_local_host: torch.Tensor,
+        num_splits: int,
+    ) -> tuple[int, int, int, int, int, list[int], list[int]]:
+        """Validate packed inputs using CPU mirrors without synchronizing CUDA."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("DCPAttentionRunner does not support CUDA Graph capture")
+        self._check_num_splits(num_splits)
+        for tensor, name in (
+            (q_local, "q_local"),
+            (k_local, "k_local"),
+            (v_local, "v_local"),
+        ):
+            if not tensor.is_cuda or tensor.dtype != torch.bfloat16 or tensor.ndim != 3:
+                raise ValueError(
+                    f"{name} must be a CUDA BF16 tensor with shape [total_tokens, H, 128]"
+                )
+            if tensor.shape[-1] != 128 or not tensor.is_contiguous():
+                raise ValueError(
+                    f"{name} must be contiguous [total_tokens, H, 128] with head_dim 128"
+                )
+            if tensor.device != self.device:
+                raise ValueError(f"{name} must be on runner device {self.device}")
+        if k_local.shape != v_local.shape:
+            raise ValueError("k_local and v_local must have identical shapes")
+
+        total_q, h_local, d = q_local.shape
+        total_k_local, h_kv, _ = k_local.shape
+        if total_q <= 0 or h_local <= 0:
+            raise ValueError("q_local requires positive total_q and Hq_local")
+        if total_k_local <= 0 or h_kv <= 0:
+            raise ValueError("local K/V requires positive total_k_local and Hkv_group")
+        if h_local % h_kv:
+            raise ValueError(
+                f"Hq_local must be divisible by Hkv_group, got {h_local} and {h_kv}"
+            )
+
+        for tensor, name in (
+            (cu_seqlens_q, "cu_seqlens_q"),
+            (cu_seqlens_k_local, "cu_seqlens_k_local"),
+        ):
+            if (
+                not tensor.is_cuda
+                or tensor.device != self.device
+                or tensor.dtype != torch.int32
+                or tensor.ndim != 1
+                or tensor.numel() < 2
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous CUDA int32 with shape [B + 1], B >= 1"
+                )
+        if cu_seqlens_q.shape != cu_seqlens_k_local.shape:
+            raise ValueError("Q and local K cumulative lengths must have the same batch size")
+
+        for host, device, name in (
+            (cu_seqlens_q_host, cu_seqlens_q, "cu_seqlens_q_host"),
+            (
+                cu_seqlens_k_local_host,
+                cu_seqlens_k_local,
+                "cu_seqlens_k_local_host",
+            ),
+        ):
+            if (
+                host.device.type != "cpu"
+                or host.dtype != torch.int32
+                or host.ndim != 1
+                or not host.is_contiguous()
+            ):
+                raise ValueError(f"{name} must be contiguous CPU int32 with shape [B + 1]")
+            if host.shape != device.shape:
+                raise ValueError(f"{name} must match its CUDA cumulative-length shape")
+
+        if max_seqlen_q <= 0 or max_seqlen_k_local <= 0:
+            raise ValueError("max_seqlen_q and max_seqlen_k_local must be positive")
+        q_lengths = self._validate_host_cu_seqlens(
+            cu_seqlens_q_host,
+            total_q,
+            max_seqlen_q,
+            "cu_seqlens_q_host",
+        )
+        k_lengths = self._validate_host_cu_seqlens(
+            cu_seqlens_k_local_host,
+            total_k_local,
+            max_seqlen_k_local,
+            "cu_seqlens_k_local_host",
+        )
+        batch_size = cu_seqlens_q.numel() - 1
+        return total_q, h_local, d, h_kv, batch_size, q_lengths, k_lengths
+
+    def _check_packed_chunk_inputs(
+        self,
+        k_chunk: torch.Tensor,
+        v_chunk: torch.Tensor,
+        total_q: int,
+        h_kv: int,
+        d: int,
+    ) -> None:
+        expected = (total_q, h_kv, d)
+        if k_chunk.shape != expected or v_chunk.shape != expected:
+            raise ValueError(
+                "k_chunk and v_chunk must have shape "
+                f"[total_q, Hkv_group, 128]={expected}"
+            )
+        for tensor, name in ((k_chunk, "k_chunk"), (v_chunk, "v_chunk")):
+            if (
+                not tensor.is_cuda
+                or tensor.device != self.device
+                or tensor.dtype != torch.bfloat16
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous CUDA BF16 on the runner device"
+                )
+
+    def _check_packed_runner_topology(self, h_kv: int) -> None:
+        del h_kv
+
     def _start_q_allgather(
         self,
         q_local: torch.Tensor,
@@ -532,6 +915,30 @@ class DCPAttentionRunner:
         if timing:
             self._record_timing("q_ag_end", compute_stream)
         return q_group
+
+    def _start_q_allgather_varlen(
+        self,
+        q_local: torch.Tensor,
+        h_kv: int,
+        compute_stream: torch.cuda.Stream,
+        *,
+        timing: bool,
+    ) -> torch.Tensor:
+        return self._start_q_allgather(
+            q_local.unsqueeze(0), h_kv, compute_stream, timing=timing
+        ).squeeze(0)
+
+    def _gather_q_single_stream_varlen(
+        self,
+        q_local: torch.Tensor,
+        h_kv: int,
+        compute_stream: torch.cuda.Stream,
+        *,
+        timing: bool,
+    ) -> torch.Tensor:
+        return self._gather_q_single_stream(
+            q_local.unsqueeze(0), h_kv, compute_stream, timing=timing
+        ).squeeze(0)
 
     def _finish_context(
         self,
@@ -715,6 +1122,72 @@ class DCPAttentionRunner:
         if use_dependency_events:
             self._history_ready.record(compute_stream)
         return history_out, history_lse
+
+    def _run_context_attention_varlen(
+        self,
+        q_group: torch.Tensor,
+        k_local: torch.Tensor,
+        v_local: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k_local: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k_local: int,
+        cu_seqlens_q_host: torch.Tensor,
+        cu_seqlens_k_local_host: torch.Tensor,
+        num_splits: int,
+        compute_stream: torch.cuda.Stream,
+        *,
+        timing: bool,
+        use_dependency_events: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if use_dependency_events:
+            compute_stream.wait_event(self._q_group_ready)
+        if timing:
+            self._record_timing("ag_chunk_end", compute_stream)
+            self._record_timing("history_start", compute_stream)
+        with _nvtx_range("dcp_varlen_local_history_attention"):
+            history_out, history_lse = min_fa3_op.forward_kvcache_varlen(
+                q_group,
+                k_local,
+                v_local,
+                cu_seqlens_q,
+                cu_seqlens_k_local,
+                max_seqlen_q,
+                max_seqlen_k_local,
+                cu_seqlens_q_host=cu_seqlens_q_host,
+                cu_seqlens_k_host=cu_seqlens_k_local_host,
+                num_splits=num_splits,
+                return_lse=True,
+                is_causal=False,
+            )
+        if timing:
+            self._record_timing("history_end", compute_stream)
+        if use_dependency_events:
+            self._history_ready.record(compute_stream)
+        return history_out, history_lse
+
+    def _finish_context_varlen(
+        self,
+        history_out: torch.Tensor,
+        history_lse: torch.Tensor,
+        output: torch.Tensor,
+        local_lse: Optional[torch.Tensor],
+        h_kv: int,
+        compute_stream: torch.cuda.Stream,
+        *,
+        timing: bool,
+        use_side_stream: bool,
+    ) -> None:
+        finish = self._finish_context if use_side_stream else self._finish_context_single_stream
+        finish(
+            history_out.unsqueeze(0),
+            history_lse.unsqueeze(0),
+            output.unsqueeze(0),
+            local_lse.unsqueeze(0) if local_lse is not None else None,
+            h_kv,
+            compute_stream,
+            timing=timing,
+        )
 
     def forward_decode(
         self,
@@ -968,6 +1441,294 @@ class DCPAttentionRunner:
         finally:
             self._enqueue_lock.release()
 
+    def forward_decode_varlen(
+        self,
+        q_local: torch.Tensor,
+        k_cache_local: torch.Tensor,
+        v_cache_local: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k_local: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k_local: int,
+        *,
+        cu_seqlens_q_host: torch.Tensor,
+        cu_seqlens_k_local_host: torch.Tensor,
+        num_splits: int = 0,
+        return_lse: bool = False,
+        _record_timing: bool = False,
+    ) -> _DCPResult:
+        """Run packed DCP decode with one query token per sequence."""
+        if not self._enqueue_lock.acquire(blocking=False):
+            raise RuntimeError("DCPAttentionRunner does not support concurrent forward calls")
+        try:
+            self._reap_inflight_tensors()
+            (
+                _,
+                h_local,
+                _,
+                h_kv,
+                _,
+                q_lengths,
+                _,
+            ) = self._check_packed_common(
+                q_local,
+                k_cache_local,
+                v_cache_local,
+                cu_seqlens_q,
+                cu_seqlens_k_local,
+                max_seqlen_q,
+                max_seqlen_k_local,
+                cu_seqlens_q_host,
+                cu_seqlens_k_local_host,
+                num_splits,
+            )
+            self._check_packed_runner_topology(h_kv)
+            if any(length != 1 for length in q_lengths):
+                raise ValueError("forward_decode_varlen requires every q_len == 1")
+
+            compute_stream = torch.cuda.current_stream(self.device)
+            if _record_timing:
+                self._last_timing_kind = "decode"
+                self._record_timing("attention_start", compute_stream)
+            if self.world_size == 1:
+                if _record_timing:
+                    self._record_timing("q_ag_start", compute_stream)
+                    self._record_timing("q_ag_end", compute_stream)
+                    self._record_timing("ag_chunk_end", compute_stream)
+                    self._record_timing("history_start", compute_stream)
+                with _nvtx_range("dcp_varlen_local_history_attention"):
+                    result = min_fa3_op.forward_kvcache_varlen(
+                        q_local,
+                        k_cache_local,
+                        v_cache_local,
+                        cu_seqlens_q,
+                        cu_seqlens_k_local,
+                        max_seqlen_q,
+                        max_seqlen_k_local,
+                        cu_seqlens_q_host=cu_seqlens_q_host,
+                        cu_seqlens_k_host=cu_seqlens_k_local_host,
+                        num_splits=num_splits,
+                        return_lse=return_lse,
+                        is_causal=False,
+                    )
+                if _record_timing:
+                    self._record_timing("history_end", compute_stream)
+                    self._record_timing("attention_end", compute_stream)
+                return result
+
+            q_group = self._start_q_allgather_varlen(
+                q_local, h_kv, compute_stream, timing=_record_timing
+            )
+            history_out, history_lse = self._run_context_attention_varlen(
+                q_group,
+                k_cache_local,
+                v_cache_local,
+                cu_seqlens_q,
+                cu_seqlens_k_local,
+                max_seqlen_q,
+                max_seqlen_k_local,
+                cu_seqlens_q_host,
+                cu_seqlens_k_local_host,
+                num_splits,
+                compute_stream,
+                timing=_record_timing,
+            )
+            output = torch.empty_like(q_local)
+            local_lse = (
+                torch.empty(
+                    (h_local, q_local.shape[0]),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                if return_lse
+                else None
+            )
+            self._finish_context_varlen(
+                history_out,
+                history_lse,
+                output,
+                local_lse,
+                h_kv,
+                compute_stream,
+                timing=_record_timing,
+                use_side_stream=True,
+            )
+            compute_stream.wait_event(self._context_ready)
+            self._workspace_completion = (
+                self._context_ready,
+                compute_stream.cuda_stream,
+            )
+            if _record_timing:
+                self._record_timing("attention_end", compute_stream)
+            return (output, local_lse) if return_lse else output
+        finally:
+            self._enqueue_lock.release()
+
+    def forward_chunk_prefill_varlen(
+        self,
+        q_local: torch.Tensor,
+        k_history_local: torch.Tensor,
+        v_history_local: torch.Tensor,
+        k_chunk: torch.Tensor,
+        v_chunk: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_history_local: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_history_local: int,
+        *,
+        cu_seqlens_q_host: torch.Tensor,
+        cu_seqlens_history_local_host: torch.Tensor,
+        num_splits: int = 0,
+        return_lse: bool = False,
+        overlap_q_allgather: bool = True,
+        _record_timing: bool = False,
+    ) -> _DCPResult:
+        """Run packed split history/chunk prefill and merge both states."""
+        if not self._enqueue_lock.acquire(blocking=False):
+            raise RuntimeError("DCPAttentionRunner does not support concurrent forward calls")
+        try:
+            self._reap_inflight_tensors()
+            (
+                total_q,
+                h_local,
+                d,
+                h_kv,
+                _,
+                _,
+                _,
+            ) = self._check_packed_common(
+                q_local,
+                k_history_local,
+                v_history_local,
+                cu_seqlens_q,
+                cu_seqlens_history_local,
+                max_seqlen_q,
+                max_seqlen_history_local,
+                cu_seqlens_q_host,
+                cu_seqlens_history_local_host,
+                num_splits,
+            )
+            self._check_packed_runner_topology(h_kv)
+            self._check_packed_chunk_inputs(k_chunk, v_chunk, total_q, h_kv, d)
+
+            compute_stream = torch.cuda.current_stream(self.device)
+            if _record_timing:
+                self._last_timing_kind = "chunk"
+                self._record_timing("attention_start", compute_stream)
+            use_side_stream = self.world_size > 1 and overlap_q_allgather
+
+            if use_side_stream:
+                q_group = self._start_q_allgather_varlen(
+                    q_local, h_kv, compute_stream, timing=_record_timing
+                )
+            elif self.world_size > 1:
+                q_group = self._gather_q_single_stream_varlen(
+                    q_local, h_kv, compute_stream, timing=_record_timing
+                )
+            else:
+                q_group = q_local
+                if _record_timing:
+                    self._record_timing("q_ag_start", compute_stream)
+                    self._record_timing("q_ag_end", compute_stream)
+
+            if _record_timing:
+                self._record_timing("chunk_start", compute_stream)
+            with _nvtx_range("dcp_varlen_local_chunk_attention"):
+                chunk_out, chunk_lse = min_fa3_op.forward_kvcache_varlen(
+                    q_local,
+                    k_chunk,
+                    v_chunk,
+                    cu_seqlens_q,
+                    cu_seqlens_q,
+                    max_seqlen_q,
+                    max_seqlen_q,
+                    cu_seqlens_q_host=cu_seqlens_q_host,
+                    cu_seqlens_k_host=cu_seqlens_q_host,
+                    num_splits=num_splits,
+                    return_lse=True,
+                    is_causal=True,
+                )
+            if _record_timing:
+                self._record_timing("chunk_end", compute_stream)
+
+            history_out, history_lse = self._run_context_attention_varlen(
+                q_group,
+                k_history_local,
+                v_history_local,
+                cu_seqlens_q,
+                cu_seqlens_history_local,
+                max_seqlen_q,
+                max_seqlen_history_local,
+                cu_seqlens_q_host,
+                cu_seqlens_history_local_host,
+                num_splits,
+                compute_stream,
+                timing=_record_timing,
+                use_dependency_events=use_side_stream,
+            )
+
+            context_out = torch.empty_like(q_local)
+            context_lse = torch.empty(
+                (h_local, total_q), device=self.device, dtype=torch.float32
+            )
+            if self.world_size == 1:
+                context_out.copy_(history_out)
+                context_lse.copy_(history_lse)
+            else:
+                self._finish_context_varlen(
+                    history_out,
+                    history_lse,
+                    context_out,
+                    context_lse,
+                    h_kv,
+                    compute_stream,
+                    timing=_record_timing,
+                    use_side_stream=use_side_stream,
+                )
+                if use_side_stream:
+                    compute_stream.wait_event(self._context_ready)
+
+            merged_out = torch.empty_like(q_local)
+            merged_lse = torch.empty_like(context_lse) if return_lse else None
+            if _record_timing:
+                self._record_timing("merge_start", compute_stream)
+            with _nvtx_range("dcp_varlen_merge_context_chunk_states"):
+                merged_lse_arg = merged_lse if merged_lse is not None else context_lse
+                _merge_attn_states_kernel[(total_q, h_local)](
+                    context_out,
+                    context_lse,
+                    chunk_out,
+                    chunk_lse,
+                    merged_out,
+                    merged_lse_arg,
+                    *merged_out.unsqueeze(0).stride()[:3],
+                    *context_lse.unsqueeze(0).stride(),
+                    B=1,
+                    SQ=total_q,
+                    H=h_local,
+                    D=d,
+                    STORE_LSE=merged_lse is not None,
+                    num_warps=4,
+                )
+            if _record_timing:
+                self._record_timing("merge_end", compute_stream)
+                self._record_timing("attention_end", compute_stream)
+            completion = self._retain_merge_inputs(
+                compute_stream,
+                context_out,
+                context_lse,
+                chunk_out,
+                chunk_lse,
+            )
+            if self.world_size > 1:
+                self._workspace_completion = (
+                    completion,
+                    compute_stream.cuda_stream,
+                )
+            return (merged_out, merged_lse) if return_lse else merged_out
+        finally:
+            self._enqueue_lock.release()
+
     def last_timing_ms(self, synchronize: bool = True) -> dict[str, float]:
         """Return timings for the most recent call made with ``_record_timing=True``."""
         if self._last_timing_kind is None:
@@ -1017,6 +1778,13 @@ class _SequentialDCPAttentionRunnerBase(DCPAttentionRunner):
 
     chunk_before_context = False
     workspace_policy = "framework_style_per_call"
+
+    def _check_packed_runner_topology(self, h_kv: int) -> None:
+        if h_kv != 1:
+            raise ValueError(
+                f"{type(self).__name__} models TP > global Hkv, so each rank must "
+                f"hold exactly one KV head; got {h_kv}"
+            )
 
     def _check_reference_common(
         self,
@@ -1086,6 +1854,38 @@ class _SequentialDCPAttentionRunnerBase(DCPAttentionRunner):
             self._record_timing("q_ag_end", compute_stream)
         return q_group
 
+    def _all_gather_q_varlen_sequential(
+        self,
+        q_local: torch.Tensor,
+        compute_stream: torch.cuda.Stream,
+        *,
+        timing: bool,
+    ) -> torch.Tensor:
+        if timing:
+            self._record_timing("q_ag_start", compute_stream)
+        if self.world_size == 1:
+            q_group = q_local
+        else:
+            total_q, h_local, d = q_local.shape
+            q_rank_major = torch.empty(
+                (self.world_size * total_q, h_local, d),
+                device=self.device,
+                dtype=q_local.dtype,
+            )
+            with _nvtx_range(f"{self.method_name}_varlen_q_allgather"):
+                dist.all_gather_into_tensor(
+                    q_rank_major, q_local, group=self.process_group
+                )
+                q_group = (
+                    q_rank_major.view(self.world_size, total_q, h_local, d)
+                    .permute(1, 0, 2, 3)
+                    .reshape(total_q, self.world_size * h_local, d)
+                    .contiguous()
+                )
+        if timing:
+            self._record_timing("q_ag_end", compute_stream)
+        return q_group
+
     def _run_history_attention_sequential(
         self,
         q_group: torch.Tensor,
@@ -1145,6 +1945,77 @@ class _SequentialDCPAttentionRunnerBase(DCPAttentionRunner):
             self._record_timing("chunk_end", compute_stream)
         return chunk_out, chunk_lse
 
+    def _run_history_attention_varlen_sequential(
+        self,
+        q_group: torch.Tensor,
+        k_local: torch.Tensor,
+        v_local: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k_local: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k_local: int,
+        cu_seqlens_q_host: torch.Tensor,
+        cu_seqlens_k_local_host: torch.Tensor,
+        num_splits: int,
+        compute_stream: torch.cuda.Stream,
+        *,
+        timing: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if timing:
+            self._record_timing("history_start", compute_stream)
+        with _nvtx_range(f"{self.method_name}_varlen_local_history_attention"):
+            history_out, history_lse = min_fa3_op.forward_kvcache_varlen(
+                q_group,
+                k_local,
+                v_local,
+                cu_seqlens_q,
+                cu_seqlens_k_local,
+                max_seqlen_q,
+                max_seqlen_k_local,
+                cu_seqlens_q_host=cu_seqlens_q_host,
+                cu_seqlens_k_host=cu_seqlens_k_local_host,
+                num_splits=num_splits,
+                return_lse=True,
+                is_causal=False,
+            )
+        if timing:
+            self._record_timing("history_end", compute_stream)
+        return history_out, history_lse
+
+    def _run_chunk_attention_varlen_sequential(
+        self,
+        q_local: torch.Tensor,
+        k_chunk: torch.Tensor,
+        v_chunk: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+        cu_seqlens_q_host: torch.Tensor,
+        num_splits: int,
+        compute_stream: torch.cuda.Stream,
+        *,
+        timing: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if timing:
+            self._record_timing("chunk_start", compute_stream)
+        with _nvtx_range(f"{self.method_name}_varlen_local_chunk_attention"):
+            chunk_out, chunk_lse = min_fa3_op.forward_kvcache_varlen(
+                q_local,
+                k_chunk,
+                v_chunk,
+                cu_seqlens_q,
+                cu_seqlens_q,
+                max_seqlen_q,
+                max_seqlen_q,
+                cu_seqlens_q_host=cu_seqlens_q_host,
+                cu_seqlens_k_host=cu_seqlens_q_host,
+                num_splits=num_splits,
+                return_lse=True,
+                is_causal=True,
+            )
+        if timing:
+            self._record_timing("chunk_end", compute_stream)
+        return chunk_out, chunk_lse
+
     def _combine_context(
         self,
         history_out: torch.Tensor,
@@ -1167,6 +2038,47 @@ class _SequentialDCPAttentionRunnerBase(DCPAttentionRunner):
         timing: bool,
     ) -> _DCPResult:
         raise NotImplementedError
+
+    def _combine_context_varlen_sequential(
+        self,
+        history_out: torch.Tensor,
+        history_lse: torch.Tensor,
+        compute_stream: torch.cuda.Stream,
+        *,
+        timing: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        output, lse = self._combine_context(
+            history_out.unsqueeze(0),
+            history_lse.unsqueeze(0),
+            compute_stream,
+            timing=timing,
+        )
+        return output.squeeze(0), lse.squeeze(0)
+
+    def _merge_context_and_chunk_varlen_sequential(
+        self,
+        context_out: torch.Tensor,
+        context_lse: torch.Tensor,
+        chunk_out: torch.Tensor,
+        chunk_lse: torch.Tensor,
+        return_lse: bool,
+        compute_stream: torch.cuda.Stream,
+        *,
+        timing: bool,
+    ) -> _DCPResult:
+        result = self._merge_context_and_chunk(
+            context_out.unsqueeze(0),
+            context_lse.unsqueeze(0),
+            chunk_out.unsqueeze(0),
+            chunk_lse.unsqueeze(0),
+            return_lse,
+            compute_stream,
+            timing=timing,
+        )
+        if return_lse:
+            output, lse = result
+            return output.squeeze(0), lse.squeeze(0)
+        return result.squeeze(0)
 
     def forward_decode(
         self,
@@ -1306,11 +2218,211 @@ class _SequentialDCPAttentionRunnerBase(DCPAttentionRunner):
         finally:
             self._enqueue_lock.release()
 
+    def forward_decode_varlen(
+        self,
+        q_local: torch.Tensor,
+        k_cache_local: torch.Tensor,
+        v_cache_local: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k_local: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k_local: int,
+        *,
+        cu_seqlens_q_host: torch.Tensor,
+        cu_seqlens_k_local_host: torch.Tensor,
+        num_splits: int = 0,
+        return_lse: bool = False,
+        _record_timing: bool = False,
+    ) -> _DCPResult:
+        if not self._enqueue_lock.acquire(blocking=False):
+            raise RuntimeError(f"{type(self).__name__} does not support concurrent calls")
+        try:
+            self._reap_inflight_tensors()
+            (
+                _,
+                _,
+                _,
+                h_kv,
+                _,
+                q_lengths,
+                _,
+            ) = self._check_packed_common(
+                q_local,
+                k_cache_local,
+                v_cache_local,
+                cu_seqlens_q,
+                cu_seqlens_k_local,
+                max_seqlen_q,
+                max_seqlen_k_local,
+                cu_seqlens_q_host,
+                cu_seqlens_k_local_host,
+                num_splits,
+            )
+            self._check_packed_runner_topology(h_kv)
+            if any(length != 1 for length in q_lengths):
+                raise ValueError("forward_decode_varlen requires every q_len == 1")
+
+            compute_stream = torch.cuda.current_stream(self.device)
+            if _record_timing:
+                self._last_timing_kind = "decode"
+                self._record_timing("attention_start", compute_stream)
+            q_group = self._all_gather_q_varlen_sequential(
+                q_local, compute_stream, timing=_record_timing
+            )
+            if _record_timing:
+                self._record_timing("ag_chunk_end", compute_stream)
+            history_out, history_lse = self._run_history_attention_varlen_sequential(
+                q_group,
+                k_cache_local,
+                v_cache_local,
+                cu_seqlens_q,
+                cu_seqlens_k_local,
+                max_seqlen_q,
+                max_seqlen_k_local,
+                cu_seqlens_q_host,
+                cu_seqlens_k_local_host,
+                num_splits,
+                compute_stream,
+                timing=_record_timing,
+            )
+            output, lse = self._combine_context_varlen_sequential(
+                history_out,
+                history_lse,
+                compute_stream,
+                timing=_record_timing,
+            )
+            if _record_timing:
+                self._record_timing("attention_end", compute_stream)
+            return (output, lse) if return_lse else output
+        finally:
+            self._enqueue_lock.release()
+
+    def forward_chunk_prefill_varlen(
+        self,
+        q_local: torch.Tensor,
+        k_history_local: torch.Tensor,
+        v_history_local: torch.Tensor,
+        k_chunk: torch.Tensor,
+        v_chunk: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_history_local: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_history_local: int,
+        *,
+        cu_seqlens_q_host: torch.Tensor,
+        cu_seqlens_history_local_host: torch.Tensor,
+        num_splits: int = 0,
+        return_lse: bool = False,
+        overlap_q_allgather: bool = False,
+        _record_timing: bool = False,
+    ) -> _DCPResult:
+        del overlap_q_allgather
+        if not self._enqueue_lock.acquire(blocking=False):
+            raise RuntimeError(f"{type(self).__name__} does not support concurrent calls")
+        try:
+            self._reap_inflight_tensors()
+            (
+                total_q,
+                _,
+                d,
+                h_kv,
+                _,
+                _,
+                _,
+            ) = self._check_packed_common(
+                q_local,
+                k_history_local,
+                v_history_local,
+                cu_seqlens_q,
+                cu_seqlens_history_local,
+                max_seqlen_q,
+                max_seqlen_history_local,
+                cu_seqlens_q_host,
+                cu_seqlens_history_local_host,
+                num_splits,
+            )
+            self._check_packed_runner_topology(h_kv)
+            self._check_packed_chunk_inputs(k_chunk, v_chunk, total_q, h_kv, d)
+
+            compute_stream = torch.cuda.current_stream(self.device)
+            if _record_timing:
+                self._last_timing_kind = "chunk"
+                self._record_timing("attention_start", compute_stream)
+
+            chunk_state: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+            if self.chunk_before_context:
+                chunk_state = self._run_chunk_attention_varlen_sequential(
+                    q_local,
+                    k_chunk,
+                    v_chunk,
+                    cu_seqlens_q,
+                    max_seqlen_q,
+                    cu_seqlens_q_host,
+                    num_splits,
+                    compute_stream,
+                    timing=_record_timing,
+                )
+
+            q_group = self._all_gather_q_varlen_sequential(
+                q_local, compute_stream, timing=_record_timing
+            )
+            if _record_timing and self.chunk_before_context:
+                self._record_timing("ag_chunk_end", compute_stream)
+            history_out, history_lse = self._run_history_attention_varlen_sequential(
+                q_group,
+                k_history_local,
+                v_history_local,
+                cu_seqlens_q,
+                cu_seqlens_history_local,
+                max_seqlen_q,
+                max_seqlen_history_local,
+                cu_seqlens_q_host,
+                cu_seqlens_history_local_host,
+                num_splits,
+                compute_stream,
+                timing=_record_timing,
+            )
+            context_out, context_lse = self._combine_context_varlen_sequential(
+                history_out,
+                history_lse,
+                compute_stream,
+                timing=_record_timing,
+            )
+
+            if chunk_state is None:
+                chunk_state = self._run_chunk_attention_varlen_sequential(
+                    q_local,
+                    k_chunk,
+                    v_chunk,
+                    cu_seqlens_q,
+                    max_seqlen_q,
+                    cu_seqlens_q_host,
+                    num_splits,
+                    compute_stream,
+                    timing=_record_timing,
+                )
+                if _record_timing:
+                    self._record_timing("ag_chunk_end", compute_stream)
+            result = self._merge_context_and_chunk_varlen_sequential(
+                context_out,
+                context_lse,
+                *chunk_state,
+                return_lse,
+                compute_stream,
+                timing=_record_timing,
+            )
+            if _record_timing:
+                self._record_timing("attention_end", compute_stream)
+            return result
+        finally:
+            self._enqueue_lock.release()
+
 
 class VLLMDCPAttentionRunner(_SequentialDCPAttentionRunnerBase):
     """Pinned vLLM default AG+RS orchestration using the local min FA3 op."""
 
     method_name = "vllm_ag_rs_min_fa3"
+    varlen_method_name = "vllm_ag_rs_min_fa3_varlen"
     output_collective_kind = "bf16_reduce_scatter"
 
     def _combine_context(
@@ -1435,6 +2547,7 @@ class SGLangDCPAttentionRunner(_SequentialDCPAttentionRunnerBase):
     """Pinned SGLang MHA AG+FP32-AR orchestration using the local min FA3 op."""
 
     method_name = "sglang_mha_ag_ar_min_fa3"
+    varlen_method_name = "sglang_mha_ag_ar_min_fa3_varlen"
     output_collective_kind = "fp32_all_reduce"
     chunk_before_context = True
 
@@ -1538,7 +2651,12 @@ class SGLangDCPAttentionRunner(_SequentialDCPAttentionRunnerBase):
 
 
 __all__ = [
+    "DCPTopology",
     "DCPAttentionRunner",
     "SGLangDCPAttentionRunner",
+    "TopologyIssue",
     "VLLMDCPAttentionRunner",
+    "make_topology",
+    "validate_group_ranks",
+    "validate_topology",
 ]

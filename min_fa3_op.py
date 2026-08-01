@@ -17,6 +17,7 @@ from _min_fa3_op import (
     parallel_remote_load_vec_out as _parallel_remote_load_vec_out_cuda,
     forward,
     forward_kvcache,
+    forward_kvcache_varlen as _forward_kvcache_varlen_cuda,
     forward_varlen as _forward_varlen_cuda,
     forward_varlen_mega_ring as _forward_varlen_mega_ring_cuda,
     forward_varlen_mega_ring_ablation as _forward_varlen_mega_ring_ablation_cuda,
@@ -331,6 +332,37 @@ def forward_varlen(
     )
 
 
+def forward_kvcache_varlen(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    *,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
+    num_splits: int = 0,
+    return_lse: bool = False,
+    is_causal: Optional[bool] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    return _forward_kvcache_varlen_cuda(
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        cu_seqlens_q_host=cu_seqlens_q_host,
+        cu_seqlens_k_host=cu_seqlens_k_host,
+        num_splits=int(num_splits),
+        return_lse=bool(return_lse),
+        is_causal=None if is_causal is None else bool(is_causal),
+    )
+
+
 def forward_varlen_ring(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -446,6 +478,7 @@ __all__ = [
     "create_parallel_tensor",
     "forward",
     "forward_kvcache",
+    "forward_kvcache_varlen",
     "forward_varlen",
     "forward_varlen_mega_ring",
     "forward_varlen_ring",

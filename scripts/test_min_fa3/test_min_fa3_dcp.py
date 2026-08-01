@@ -15,10 +15,12 @@ import torch.distributed as dist
 import min_fa3_op
 from min_fa3_dcp import (
     DCPAttentionRunner,
+    DCPTopology,
     SGLangDCPAttentionRunner,
     VLLMDCPAttentionRunner,
+    make_topology,
+    validate_topology,
 )
-from min_fa3_dcp_topology import DCPTopology, make_topology, validate_topology
 
 
 METHOD_OURS_OVERLAP = "ours_overlap"

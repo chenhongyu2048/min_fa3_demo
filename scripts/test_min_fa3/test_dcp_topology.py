@@ -1,6 +1,6 @@
 import unittest
 
-from min_fa3_dcp_topology import (
+from min_fa3_dcp import (
     make_topology,
     validate_group_ranks,
     validate_topology,
