@@ -18,6 +18,7 @@ import torch.distributed as dist
 
 import min_fa3_op
 from min_fa3_dcp import (
+    DCPAttentionCUDAGraph,
     DCPAttentionRunner,
     SGLangDCPAttentionRunner,
     VLLMDCPAttentionRunner,
@@ -38,11 +39,14 @@ STAGES = (
     "attention_end_to_end_ms",
     "q_allgather_and_reorder_ms",
     "local_chunk_attention_ms",
+    "overlapped_ag_chunk_window_ms",
+    "overlap_hidden_time_ms",
     "local_history_attention_ms",
     "lse_allgather_correct_ms",
     "output_collective_ms",
     "state_merge_ms",
 )
+CAPTURE_EAGER_WARMUP = 3
 
 
 @dataclass
@@ -283,6 +287,7 @@ def runner_call(
             max(inputs.q_lengths),
             max(inputs.local_history_lengths),
             cu_seqlens_k_local_host=inputs.cu_history_local_host,
+            overlap_q_allgather=overlap,
             **common,
         )
     assert inputs.k_chunk is not None and inputs.v_chunk is not None
@@ -298,6 +303,48 @@ def runner_call(
         max(inputs.local_history_lengths),
         cu_seqlens_history_local_host=inputs.cu_history_local_host,
         overlap_q_allgather=overlap,
+        **common,
+    )
+
+
+def capture_runner(
+    runner: DCPAttentionRunner,
+    inputs: Inputs,
+    args: argparse.Namespace,
+    overlap: bool,
+) -> DCPAttentionCUDAGraph:
+    common = dict(
+        cu_seqlens_q_host=inputs.cu_q_host,
+        num_splits=args.num_splits,
+        return_lse=False,
+        overlap_q_allgather=overlap,
+        record_timing=True,
+        capture_warmup=CAPTURE_EAGER_WARMUP,
+    )
+    if args.workload == "decode":
+        return runner.capture_decode_varlen(
+            inputs.q_local,
+            inputs.k_history_local,
+            inputs.v_history_local,
+            inputs.cu_q,
+            inputs.cu_history_local,
+            max(inputs.q_lengths),
+            max(inputs.local_history_lengths),
+            cu_seqlens_k_local_host=inputs.cu_history_local_host,
+            **common,
+        )
+    assert inputs.k_chunk is not None and inputs.v_chunk is not None
+    return runner.capture_chunk_prefill_varlen(
+        inputs.q_local,
+        inputs.k_history_local,
+        inputs.v_history_local,
+        inputs.k_chunk,
+        inputs.v_chunk,
+        inputs.cu_q,
+        inputs.cu_history_local,
+        max(inputs.q_lengths),
+        max(inputs.local_history_lengths),
+        cu_seqlens_history_local_host=inputs.cu_history_local_host,
         **common,
     )
 
@@ -334,41 +381,157 @@ def summarize_samples(samples: list[dict[str, float]]) -> dict[str, dict[str, fl
 def measure_runner(
     runner: DCPAttentionRunner,
     call: Callable[[bool], torch.Tensor],
+    inputs: Inputs,
     args: argparse.Namespace,
     device: torch.device,
-) -> dict[str, dict[str, float]]:
-    for _ in range(args.warmup):
-        call(False)
-    torch.cuda.synchronize(device)
-    samples = []
-    for _ in range(args.iters):
-        call(True)
-        samples.append(global_max_values(runner.last_timing_ms(), device))
-    return summarize_samples(samples)
+    *,
+    overlap: bool,
+    expected: torch.Tensor,
+) -> tuple[dict[str, dict[str, float]], dict[str, object]]:
+    captured = capture_runner(runner, inputs, args, overlap) if args.cuda_graph else None
+    try:
+        check_output(
+            runner.varlen_overlap_method_name if overlap else runner.varlen_method_name,
+            captured.replay() if captured is not None else call(False),
+            expected,
+        )
+        for _ in range(args.warmup):
+            captured.replay() if captured is not None else call(False)
+        torch.cuda.synchronize(device)
+        samples = []
+        for _ in range(args.iters):
+            if captured is not None:
+                captured.replay()
+            else:
+                call(True)
+            local_timing = runner.last_timing_ms()
+            local_timing["overlap_hidden_time_ms"] = (
+                max(
+                    0.0,
+                    local_timing["q_allgather_and_reorder_ms"]
+                    + local_timing["local_chunk_attention_ms"]
+                    - local_timing["overlapped_ag_chunk_window_ms"],
+                )
+                if overlap and args.workload == "chunk"
+                else 0.0
+            )
+            samples.append(global_max_values(local_timing, device))
+        execution = {
+            "execution_mode": "cuda_graph" if args.cuda_graph else "eager",
+            "capture_eager_warmup": (
+                CAPTURE_EAGER_WARMUP if args.cuda_graph else 0
+            ),
+            "post_capture_warmup": args.warmup,
+            "stream_policy": (
+                "compute_plus_communication" if overlap else "single_stream"
+            ),
+            "overlap_q_allgather": overlap,
+            "graph_static_signature": (
+                captured.signature if captured is not None else None
+            ),
+        }
+        return summarize_samples(samples), execution
+    finally:
+        if captured is not None:
+            captured.close()
 
 
 def measure_full(
     call: Callable[[], torch.Tensor],
     args: argparse.Namespace,
     device: torch.device,
-) -> dict[str, dict[str, float]]:
-    for _ in range(args.warmup):
-        call()
-    torch.cuda.synchronize(device)
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    samples = []
-    for _ in range(args.iters):
-        start.record()
-        call()
-        end.record()
-        end.synchronize()
-        total = torch.tensor(start.elapsed_time(end), device=device, dtype=torch.float64)
-        dist.all_reduce(total, op=dist.ReduceOp.MAX)
-        values = {stage: 0.0 for stage in STAGES}
-        values["attention_end_to_end_ms"] = float(total.item())
-        samples.append(values)
-    return summarize_samples(samples)
+    inputs: Inputs,
+) -> tuple[dict[str, dict[str, float]], dict[str, object]]:
+    graph: torch.cuda.CUDAGraph | None = None
+    capture_stream: torch.cuda.Stream | None = None
+    if args.cuda_graph:
+        capture_stream = torch.cuda.Stream(device=device)
+        caller_stream = torch.cuda.current_stream(device)
+        capture_stream.wait_stream(caller_stream)
+        with torch.cuda.stream(capture_stream):
+            for _ in range(CAPTURE_EAGER_WARMUP):
+                call()
+        caller_stream.wait_stream(capture_stream)
+        torch.cuda.synchronize(device)
+        dist.barrier()
+        torch.cuda.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(
+                graph, stream=capture_stream, capture_error_mode="global"
+            ):
+                static_output = call()
+        except Exception:
+            torch.cuda.synchronize(device)
+            graph.reset()
+            raise
+    else:
+        static_output = call()
+
+    def replay() -> torch.Tensor:
+        if graph is None or capture_stream is None:
+            return call()
+        current_stream = torch.cuda.current_stream(device)
+        capture_stream.wait_stream(current_stream)
+        with torch.cuda.stream(capture_stream):
+            graph.replay()
+        current_stream.wait_stream(capture_stream)
+        return static_output
+
+    try:
+        for _ in range(args.warmup):
+            replay()
+        torch.cuda.synchronize(device)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        samples = []
+        for _ in range(args.iters):
+            start.record()
+            replay()
+            end.record()
+            end.synchronize()
+            total = torch.tensor(start.elapsed_time(end), device=device, dtype=torch.float64)
+            dist.all_reduce(total, op=dist.ReduceOp.MAX)
+            values = {stage: 0.0 for stage in STAGES}
+            values["attention_end_to_end_ms"] = float(total.item())
+            samples.append(values)
+        signature = {
+            "operation": "full_kv_varlen",
+            "bindings": {
+                name: DCPAttentionRunner._tensor_signature(tensor)
+                for name, tensor in {
+                    "q_local": inputs.q_local,
+                    "k_reference": inputs.k_reference,
+                    "v_reference": inputs.v_reference,
+                    "cu_q": inputs.cu_q,
+                    "cu_reference": inputs.cu_reference,
+                    "cu_q_host": inputs.cu_q_host,
+                    "cu_reference_host": inputs.cu_reference_host,
+                }.items()
+            },
+            "scalars": {
+                "max_seqlen_q": max(inputs.q_lengths),
+                "max_seqlen_k": max(inputs.reference_lengths),
+                "num_splits": args.num_splits,
+                "return_lse": False,
+                "is_causal": args.workload == "chunk",
+            },
+        }
+        execution = {
+            "execution_mode": "cuda_graph" if args.cuda_graph else "eager",
+            "capture_eager_warmup": (
+                CAPTURE_EAGER_WARMUP if args.cuda_graph else 0
+            ),
+            "post_capture_warmup": args.warmup,
+            "stream_policy": "single_stream",
+            "overlap_q_allgather": False,
+            "graph_static_signature": signature if args.cuda_graph else None,
+        }
+        return summarize_samples(samples), execution
+    finally:
+        if graph is not None:
+            torch.cuda.synchronize(device)
+            graph.reset()
 
 
 def check_output(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -454,6 +617,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-splits", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument(
+        "--cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Capture each method and full-KV reference before timed replay",
+    )
     parser.add_argument("--output-json", type=Path, default=None)
     return parser.parse_args()
 
@@ -496,9 +665,8 @@ def main() -> None:
 
         runners: dict[str, DCPAttentionRunner] = {}
         if "ours" in implementations:
+            runners[METHOD_OURS_NO_OVERLAP] = DCPAttentionRunner(process_group)
             runners[METHOD_OURS_OVERLAP] = DCPAttentionRunner(process_group)
-            if args.workload == "chunk":
-                runners[METHOD_OURS_NO_OVERLAP] = DCPAttentionRunner(process_group)
         if "vllm" in implementations:
             runners[METHOD_VLLM] = VLLMDCPAttentionRunner(process_group)
         if "sglang" in implementations:
@@ -511,19 +679,37 @@ def main() -> None:
             call = lambda timed, runner=runner, overlap=overlap: runner_call(
                 runner, inputs, args, overlap, timed
             )
-            check_output(method, call(False), reference_output)
+            stages, execution = measure_runner(
+                runner,
+                call,
+                inputs,
+                args,
+                device,
+                overlap=overlap,
+                expected=reference_output,
+            )
             reports[method] = {
-                "stages_ms": measure_runner(runner, call, args, device),
+                "stages_ms": stages,
                 "output_collective_kind": runner.output_collective_kind,
                 "workspace_policy": runner.workspace_policy,
+                "execution": execution,
             }
+            if method == METHOD_OURS_OVERLAP and args.workload == "chunk":
+                reports[method]["overlap"] = {
+                    "hidden_time_ms": stages["overlap_hidden_time_ms"],
+                    "ag_chunk_window_ms": stages[
+                        "overlapped_ag_chunk_window_ms"
+                    ],
+                }
         if "full" in implementations:
+            stages, execution = measure_full(
+                lambda: full_forward(inputs, args), args, device, inputs
+            )
             reports[METHOD_FULL] = {
-                "stages_ms": measure_full(
-                    lambda: full_forward(inputs, args), args, device
-                ),
+                "stages_ms": stages,
                 "output_collective_kind": "none",
                 "workspace_policy": "operator_managed",
+                "execution": execution,
             }
 
         pairs = effective_pairs(inputs, args.workload)
@@ -538,6 +724,14 @@ def main() -> None:
             p50 = report["stages_ms"]["attention_end_to_end_ms"]["p50"]
             report["speedup_vs_full_kv"] = baseline_p50 / p50 if baseline_p50 else None
             report["effective_tflops"] = global_flops / (p50 * 1.0e9)
+        ours = reports.get(METHOD_OURS_NO_OVERLAP)
+        if ours is not None:
+            ours_p50 = ours["stages_ms"]["attention_end_to_end_ms"]["p50"]
+            for report in reports.values():
+                method_p50 = report["stages_ms"]["attention_end_to_end_ms"]["p50"]
+                report["ours_no_overlap_speedup_vs_method"] = (
+                    method_p50 / max(ours_p50, 1.0e-12)
+                )
 
         bf16_bytes = 2
         full_kv_bytes = 2 * sum(inputs.reference_lengths) * args.headdim * bf16_bytes
@@ -566,12 +760,21 @@ def main() -> None:
             * bf16_bytes,
         }
         result = {
-            "schema_version": 1,
+            "schema_version": 2,
             "comparison_scope": (
                 "Same min_fa3_op.forward_kvcache_varlen kernel; orchestration "
                 "baseline only, not native vLLM/SGLang backend performance."
             ),
             "environment": environment(device),
+            "execution": {
+                "execution_mode": "cuda_graph" if args.cuda_graph else "eager",
+                "capture_eager_warmup": (
+                    CAPTURE_EAGER_WARMUP if args.cuda_graph else 0
+                ),
+                "warmup_semantics": (
+                    "post_capture_replay" if args.cuda_graph else "eager_call"
+                ),
+            },
             "parameters": {
                 **vars(args),
                 "output_json": str(args.output_json) if args.output_json else None,

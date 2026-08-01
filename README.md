@@ -180,8 +180,9 @@ does not allocate a dense `B * max_seqlen_q` workspace.
 ## Head-sharded decode context parallel attention
 
 `min_fa3_dcp` provides three standalone Python/Triton DCP runners on top of
-the same dense and packed-varlen KV-cache siblings. `DCPAttentionRunner` is the local overlapped
-implementation. `VLLMDCPAttentionRunner` copies and trims vLLM's default
+the same dense and packed-varlen KV-cache siblings. `DCPAttentionRunner` is
+the local implementation, with single-stream execution by default and an
+explicit overlap mode. `VLLMDCPAttentionRunner` copies and trims vLLM's default
 `ag_rs` path at commit `a89015c6df8eeb37a843b717c97a5be1355de83d`.
 `SGLangDCPAttentionRunner` copies and trims SGLang's MHA DCP path at commit
 `8d6549bc4039d33635844495d86684677a4f0df8`. Neither comparison runner imports
@@ -202,7 +203,7 @@ out = runner.forward_decode(
 out = runner.forward_chunk_prefill(
     q_local, k_history_local, v_history_local, history_seqlens_local,
     k_chunk, v_chunk, num_splits=0, return_lse=False,
-    overlap_q_allgather=True,
+    overlap_q_allgather=False,
 )
 
 out = runner.forward_decode_varlen(
@@ -219,8 +220,18 @@ out = runner.forward_chunk_prefill_varlen(
     max_seqlen_q, max_seqlen_history_local,
     cu_seqlens_q_host=cu_seqlens_q_host,
     cu_seqlens_history_local_host=cu_seqlens_history_local_host,
-    num_splits=0, return_lse=False, overlap_q_allgather=True,
+    num_splits=0, return_lse=False, overlap_q_allgather=False,
 )
+
+# Capture one fixed decode bucket, update bound tensors in place, then replay.
+with runner.capture_decode(
+    q_local, k_cache_local, v_cache_local, cache_seqlens_local,
+    num_splits=0, return_lse=False, overlap_q_allgather=False,
+    record_timing=False, capture_warmup=3,
+) as graph:
+    q_local.copy_(next_q)
+    cache_seqlens_local.copy_(next_cache_seqlens)
+    out = graph.replay()
 ```
 
 Decode inputs use `q_local: [B, 1, Hq_local, 128]`. Chunk inputs use
@@ -249,14 +260,16 @@ remains outside this API.
 
 All methods all-gather Q heads and run min FA3 over the local history shard.
 The local implementation fuses LSE correction with head packing and performs
-a BF16 reduce-scatter. Its overlap mode uses a communication stream and CUDA
-events to overlap chunk attention with Q all-gather; its non-overlap mode runs
-the full forward sequentially on the caller's compute stream without
-intra-forward dependency events. The vLLM path uses a separate Triton
+a BF16 reduce-scatter. Decode and chunk calls default to non-overlap mode,
+which runs the full forward sequentially on the caller's compute stream
+without intra-forward dependency events. Passing `overlap_q_allgather=True`
+to the local runner uses its persistent communication stream and CUDA events;
+for chunk it overlaps Q all-gather with local chunk attention. The vLLM path uses a separate Triton
 correction followed by BF16 reduce-scatter and a Triton state merge. The
 SGLang MHA path uses natural-log Torch `logsumexp`, FP32 scaling and full-head
 all-reduce, slices local heads, and merges chunk states in FP32 Torch before
-converting output to BF16. All methods return BF16 `[B, Sq, Hq_local, 128]`
+converting output to BF16. vLLM and SGLang are always single-stream and reject
+`overlap_q_allgather=True`. All methods return BF16 `[B, Sq, Hq_local, 128]`
 and optional FP32 LSE `[B, Hq_local, Sq]`.
 
 The packed siblings use `q_local: [total_q, Hq_local, 128]`, tightly packed
@@ -280,11 +293,33 @@ head reordering; no `B * max_seqlen_q` padding is introduced.
 
 The local `DCPAttentionRunner` owns one persistent communication stream,
 reusable CUDA events, grow-only collective/layout buffers, and outstanding
-NCCL work handles for overlap/decode. Non-overlap chunk calls reuse the same
+NCCL work handles for overlap. Non-overlap decode/chunk calls reuse the same
 buffers on one compute stream and retain only the completion dependency needed
 to make back-to-back calls from different current streams safe. Calls may be
 enqueued back-to-back, but one runner must not be called concurrently by
-multiple host threads. CUDA Graph capture is not supported. Current chunk
+multiple host threads.
+
+The four formal capture entry points are `capture_decode`,
+`capture_chunk_prefill`, `capture_decode_varlen`, and
+`capture_chunk_prefill_varlen`. Capture performs three eager warmup calls by
+default, synchronizes the compute and communication streams, barriers the DCP
+subgroup, and captures min FA3, Torch/Triton post-processing, NCCL collectives,
+and the optional two-stream fork/join in one graph. `replay()` asynchronously
+submits the graph and returns its bound static output; every replay overwrites
+that output. Copy it explicitly when a result must survive another replay.
+
+A graph fixes tensor addresses, shapes, strides, dtypes, `num_splits`, LSE
+return mode, overlap mode, and scalar max lengths. Dense Q/K/V data and CUDA
+`cache_seqlens` contents may be changed in place within the captured capacity.
+Packed Q/K/V data may be changed in place, but CPU/CUDA cumulative-length
+arrays, their contents, batch size, total token counts, and max lengths remain
+fixed for the graph lifetime. The capture APIs do not copy a large KV cache.
+One runner owns at most one active graph: eager calls and a second capture are
+rejected until `close()`. Always close the graph, preferably with its context
+manager, before `destroy_process_group()`; `close()` synchronizes in-flight
+replay, resets the graph, releases NCCL/tensor references, and makes the runner
+reusable. Wrapping a forward directly in `torch.cuda.graph` is rejected with a
+message directing callers to these APIs. Current chunk
 insertion into sharded KV cache is intentionally outside this attention-only
 API.
 
@@ -390,7 +425,10 @@ replicas, and DCP rank. The default 8-GPU launch covers the six legal
 chunk sizes 2/8/32/128, `num_splits=0/1/2`, repeated forwards, both local
 overlap modes, and the pinned vLLM/SGLang runners. It compares every method
 with the complete-KV min FA3 reference and records global max/mean output and
-LSE absolute error:
+LSE absolute error. CUDA Graph capture/replay is the default and additionally
+checks in-place input updates, dynamic dense effective lengths, overlap
+fork/join, active-graph exclusion, and close-then-recapture. Use
+`--no-cuda-graph` for the eager fallback smoke:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 --module \
@@ -405,7 +443,8 @@ covers decode, mixed chunk lengths `[1,8,32]`, ragged history, GQA and MQA,
 DCP `2/4/8`, `num_splits=0/1/2/8`, both ours overlap modes, pinned
 vLLM/SGLang orchestration, returned LSE, repeated calls on alternating caller
 streams, grow-only workspace reuse, uniform packed-vs-dense parity, and input
-contract failures:
+contract failures. Its default graph checks also freeze and report the packed
+cumulative-length metadata while allowing Q/K/V contents to change in place:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 --module \
@@ -822,7 +861,8 @@ one fused packed call against a loop of `B` calls to the dense
 reports the packed call's prepare, attention, and combine CUDA kernel time.
 
 The DCP attention-only benchmark compares five method labels while holding the
-local attention kernel fixed: `ours_overlap`, chunk-only `ours_no_overlap`,
+local attention kernel fixed: default `ours_no_overlap`, explicit
+`ours_overlap`,
 `vllm_ag_rs_min_fa3`, `sglang_mha_ag_ar_min_fa3`, and
 `full_kv_min_fa3`. It uses global model head counts and defaults to `TP=8`,
 `Hq=32/64`, `Hkv=2/4`, and candidate `DCP=2/4/8`. Production topology checks
@@ -831,7 +871,7 @@ written as `skipped_topology` with structured reasons.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 --module \
-  scripts.legacy_benchmark.benchmark_dcp \
+  dcp_test.benchmark_dcp \
   --qhead 32,64 --kvhead 2,4 --tp-size 8 --dcp-sizes 2,4,8 \
   --implementations ours,vllm,sglang --workload both \
   --decode-b 1,8,32 --chunk-b 1,4,16 \
@@ -853,6 +893,13 @@ against a complete cache for that rank's global KV head. For chunk prefill it
 concatenates full history and current chunk and runs bottom-right causal min
 FA3. This isolates the latency exchanged for KV-memory reduction.
 
+CUDA Graph is the benchmark default for all five methods, including full-KV.
+Each fixed case performs three eager capture warmups before capture, then
+`--warmup` unmeasured graph replays, followed by timed replays. Use
+`--no-cuda-graph` to run the same methods eagerly; in that mode `--warmup`
+counts eager calls. The local no-overlap, vLLM, SGLang, and full-KV paths use
+one stream. `ours_overlap` alone captures compute plus communication streams.
+
 All DCP subgroups for a topology run concurrently. Every sample is reduced to
 the maximum over all eight global ranks before p50/p90 aggregation, and only
 global rank 0 emits a case. The JSON records full parameters, environment and
@@ -860,6 +907,10 @@ pinned commits, topology decisions, raw samples, stage p50/p90, effective
 global-model TFLOP/s, full/local KV bytes, speedups, and method-specific
 collective payload. SGLang's output collective is modeled as an FP32 ring
 all-reduce; current/vLLM output collectives are BF16 reduce-scatter.
+Per-method execution metadata records the mode, capture warmup, stream policy,
+overlap flag, and graph-static tensor/scalar signature. Primary comparison
+fields use `ours_no_overlap_speedup_vs_method`; overlap latency and hidden-time
+metrics remain separate.
 
 Useful FLOPs and chunk KV-memory reduction use:
 
@@ -883,14 +934,14 @@ A short three-method smoke run can use:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 --module \
-  scripts.legacy_benchmark.benchmark_dcp \
+  dcp_test.benchmark_dcp \
   --qhead 32 --kvhead 2 --tp-size 8 --dcp-sizes 2 \
   --workload both --decode-b 1 --chunk-b 1 \
   --seqlen 4096 --sq 8 --warmup 1 --iters 3 --no-mqa-control
 ```
 
 The independent packed-varlen DCP benchmark uses the sibling method labels
-`ours_overlap_varlen`, chunk-only `ours_no_overlap_varlen`,
+`ours_no_overlap_varlen`, explicit `ours_overlap_varlen`,
 `vllm_ag_rs_min_fa3_varlen`, `sglang_mha_ag_ar_min_fa3_varlen`, and
 `full_kv_min_fa3_varlen`. `--sq` and `--seqlen` each accept one broadcast
 value or exactly `B` comma-separated values. Decode requires `--sq 1`, and
@@ -903,19 +954,22 @@ Useful FLOPs, KV bytes, collective payload, and throughput use `sum(q_len)`,
 actual packed local K tokens, and per-sequence effective decode/causal pairs.
 JSON records global and rank-local lengths, packed token counts, stage p50/p90,
 speedup, effective TFLOP/s, memory reduction, and both pinned source commits.
+It uses the same default CUDA Graph policy, fixed three-call capture warmup,
+post-capture `--warmup` semantics, full-KV graph baseline, execution metadata,
+and `--no-cuda-graph` eager fallback as the dense benchmark.
 
 Mixed chunk and ragged decode smoke runs:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 --module \
-  scripts.legacy_benchmark.benchmark_dcp_varlen \
+  dcp_test.benchmark_dcp_varlen \
   --b 3 --sq 1,8,32 --seqlen 129,1024,3131 \
   --qhead 32 --kvhead 1 --headdim 128 --tp-size 8 --dcp-size 8 \
   --workload chunk --implementations ours,vllm,sglang,full \
   --num-splits 0 --warmup 2 --iters 5
 
 torchrun --standalone --nproc_per_node=8 --module \
-  scripts.legacy_benchmark.benchmark_dcp_varlen \
+  dcp_test.benchmark_dcp_varlen \
   --b 3 --sq 1 --seqlen 129,1024,3131 \
   --qhead 32 --kvhead 1 --headdim 128 --tp-size 8 --dcp-size 8 \
   --workload decode --implementations ours,vllm,sglang,full \

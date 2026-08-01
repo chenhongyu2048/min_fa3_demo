@@ -8,8 +8,10 @@ copied and trimmed from the same commit's
 runtime dependency on vLLM or SGLang.
 
 The communication-stream/event ordering follows the side-stream design used
-by SGLang commit ``8d6549bc4039d33635844495d86684677a4f0df8``.  The runner is
-not CUDA-graph capturable and its workspace must not be used concurrently.
+by SGLang commit ``8d6549bc4039d33635844495d86684677a4f0df8``.  The runner's
+formal capture APIs include the local kernel, post-processing, NCCL
+collectives, and the optional communication-stream fork/join in one CUDA
+graph.  Its workspace must not be used concurrently.
 
 The module also contains standalone, copied-and-trimmed vLLM ``ag_rs`` and
 SGLang MHA runners.  All three runners invoke the same local dense or packed
@@ -25,7 +27,7 @@ from __future__ import annotations
 import threading
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
-from typing import Iterable, Optional, Tuple, Union
+from typing import Callable, Iterable, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -489,6 +491,93 @@ def _nvtx_range(name: str):
     return torch.cuda.nvtx.range(name) if hasattr(torch.cuda, "nvtx") else nullcontext()
 
 
+class DCPAttentionCUDAGraph:
+    """One fixed-signature CUDA Graph captured from a DCP attention runner.
+
+    The input and output tensors are capture-bound.  Callers may update input
+    tensor contents in place before :meth:`replay`, but must close and
+    recapture when an address, shape, stride, dtype, or captured scalar changes.
+    """
+
+    def __init__(
+        self,
+        runner: "DCPAttentionRunner",
+        graph: torch.cuda.CUDAGraph,
+        output: _DCPResult,
+        capture_stream: torch.cuda.Stream,
+        static_references: tuple[object, ...],
+        retained_works: tuple[dist.Work, ...],
+        signature: dict[str, object],
+        *,
+        record_timing: bool,
+        overlap_q_allgather: bool,
+    ) -> None:
+        self._runner: Optional[DCPAttentionRunner] = runner
+        self._graph: Optional[torch.cuda.CUDAGraph] = graph
+        self._output: Optional[_DCPResult] = output
+        self._capture_stream: Optional[torch.cuda.Stream] = capture_stream
+        self._static_references = static_references
+        self._retained_works = retained_works
+        self.signature = signature
+        self.record_timing = record_timing
+        self.overlap_q_allgather = overlap_q_allgather
+        self._closed = False
+
+    @property
+    def output(self) -> _DCPResult:
+        """Return the static output whose contents are replaced by each replay."""
+        if self._closed or self._output is None:
+            raise RuntimeError("DCPAttentionCUDAGraph is closed")
+        return self._output
+
+    def replay(self) -> _DCPResult:
+        """Asynchronously enqueue one replay and return the static output."""
+        if self._closed or self._graph is None or self._runner is None:
+            raise RuntimeError("DCPAttentionCUDAGraph is closed")
+        capture_stream = self._capture_stream
+        assert capture_stream is not None
+        current_stream = torch.cuda.current_stream(self._runner.device)
+        if current_stream.cuda_stream != capture_stream.cuda_stream:
+            capture_stream.wait_stream(current_stream)
+            with torch.cuda.stream(capture_stream):
+                self._graph.replay()
+            current_stream.wait_stream(capture_stream)
+        else:
+            self._graph.replay()
+        return self.output
+
+    def close(self) -> None:
+        """Synchronize replay, reset the graph, and release runner ownership."""
+        if self._closed:
+            return
+        runner = self._runner
+        graph = self._graph
+        try:
+            if runner is not None:
+                torch.cuda.synchronize(runner.device)
+            if graph is not None:
+                graph.reset()
+        finally:
+            if runner is not None:
+                runner._release_graph(self)
+            self._retained_works = ()
+            self._static_references = ()
+            self._capture_stream = None
+            self._output = None
+            self._graph = None
+            self._runner = None
+            self._closed = True
+
+    def __enter__(self) -> "DCPAttentionCUDAGraph":
+        if self._closed:
+            raise RuntimeError("DCPAttentionCUDAGraph is closed")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        del exc_type, exc_value, traceback
+        self.close()
+
+
 class DCPAttentionRunner:
     """Reusable head-sharded DCP workspace backed by one NCCL process group.
 
@@ -497,11 +586,13 @@ class DCPAttentionRunner:
     is unsupported and raises ``RuntimeError``.
     """
 
-    method_name = "ours_overlap"
-    varlen_method_name = "ours_overlap_varlen"
-    varlen_no_overlap_method_name = "ours_no_overlap_varlen"
+    method_name = "ours_no_overlap"
+    overlap_method_name = "ours_overlap"
+    varlen_method_name = "ours_no_overlap_varlen"
+    varlen_overlap_method_name = "ours_overlap_varlen"
     output_collective_kind = "bf16_reduce_scatter"
     workspace_policy = "persistent_grow_only"
+    supports_overlap_q_allgather = True
 
     def __init__(self, process_group: Optional[dist.ProcessGroup]):
         if not dist.is_available() or not dist.is_initialized():
@@ -532,8 +623,15 @@ class DCPAttentionRunner:
         ] = []
         self._workspace_completion: Optional[tuple[torch.cuda.Event, int]] = None
         self._enqueue_lock = threading.Lock()
+        self._active_graph: Optional[DCPAttentionCUDAGraph] = None
+        self._capture_owner_thread: Optional[int] = None
+        self._capture_in_progress = False
+        self._capture_tensors: list[torch.Tensor] = []
         self._timing_events = {
-            name: torch.cuda.Event(enable_timing=True)
+            # External event nodes remain host-queryable after graph replay.
+            # Dependency-only events above intentionally retain the default
+            # internal capture semantics.
+            name: torch.cuda.Event(enable_timing=True, external=True)
             for name in (
                 "attention_start",
                 "attention_end",
@@ -554,6 +652,352 @@ class DCPAttentionRunner:
         }
         self._last_timing_kind: Optional[str] = None
 
+    @staticmethod
+    def _tensor_signature(tensor: torch.Tensor) -> dict[str, object]:
+        signature: dict[str, object] = {
+            "address": tensor.data_ptr(),
+            "shape": list(tensor.shape),
+            "stride": list(tensor.stride()),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+        }
+        if tensor.device.type == "cpu":
+            signature["contents"] = tensor.tolist()
+        return signature
+
+    def _graph_signature(
+        self,
+        operation: str,
+        bindings: dict[str, object],
+    ) -> dict[str, object]:
+        values: dict[str, object] = {}
+        for name, value in bindings.items():
+            values[name] = (
+                self._tensor_signature(value)
+                if isinstance(value, torch.Tensor)
+                else value
+            )
+        return {
+            "operation": operation,
+            "runner": type(self).__name__,
+            "world_size": self.world_size,
+            "rank": self.rank,
+            "bindings": values,
+        }
+
+    def _check_forward_state(self) -> None:
+        owner = self._capture_owner_thread
+        current_thread = threading.get_ident()
+        if self._active_graph is not None:
+            raise RuntimeError(
+                "This runner has an active CUDA Graph; replay or close it before "
+                "calling eager forward"
+            )
+        if owner is not None and owner != current_thread:
+            raise RuntimeError("This runner is currently being captured by another thread")
+        if torch.cuda.is_current_stream_capturing() and not self._capture_in_progress:
+            raise RuntimeError(
+                "Direct CUDA Graph capture is unsupported; use capture_decode(), "
+                "capture_chunk_prefill(), capture_decode_varlen(), or "
+                "capture_chunk_prefill_varlen()"
+            )
+
+    def _clear_completed_bookkeeping(self) -> None:
+        torch.cuda.synchronize(self.device)
+        self._works.clear()
+        self._inflight_tensors.clear()
+        self._workspace_completion = None
+
+    def _capture_forward(
+        self,
+        operation: str,
+        forward_call: Callable[[], _DCPResult],
+        bindings: dict[str, object],
+        *,
+        overlap_q_allgather: bool,
+        record_timing: bool,
+        capture_warmup: int,
+    ) -> DCPAttentionCUDAGraph:
+        if not isinstance(capture_warmup, int) or capture_warmup < 0:
+            raise ValueError("capture_warmup must be a nonnegative integer")
+        if overlap_q_allgather and not self.supports_overlap_q_allgather:
+            raise ValueError(
+                f"{type(self).__name__} only supports single-stream execution; "
+                "overlap_q_allgather must be False"
+            )
+        if self._active_graph is not None:
+            raise RuntimeError("This runner already has an active CUDA Graph")
+        if self._capture_owner_thread is not None:
+            raise RuntimeError("This runner is already preparing a CUDA Graph capture")
+
+        self._capture_owner_thread = threading.get_ident()
+        capture_stream = torch.cuda.Stream(device=self.device)
+        graph: Optional[torch.cuda.CUDAGraph] = None
+        try:
+            caller_stream = torch.cuda.current_stream(self.device)
+            capture_stream.wait_stream(caller_stream)
+            with torch.cuda.stream(capture_stream):
+                for _ in range(capture_warmup):
+                    forward_call()
+            caller_stream.wait_stream(capture_stream)
+
+            torch.cuda.synchronize(self.device)
+            dist.barrier(group=self.process_group)
+            torch.cuda.synchronize(self.device)
+            self._clear_completed_bookkeeping()
+            self._capture_tensors = []
+
+            graph = torch.cuda.CUDAGraph()
+            self._capture_in_progress = True
+            with torch.cuda.graph(
+                graph,
+                stream=capture_stream,
+                capture_error_mode="global",
+            ):
+                output = forward_call()
+            self._capture_in_progress = False
+            caller_stream.wait_stream(capture_stream)
+
+            static_references: tuple[object, ...] = (
+                tuple(bindings.values()),
+                output,
+                tuple(self._buffers.values()),
+                tuple(self._capture_tensors),
+                tuple(self._inflight_tensors),
+            )
+            captured = DCPAttentionCUDAGraph(
+                self,
+                graph,
+                output,
+                capture_stream,
+                static_references,
+                tuple(self._works),
+                self._graph_signature(operation, bindings),
+                record_timing=record_timing,
+                overlap_q_allgather=overlap_q_allgather,
+            )
+            self._active_graph = captured
+            return captured
+        except Exception:
+            self._capture_in_progress = False
+            torch.cuda.synchronize(self.device)
+            if graph is not None:
+                graph.reset()
+            self._clear_completed_bookkeeping()
+            raise
+        finally:
+            self._capture_owner_thread = None
+
+    def _release_graph(self, graph: DCPAttentionCUDAGraph) -> None:
+        if self._active_graph is graph:
+            self._active_graph = None
+        self._works.clear()
+        self._inflight_tensors.clear()
+        self._workspace_completion = None
+        self._capture_tensors.clear()
+
+    def capture_decode(
+        self,
+        q_local: torch.Tensor,
+        k_cache_local: torch.Tensor,
+        v_cache_local: torch.Tensor,
+        cache_seqlens_local: torch.Tensor,
+        num_splits: int = 0,
+        return_lse: bool = False,
+        overlap_q_allgather: bool = False,
+        *,
+        record_timing: bool = False,
+        capture_warmup: int = 3,
+    ) -> DCPAttentionCUDAGraph:
+        bindings = dict(
+            q_local=q_local,
+            k_cache_local=k_cache_local,
+            v_cache_local=v_cache_local,
+            cache_seqlens_local=cache_seqlens_local,
+            num_splits=num_splits,
+            return_lse=return_lse,
+            overlap_q_allgather=overlap_q_allgather,
+        )
+        return self._capture_forward(
+            "decode",
+            lambda: self.forward_decode(
+                q_local,
+                k_cache_local,
+                v_cache_local,
+                cache_seqlens_local,
+                num_splits=num_splits,
+                return_lse=return_lse,
+                overlap_q_allgather=overlap_q_allgather,
+                _record_timing=record_timing,
+            ),
+            bindings,
+            overlap_q_allgather=overlap_q_allgather,
+            record_timing=record_timing,
+            capture_warmup=capture_warmup,
+        )
+
+    def capture_chunk_prefill(
+        self,
+        q_local: torch.Tensor,
+        k_history_local: torch.Tensor,
+        v_history_local: torch.Tensor,
+        history_seqlens_local: torch.Tensor,
+        k_chunk: torch.Tensor,
+        v_chunk: torch.Tensor,
+        num_splits: int = 0,
+        return_lse: bool = False,
+        overlap_q_allgather: bool = False,
+        *,
+        record_timing: bool = False,
+        capture_warmup: int = 3,
+    ) -> DCPAttentionCUDAGraph:
+        bindings = dict(
+            q_local=q_local,
+            k_history_local=k_history_local,
+            v_history_local=v_history_local,
+            history_seqlens_local=history_seqlens_local,
+            k_chunk=k_chunk,
+            v_chunk=v_chunk,
+            num_splits=num_splits,
+            return_lse=return_lse,
+            overlap_q_allgather=overlap_q_allgather,
+        )
+        return self._capture_forward(
+            "chunk_prefill",
+            lambda: self.forward_chunk_prefill(
+                q_local,
+                k_history_local,
+                v_history_local,
+                history_seqlens_local,
+                k_chunk,
+                v_chunk,
+                num_splits=num_splits,
+                return_lse=return_lse,
+                overlap_q_allgather=overlap_q_allgather,
+                _record_timing=record_timing,
+            ),
+            bindings,
+            overlap_q_allgather=overlap_q_allgather,
+            record_timing=record_timing,
+            capture_warmup=capture_warmup,
+        )
+
+    def capture_decode_varlen(
+        self,
+        q_local: torch.Tensor,
+        k_cache_local: torch.Tensor,
+        v_cache_local: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k_local: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k_local: int,
+        *,
+        cu_seqlens_q_host: torch.Tensor,
+        cu_seqlens_k_local_host: torch.Tensor,
+        num_splits: int = 0,
+        return_lse: bool = False,
+        overlap_q_allgather: bool = False,
+        record_timing: bool = False,
+        capture_warmup: int = 3,
+    ) -> DCPAttentionCUDAGraph:
+        bindings = dict(
+            q_local=q_local,
+            k_cache_local=k_cache_local,
+            v_cache_local=v_cache_local,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_local=cu_seqlens_k_local,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k_local=max_seqlen_k_local,
+            cu_seqlens_q_host=cu_seqlens_q_host,
+            cu_seqlens_k_local_host=cu_seqlens_k_local_host,
+            num_splits=num_splits,
+            return_lse=return_lse,
+            overlap_q_allgather=overlap_q_allgather,
+        )
+        return self._capture_forward(
+            "decode_varlen",
+            lambda: self.forward_decode_varlen(
+                q_local,
+                k_cache_local,
+                v_cache_local,
+                cu_seqlens_q,
+                cu_seqlens_k_local,
+                max_seqlen_q,
+                max_seqlen_k_local,
+                cu_seqlens_q_host=cu_seqlens_q_host,
+                cu_seqlens_k_local_host=cu_seqlens_k_local_host,
+                num_splits=num_splits,
+                return_lse=return_lse,
+                overlap_q_allgather=overlap_q_allgather,
+                _record_timing=record_timing,
+            ),
+            bindings,
+            overlap_q_allgather=overlap_q_allgather,
+            record_timing=record_timing,
+            capture_warmup=capture_warmup,
+        )
+
+    def capture_chunk_prefill_varlen(
+        self,
+        q_local: torch.Tensor,
+        k_history_local: torch.Tensor,
+        v_history_local: torch.Tensor,
+        k_chunk: torch.Tensor,
+        v_chunk: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_history_local: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_history_local: int,
+        *,
+        cu_seqlens_q_host: torch.Tensor,
+        cu_seqlens_history_local_host: torch.Tensor,
+        num_splits: int = 0,
+        return_lse: bool = False,
+        overlap_q_allgather: bool = False,
+        record_timing: bool = False,
+        capture_warmup: int = 3,
+    ) -> DCPAttentionCUDAGraph:
+        bindings = dict(
+            q_local=q_local,
+            k_history_local=k_history_local,
+            v_history_local=v_history_local,
+            k_chunk=k_chunk,
+            v_chunk=v_chunk,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_history_local=cu_seqlens_history_local,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_history_local=max_seqlen_history_local,
+            cu_seqlens_q_host=cu_seqlens_q_host,
+            cu_seqlens_history_local_host=cu_seqlens_history_local_host,
+            num_splits=num_splits,
+            return_lse=return_lse,
+            overlap_q_allgather=overlap_q_allgather,
+        )
+        return self._capture_forward(
+            "chunk_prefill_varlen",
+            lambda: self.forward_chunk_prefill_varlen(
+                q_local,
+                k_history_local,
+                v_history_local,
+                k_chunk,
+                v_chunk,
+                cu_seqlens_q,
+                cu_seqlens_history_local,
+                max_seqlen_q,
+                max_seqlen_history_local,
+                cu_seqlens_q_host=cu_seqlens_q_host,
+                cu_seqlens_history_local_host=cu_seqlens_history_local_host,
+                num_splits=num_splits,
+                return_lse=return_lse,
+                overlap_q_allgather=overlap_q_allgather,
+                _record_timing=record_timing,
+            ),
+            bindings,
+            overlap_q_allgather=overlap_q_allgather,
+            record_timing=record_timing,
+            capture_warmup=capture_warmup,
+        )
+
     def _buffer(
         self,
         name: str,
@@ -572,14 +1016,20 @@ class DCPAttentionRunner:
         ):
             storage = torch.empty(numel, device=self.device, dtype=dtype)
             self._buffers[name] = storage
-        return storage[:numel].view(shape)
+        result = storage[:numel].view(shape)
+        if self._capture_in_progress:
+            self._capture_tensors.append(result)
+        return result
 
     def _record_timing(self, name: str, stream: torch.cuda.Stream) -> None:
         self._timing_events[name].record(stream)
 
     def _retain_work(self, work: Optional[dist.Work]) -> None:
         if work is not None:
-            self._works = [pending for pending in self._works if not pending.is_completed()]
+            if not self._capture_in_progress:
+                self._works = [
+                    pending for pending in self._works if not pending.is_completed()
+                ]
             self._works.append(work)
             # This inserts a completion dependency only on the currently active
             # G stream and is guaranteed to return immediately.  Work.wait()
@@ -587,6 +1037,9 @@ class DCPAttentionRunner:
             work.block_current_stream()
 
     def _reap_inflight_tensors(self) -> None:
+        self._check_forward_state()
+        if self._capture_in_progress:
+            return
         self._inflight_tensors = [
             item for item in self._inflight_tensors if not item[0].query()
         ]
@@ -602,6 +1055,8 @@ class DCPAttentionRunner:
         completion = torch.cuda.Event()
         completion.record(compute_stream)
         self._inflight_tensors.append((completion, tensors))
+        if self._capture_in_progress:
+            self._capture_tensors.extend(tensors)
         return completion
 
     def _prepare_persistent_workspace(
@@ -611,7 +1066,10 @@ class DCPAttentionRunner:
         if pending is None:
             return
         completion, stream_id = pending
-        if not completion.query() and compute_stream.cuda_stream != stream_id:
+        if self._capture_in_progress:
+            if compute_stream.cuda_stream != stream_id:
+                compute_stream.wait_event(completion)
+        elif not completion.query() and compute_stream.cuda_stream != stream_id:
             compute_stream.wait_event(completion)
         self._workspace_completion = None
 
@@ -622,8 +1080,7 @@ class DCPAttentionRunner:
         v_local: torch.Tensor,
         seqlens_local: torch.Tensor,
     ) -> tuple[int, int, int, int]:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("DCPAttentionRunner does not support CUDA Graph capture")
+        self._check_forward_state()
         if q_local.device != self.device:
             raise ValueError(f"q_local must be on runner device {self.device}, got {q_local.device}")
         for tensor, name in ((q_local, "q_local"), (k_local, "k_local"), (v_local, "v_local")):
@@ -701,8 +1158,7 @@ class DCPAttentionRunner:
         num_splits: int,
     ) -> tuple[int, int, int, int, int, list[int], list[int]]:
         """Validate packed inputs using CPU mirrors without synchronizing CUDA."""
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("DCPAttentionRunner does not support CUDA Graph capture")
+        self._check_forward_state()
         self._check_num_splits(num_splits)
         for tensor, name in (
             (q_local, "q_local"),
@@ -1197,6 +1653,7 @@ class DCPAttentionRunner:
         cache_seqlens_local: torch.Tensor,
         num_splits: int = 0,
         return_lse: bool = False,
+        overlap_q_allgather: bool = False,
         *,
         _record_timing: bool = False,
     ) -> _DCPResult:
@@ -1214,6 +1671,7 @@ class DCPAttentionRunner:
             if _record_timing:
                 self._last_timing_kind = "decode"
                 self._record_timing("attention_start", compute_stream)
+            use_side_stream = self.world_size > 1 and overlap_q_allgather
             if self.world_size == 1:
                 if _record_timing:
                     self._record_timing("q_ag_start", compute_stream)
@@ -1234,12 +1692,20 @@ class DCPAttentionRunner:
                     self._record_timing("attention_end", compute_stream)
                 return result
 
-            q_group = self._start_q_allgather(
-                q_local,
-                k_cache_local.shape[2],
-                compute_stream,
-                timing=_record_timing,
-            )
+            if use_side_stream:
+                q_group = self._start_q_allgather(
+                    q_local,
+                    k_cache_local.shape[2],
+                    compute_stream,
+                    timing=_record_timing,
+                )
+            else:
+                q_group = self._gather_q_single_stream(
+                    q_local,
+                    k_cache_local.shape[2],
+                    compute_stream,
+                    timing=_record_timing,
+                )
             history_out, history_lse = self._run_context_attention(
                 q_group,
                 k_cache_local,
@@ -1248,6 +1714,7 @@ class DCPAttentionRunner:
                 num_splits,
                 compute_stream,
                 timing=_record_timing,
+                use_dependency_events=use_side_stream,
             )
             output = torch.empty_like(q_local)
             local_lse = (
@@ -1255,20 +1722,31 @@ class DCPAttentionRunner:
                 if return_lse
                 else None
             )
-            self._finish_context(
-                history_out,
-                history_lse,
-                output,
-                local_lse,
-                k_cache_local.shape[2],
-                compute_stream,
-                timing=_record_timing,
-            )
-            compute_stream.wait_event(self._context_ready)
-            self._workspace_completion = (
-                self._context_ready,
-                compute_stream.cuda_stream,
-            )
+            if use_side_stream:
+                self._finish_context(
+                    history_out,
+                    history_lse,
+                    output,
+                    local_lse,
+                    k_cache_local.shape[2],
+                    compute_stream,
+                    timing=_record_timing,
+                )
+                compute_stream.wait_event(self._context_ready)
+                completion = self._context_ready
+            else:
+                self._finish_context_single_stream(
+                    history_out,
+                    history_lse,
+                    output,
+                    local_lse,
+                    k_cache_local.shape[2],
+                    compute_stream,
+                    timing=_record_timing,
+                )
+                completion = torch.cuda.Event()
+                completion.record(compute_stream)
+            self._workspace_completion = (completion, compute_stream.cuda_stream)
             if _record_timing:
                 self._record_timing("attention_end", compute_stream)
             return (output, local_lse) if return_lse else output
@@ -1285,7 +1763,7 @@ class DCPAttentionRunner:
         v_chunk: torch.Tensor,
         num_splits: int = 0,
         return_lse: bool = False,
-        overlap_q_allgather: bool = True,
+        overlap_q_allgather: bool = False,
         *,
         _record_timing: bool = False,
     ) -> _DCPResult:
@@ -1455,6 +1933,7 @@ class DCPAttentionRunner:
         cu_seqlens_k_local_host: torch.Tensor,
         num_splits: int = 0,
         return_lse: bool = False,
+        overlap_q_allgather: bool = False,
         _record_timing: bool = False,
     ) -> _DCPResult:
         """Run packed DCP decode with one query token per sequence."""
@@ -1490,6 +1969,7 @@ class DCPAttentionRunner:
             if _record_timing:
                 self._last_timing_kind = "decode"
                 self._record_timing("attention_start", compute_stream)
+            use_side_stream = self.world_size > 1 and overlap_q_allgather
             if self.world_size == 1:
                 if _record_timing:
                     self._record_timing("q_ag_start", compute_stream)
@@ -1516,9 +1996,14 @@ class DCPAttentionRunner:
                     self._record_timing("attention_end", compute_stream)
                 return result
 
-            q_group = self._start_q_allgather_varlen(
-                q_local, h_kv, compute_stream, timing=_record_timing
-            )
+            if use_side_stream:
+                q_group = self._start_q_allgather_varlen(
+                    q_local, h_kv, compute_stream, timing=_record_timing
+                )
+            else:
+                q_group = self._gather_q_single_stream_varlen(
+                    q_local, h_kv, compute_stream, timing=_record_timing
+                )
             history_out, history_lse = self._run_context_attention_varlen(
                 q_group,
                 k_cache_local,
@@ -1532,6 +2017,7 @@ class DCPAttentionRunner:
                 num_splits,
                 compute_stream,
                 timing=_record_timing,
+                use_dependency_events=use_side_stream,
             )
             output = torch.empty_like(q_local)
             local_lse = (
@@ -1551,13 +2037,15 @@ class DCPAttentionRunner:
                 h_kv,
                 compute_stream,
                 timing=_record_timing,
-                use_side_stream=True,
+                use_side_stream=use_side_stream,
             )
-            compute_stream.wait_event(self._context_ready)
-            self._workspace_completion = (
-                self._context_ready,
-                compute_stream.cuda_stream,
-            )
+            if use_side_stream:
+                compute_stream.wait_event(self._context_ready)
+                completion = self._context_ready
+            else:
+                completion = torch.cuda.Event()
+                completion.record(compute_stream)
+            self._workspace_completion = (completion, compute_stream.cuda_stream)
             if _record_timing:
                 self._record_timing("attention_end", compute_stream)
             return (output, local_lse) if return_lse else output
@@ -1580,7 +2068,7 @@ class DCPAttentionRunner:
         cu_seqlens_history_local_host: torch.Tensor,
         num_splits: int = 0,
         return_lse: bool = False,
-        overlap_q_allgather: bool = True,
+        overlap_q_allgather: bool = False,
         _record_timing: bool = False,
     ) -> _DCPResult:
         """Run packed split history/chunk prefill and merge both states."""
@@ -1778,6 +2266,14 @@ class _SequentialDCPAttentionRunnerBase(DCPAttentionRunner):
 
     chunk_before_context = False
     workspace_policy = "framework_style_per_call"
+    supports_overlap_q_allgather = False
+
+    def _reject_overlap(self, overlap_q_allgather: bool) -> None:
+        if overlap_q_allgather:
+            raise ValueError(
+                f"{type(self).__name__} only supports single-stream execution; "
+                "overlap_q_allgather must be False"
+            )
 
     def _check_packed_runner_topology(self, h_kv: int) -> None:
         if h_kv != 1:
@@ -2088,6 +2584,7 @@ class _SequentialDCPAttentionRunnerBase(DCPAttentionRunner):
         cache_seqlens_local: torch.Tensor,
         num_splits: int = 0,
         return_lse: bool = False,
+        overlap_q_allgather: bool = False,
         *,
         _record_timing: bool = False,
     ) -> _DCPResult:
@@ -2095,6 +2592,7 @@ class _SequentialDCPAttentionRunnerBase(DCPAttentionRunner):
             raise RuntimeError(f"{type(self).__name__} does not support concurrent calls")
         try:
             self._reap_inflight_tensors()
+            self._reject_overlap(overlap_q_allgather)
             _, sq, _, _ = self._check_reference_common(
                 q_local, k_cache_local, v_cache_local, cache_seqlens_local
             )
@@ -2144,11 +2642,11 @@ class _SequentialDCPAttentionRunnerBase(DCPAttentionRunner):
         *,
         _record_timing: bool = False,
     ) -> _DCPResult:
-        del overlap_q_allgather
         if not self._enqueue_lock.acquire(blocking=False):
             raise RuntimeError(f"{type(self).__name__} does not support concurrent calls")
         try:
             self._reap_inflight_tensors()
+            self._reject_overlap(overlap_q_allgather)
             b, sq, _, d = self._check_reference_common(
                 q_local,
                 k_history_local,
@@ -2232,12 +2730,14 @@ class _SequentialDCPAttentionRunnerBase(DCPAttentionRunner):
         cu_seqlens_k_local_host: torch.Tensor,
         num_splits: int = 0,
         return_lse: bool = False,
+        overlap_q_allgather: bool = False,
         _record_timing: bool = False,
     ) -> _DCPResult:
         if not self._enqueue_lock.acquire(blocking=False):
             raise RuntimeError(f"{type(self).__name__} does not support concurrent calls")
         try:
             self._reap_inflight_tensors()
+            self._reject_overlap(overlap_q_allgather)
             (
                 _,
                 _,
@@ -2316,11 +2816,11 @@ class _SequentialDCPAttentionRunnerBase(DCPAttentionRunner):
         overlap_q_allgather: bool = False,
         _record_timing: bool = False,
     ) -> _DCPResult:
-        del overlap_q_allgather
         if not self._enqueue_lock.acquire(blocking=False):
             raise RuntimeError(f"{type(self).__name__} does not support concurrent calls")
         try:
             self._reap_inflight_tensors()
+            self._reject_overlap(overlap_q_allgather)
             (
                 total_q,
                 _,
@@ -2652,6 +3152,7 @@ class SGLangDCPAttentionRunner(_SequentialDCPAttentionRunnerBase):
 
 __all__ = [
     "DCPTopology",
+    "DCPAttentionCUDAGraph",
     "DCPAttentionRunner",
     "SGLangDCPAttentionRunner",
     "TopologyIssue",

@@ -14,6 +14,7 @@ import torch.distributed as dist
 
 import min_fa3_op
 from min_fa3_dcp import (
+    DCPAttentionCUDAGraph,
     DCPAttentionRunner,
     DCPTopology,
     SGLangDCPAttentionRunner,
@@ -27,6 +28,7 @@ METHOD_OURS_OVERLAP = "ours_overlap_varlen"
 METHOD_OURS_NO_OVERLAP = "ours_no_overlap_varlen"
 METHOD_VLLM = "vllm_ag_rs_min_fa3_varlen"
 METHOD_SGLANG = "sglang_mha_ag_ar_min_fa3_varlen"
+CAPTURE_EAGER_WARMUP = 3
 
 
 @dataclass(frozen=True)
@@ -275,12 +277,21 @@ def method_calls(
     )
     if workload == "decode":
         calls = []
-        for method in (METHOD_OURS_OVERLAP, METHOD_VLLM, METHOD_SGLANG):
-            runner = runners[method]
+        for method, overlap in (
+            (METHOD_OURS_NO_OVERLAP, False),
+            (METHOD_VLLM, False),
+            (METHOD_SGLANG, False),
+            (METHOD_OURS_OVERLAP, True),
+        ):
+            runner = (
+                runners[METHOD_OURS_OVERLAP]
+                if method == METHOD_OURS_NO_OVERLAP
+                else runners[method]
+            )
             calls.append(
                 (
                     method,
-                    lambda runner=runner: runner.forward_decode_varlen(
+                    lambda runner=runner, overlap=overlap: runner.forward_decode_varlen(
                         inputs.q_local,
                         inputs.k_history_local,
                         inputs.v_history_local,
@@ -289,6 +300,7 @@ def method_calls(
                         max(inputs.q_lengths),
                         max(inputs.history_lengths_local),
                         cu_seqlens_k_local_host=inputs.cu_history_local_host,
+                        overlap_q_allgather=overlap,
                         **common,
                     ),
                 )
@@ -298,12 +310,16 @@ def method_calls(
     assert inputs.k_chunk is not None and inputs.v_chunk is not None
     calls = []
     for method, overlap in (
-        (METHOD_OURS_OVERLAP, True),
         (METHOD_OURS_NO_OVERLAP, False),
         (METHOD_VLLM, False),
         (METHOD_SGLANG, False),
+        (METHOD_OURS_OVERLAP, True),
     ):
-        runner = runners[method]
+        runner = (
+            runners[METHOD_OURS_OVERLAP]
+            if method == METHOD_OURS_NO_OVERLAP
+            else runners[method]
+        )
         calls.append(
             (
                 method,
@@ -324,6 +340,54 @@ def method_calls(
             )
         )
     return calls
+
+
+def capture_method(
+    method: str,
+    workload: str,
+    inputs: PackedInputs,
+    runners: dict[str, DCPAttentionRunner],
+    num_splits: int,
+) -> DCPAttentionCUDAGraph:
+    runner = (
+        runners[METHOD_OURS_OVERLAP]
+        if method in (METHOD_OURS_NO_OVERLAP, METHOD_OURS_OVERLAP)
+        else runners[method]
+    )
+    overlap = method == METHOD_OURS_OVERLAP
+    common = dict(
+        cu_seqlens_q_host=inputs.cu_q_host,
+        num_splits=num_splits,
+        return_lse=True,
+        overlap_q_allgather=overlap,
+        capture_warmup=CAPTURE_EAGER_WARMUP,
+    )
+    if workload == "decode":
+        return runner.capture_decode_varlen(
+            inputs.q_local,
+            inputs.k_history_local,
+            inputs.v_history_local,
+            inputs.cu_q,
+            inputs.cu_history_local,
+            max(inputs.q_lengths),
+            max(inputs.history_lengths_local),
+            cu_seqlens_k_local_host=inputs.cu_history_local_host,
+            **common,
+        )
+    assert inputs.k_chunk is not None and inputs.v_chunk is not None
+    return runner.capture_chunk_prefill_varlen(
+        inputs.q_local,
+        inputs.k_history_local,
+        inputs.v_history_local,
+        inputs.k_chunk,
+        inputs.v_chunk,
+        inputs.cu_q,
+        inputs.cu_history_local,
+        max(inputs.q_lengths),
+        max(inputs.history_lengths_local),
+        cu_seqlens_history_local_host=inputs.cu_history_local_host,
+        **common,
+    )
 
 
 def error_stats(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float | bool]:
@@ -379,6 +443,7 @@ def run_case(
     runners: dict[str, DCPAttentionRunner],
     repeat: int,
     device: torch.device,
+    cuda_graph: bool,
 ) -> dict[str, object]:
     inputs = build_inputs(
         topology,
@@ -393,7 +458,18 @@ def run_case(
     reports: dict[str, object] = {}
     for method, call in method_calls(workload, inputs, runners, num_splits):
         report = None
-        if method == METHOD_OURS_OVERLAP and repeat > 1:
+        captured = (
+            capture_method(method, workload, inputs, runners, num_splits)
+            if cuda_graph
+            else None
+        )
+        if captured is not None:
+            try:
+                for _ in range(repeat):
+                    report = check_result(method, captured.replay(), expected)
+            finally:
+                captured.close()
+        elif method == METHOD_OURS_OVERLAP and repeat > 1:
             caller_stream = torch.cuda.current_stream(device)
             alternate_stream = torch.cuda.Stream(device=device)
             queued = []
@@ -417,6 +493,8 @@ def run_case(
         "total_q": sum(q_lengths),
         "total_k_local": sum(inputs.history_lengths_local),
         "num_splits": num_splits,
+        "execution_mode": "cuda_graph" if cuda_graph else "eager",
+        "capture_eager_warmup": CAPTURE_EAGER_WARMUP if cuda_graph else 0,
         "methods": reports,
     }
 
@@ -548,6 +626,121 @@ def check_failures(
     )
 
 
+def check_graph_lifecycle(
+    topology: DCPTopology,
+    runners: dict[str, DCPAttentionRunner],
+    device: torch.device,
+) -> dict[str, str]:
+    q_lengths = [1, 1, 1]
+    history_lengths = [129, 258, 515]
+    inputs = build_inputs(
+        topology,
+        "decode",
+        q_lengths,
+        history_lengths,
+        1,
+        dist.get_rank(),
+        device,
+    )
+    runner = runners[METHOD_OURS_OVERLAP]
+
+    def expected() -> tuple[torch.Tensor, torch.Tensor]:
+        return reference(inputs, "decode", 1)
+
+    graph = capture_method(
+        METHOD_OURS_NO_OVERLAP, "decode", inputs, runners, 1
+    )
+    try:
+        check_result("graph_initial_varlen", graph.replay(), expected())
+        bindings = graph.signature["bindings"]
+        if not isinstance(bindings, dict):
+            raise AssertionError("graph signature bindings must be a dictionary")
+        for name, host in (
+            ("cu_seqlens_q_host", inputs.cu_q_host),
+            ("cu_seqlens_k_local_host", inputs.cu_history_local_host),
+        ):
+            tensor_signature = bindings[name]
+            if (
+                not isinstance(tensor_signature, dict)
+                or tensor_signature.get("contents") != host.tolist()
+            ):
+                raise AssertionError(f"graph signature did not freeze {name} contents")
+        expect_error(
+            "second active varlen graph",
+            "already has an active CUDA Graph",
+            lambda: capture_method(
+                METHOD_OURS_NO_OVERLAP, "decode", inputs, runners, 1
+            ),
+        )
+        expect_error(
+            "varlen eager during active graph",
+            "active CUDA Graph",
+            lambda: runner.forward_decode_varlen(
+                inputs.q_local,
+                inputs.k_history_local,
+                inputs.v_history_local,
+                inputs.cu_q,
+                inputs.cu_history_local,
+                max(inputs.q_lengths),
+                max(inputs.history_lengths_local),
+                cu_seqlens_q_host=inputs.cu_q_host,
+                cu_seqlens_k_local_host=inputs.cu_history_local_host,
+                num_splits=1,
+                return_lse=True,
+            ),
+        )
+
+        inputs.q_local.copy_(
+            randn_bf16(
+                tuple(inputs.q_local.shape),
+                991_337 + dist.get_rank(),
+                device,
+            )
+        )
+        inputs.k_history_local.mul_(0.5)
+        inputs.v_history_local.mul_(0.75)
+        inputs.k_history_full.mul_(0.5)
+        inputs.v_history_full.mul_(0.75)
+        check_result("graph_in_place_varlen", graph.replay(), expected())
+    finally:
+        graph.close()
+
+    with capture_method(
+        METHOD_OURS_OVERLAP, "decode", inputs, runners, 1
+    ) as overlap_graph:
+        check_result("graph_recapture_overlap_varlen", overlap_graph.replay(), expected())
+
+    for method in (METHOD_VLLM, METHOD_SGLANG):
+        sequential = runners[method]
+        expect_error(
+            f"{method} overlap",
+            "only supports single-stream execution",
+            lambda sequential=sequential: sequential.forward_decode_varlen(
+                inputs.q_local,
+                inputs.k_history_local,
+                inputs.v_history_local,
+                inputs.cu_q,
+                inputs.cu_history_local,
+                max(inputs.q_lengths),
+                max(inputs.history_lengths_local),
+                cu_seqlens_q_host=inputs.cu_q_host,
+                cu_seqlens_k_local_host=inputs.cu_history_local_host,
+                num_splits=1,
+                return_lse=True,
+                overlap_q_allgather=True,
+            ),
+        )
+    dist.barrier(group=runner.process_group)
+    return {
+        "in_place_input_update": "ok",
+        "fixed_varlen_metadata_signature": "ok",
+        "active_graph_exclusion": "ok",
+        "close_and_recapture": "ok",
+        "overlap_fork_join": "ok",
+        "sequential_overlap_rejection": "ok",
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Packed-varlen DCP correctness matrix on SM90."
@@ -563,6 +756,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-splits", type=str, default="0,1,2,8")
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--output-json", type=Path, default=None)
+    parser.add_argument(
+        "--cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use formal runner capture/replay APIs for every correctness case",
+    )
     return parser.parse_args()
 
 
@@ -630,6 +829,7 @@ def main() -> None:
                         runners,
                         1,
                         device,
+                        args.cuda_graph,
                     )
                 )
                 cases.append(
@@ -642,6 +842,7 @@ def main() -> None:
                         runners,
                         args.repeat if num_splits == split_values[-1] else 1,
                         device,
+                        args.cuda_graph,
                     )
                 )
             if global_rank == 0:
@@ -662,11 +863,24 @@ def main() -> None:
                 device,
             )
 
+        graph_lifecycle = (
+            check_graph_lifecycle(
+                topologies[-1], runners_for(topologies[-1].dcp_size), device
+            )
+            if args.cuda_graph and topologies
+            else "not_run"
+        )
+
         result = {
             "comparison_scope": (
                 "Same min_fa3_op.forward_kvcache_varlen kernel; DCP orchestration only."
             ),
             "world_size": world_size,
+            "execution_mode": "cuda_graph" if args.cuda_graph else "eager",
+            "capture_eager_warmup": (
+                CAPTURE_EAGER_WARMUP if args.cuda_graph else 0
+            ),
+            "graph_lifecycle": graph_lifecycle,
             "cases": cases,
             "dense_parity": "ok",
             "failure_contracts": "ok",

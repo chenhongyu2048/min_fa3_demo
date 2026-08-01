@@ -57,33 +57,39 @@ ALLGATHER_OVERLAPPING_HEADS_K_STRIDE=${ALLGATHER_OVERLAPPING_HEADS_K_STRIDE:-1}
 #     --b 3 --sq 1,8,32 --seqlen 129,1024,3131 \
 #     --qhead 32 --kvhead 8 --headdim 128 --mode all --profile-kernels
 
-# Packed-varlen DCP correctness and same-kernel orchestration smoke. This Slurm
-# file requests four GPUs, so these examples use TP=4/DCP=4; README.md carries
-# the complete eight-GPU DCP=2/4/8 matrix.
+# Dense and packed-varlen DCP correctness/benchmark entry points use CUDA Graph
+# by default. Capture includes NCCL and the optional ours two-stream fork/join;
+# each graph is closed before process-group destruction. Pass --no-cuda-graph
+# for the eager fallback. This Slurm file requests four GPUs, so these examples
+# use TP=4/DCP=4; README.md carries the complete eight-GPU DCP=2/4/8 matrix.
+# PYTHONPATH=. torchrun --standalone --nproc_per_node=4 \
+#     scripts/test_min_fa3/test_min_fa3_dcp.py \
+#     --qhead 32 --kvhead 2 --tp-size 4 --dcp-sizes 2 \
+#     --sq 2,8 --num-splits 0,1,2 --cuda-graph
 # PYTHONPATH=. torchrun --standalone --nproc_per_node=4 \
 #     scripts/test_min_fa3/test_min_fa3_dcp_varlen.py \
 #     --b 3 --sq 1,8,32 --seqlen 129,258,515 \
 #     --qhead 32 --kvhead 1 --headdim 128 --tp-size 4 \
-#     --dcp-sizes 2,4 --num-splits 0,1,2,8
+#     --dcp-sizes 2,4 --num-splits 0,1,2,8 --cuda-graph
 # PYTHONPATH=. torchrun --standalone --nproc_per_node=4 \
-#     scripts/legacy_benchmark/benchmark_dcp_varlen.py \
+#     dcp_test/benchmark_dcp_varlen.py \
 #     --b 3 --sq 1,8,32 --seqlen 129,1024,3131 \
 #     --qhead 32 --kvhead 1 --headdim 128 --tp-size 4 --dcp-size 4 \
 #     --workload chunk --implementations ours,vllm,sglang,full \
-#     --num-splits 0 --warmup 2 --iters 5
+#     --num-splits 0 --warmup 2 --iters 5 --cuda-graph
 # PYTHONPATH=. torchrun --standalone --nproc_per_node=4 \
-#     scripts/legacy_benchmark/benchmark_dcp_varlen.py \
+#     dcp_test/benchmark_dcp_varlen.py \
 #     --b 3 --sq 1 --seqlen 129,1024,3131 \
 #     --qhead 32 --kvhead 1 --headdim 128 --tp-size 4 --dcp-size 4 \
 #     --workload decode --implementations ours,vllm,sglang,full \
-#     --num-splits 2 --warmup 2 --iters 5
+#     --num-splits 2 --warmup 2 --iters 5 --cuda-graph
 # PYTHONPATH=. nsys profile -t cuda,nvtx -o dcp_varlen_stage_smoke \
 #     torchrun --standalone --nproc_per_node=4 \
-#     scripts/legacy_benchmark/benchmark_dcp_varlen.py \
+#     dcp_test/benchmark_dcp_varlen.py \
 #     --b 3 --sq 1,8,32 --seqlen 129,1024,3131 \
 #     --qhead 32 --kvhead 1 --headdim 128 --tp-size 4 --dcp-size 4 \
 #     --workload chunk --implementations ours --num-splits 2 \
-#     --warmup 1 --iters 2
+#     --warmup 1 --iters 2 --cuda-graph
 
 # Remote-load benchmark note:
 # This script requests 2 GPUs, so benchmark_parallel_remote_load.py can be run with:
