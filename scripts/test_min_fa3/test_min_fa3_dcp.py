@@ -1,43 +1,84 @@
+"""Multi-GPU correctness matrix for production-shaped GQA DCP topologies."""
+
+from __future__ import annotations
+
 import argparse
-import math
+import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Iterable
 
 import torch
 import torch.distributed as dist
 
 import min_fa3_op
-from min_fa3_dcp import DCPAttentionRunner
+from min_fa3_dcp import (
+    DCPAttentionRunner,
+    SGLangDCPAttentionRunner,
+    VLLMDCPAttentionRunner,
+)
+from min_fa3_dcp_topology import DCPTopology, make_topology, validate_topology
+
+
+METHOD_OURS_OVERLAP = "ours_overlap"
+METHOD_OURS_NO_OVERLAP = "ours_no_overlap"
+METHOD_VLLM = "vllm_ag_rs_min_fa3"
+METHOD_SGLANG = "sglang_mha_ag_ar_min_fa3"
 
 
 @dataclass(frozen=True)
 class DCPGroup:
     size: int
     start_rank: int
+    ranks: tuple[int, ...]
     process_group: dist.ProcessGroup
 
 
+@dataclass
+class CorrectnessInputs:
+    q_local: torch.Tensor
+    k_history_full: torch.Tensor
+    v_history_full: torch.Tensor
+    k_history_local: torch.Tensor
+    v_history_local: torch.Tensor
+    history_lengths: list[int]
+    history_lengths_local: torch.Tensor
+    k_chunk: torch.Tensor | None = None
+    v_chunk: torch.Tensor | None = None
+    k_reference: torch.Tensor | None = None
+    v_reference: torch.Tensor | None = None
+    reference_lengths: torch.Tensor | None = None
+
+
 def parse_int_list(spec: str, name: str) -> list[int]:
-    values = [int(token.strip()) for token in spec.split(",") if token.strip()]
+    try:
+        values = [int(token.strip()) for token in spec.split(",") if token.strip()]
+    except ValueError as error:
+        raise SystemExit(f"{name} must be a comma-separated integer list") from error
     if not values:
         raise SystemExit(f"{name} must contain at least one integer")
     return values
 
 
-def make_dcp_groups(sizes: list[int], device: torch.device) -> list[DCPGroup]:
+def make_dcp_groups(sizes: Iterable[int], device: torch.device) -> dict[int, DCPGroup]:
     world_size = dist.get_world_size()
-    rank = dist.get_rank()
-    local_groups: list[DCPGroup] = []
-    for size in sizes:
+    global_rank = dist.get_rank()
+    local_groups: dict[int, DCPGroup] = {}
+    for size in sorted(set(sizes)):
         if size <= 0 or size > world_size or world_size % size:
             raise SystemExit(
                 f"every DCP size must divide torchrun world size {world_size}, got {size}"
             )
         for start_rank in range(0, world_size, size):
-            ranks = list(range(start_rank, start_rank + size))
-            process_group = dist.new_group(ranks, backend="nccl", device_id=device)
-            if start_rank <= rank < start_rank + size:
-                local_groups.append(DCPGroup(size, start_rank, process_group))
+            ranks = tuple(range(start_rank, start_rank + size))
+            process_group = dist.new_group(
+                list(ranks), backend="nccl", device_id=device
+            )
+            if global_rank in ranks:
+                local_groups[size] = DCPGroup(
+                    size, start_rank, ranks, process_group
+                )
     return local_groups
 
 
@@ -53,283 +94,362 @@ def randn_bf16(
     return torch.randn(shape, generator=generator, device=device, dtype=torch.bfloat16)
 
 
-def shard_interleaved(
-    tensor: torch.Tensor, rank: int, world_size: int
-) -> torch.Tensor:
-    return tensor[:, rank::world_size].contiguous()
+def local_length(global_length: int, dcp_rank: int, dcp_size: int) -> int:
+    return max(0, (global_length + dcp_size - 1 - dcp_rank) // dcp_size)
 
 
-def local_lengths(
-    global_lengths: list[int], rank: int, world_size: int, device: torch.device
-) -> torch.Tensor:
-    values = [
-        max(0, (length + world_size - 1 - rank) // world_size)
-        for length in global_lengths
-    ]
-    return torch.tensor(values, device=device, dtype=torch.int32)
-
-
-def local_q_heads(q_group: torch.Tensor, rank: int, h_local: int) -> torch.Tensor:
-    return q_group[:, :, rank * h_local : (rank + 1) * h_local].contiguous()
-
-
-def full_kvcache_reference(
-    q_local: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    cache_lengths: list[int],
-    num_splits: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    lengths = torch.tensor(cache_lengths, device=q_local.device, dtype=torch.int32)
-    return min_fa3_op.forward_kvcache(
-        q_local,
-        k_cache,
-        v_cache,
-        lengths,
-        num_splits=num_splits,
-        return_lse=True,
-    )
-
-
-def torch_chunk_reference(
-    q: torch.Tensor,
+def make_full_chunk_cache(
     k_history: torch.Tensor,
     v_history: torch.Tensor,
     history_lengths: list[int],
     k_chunk: torch.Tensor,
     v_chunk: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    b, sq, hq, d = q.shape
-    repeats = hq // k_history.shape[2]
-    outputs: list[torch.Tensor] = []
-    lses: list[torch.Tensor] = []
-    for batch_idx in range(b):
-        history_len = history_lengths[batch_idx]
-        k = torch.cat((k_history[batch_idx, :history_len], k_chunk[batch_idx]), dim=0)
-        v = torch.cat((v_history[batch_idx, :history_len], v_chunk[batch_idx]), dim=0)
-        k = k.float().repeat_interleave(repeats, dim=1)
-        v = v.float().repeat_interleave(repeats, dim=1)
-        scores = torch.einsum("qhd,khd->hqk", q[batch_idx].float(), k) / math.sqrt(d)
-        query_idx = torch.arange(sq, device=q.device)[:, None]
-        key_idx = torch.arange(history_len + sq, device=q.device)[None, :]
-        scores.masked_fill_(key_idx > history_len + query_idx, -torch.inf)
-        probabilities = torch.softmax(scores, dim=-1)
-        outputs.append(torch.einsum("hqk,khd->qhd", probabilities, v))
-        lses.append(torch.logsumexp(scores, dim=-1))
-    return torch.stack(outputs), torch.stack(lses)
-
-
-def make_chunk_full_cache(
-    k_history: torch.Tensor,
-    v_history: torch.Tensor,
-    history_lengths: list[int],
-    k_chunk: torch.Tensor,
-    v_chunk: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-    b, sq, h_kv, d = k_chunk.shape
-    capacity = k_history.shape[1] + sq
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    b, sq, _, d = k_chunk.shape
+    capacity = max(history_lengths) + sq
     k_full = torch.zeros(
-        (b, capacity, h_kv, d), device=k_history.device, dtype=k_history.dtype
+        (b, capacity, 1, d), device=k_history.device, dtype=torch.bfloat16
     )
     v_full = torch.zeros_like(k_full)
-    lengths: list[int] = []
-    for batch_idx, history_len in enumerate(history_lengths):
-        k_full[batch_idx, :history_len].copy_(k_history[batch_idx, :history_len])
-        v_full[batch_idx, :history_len].copy_(v_history[batch_idx, :history_len])
-        k_full[batch_idx, history_len : history_len + sq].copy_(k_chunk[batch_idx])
-        v_full[batch_idx, history_len : history_len + sq].copy_(v_chunk[batch_idx])
-        lengths.append(history_len + sq)
-    return k_full, v_full, lengths
-
-
-def assert_attention_close(
-    out: torch.Tensor,
-    lse: torch.Tensor,
-    out_ref: torch.Tensor,
-    lse_ref: torch.Tensor,
-    label: str,
-) -> None:
-    torch.testing.assert_close(
-        out.float(), out_ref.float(), atol=3e-2, rtol=3e-2, msg=lambda msg: f"{label}: {msg}"
-    )
-    torch.testing.assert_close(
-        lse, lse_ref, atol=3e-3, rtol=3e-3, msg=lambda msg: f"{label}: {msg}"
+    full_lengths: list[int] = []
+    for batch_idx, history_length in enumerate(history_lengths):
+        k_full[batch_idx, :history_length].copy_(
+            k_history[batch_idx, :history_length]
+        )
+        v_full[batch_idx, :history_length].copy_(
+            v_history[batch_idx, :history_length]
+        )
+        k_full[batch_idx, history_length : history_length + sq].copy_(
+            k_chunk[batch_idx]
+        )
+        v_full[batch_idx, history_length : history_length + sq].copy_(
+            v_chunk[batch_idx]
+        )
+        full_lengths.append(history_length + sq)
+    return (
+        k_full,
+        v_full,
+        torch.tensor(full_lengths, device=k_history.device, dtype=torch.int32),
     )
 
 
-def run_decode_case(
-    runner: DCPAttentionRunner,
-    start_rank: int,
-    h_kv: int,
-    num_splits: int,
-    h_local: int,
-    device: torch.device,
-) -> None:
-    b, sq, d = 2, 1, 128
-    capacity = 263
-    lengths = [257, 262]
-    generator = make_generator(
-        1000 + start_rank * 97 + h_kv * 11 + num_splits, device
-    )
-    q_group = randn_bf16(
-        (b, sq, h_local * runner.world_size, d), generator, device
-    )
-    q_local = local_q_heads(q_group, runner.rank, h_local)
-    k_full = randn_bf16((b, capacity, h_kv, d), generator, device)
-    v_full = randn_bf16((b, capacity, h_kv, d), generator, device)
-    k_local = shard_interleaved(k_full, runner.rank, runner.world_size)
-    v_local = shard_interleaved(v_full, runner.rank, runner.world_size)
-    lengths_local = local_lengths(lengths, runner.rank, runner.world_size, device)
-
-    out_ref, lse_ref = full_kvcache_reference(
-        q_local, k_full, v_full, lengths, num_splits
-    )
-    out, lse = runner.forward_decode(
-        q_local,
-        k_local,
-        v_local,
-        lengths_local,
-        num_splits=num_splits,
-        return_lse=True,
-    )
-    assert_attention_close(
-        out,
-        lse,
-        out_ref,
-        lse_ref,
-        f"decode N={runner.world_size} Hkv={h_kv} split={num_splits}",
-    )
-
-
-def run_chunk_case(
-    runner: DCPAttentionRunner,
-    start_rank: int,
+def build_inputs(
+    topology: DCPTopology,
+    workload: str,
     sq: int,
-    h_kv: int,
     num_splits: int,
-    h_local: int,
+    tp_rank: int,
     device: torch.device,
-    *,
-    repeat_overlap: int,
-    nondefault_stream: bool,
-    check_torch_reference: bool,
-) -> None:
+) -> CorrectnessInputs:
     b, d = 2, 128
-    history_capacity = 259
-    history_lengths = [129, 258]
-    generator = make_generator(
-        2000 + start_rank * 193 + sq * 17 + h_kv * 7 + num_splits, device
+    history_lengths = [257, 262] if workload == "decode" else [129, 258]
+    history_capacity = max(history_lengths) + 1
+    seed = (
+        31013
+        + topology.q_heads * 1009
+        + topology.kv_heads * 503
+        + topology.dcp_size * 211
+        + sq * 53
+        + num_splits * 17
+        + (1 if workload == "chunk" else 0)
     )
-    q_group = randn_bf16(
-        (b, sq, h_local * runner.world_size, d), generator, device
+    q_generator = make_generator(seed + tp_rank * 100_003, device)
+    q_local = randn_bf16(
+        (b, sq, topology.q_heads_local, d), q_generator, device
     )
-    q_local = local_q_heads(q_group, runner.rank, h_local)
-    k_history = randn_bf16((b, history_capacity, h_kv, d), generator, device)
-    v_history = randn_bf16((b, history_capacity, h_kv, d), generator, device)
-    k_chunk = randn_bf16((b, sq, h_kv, d), generator, device)
-    v_chunk = randn_bf16((b, sq, h_kv, d), generator, device)
-    k_local = shard_interleaved(k_history, runner.rank, runner.world_size)
-    v_local = shard_interleaved(v_history, runner.rank, runner.world_size)
-    lengths_local = local_lengths(
-        history_lengths, runner.rank, runner.world_size, device
+    kv_head = topology.kv_head_for_rank(tp_rank)
+    kv_generator = make_generator(seed + kv_head * 1_000_003, device)
+    k_history_full = randn_bf16(
+        (b, history_capacity, 1, d), kv_generator, device
     )
-    k_full, v_full, full_lengths = make_chunk_full_cache(
-        k_history, v_history, history_lengths, k_chunk, v_chunk
+    v_history_full = randn_bf16(
+        (b, history_capacity, 1, d), kv_generator, device
     )
-    out_ref, lse_ref = full_kvcache_reference(
-        q_local, k_full, v_full, full_lengths, num_splits
+    dcp_rank = topology.dcp_rank(tp_rank)
+    k_history_local = k_history_full[:, dcp_rank::topology.dcp_size].contiguous()
+    v_history_local = v_history_full[:, dcp_rank::topology.dcp_size].contiguous()
+    history_lengths_local = torch.tensor(
+        [
+            local_length(length, dcp_rank, topology.dcp_size)
+            for length in history_lengths
+        ],
+        device=device,
+        dtype=torch.int32,
     )
-    label = f"chunk N={runner.world_size} Sq={sq} Hkv={h_kv} split={num_splits}"
+    inputs = CorrectnessInputs(
+        q_local=q_local,
+        k_history_full=k_history_full,
+        v_history_full=v_history_full,
+        k_history_local=k_history_local,
+        v_history_local=v_history_local,
+        history_lengths=history_lengths,
+        history_lengths_local=history_lengths_local,
+    )
+    if workload == "decode":
+        inputs.k_reference = k_history_full
+        inputs.v_reference = v_history_full
+        inputs.reference_lengths = torch.tensor(
+            history_lengths, device=device, dtype=torch.int32
+        )
+        return inputs
 
-    sequential = runner.forward_chunk_prefill(
-        q_local,
-        k_local,
-        v_local,
-        lengths_local,
+    k_chunk = randn_bf16((b, sq, 1, d), kv_generator, device)
+    v_chunk = randn_bf16((b, sq, 1, d), kv_generator, device)
+    inputs.k_chunk = k_chunk
+    inputs.v_chunk = v_chunk
+    (
+        inputs.k_reference,
+        inputs.v_reference,
+        inputs.reference_lengths,
+    ) = make_full_chunk_cache(
+        k_history_full,
+        v_history_full,
+        history_lengths,
         k_chunk,
         v_chunk,
-        num_splits=num_splits,
-        return_lse=True,
-        overlap_q_allgather=False,
     )
-    assert_attention_close(*sequential, out_ref, lse_ref, f"{label} sequential")
+    return inputs
 
-    for repeat_idx in range(repeat_overlap):
-        overlapped = runner.forward_chunk_prefill(
-            q_local,
-            k_local,
-            v_local,
-            lengths_local,
-            k_chunk,
-            v_chunk,
-            num_splits=num_splits,
-            return_lse=True,
-            overlap_q_allgather=True,
-        )
-        assert_attention_close(
-            *overlapped, out_ref, lse_ref, f"{label} overlap repeat={repeat_idx}"
-        )
 
-    if nondefault_stream:
-        stream = torch.cuda.Stream(device=device)
-        with torch.cuda.stream(stream):
-            side_stream_result = runner.forward_chunk_prefill(
-                q_local,
-                k_local,
-                v_local,
-                lengths_local,
-                k_chunk,
-                v_chunk,
+def global_error_stats(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    atol: float,
+    rtol: float,
+) -> dict[str, float | bool]:
+    difference = (actual.float() - expected.float()).abs()
+    max_error = difference.max().to(torch.float64)
+    error_sum = difference.sum(dtype=torch.float64)
+    count = torch.tensor(difference.numel(), device=actual.device, dtype=torch.float64)
+    close = torch.tensor(
+        int(torch.isclose(actual.float(), expected.float(), atol=atol, rtol=rtol).all()),
+        device=actual.device,
+        dtype=torch.int32,
+    )
+    dist.all_reduce(max_error, op=dist.ReduceOp.MAX)
+    dist.all_reduce(error_sum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(count, op=dist.ReduceOp.SUM)
+    dist.all_reduce(close, op=dist.ReduceOp.MIN)
+    return {
+        "max_abs_error": float(max_error.item()),
+        "mean_abs_error": float((error_sum / count).item()),
+        "close": bool(close.item()),
+    }
+
+
+def check_result(
+    method: str,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    reference_output: torch.Tensor,
+    reference_lse: torch.Tensor,
+) -> dict[str, object]:
+    if output.shape != reference_output.shape or output.dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"{method} output contract failed: shape={tuple(output.shape)}, "
+            f"dtype={output.dtype}, expected_shape={tuple(reference_output.shape)}, "
+            "expected_dtype=torch.bfloat16"
+        )
+    if lse.shape != reference_lse.shape or lse.dtype != torch.float32:
+        raise RuntimeError(
+            f"{method} LSE contract failed: shape={tuple(lse.shape)}, "
+            f"dtype={lse.dtype}, expected_shape={tuple(reference_lse.shape)}, "
+            "expected_dtype=torch.float32"
+        )
+    output_stats = global_error_stats(output, reference_output, 3.0e-2, 3.0e-2)
+    lse_stats = global_error_stats(lse, reference_lse, 3.0e-3, 3.0e-3)
+    if not output_stats["close"] or not lse_stats["close"]:
+        raise RuntimeError(
+            f"{method} correctness failed: output={output_stats}, lse={lse_stats}"
+        )
+    return {"output": output_stats, "lse": lse_stats}
+
+
+def method_calls(
+    workload: str,
+    inputs: CorrectnessInputs,
+    runners: dict[str, DCPAttentionRunner],
+    num_splits: int,
+) -> list[tuple[str, Callable[[], tuple[torch.Tensor, torch.Tensor]]]]:
+    ours = runners[METHOD_OURS_OVERLAP]
+    vllm = runners[METHOD_VLLM]
+    sglang = runners[METHOD_SGLANG]
+    if workload == "decode":
+        return [
+            (
+                METHOD_OURS_OVERLAP,
+                lambda: ours.forward_decode(
+                    inputs.q_local,
+                    inputs.k_history_local,
+                    inputs.v_history_local,
+                    inputs.history_lengths_local,
+                    num_splits=num_splits,
+                    return_lse=True,
+                ),
+            ),
+            (
+                METHOD_VLLM,
+                lambda: vllm.forward_decode(
+                    inputs.q_local,
+                    inputs.k_history_local,
+                    inputs.v_history_local,
+                    inputs.history_lengths_local,
+                    num_splits=num_splits,
+                    return_lse=True,
+                ),
+            ),
+            (
+                METHOD_SGLANG,
+                lambda: sglang.forward_decode(
+                    inputs.q_local,
+                    inputs.k_history_local,
+                    inputs.v_history_local,
+                    inputs.history_lengths_local,
+                    num_splits=num_splits,
+                    return_lse=True,
+                ),
+            ),
+        ]
+
+    assert inputs.k_chunk is not None and inputs.v_chunk is not None
+    return [
+        (
+            METHOD_OURS_OVERLAP,
+            lambda: ours.forward_chunk_prefill(
+                inputs.q_local,
+                inputs.k_history_local,
+                inputs.v_history_local,
+                inputs.history_lengths_local,
+                inputs.k_chunk,
+                inputs.v_chunk,
                 num_splits=num_splits,
                 return_lse=True,
                 overlap_q_allgather=True,
-            )
-            assert_attention_close(
-                *side_stream_result, out_ref, lse_ref, f"{label} nondefault stream"
-            )
-        stream.synchronize()
+            ),
+        ),
+        (
+            METHOD_OURS_NO_OVERLAP,
+            lambda: ours.forward_chunk_prefill(
+                inputs.q_local,
+                inputs.k_history_local,
+                inputs.v_history_local,
+                inputs.history_lengths_local,
+                inputs.k_chunk,
+                inputs.v_chunk,
+                num_splits=num_splits,
+                return_lse=True,
+                overlap_q_allgather=False,
+            ),
+        ),
+        (
+            METHOD_VLLM,
+            lambda: vllm.forward_chunk_prefill(
+                inputs.q_local,
+                inputs.k_history_local,
+                inputs.v_history_local,
+                inputs.history_lengths_local,
+                inputs.k_chunk,
+                inputs.v_chunk,
+                num_splits=num_splits,
+                return_lse=True,
+            ),
+        ),
+        (
+            METHOD_SGLANG,
+            lambda: sglang.forward_chunk_prefill(
+                inputs.q_local,
+                inputs.k_history_local,
+                inputs.v_history_local,
+                inputs.history_lengths_local,
+                inputs.k_chunk,
+                inputs.v_chunk,
+                num_splits=num_splits,
+                return_lse=True,
+            ),
+        ),
+    ]
 
-    if check_torch_reference:
-        torch_out, torch_lse = torch_chunk_reference(
-            q_local,
-            k_history,
-            v_history,
-            history_lengths,
-            k_chunk,
-            v_chunk,
-        )
-        assert_attention_close(out_ref, lse_ref, torch_out, torch_lse, f"{label} FP32")
+
+def run_case(
+    topology: DCPTopology,
+    workload: str,
+    sq: int,
+    num_splits: int,
+    runners: dict[str, DCPAttentionRunner],
+    repeat: int,
+    device: torch.device,
+) -> dict[str, object]:
+    inputs = build_inputs(
+        topology, workload, sq, num_splits, dist.get_rank(), device
+    )
+    assert inputs.k_reference is not None
+    assert inputs.v_reference is not None
+    assert inputs.reference_lengths is not None
+    reference_output, reference_lse = min_fa3_op.forward_kvcache(
+        inputs.q_local,
+        inputs.k_reference,
+        inputs.v_reference,
+        inputs.reference_lengths,
+        num_splits=num_splits,
+        return_lse=True,
+        is_causal=workload == "chunk",
+    )
+    methods: dict[str, object] = {}
+    for method, call in method_calls(workload, inputs, runners, num_splits):
+        stats: dict[str, object] | None = None
+        if method == METHOD_OURS_NO_OVERLAP and repeat > 1:
+            caller_stream = torch.cuda.current_stream(device)
+            alternate_stream = torch.cuda.Stream(device=device)
+            queued_results: list[tuple[torch.Tensor, torch.Tensor]] = []
+            for repeat_idx in range(repeat):
+                stream = caller_stream if repeat_idx % 2 == 0 else alternate_stream
+                with torch.cuda.stream(stream):
+                    queued_results.append(call())
+            caller_stream.wait_stream(alternate_stream)
+            for output, lse in queued_results:
+                stats = check_result(
+                    method, output, lse, reference_output, reference_lse
+                )
+        else:
+            for _ in range(repeat):
+                output, lse = call()
+                stats = check_result(
+                    method, output, lse, reference_output, reference_lse
+                )
+        assert stats is not None
+        methods[method] = stats
+    return {
+        "status": "ok",
+        "topology": topology.to_dict(),
+        "workload": workload,
+        "sq": sq,
+        "ragged_history_lengths": inputs.history_lengths,
+        "num_splits": num_splits,
+        "repeat": repeat,
+        "methods": methods,
+    }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Multi-GPU correctness test for minimal FA3 DCP decode/chunk prefill."
+        description="Multi-GPU correctness matrix for min FA3 DCP orchestrations."
     )
+    parser.add_argument("--qhead", type=str, default="32,64")
+    parser.add_argument("--kvhead", type=str, default="2,4")
+    parser.add_argument("--tp-size", type=int, default=8)
+    parser.add_argument("--dcp-sizes", type=str, default="2,4,8")
+    parser.add_argument("--sq", type=str, default="2,8,32,128")
+    parser.add_argument("--num-splits", type=str, default="0,1,2")
     parser.add_argument(
-        "--dcp-sizes",
-        type=str,
-        default="1,2,4,8",
-        help="Comma-separated subgroup sizes; every size must divide torchrun world size",
-    )
-    parser.add_argument(
-        "--sq", type=str, default="2,8,32,128", help="Chunk query lengths"
-    )
-    parser.add_argument(
-        "--num-splits",
-        type=str,
-        default="0,1,2",
-        help="0=auto, 1=NoSplit, values >=2 force Split",
-    )
-    parser.add_argument(
-        "--kvheads", type=str, default="1,2", help="MQA/GQA KV-head counts"
-    )
-    parser.add_argument("--qhead-local", type=int, default=8)
-    parser.add_argument(
-        "--repeat-overlap",
+        "--repeat",
         type=int,
-        default=1,
-        help="Ordinary overlap repetitions; one representative case is always repeated five times",
+        default=3,
+        help=(
+            "Repeat the largest chunk case across alternating compute streams "
+            "to validate workspace reuse"
+        ),
     )
+    parser.add_argument("--output-json", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -340,62 +460,130 @@ def main() -> None:
     device = torch.device("cuda", local_rank)
     dist.init_process_group("nccl", device_id=device)
     try:
+        world_size = dist.get_world_size()
+        global_rank = dist.get_rank()
         if torch.cuda.get_device_capability(device) != (9, 0):
+            raise SystemExit("This test requires SM90 Hopper")
+        if args.tp_size != world_size:
             raise SystemExit(
-                f"This test requires SM90 Hopper, got {torch.cuda.get_device_capability(device)}"
+                f"--tp-size ({args.tp_size}) must equal torchrun world size ({world_size})"
             )
+        if args.repeat <= 0:
+            raise SystemExit("--repeat must be positive")
+
+        q_heads = parse_int_list(args.qhead, "--qhead")
+        kv_heads = parse_int_list(args.kvhead, "--kvhead")
         dcp_sizes = parse_int_list(args.dcp_sizes, "--dcp-sizes")
         sq_values = parse_int_list(args.sq, "--sq")
         split_values = parse_int_list(args.num_splits, "--num-splits")
-        kv_heads = parse_int_list(args.kvheads, "--kvheads")
-        if args.qhead_local <= 0 or any(
-            h_kv <= 0 or args.qhead_local % h_kv for h_kv in kv_heads
-        ):
-            raise SystemExit("--qhead-local must be positive and divisible by every --kvheads value")
+        if any(value <= 0 for value in q_heads + kv_heads + sq_values):
+            raise SystemExit("head counts and Sq values must be positive")
         if any(value < 0 or value > 128 for value in split_values):
             raise SystemExit("--num-splits values must be in [0, 128]")
-        if any(sq <= 0 for sq in sq_values):
-            raise SystemExit("--sq values must be positive")
 
-        local_groups = make_dcp_groups(dcp_sizes, device)
-        for group_info in local_groups:
-            runner = DCPAttentionRunner(group_info.process_group)
-            for h_kv in kv_heads:
-                for num_splits in split_values:
-                    run_decode_case(
-                        runner,
-                        group_info.start_rank,
-                        h_kv,
+        groups = make_dcp_groups(dcp_sizes, device)
+        topologies: list[DCPTopology] = []
+        skipped: list[dict[str, object]] = []
+        for hq in q_heads:
+            for hkv in kv_heads:
+                for dcp_size in dcp_sizes:
+                    issues = validate_topology(hq, hkv, args.tp_size, dcp_size)
+                    if issues:
+                        skipped.append(
+                            {
+                                "status": "skipped_topology",
+                                "q_heads": hq,
+                                "kv_heads": hkv,
+                                "tp_size": args.tp_size,
+                                "dcp_size": dcp_size,
+                                "reasons": [issue.to_dict() for issue in issues],
+                            }
+                        )
+                    else:
+                        topologies.append(
+                            make_topology(hq, hkv, args.tp_size, dcp_size)
+                        )
+
+        runner_cache: dict[int, dict[str, DCPAttentionRunner]] = {}
+
+        def runners_for(dcp_size: int) -> dict[str, DCPAttentionRunner]:
+            cached = runner_cache.get(dcp_size)
+            if cached is None:
+                group = groups[dcp_size].process_group
+                cached = {
+                    METHOD_OURS_OVERLAP: DCPAttentionRunner(group),
+                    METHOD_VLLM: VLLMDCPAttentionRunner(group),
+                    METHOD_SGLANG: SGLangDCPAttentionRunner(group),
+                }
+                runner_cache[dcp_size] = cached
+            return cached
+
+        cases: list[dict[str, object]] = []
+        for topology in topologies:
+            expected_group = topology.dcp_group_ranks(global_rank)
+            actual_group = groups[topology.dcp_size].ranks
+            if actual_group != expected_group:
+                raise RuntimeError(
+                    f"DCP group {actual_group} crosses the topology's KV replica "
+                    f"boundary; expected {expected_group} for TP rank {global_rank}"
+                )
+            runners = runners_for(topology.dcp_size)
+            for num_splits in split_values:
+                cases.append(
+                    run_case(
+                        topology,
+                        "decode",
+                        1,
                         num_splits,
-                        args.qhead_local,
+                        runners,
+                        1,
                         device,
                     )
-                    for sq in sq_values:
-                        representative = (
-                            group_info.size == max(dcp_sizes)
-                            and sq == max(sq_values)
-                            and h_kv == kv_heads[-1]
-                            and num_splits == split_values[-1]
-                        )
-                        run_chunk_case(
-                            runner,
-                            group_info.start_rank,
+                )
+                for sq in sq_values:
+                    representative = (
+                        topology == topologies[-1]
+                        and num_splits == split_values[-1]
+                        and sq == sq_values[-1]
+                    )
+                    cases.append(
+                        run_case(
+                            topology,
+                            "chunk",
                             sq,
-                            h_kv,
                             num_splits,
-                            args.qhead_local,
+                            runners,
+                            args.repeat if representative else 1,
                             device,
-                            repeat_overlap=max(args.repeat_overlap, 5 if representative else 1),
-                            nondefault_stream=representative,
-                            check_torch_reference=sq == min(sq_values) and num_splits == 1,
                         )
-            dist.barrier(group=group_info.process_group)
-            if runner.rank == 0:
+                    )
+            if global_rank == 0:
                 print(
-                    f"DCP correctness: ok (size={group_info.size}, "
-                    f"Sq={sq_values}, Hkv={kv_heads}, splits={split_values})",
+                    f"DCP correctness ok: Hq={topology.q_heads} "
+                    f"Hkv={topology.kv_heads} DCP={topology.dcp_size}",
                     flush=True,
                 )
+
+        result = {
+            "comparison_scope": (
+                "Same min_fa3_op.forward_kvcache kernel; DCP orchestration only."
+            ),
+            "world_size": world_size,
+            "cases": cases,
+            "skipped_topologies": skipped,
+        }
+        if global_rank == 0:
+            if args.output_json is not None:
+                args.output_json.parent.mkdir(parents=True, exist_ok=True)
+                args.output_json.write_text(
+                    json.dumps(result, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            print(
+                f"DCP correctness matrix: ok ({len(cases)} cases, "
+                f"{len(topologies)} valid topologies, {len(skipped)} skipped)",
+                flush=True,
+            )
         dist.barrier()
     finally:
         dist.destroy_process_group()

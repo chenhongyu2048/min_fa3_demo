@@ -145,14 +145,20 @@ attention.
 
 ## Head-sharded decode context parallel attention
 
-`min_fa3_dcp.DCPAttentionRunner` is a standalone Python/Triton DCP baseline on
-top of the dense KV-cache sibling. Within one NCCL process group, Q/output
-heads are rank-sharded, historical KV positions are interleaved across ranks,
-and current chunk K/V is replicated. `Hq_local` must be divisible by the
-group-wide KV-head count.
+`min_fa3_dcp` provides three standalone Python/Triton DCP runners on top of
+the same dense KV-cache sibling. `DCPAttentionRunner` is the local overlapped
+implementation. `VLLMDCPAttentionRunner` copies and trims vLLM's default
+`ag_rs` path at commit `a89015c6df8eeb37a843b717c97a5be1355de83d`.
+`SGLangDCPAttentionRunner` copies and trims SGLang's MHA DCP path at commit
+`8d6549bc4039d33635844495d86684677a4f0df8`. Neither comparison runner imports
+or installs its source serving runtime.
 
 ```python
-from min_fa3_dcp import DCPAttentionRunner
+from min_fa3_dcp import (
+    DCPAttentionRunner,
+    SGLangDCPAttentionRunner,
+    VLLMDCPAttentionRunner,
+)
 
 runner = DCPAttentionRunner(process_group)
 out = runner.forward_decode(
@@ -171,27 +177,46 @@ Decode inputs use `q_local: [B, 1, Hq_local, 128]`. Chunk inputs use
 `k_chunk/v_chunk: [B, Sq, Hkv_group, 128]`. Both methods optionally return
 natural-log FP32 LSE with shape `[B, Hq_local, Sq]`.
 
-The runner is intentionally limited to SM90, contiguous CUDA BF16 tensors,
-head dimension 128, and NCCL group sizes 1 through 8. All ranks in a group
-must use the same `B`, `Sq`, `Hq_local`, and `Hkv_group`, with
-`Hq_local % Hkv_group == 0`; replicated chunk K/V must also contain identical
-values on every rank. For decode, the sequence-sharded local cache already
-contains the current token only on its position-owner rank. Chunk history
-contains only rows preceding the current chunk; cache insertion remains
-outside this API.
+Decode assumes that the current token's K/V have already been written to the
+last valid position of `k_cache_local/v_cache_local` before any runner is
+called. Consequently, the local cache attention includes the current token's
+self-attention term; there is no separate current-token attention or cache
+append inside these runners. The local, vLLM, and SGLang same-kernel baselines
+all use this contract. They compare DCP communication, LSE correction, output
+reduction, layout, and scheduling after the cache update, not KV-cache
+insertion strategy. Accordingly, benchmark decode `Sk` is the inclusive cache
+length containing the current token, while chunk history length excludes the
+separately supplied current chunk.
 
-Decode all-gathers Q heads, runs FA3 over each rank's KV position shard,
-all-gathers partial LSE, corrects each BF16 partial output, and reduce-scatters
-output heads. Chunk prefill overlaps Q all-gather with local causal chunk
-attention, runs gathered-Q/noncausal-history attention, and stably merges the
-context and chunk states.
+The runners are intentionally limited to SM90, contiguous CUDA BF16 tensors,
+head dimension 128, and NCCL group sizes 1 through 8. The production-shaped
+comparison topology uses global model head counts with `TP > Hkv`, so every TP
+rank owns `Hq/TP` query heads and one replicated global KV head. A DCP group
+must remain inside one KV-head replica group. Replicated current chunk K/V
+must contain identical values on all ranks in that group; cache insertion
+remains outside this API.
 
-The runner owns one persistent communication stream, reusable CUDA events,
-grow-only collective/layout buffers, and outstanding NCCL work handles. Calls
-may be enqueued back-to-back, including from different current CUDA streams,
-but one runner must not be called concurrently by multiple host threads. CUDA
-Graph capture is not supported. Current chunk insertion into sharded KV cache
-is intentionally outside this attention-only API.
+All methods all-gather Q heads and run min FA3 over the local history shard.
+The local implementation fuses LSE correction with head packing and performs
+a BF16 reduce-scatter. Its overlap mode uses a communication stream and CUDA
+events to overlap chunk attention with Q all-gather; its non-overlap mode runs
+the full forward sequentially on the caller's compute stream without
+intra-forward dependency events. The vLLM path uses a separate Triton
+correction followed by BF16 reduce-scatter and a Triton state merge. The
+SGLang MHA path uses natural-log Torch `logsumexp`, FP32 scaling and full-head
+all-reduce, slices local heads, and merges chunk states in FP32 Torch before
+converting output to BF16. All methods return BF16 `[B, Sq, Hq_local, 128]`
+and optional FP32 LSE `[B, Hq_local, Sq]`.
+
+The local `DCPAttentionRunner` owns one persistent communication stream,
+reusable CUDA events, grow-only collective/layout buffers, and outstanding
+NCCL work handles for overlap/decode. Non-overlap chunk calls reuse the same
+buffers on one compute stream and retain only the completion dependency needed
+to make back-to-back calls from different current streams safe. Calls may be
+enqueued back-to-back, but one runner must not be called concurrently by
+multiple host threads. CUDA Graph capture is not supported. Current chunk
+insertion into sharded KV cache is intentionally outside this attention-only
+API.
 
 ## What was trimmed away
 
@@ -265,11 +290,13 @@ the import path.
 
 ## Test
 
-CPU-only sampler, BR-PBS, and load-balance topology-adapter tests do not
+CPU-only sampler, BR-PBS, load-balance topology-adapter, and DCP topology tests do not
 require CUDA:
 
 ```bash
-python -m unittest balancer.test_balancer ring_test.load_balance_bench.test_topology
+python -m unittest balancer.test_balancer \
+  ring_test.load_balance_bench.test_topology \
+  scripts.test_min_fa3.test_dcp_topology
 ```
 
 Fixed-layout and varlen kernel tests:
@@ -284,16 +311,19 @@ python -m scripts.test_min_fa3.test_min_fa3_kvcache \
   --qhead 8 --kvhead 2 --headdim 128 --mode all
 ```
 
-The DCP correctness suite covers subgroup sizes 1, 2, 4, and 8 in one 8-GPU
-launch. It checks MQA/GQA, automatic/NoSplit/forced Split, ragged decode,
-chunk sizes 2/8/32/128, sequential and overlapped execution, repeated
-forwards, and a non-default current stream:
+The DCP correctness suite models global TP rank, global KV-head ownership, KV
+replicas, and DCP rank. The default 8-GPU launch covers the six legal
+`Hq=32/64`, `Hkv=2/4`, `DCP=2/4` GQA topologies, ragged decode/chunk history,
+chunk sizes 2/8/32/128, `num_splits=0/1/2`, repeated forwards, both local
+overlap modes, and the pinned vLLM/SGLang runners. It compares every method
+with the complete-KV min FA3 reference and records global max/mean output and
+LSE absolute error:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 --module \
   scripts.test_min_fa3.test_min_fa3_dcp \
-  --dcp-sizes 1,2,4,8 --sq 2,8,32,128 \
-  --num-splits 0,1,2 --kvheads 1,2 --qhead-local 8
+  --qhead 32,64 --kvhead 2,4 --tp-size 8 \
+  --dcp-sizes 2,4,8 --sq 2,8,32,128 --num-splits 0,1,2
 ```
 
 Backward tests:
@@ -693,88 +723,73 @@ The bandwidth is an algorithmic effective rate, not a hardware DRAM counter;
 scheduler metadata and Split's internal FP32 partial O/LSE traffic are not
 included.
 
-The DCP attention-only benchmark compares full-KV minimal FA3, sequential DCP,
-and Q-all-gather/local-chunk-FA3 overlapped DCP. Defaults cover DCP 2/4/8,
-decode `B=1/8/32, Sk=4K/16K/64K`, and chunk
-`B=1/4/16, Sq=8/32/128, history=4K/16K/64K`:
+The DCP attention-only benchmark compares five method labels while holding the
+local attention kernel fixed: `ours_overlap`, chunk-only `ours_no_overlap`,
+`vllm_ag_rs_min_fa3`, `sglang_mha_ag_ar_min_fa3`, and
+`full_kv_min_fa3`. It uses global model head counts and defaults to `TP=8`,
+`Hq=32/64`, `Hkv=2/4`, and candidate `DCP=2/4/8`. Production topology checks
+select exactly six legal GQA combinations; every rejected combination is
+written as `skipped_topology` with structured reasons.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 --module \
   scripts.legacy_benchmark.benchmark_dcp \
-  --dcp-sizes 2,4,8 --workload both \
+  --qhead 32,64 --kvhead 2,4 --tp-size 8 --dcp-sizes 2,4,8 \
+  --implementations ours,vllm,sglang --workload both \
   --decode-b 1,8,32 --chunk-b 1,4,16 \
   --seqlen 4096,16384,65536 --sq 8,32,128 \
-  --qhead-local 8 --kvhead 1 --headdim 128
+  --headdim 128 --num-splits 0 --warmup 5 --iters 20
 ```
 
-Timing starts after Q/K/V are ready and ends when local-head attention output
-is ready on the caller's compute stream. It excludes Q/K/V and O projections,
-input/cache construction, and current-chunk cache insertion. Grow-only runner
-buffers are warmed up before samples are collected.
+The main matrix has 36 workload shapes per legal topology: decode
+`B=1/8/32, Sk=4K/16K/64K` and chunk
+`B=1/4/16, Sq=8/32/128, history=4K/16K/64K`, for 216 GQA cases. Two fixed
+`Hq=64,Hkv=1,TP=8,DCP=8` MQA controls run separately by default: decode
+`B=8,Sk=16K` and chunk `B=4,Sq=128,history=16K`. Use `--no-mqa-control` to
+omit them. MQA controls are excluded from GQA summaries.
 
-The full-KV baseline is measured in the same benchmark process. Every rank
-runs `min_fa3_op.forward_kvcache` for its `Hq_local` query heads against a
-complete replicated KV cache, with no DCP collective. For chunk prefill, the
-reference cache concatenates full history and current chunk K/V and uses
-bottom-right causal attention. CUDA events time the full minimal FA3 op with
-the same `num_splits`; cache construction is outside the interval. Thus this
-baseline measures the latency cost exchanged for DCP's KV-memory reduction,
-not one GPU redundantly computing all group-wide query heads.
+Timing starts after Q/K/V are ready and ends when BF16 local-head output is
+ready. It excludes projections, input/cache construction, and chunk cache
+insertion. The full-KV method runs each TP rank's distinct `Hq/TP` query shard
+against a complete cache for that rank's global KV head. For chunk prefill it
+concatenates full history and current chunk and runs bottom-right causal min
+FA3. This isolates the latency exchanged for KV-memory reduction.
 
-Each sample is reduced to maximum rank time before p50/p90 aggregation. The
-report includes Q all-gather/reorder, local chunk and history attention, LSE
-all-gather/correction, output reduce-scatter, state merge, end-to-end time,
-overlap hidden time/fraction, speedups, aggregate and per-GPU useful TFLOP/s,
-group-aggregate and average per-GPU logical HBM bandwidth, per-rank
-communication payload GB/s, and full/local KV bytes. The aggregate HBM metric
-sums logical traffic across the DCP group and the per-GPU metric divides that
-traffic by the group size. Both are effective bandwidths based on end-to-end
-latency, not hardware DRAM counters. The legacy `logical_effective_hbm_gbps`
-field aliases `average_logical_effective_hbm_gbps_per_gpu`.
+All DCP subgroups for a topology run concurrently. Every sample is reduced to
+the maximum over all eight global ranks before p50/p90 aggregation, and only
+global rank 0 emits a case. The JSON records full parameters, environment and
+pinned commits, topology decisions, raw samples, stage p50/p90, effective
+global-model TFLOP/s, full/local KV bytes, speedups, and method-specific
+collective payload. SGLang's output collective is modeled as an FP32 ring
+all-reduce; current/vLLM output collectives are BF16 reduce-scatter.
 
-Overlap and useful-throughput metrics use:
+Useful FLOPs and chunk KV-memory reduction use:
 
 ```text
-hidden_time = q_ag_path_ms + chunk_attention_ms - overlapped_window_ms
-hidden_fraction = hidden_time / min(q_ag_path_ms, chunk_attention_ms)
-
-decode useful FLOPs = 4 * B * Hq_group * D * Sk
-chunk useful FLOPs = 4 * B * Hq_group * D
+decode useful FLOPs = 4 * B * Hq_global * D * Sk
+chunk useful FLOPs = 4 * B * Hq_global * D
                      * (Sq * Sk_history + Sq * (Sq + 1) / 2)
-
-aggregate useful TFLOP/s = useful FLOPs / rank-max end-to-end time
-average useful TFLOP/s/GPU = aggregate useful TFLOP/s / DCP size
+effective TFLOP/s = useful FLOPs / global-rank-max latency
+KV reduction = (Sk_history + Sq)
+               / (ceil(Sk_history / DCP_size) + Sq)
 ```
 
-Logical HBM traffic includes gathered-Q reads, local K/V reads, partial BF16
-output and FP32 LSE writes, and chunk-state merge traffic. Group aggregate
-bandwidth uses the sum across ranks; average per-GPU bandwidth divides it by
-the DCP size. Sequence-sharded history KV is counted once across the group,
-while replicated current-chunk KV is counted once per rank. For chunk prefill,
-the reported logical KV-memory reduction is:
+Results default to the ignored timestamped path
+`benchmarks/results/dcp_gqa_compare_h100_8gpu_<timestamp>.json`; use
+`--output-json PATH` to select an explicit file. Summaries are grouped by
+`Hq/Hkv/DCP`, workload, batch, and context length. This is an attention-only
+DCP orchestration comparison under one min FA3 kernel, not an end-to-end
+serving-engine or native backend benchmark for vLLM or SGLang.
 
-```text
-(Sk_history + Sq) / (ceil(Sk_history / DCP_size) + Sq)
-```
-
-Derived latency ratios, throughput, and bandwidth are computed per sample
-before quantiles. Consequently a throughput p90 is the high-side throughput
-quantile, not the reciprocal of latency p90.
-
-For the representative 8-GPU overlap timeline:
+A short three-method smoke run can use:
 
 ```bash
-nsys profile --trace=cuda,nvtx --sample=none --force-overwrite=true \
-  --output=dcp_chunk_overlap \
-  torchrun --standalone --nproc_per_node=8 --module \
+torchrun --standalone --nproc_per_node=8 --module \
   scripts.legacy_benchmark.benchmark_dcp \
-  --dcp-sizes 8 --workload chunk --chunk-b 4 \
-  --seqlen 16384 --sq 128 --warmup 3 --iters 5 --profile-only
+  --qhead 32 --kvhead 2 --tp-size 8 --dcp-sizes 2 \
+  --workload both --decode-b 1 --chunk-b 1 \
+  --seqlen 4096 --sq 8 --warmup 1 --iters 3 --no-mqa-control
 ```
-
-The `dcp_profile_window` NVTX range contains per-stage ranges for Q
-all-gather, local chunk/history attention, LSE all-gather/correction, output
-reduce-scatter, and context/chunk state merge.
 
 Remote-load microbenchmark:
 
