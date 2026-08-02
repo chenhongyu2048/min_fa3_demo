@@ -14,8 +14,8 @@ collectives, and the optional communication-stream fork/join in one CUDA
 graph.  Its workspace must not be used concurrently.
 
 The module also contains standalone, copied-and-trimmed vLLM ``ag_rs`` and
-SGLang MHA runners.  All three runners invoke the same local dense or packed
-KV-cache kernel; only orchestration differs.
+``a2a`` runners plus an SGLang MHA runner.  All runners invoke the same local
+dense or packed KV-cache kernel; only orchestration differs.
 
 The TP/DCP topology validation is copied and trimmed from the GQA/MQA
 constraints in the pinned vLLM commit and the contiguous DCP group
@@ -255,6 +255,337 @@ def validate_group_ranks(
 
 
 _DCPResult = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+
+
+# Copied and trimmed from vLLM commit
+# a89015c6df8eeb37a843b717c97a5be1355de83d,
+# vllm/v1/attention/ops/dcp_alltoall.py.  The packed A2A combine arrived in
+# vLLM PR #41160; PR #45487 made the per-call allocations CUDA-Graph safe and
+# PR #47801 restored the required FP32 LSE bit-cast contract.
+def _dcp_a2a_lse_weighted_combine_reference(
+    outputs: torch.Tensor,
+    lses: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure-Torch base-e reference for the copied A2A combine."""
+    if outputs.ndim != 4 or lses.shape != outputs.shape[:3]:
+        raise ValueError("outputs must be [N, T, H, D] and lses must be [N, T, H]")
+    valid_lses = torch.where(
+        torch.isnan(lses) | torch.isinf(lses),
+        torch.full_like(lses, -float("inf")),
+        lses,
+    )
+    lse_max = valid_lses.max(dim=0).values
+    finite_max = torch.where(
+        lse_max == -float("inf"), torch.zeros_like(lse_max), lse_max
+    )
+    weights = torch.exp(valid_lses - finite_max.unsqueeze(0))
+    weights = torch.where(torch.isnan(weights), torch.zeros_like(weights), weights)
+    weight_sum = weights.sum(dim=0)
+    normalized = weights / weight_sum.clamp(min=1.0e-10).unsqueeze(0)
+    combined = (outputs * normalized.unsqueeze(-1)).sum(dim=0)
+    global_lse = torch.log(weight_sum) + finite_max
+    return combined, global_lse
+
+
+def _dcp_a2a_lse_pack_dim(output_dtype: torch.dtype) -> int:
+    bits = torch.finfo(output_dtype).bits
+    if bits == 16:
+        return 2
+    if bits == 32:
+        return 1
+    raise ValueError(f"Cannot pack fp32 LSE into output dtype {output_dtype}.")
+
+
+def _dcp_a2a_head_owner_ranges(
+    h_group: int, world_size: int
+) -> tuple[tuple[int, int], ...]:
+    if h_group <= 0 or world_size <= 0 or h_group % world_size:
+        raise ValueError(
+            f"H_group={h_group} must be positive and divisible by DCP={world_size}"
+        )
+    h_local = h_group // world_size
+    return tuple(
+        (rank * h_local, (rank + 1) * h_local) for rank in range(world_size)
+    )
+
+
+def _dcp_a2a_payload_bytes(
+    total_tokens: int,
+    h_local: int,
+    head_dim: int,
+    world_size: int,
+    element_size: int = 2,
+) -> tuple[int, int]:
+    values = (total_tokens, h_local, head_dim, world_size, element_size)
+    if any(value <= 0 for value in values):
+        raise ValueError("A2A payload dimensions and element_size must be positive")
+    per_owner = total_tokens * h_local * (head_dim + 2) * element_size
+    return world_size * per_owner, (world_size - 1) * per_owner
+
+
+@triton.jit
+def _dcp_a2a_pack_send_kernel(
+    out_ptr,
+    lse_ptr,
+    send_ptr,
+    out_stride_B,
+    out_stride_H,
+    out_stride_D,
+    lse_stride_B,
+    lse_stride_H,
+    send_stride_N,
+    send_stride_B,
+    send_stride_H,
+    send_stride_D,
+    N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    H_PER_RANK: tl.constexpr,
+    LSE_PACK_DIM: tl.constexpr,
+):
+    batch_idx = tl.program_id(0).to(tl.int64)
+    local_head_idx = tl.program_id(1).to(tl.int64)
+    d_offsets = tl.arange(0, HEAD_DIM)
+
+    for rank_idx in tl.static_range(N):
+        src_head_idx = rank_idx * H_PER_RANK + local_head_idx
+        send_base = (
+            rank_idx * send_stride_N
+            + batch_idx * send_stride_B
+            + local_head_idx * send_stride_H
+        )
+        out_offsets = (
+            batch_idx * out_stride_B
+            + src_head_idx * out_stride_H
+            + d_offsets * out_stride_D
+        )
+        tl.store(
+            send_ptr + send_base + d_offsets * send_stride_D,
+            tl.load(out_ptr + out_offsets),
+        )
+
+        lse_val = tl.load(
+            lse_ptr + batch_idx * lse_stride_B + src_head_idx * lse_stride_H
+        )
+        if LSE_PACK_DIM == 1:
+            tl.store(
+                send_ptr + send_base + HEAD_DIM * send_stride_D,
+                lse_val.to(send_ptr.dtype.element_ty),
+            )
+        else:
+            lse_bits = lse_val.to(tl.uint32, bitcast=True)
+            lo = (lse_bits & 0xFFFF).to(tl.uint16)
+            hi = ((lse_bits >> 16) & 0xFFFF).to(tl.uint16)
+            tl.store(
+                send_ptr + send_base + HEAD_DIM * send_stride_D,
+                lo.to(send_ptr.dtype.element_ty, bitcast=True),
+            )
+            tl.store(
+                send_ptr + send_base + (HEAD_DIM + 1) * send_stride_D,
+                hi.to(send_ptr.dtype.element_ty, bitcast=True),
+            )
+
+
+@triton.jit
+def _dcp_a2a_unpack_combine_kernel(
+    recv_ptr,
+    out_ptr,
+    out_lse_ptr,
+    recv_stride_N,
+    recv_stride_B,
+    recv_stride_H,
+    recv_stride_D,
+    out_stride_B,
+    out_stride_H,
+    out_stride_D,
+    out_lse_stride_B,
+    out_lse_stride_H,
+    N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_BASE_E: tl.constexpr,
+    RETURN_LSE: tl.constexpr,
+    LSE_PACK_DIM: tl.constexpr,
+):
+    batch_idx = tl.program_id(0).to(tl.int64)
+    head_idx = tl.program_id(1).to(tl.int64)
+    d_offsets = tl.arange(0, HEAD_DIM)
+
+    lse_max = -float("inf")
+    for rank_idx in tl.static_range(N):
+        recv_base = (
+            rank_idx * recv_stride_N
+            + batch_idx * recv_stride_B
+            + head_idx * recv_stride_H
+        )
+        if LSE_PACK_DIM == 1:
+            lse_val = tl.load(
+                recv_ptr + recv_base + HEAD_DIM * recv_stride_D
+            ).to(tl.float32)
+        else:
+            lo_raw = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D)
+            hi_raw = tl.load(
+                recv_ptr + recv_base + (HEAD_DIM + 1) * recv_stride_D
+            )
+            lo = lo_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            hi = hi_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            lse_val = (lo | (hi << 16)).to(tl.float32, bitcast=True)
+        lse_val = tl.where(
+            (lse_val != lse_val) | (lse_val == float("inf")),
+            -float("inf"),
+            lse_val,
+        )
+        lse_max = tl.maximum(lse_max, lse_val)
+
+    lse_max = tl.where(lse_max == -float("inf"), 0.0, lse_max)
+    lse_sum = 0.0
+    for rank_idx in tl.static_range(N):
+        recv_base = (
+            rank_idx * recv_stride_N
+            + batch_idx * recv_stride_B
+            + head_idx * recv_stride_H
+        )
+        if LSE_PACK_DIM == 1:
+            lse_val = tl.load(
+                recv_ptr + recv_base + HEAD_DIM * recv_stride_D
+            ).to(tl.float32)
+        else:
+            lo_raw = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D)
+            hi_raw = tl.load(
+                recv_ptr + recv_base + (HEAD_DIM + 1) * recv_stride_D
+            )
+            lo = lo_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            hi = hi_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            lse_val = (lo | (hi << 16)).to(tl.float32, bitcast=True)
+        lse_val = tl.where(
+            (lse_val != lse_val) | (lse_val == float("inf")),
+            -float("inf"),
+            lse_val,
+        )
+        if IS_BASE_E:
+            lse_sum += tl.exp(lse_val - lse_max)
+        else:
+            lse_sum += tl.exp2(lse_val - lse_max)
+
+    if IS_BASE_E:
+        global_lse = tl.log(lse_sum) + lse_max
+    else:
+        global_lse = tl.log2(lse_sum) + lse_max
+
+    acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
+    for rank_idx in tl.static_range(N):
+        recv_base = (
+            rank_idx * recv_stride_N
+            + batch_idx * recv_stride_B
+            + head_idx * recv_stride_H
+        )
+        if LSE_PACK_DIM == 1:
+            lse_val = tl.load(
+                recv_ptr + recv_base + HEAD_DIM * recv_stride_D
+            ).to(tl.float32)
+        else:
+            lo_raw = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D)
+            hi_raw = tl.load(
+                recv_ptr + recv_base + (HEAD_DIM + 1) * recv_stride_D
+            )
+            lo = lo_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            hi = hi_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
+            lse_val = (lo | (hi << 16)).to(tl.float32, bitcast=True)
+        lse_val = tl.where(
+            (lse_val != lse_val) | (lse_val == float("inf")),
+            -float("inf"),
+            lse_val,
+        )
+        if IS_BASE_E:
+            weight = tl.exp(lse_val - global_lse)
+        else:
+            weight = tl.exp2(lse_val - global_lse)
+        weight = tl.where(weight != weight, 0.0, weight)
+        acc += (
+            tl.load(recv_ptr + recv_base + d_offsets * recv_stride_D).to(
+                tl.float32
+            )
+            * weight
+        )
+
+    final_offsets = (
+        batch_idx * out_stride_B
+        + head_idx * out_stride_H
+        + d_offsets * out_stride_D
+    )
+    tl.store(out_ptr + final_offsets, acc)
+    if RETURN_LSE:
+        out_lse_offset = (
+            batch_idx * out_lse_stride_B + head_idx * out_lse_stride_H
+        )
+        tl.store(out_lse_ptr + out_lse_offset, global_lse)
+
+
+def _dcp_a2a_pack_send(
+    partial_out: torch.Tensor,
+    partial_lse: torch.Tensor,
+    send_buffer: torch.Tensor,
+    world_size: int,
+    h_per_rank: int,
+    head_dim: int,
+    lse_pack_dim: int,
+) -> None:
+    grid = (partial_out.shape[0], h_per_rank, 1)
+    _dcp_a2a_pack_send_kernel[grid](
+        partial_out,
+        partial_lse,
+        send_buffer,
+        partial_out.stride(0),
+        partial_out.stride(1),
+        partial_out.stride(2),
+        partial_lse.stride(0),
+        partial_lse.stride(1),
+        send_buffer.stride(0),
+        send_buffer.stride(1),
+        send_buffer.stride(2),
+        send_buffer.stride(3),
+        N=world_size,
+        HEAD_DIM=head_dim,
+        H_PER_RANK=h_per_rank,
+        LSE_PACK_DIM=lse_pack_dim,
+    )
+
+
+def _dcp_a2a_unpack_combine(
+    recv_buffer: torch.Tensor,
+    head_dim: int,
+    lse_pack_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    world_size, total_tokens, h_per_rank, _ = recv_buffer.shape
+    output = torch.empty(
+        (total_tokens, h_per_rank, head_dim),
+        device=recv_buffer.device,
+        dtype=recv_buffer.dtype,
+    )
+    output_lse = torch.empty(
+        (total_tokens, h_per_rank),
+        device=recv_buffer.device,
+        dtype=torch.float32,
+    )
+    grid = (total_tokens, h_per_rank, 1)
+    _dcp_a2a_unpack_combine_kernel[grid](
+        recv_buffer,
+        output,
+        output_lse,
+        recv_buffer.stride(0),
+        recv_buffer.stride(1),
+        recv_buffer.stride(2),
+        recv_buffer.stride(3),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        output_lse.stride(0),
+        output_lse.stride(1),
+        N=world_size,
+        HEAD_DIM=head_dim,
+        IS_BASE_E=True,
+        RETURN_LSE=True,
+        LSE_PACK_DIM=lse_pack_dim,
+    )
+    return output, output_lse
 
 
 @triton.jit
@@ -646,6 +977,12 @@ class DCPAttentionRunner:
                 "lse_correct_end",
                 "reduce_scatter_start",
                 "reduce_scatter_end",
+                "a2a_pack_start",
+                "a2a_pack_end",
+                "a2a_all_to_all_start",
+                "a2a_all_to_all_end",
+                "a2a_unpack_combine_start",
+                "a2a_unpack_combine_end",
                 "merge_start",
                 "merge_end",
             )
@@ -2243,7 +2580,8 @@ class DCPAttentionRunner:
                 overlapped_ag_chunk_window_ms=values["q_allgather_and_reorder_ms"],
                 state_merge_ms=0.0,
             )
-        if self.world_size > 1:
+        is_a2a = self.output_collective_kind == "bf16_packed_all_to_all"
+        if self.world_size > 1 and not is_a2a:
             values.update(
                 lse_allgather_correct_ms=events["lse_correct_start"].elapsed_time(
                     events["lse_correct_end"]
@@ -2254,7 +2592,29 @@ class DCPAttentionRunner:
             )
         else:
             values.update(lse_allgather_correct_ms=0.0, output_reduce_scatter_ms=0.0)
-        values["output_collective_ms"] = values["output_reduce_scatter_ms"]
+        if self.world_size > 1 and is_a2a:
+            values.update(
+                a2a_pack_ms=events["a2a_pack_start"].elapsed_time(
+                    events["a2a_pack_end"]
+                ),
+                a2a_all_to_all_ms=events["a2a_all_to_all_start"].elapsed_time(
+                    events["a2a_all_to_all_end"]
+                ),
+                a2a_unpack_combine_ms=events[
+                    "a2a_unpack_combine_start"
+                ].elapsed_time(events["a2a_unpack_combine_end"]),
+            )
+        else:
+            values.update(
+                a2a_pack_ms=0.0,
+                a2a_all_to_all_ms=0.0,
+                a2a_unpack_combine_ms=0.0,
+            )
+        values["output_collective_ms"] = (
+            values["a2a_all_to_all_ms"]
+            if is_a2a
+            else values["output_reduce_scatter_ms"]
+        )
         values["sequential_ag_plus_chunk_ms"] = (
             values["q_allgather_and_reorder_ms"] + values["local_chunk_attention_ms"]
         )
@@ -3043,6 +3403,117 @@ class VLLMDCPAttentionRunner(_SequentialDCPAttentionRunnerBase):
         return (merged_out, merged_lse) if return_lse else merged_out
 
 
+class VLLMA2ADCPAttentionRunner(VLLMDCPAttentionRunner):
+    """Pinned vLLM A2A orchestration using the local min FA3 op.
+
+    The data flow matches the ordinary GQA backend integration at
+    ``vllm/v1/attention/backends/flash_attn.py`` in pinned commit
+    ``a89015c6df8eeb37a843b717c97a5be1355de83d``.  Only the partial-state
+    combine differs from :class:`VLLMDCPAttentionRunner`.
+    """
+
+    method_name = "vllm_a2a_min_fa3"
+    varlen_method_name = "vllm_a2a_min_fa3_varlen"
+    output_collective_kind = "bf16_packed_all_to_all"
+
+    def _combine_context(
+        self,
+        history_out: torch.Tensor,
+        history_lse: torch.Tensor,
+        compute_stream: torch.cuda.Stream,
+        *,
+        timing: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if history_out.ndim != 4:
+            raise ValueError("A2A history output must have shape [B, S, H_group, D]")
+        b, sq, h_group, d = history_out.shape
+        if history_out.dtype != torch.bfloat16 or d != 128:
+            raise ValueError("A2A history output must be BF16 with head_dim 128")
+        if history_lse.shape != (b, h_group, sq):
+            raise ValueError(
+                "A2A history LSE must have shape "
+                f"[{b}, {h_group}, {sq}], got {tuple(history_lse.shape)}"
+            )
+        _dcp_a2a_head_owner_ranges(h_group, self.world_size)
+        if history_lse.dtype != torch.float32:
+            # vLLM PR #47801: the pack kernel bit-casts one FP32 LSE into two
+            # BF16 lanes even when an attention backend returned activation dtype.
+            history_lse = history_lse.to(torch.float32)
+        if self.world_size == 1:
+            return history_out, history_lse
+
+        total_tokens = b * sq
+        h_local = h_group // self.world_size
+        output_flat = history_out.view(total_tokens, h_group, d)
+        lse_flat = (
+            history_lse.permute(0, 2, 1)
+            .contiguous()
+            .view(total_tokens, h_group)
+        )
+        lse_pack_dim = _dcp_a2a_lse_pack_dim(history_out.dtype)
+        buffer_shape = (
+            self.world_size,
+            total_tokens,
+            h_local,
+            d + lse_pack_dim,
+        )
+        # vLLM PR #45487: graph-captured A2A buffers must be per-call tensors
+        # owned by the graph private pool, never slices of a growable workspace.
+        send_buffer = torch.empty(
+            buffer_shape, device=self.device, dtype=history_out.dtype
+        )
+        recv_buffer = torch.empty_like(send_buffer)
+        if self._capture_in_progress:
+            self._capture_tensors.extend((send_buffer, recv_buffer))
+
+        if timing:
+            self._record_timing("a2a_pack_start", compute_stream)
+        with _nvtx_range("vllm_a2a_pack_partial_states"):
+            _dcp_a2a_pack_send(
+                output_flat,
+                lse_flat,
+                send_buffer,
+                self.world_size,
+                h_local,
+                d,
+                lse_pack_dim,
+            )
+        if timing:
+            self._record_timing("a2a_pack_end", compute_stream)
+            self._record_timing("a2a_all_to_all_start", compute_stream)
+        with _nvtx_range("vllm_packed_output_lse_all_to_all"):
+            work = dist.all_to_all_single(
+                recv_buffer.view(-1),
+                send_buffer.view(-1),
+                group=self.process_group,
+                async_op=True,
+            )
+            work.wait()
+        if self._capture_in_progress:
+            self._works.append(work)
+        if timing:
+            self._record_timing("a2a_all_to_all_end", compute_stream)
+            self._record_timing("a2a_unpack_combine_start", compute_stream)
+        with _nvtx_range("vllm_a2a_unpack_lse_weighted_combine"):
+            output, output_lse = _dcp_a2a_unpack_combine(
+                recv_buffer, d, lse_pack_dim
+            )
+        if timing:
+            self._record_timing("a2a_unpack_combine_end", compute_stream)
+        self._retain_merge_inputs(
+            compute_stream,
+            history_out,
+            history_lse,
+            lse_flat,
+            send_buffer,
+            recv_buffer,
+        )
+        return (
+            output.view(b, sq, h_local, d),
+            output_lse.view(b, sq, h_local).permute(0, 2, 1).contiguous(),
+        )
+
+
 class SGLangDCPAttentionRunner(_SequentialDCPAttentionRunnerBase):
     """Pinned SGLang MHA AG+FP32-AR orchestration using the local min FA3 op."""
 
@@ -3156,6 +3627,7 @@ __all__ = [
     "DCPAttentionRunner",
     "SGLangDCPAttentionRunner",
     "TopologyIssue",
+    "VLLMA2ADCPAttentionRunner",
     "VLLMDCPAttentionRunner",
     "make_topology",
     "validate_group_ranks",

@@ -22,6 +22,22 @@ Captured shapes bind tensor addresses and static scalar/varlen metadata; close
 the graph before destroying its NCCL process group. The benchmark entry points
 handle that close ordering internally.
 
+The six dense labels are `ours_no_overlap`, `ours_overlap`,
+`vllm_ag_rs_min_fa3`, `vllm_a2a_min_fa3`, `sglang_mha_ag_ar_min_fa3`, and
+`full_kv_min_fa3`; packed-varlen appends `_varlen` to each label. Selecting
+`--implementations vllm` runs both vLLM baselines. The A2A code is copied and
+trimmed from vLLM commit `a89015c6df8eeb37a843b717c97a5be1355de83d` and its
+ordinary GQA/MQA FlashAttention integration. It retains the packed-combine
+design from PR #41160, graph-private per-call buffers from PR #45487, and the
+FP32 LSE pack contract from PR #47801.
+
+A2A stage timing separates pack, `all_to_all_single`, and unpack/FP32 base-e
+LSE-weighted combine. `output_collective_ms` covers only the all-to-all. The
+payload report distinguishes the full BF16 buffer
+`DCP*T*H_local*(D+2)*2` from remote traffic excluding self-copy,
+`(DCP-1)*T*H_local*(D+2)*2`; A2A LSE-all-gather and reduce-scatter fields are
+zero. Dense JSON uses schema 4 and packed-varlen uses schema 3.
+
 Dense example:
 
 ```bash
@@ -63,4 +79,168 @@ torchrun --standalone --nproc_per_node=8 --module dcp_test.benchmark_dcp_varlen 
 
 Packed-varlen decode requires every `--sq` value to be `1`. Both benchmarks
 also accept `--output-json PATH`. See the repository `README.md` for topology,
-timing boundary, method-label, and JSON-schema details.
+timing boundary, method-label, and JSON-schema details. These are
+attention-only, same-min-FA3 orchestration baselines, not native vLLM/SGLang
+serving-runtime benchmarks.
+
+## Measured eight-GPU reference run (2026-08-02)
+
+This section records one complete performance run of all six methods in both
+eager and CUDA Graph modes. It is a measured reference for the shapes below,
+not a claim about native vLLM or SGLang serving performance. The run used the
+working tree containing the A2A implementation documented above; the recorded
+repository HEAD was `8432d61df9bbbbf2c04292d12097f8ea4c794971`.
+
+### Environment and timing
+
+- Host: `zkrh-58`
+- GPU: 8 x NVIDIA H100 80GB HBM3, compute capability 9.0
+- CUDA runtime: 12.8
+- PyTorch: `2.10.0+cu128`
+- NCCL: 2.27.5
+- Python: 3.12.13
+- vLLM source commit: `a89015c6df8eeb37a843b717c97a5be1355de83d`
+- SGLang source commit: `8d6549bc4039d33635844495d86684677a4f0df8`
+- Dtype/head dimension: BF16/128
+- Split policy: `--num-splits 0`
+- Warmup and samples: `--warmup 5 --iters 20`
+
+Physical GPUs 0-7 were idle immediately before launch and were held by one
+repo-local `flock` for a continuous fail-fast batch. The same eight GPUs were
+used for all six jobs. Every method performs an eager correctness precheck
+before measurement. CUDA Graph mode performs three additional eager capture
+warmups, captures a fixed shape, runs five unmeasured graph replays, and then
+measures 20 replays. Eager mode runs five unmeasured calls followed by 20
+measured calls. Every latency sample is reduced to the maximum across all
+eight global ranks before p50/p90 aggregation.
+
+The measured interval starts after Q/K/V are ready and ends when the BF16
+local-head output is ready. It excludes projection, input/cache construction,
+packing/sharding performed by the benchmark input builder, and serving-engine
+overhead. The full-KV baseline has no DCP collective but replicates complete
+KV state on each relevant rank; its latency and memory behavior should be
+interpreted together.
+
+### Dense matrix
+
+The dense run used the command shown in the earlier dense example, plus
+`--output-json`. CUDA Graph used the default `--cuda-graph`; the eager run used
+the same command with `--no-cuda-graph`. Dense accepts implementation
+categories `ours,vllm,sglang` and always adds `full_kv_min_fa3`, so `full`
+must not be passed to its `--implementations` option.
+
+The candidate topology matrix was `Hq=32/64`, `Hkv=2/4`, `TP=8`, and
+`DCP=2/4/8`. Production topology checks admitted six GQA topologies and wrote
+six rejected combinations as structured `skipped_topology` records. Each
+legal topology ran these 36 workload shapes:
+
+- Decode: `B=1/8/32`, `Sq=1`, `Sk=4096/16384/65536`
+- Chunk: `B=1/4/16`, `Sq=8/32/128`, `Sk_history=4096/16384/65536`
+
+This produced 216 GQA cases. Two fixed `Hq=64,Hkv=1,TP=8,DCP=8` MQA controls
+were added: decode `B=8,Sq=1,Sk=16384` and chunk
+`B=4,Sq=128,Sk_history=16384`.
+
+The following values are geometric means of global-rank-max p50 latency over
+the 216 GQA cases, in milliseconds. The MQA controls are reported separately
+and are not included in these means. `Eager / Graph` greater than one means
+CUDA Graph was faster.
+
+| Method | CUDA Graph (ms) | Eager (ms) | Eager / Graph |
+| --- | ---: | ---: | ---: |
+| `full_kv_min_fa3` | 0.0729 | 0.0634 | 0.87x |
+| `ours_no_overlap` | 0.1338 | 0.2815 | 2.10x |
+| `ours_overlap` | 0.1280 | 0.3682 | 2.88x |
+| `vllm_ag_rs_min_fa3` | 0.1445 | 0.3205 | 2.22x |
+| `vllm_a2a_min_fa3` | 0.1421 | 0.3172 | 2.23x |
+| `sglang_mha_ag_ar_min_fa3` | 0.1948 | 0.4291 | 2.20x |
+
+CUDA Graph p50 geometric means split by workload were:
+
+| Method | Decode (ms) | Chunk (ms) |
+| --- | ---: | ---: |
+| `full_kv_min_fa3` | 0.0747 | 0.0722 |
+| `ours_no_overlap` | 0.0940 | 0.1505 |
+| `ours_overlap` | 0.0968 | 0.1405 |
+| `vllm_ag_rs_min_fa3` | 0.0987 | 0.1641 |
+| `vllm_a2a_min_fa3` | 0.0982 | 0.1608 |
+| `sglang_mha_ag_ar_min_fa3` | 0.1269 | 0.2247 |
+
+The two MQA-control p50 measurements were:
+
+| Method | Graph decode | Eager decode | Graph chunk | Eager chunk |
+| --- | ---: | ---: | ---: | ---: |
+| `full_kv_min_fa3` | 0.0614 | 0.0532 | 0.0906 | 0.0808 |
+| `ours_no_overlap` | 0.0956 | 0.2221 | 0.2761 | 0.3336 |
+| `ours_overlap` | 0.0960 | 0.2947 | 0.2595 | 0.4203 |
+| `vllm_ag_rs_min_fa3` | 0.1027 | 0.2442 | 0.2971 | 0.3662 |
+| `vllm_a2a_min_fa3` | 0.0926 | 0.2880 | 0.2652 | 0.3583 |
+| `sglang_mha_ag_ar_min_fa3` | 0.1326 | 0.3523 | 0.4288 | 0.5194 |
+
+For the dense GQA matrix:
+
+- CUDA Graph made the DCP methods 2.10x-2.88x faster than eager. The very
+  small, communication-free full-KV calls were instead 13% faster in eager.
+- Under CUDA Graph, overlap was 4.6% faster than non-overlap over all GQA
+  cases and 7.2% faster for chunk. It was 2.9% slower for decode.
+- Under CUDA Graph, A2A was 1.7% faster than AG+RS overall and 2.1% faster for
+  chunk. The chunk advantage was 1.1% at DCP=2 and 4.2% at DCP=4.
+- In eager mode, multi-stream overlap was 30.8% slower than non-overlap over
+  the full matrix because the launch/synchronization cost was not amortized.
+- Full-KV won 192 of 216 CUDA Graph GQA cases. A DCP method won the remaining
+  24 cases, primarily large-batch, long-context cases. The largest DCP
+  latency advantage was 2.26x for
+  `Hq=32,Hkv=2,DCP=4,decode,B=32,Sk=65536`: `ours_no_overlap` took
+  0.1700 ms versus 0.3841 ms for full-KV.
+- In eager mode a DCP method won 6 of 216 cases; the maximum advantage was
+  1.61x for the same large decode shape.
+
+### Packed-varlen matrix
+
+Packed-varlen used `Hq=32,Hkv=1,TP=8,DCP=8,B=3`. Decode used `Sq=1,1,1`
+and cache lengths `129,1024,3131`, for `total_q=3`. Chunk used query lengths
+`1,8,32` and history lengths `129,1024,3131`, for `total_q=41`. Decode cache
+lengths include the current token; chunk history lengths exclude the supplied
+chunk. Both workloads selected `--implementations ours,vllm,sglang,full` and
+were run once with `--cuda-graph` and once with `--no-cuda-graph`.
+
+Global-rank-max p50 latency in milliseconds was:
+
+| Method | Graph decode | Eager decode | Graph chunk | Eager chunk |
+| --- | ---: | ---: | ---: | ---: |
+| `full_kv_min_fa3_varlen` | 0.0480 | 0.0315 | 0.0356 | 0.0317 |
+| `ours_no_overlap_varlen` | 0.0914 | 0.2351 | 0.1259 | 0.3076 |
+| `ours_overlap_varlen` | 0.0927 | 0.3046 | 0.1119 | 0.4021 |
+| `vllm_ag_rs_min_fa3_varlen` | 0.0990 | 0.2622 | 0.1385 | 0.3565 |
+| `vllm_a2a_min_fa3_varlen` | 0.1140 | 0.2982 | 0.1255 | 0.3627 |
+| `sglang_mha_ag_ar_min_fa3_varlen` | 0.1538 | 0.3401 | 0.1916 | 0.4868 |
+
+For the packed chunk CUDA Graph case, overlap was 12.5% faster than
+non-overlap and A2A was 10.3% faster than AG+RS. The three A2A p50 stages were
+0.0077 ms pack, 0.0159 ms `all_to_all_single`, and 0.0059 ms unpack/combine.
+For packed decode, A2A was 15.2% slower than AG+RS because only three query
+tokens were available to amortize packing and collective fixed costs.
+
+The complete A2A stage p50 measurements were:
+
+| Workload/mode | Pack (ms) | All-to-all (ms) | Unpack/combine (ms) | End-to-end (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Decode CUDA Graph | 0.0075 | 0.0127 | 0.0059 | 0.1140 |
+| Decode eager | 0.0355 | 0.0911 | 0.0365 | 0.2982 |
+| Chunk CUDA Graph | 0.0077 | 0.0159 | 0.0059 | 0.1255 |
+| Chunk eager | 0.0356 | 0.0766 | 0.0347 | 0.3627 |
+
+### Result artifacts
+
+The full raw samples, p50/p90 stage timings, communication payloads, topology
+records, execution metadata, and environment details are stored under the
+gitignored local directory
+`benchmarks/results/dcp_six_methods_8gpu_20260802/`:
+
+- `dense_cuda_graph.json` and `dense_eager.json`
+- `varlen_decode_cuda_graph.json` and `varlen_decode_eager.json`
+- `varlen_chunk_cuda_graph.json` and `varlen_chunk_eager.json`
+- Matching `.log` files for all six jobs
+
+All six jobs completed successfully. The selected GPUs returned to zero
+reported utilization and zero allocated memory after the batch.

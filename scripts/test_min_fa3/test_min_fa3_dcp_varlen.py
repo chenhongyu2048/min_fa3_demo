@@ -18,6 +18,7 @@ from min_fa3_dcp import (
     DCPAttentionRunner,
     DCPTopology,
     SGLangDCPAttentionRunner,
+    VLLMA2ADCPAttentionRunner,
     VLLMDCPAttentionRunner,
     make_topology,
     validate_topology,
@@ -27,6 +28,7 @@ from min_fa3_dcp import (
 METHOD_OURS_OVERLAP = "ours_overlap_varlen"
 METHOD_OURS_NO_OVERLAP = "ours_no_overlap_varlen"
 METHOD_VLLM = "vllm_ag_rs_min_fa3_varlen"
+METHOD_VLLM_A2A = "vllm_a2a_min_fa3_varlen"
 METHOD_SGLANG = "sglang_mha_ag_ar_min_fa3_varlen"
 CAPTURE_EAGER_WARMUP = 3
 
@@ -280,6 +282,7 @@ def method_calls(
         for method, overlap in (
             (METHOD_OURS_NO_OVERLAP, False),
             (METHOD_VLLM, False),
+            (METHOD_VLLM_A2A, False),
             (METHOD_SGLANG, False),
             (METHOD_OURS_OVERLAP, True),
         ):
@@ -312,6 +315,7 @@ def method_calls(
     for method, overlap in (
         (METHOD_OURS_NO_OVERLAP, False),
         (METHOD_VLLM, False),
+        (METHOD_VLLM_A2A, False),
         (METHOD_SGLANG, False),
         (METHOD_OURS_OVERLAP, True),
     ):
@@ -458,6 +462,8 @@ def run_case(
     reports: dict[str, object] = {}
     for method, call in method_calls(workload, inputs, runners, num_splits):
         report = None
+        if cuda_graph:
+            check_result(f"{method}_eager", call(), expected)
         captured = (
             capture_method(method, workload, inputs, runners, num_splits)
             if cuda_graph
@@ -710,7 +716,25 @@ def check_graph_lifecycle(
     ) as overlap_graph:
         check_result("graph_recapture_overlap_varlen", overlap_graph.replay(), expected())
 
-    for method in (METHOD_VLLM, METHOD_SGLANG):
+    a2a_graph = capture_method(
+        METHOD_VLLM_A2A, "decode", inputs, runners, 1
+    )
+    try:
+        check_result("a2a_graph_initial_varlen", a2a_graph.replay(), expected())
+        inputs.q_local.neg_()
+        inputs.v_history_local.mul_(0.625)
+        inputs.v_history_full.mul_(0.625)
+        check_result("a2a_graph_in_place_varlen", a2a_graph.replay(), expected())
+    finally:
+        a2a_graph.close()
+    with capture_method(
+        METHOD_VLLM_A2A, "decode", inputs, runners, 1
+    ) as recaptured_a2a:
+        check_result(
+            "a2a_graph_recapture_varlen", recaptured_a2a.replay(), expected()
+        )
+
+    for method in (METHOD_VLLM, METHOD_VLLM_A2A, METHOD_SGLANG):
         sequential = runners[method]
         expect_error(
             f"{method} overlap",
@@ -736,6 +760,7 @@ def check_graph_lifecycle(
         "fixed_varlen_metadata_signature": "ok",
         "active_graph_exclusion": "ok",
         "close_and_recapture": "ok",
+        "a2a_graph_private_buffers": "ok",
         "overlap_fork_join": "ok",
         "sequential_overlap_rejection": "ok",
     }
@@ -809,6 +834,7 @@ def main() -> None:
                     METHOD_OURS_OVERLAP: ours,
                     METHOD_OURS_NO_OVERLAP: ours,
                     METHOD_VLLM: VLLMDCPAttentionRunner(group),
+                    METHOD_VLLM_A2A: VLLMA2ADCPAttentionRunner(group),
                     METHOD_SGLANG: SGLangDCPAttentionRunner(group),
                 }
             return runner_cache[dcp_size]

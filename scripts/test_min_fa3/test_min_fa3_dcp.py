@@ -18,6 +18,7 @@ from min_fa3_dcp import (
     DCPAttentionRunner,
     DCPTopology,
     SGLangDCPAttentionRunner,
+    VLLMA2ADCPAttentionRunner,
     VLLMDCPAttentionRunner,
     make_topology,
     validate_topology,
@@ -27,6 +28,7 @@ from min_fa3_dcp import (
 METHOD_OURS_OVERLAP = "ours_overlap"
 METHOD_OURS_NO_OVERLAP = "ours_no_overlap"
 METHOD_VLLM = "vllm_ag_rs_min_fa3"
+METHOD_VLLM_A2A = "vllm_a2a_min_fa3"
 METHOD_SGLANG = "sglang_mha_ag_ar_min_fa3"
 CAPTURE_EAGER_WARMUP = 3
 
@@ -277,6 +279,7 @@ def method_calls(
 ) -> list[tuple[str, Callable[[], tuple[torch.Tensor, torch.Tensor]]]]:
     ours = runners[METHOD_OURS_OVERLAP]
     vllm = runners[METHOD_VLLM]
+    vllm_a2a = runners[METHOD_VLLM_A2A]
     sglang = runners[METHOD_SGLANG]
     if workload == "decode":
         return [
@@ -295,6 +298,18 @@ def method_calls(
             (
                 METHOD_VLLM,
                 lambda: vllm.forward_decode(
+                    inputs.q_local,
+                    inputs.k_history_local,
+                    inputs.v_history_local,
+                    inputs.history_lengths_local,
+                    num_splits=num_splits,
+                    return_lse=True,
+                    overlap_q_allgather=False,
+                ),
+            ),
+            (
+                METHOD_VLLM_A2A,
+                lambda: vllm_a2a.forward_decode(
                     inputs.q_local,
                     inputs.k_history_local,
                     inputs.v_history_local,
@@ -349,6 +364,20 @@ def method_calls(
         (
             METHOD_VLLM,
             lambda: vllm.forward_chunk_prefill(
+                inputs.q_local,
+                inputs.k_history_local,
+                inputs.v_history_local,
+                inputs.history_lengths_local,
+                inputs.k_chunk,
+                inputs.v_chunk,
+                num_splits=num_splits,
+                return_lse=True,
+                overlap_q_allgather=False,
+            ),
+        ),
+        (
+            METHOD_VLLM_A2A,
+            lambda: vllm_a2a.forward_chunk_prefill(
                 inputs.q_local,
                 inputs.k_history_local,
                 inputs.v_history_local,
@@ -458,6 +487,15 @@ def run_case(
     methods: dict[str, object] = {}
     for method, call in method_calls(workload, inputs, runners, num_splits):
         stats: dict[str, object] | None = None
+        if cuda_graph:
+            eager_output, eager_lse = call()
+            check_result(
+                f"{method}_eager",
+                eager_output,
+                eager_lse,
+                reference_output,
+                reference_lse,
+            )
         captured = (
             capture_method(method, workload, inputs, runners, num_splits)
             if cuda_graph
@@ -605,7 +643,23 @@ def check_graph_lifecycle(
             expected_lse,
         )
 
-    for method in (METHOD_VLLM, METHOD_SGLANG):
+    a2a_graph = capture_method(
+        METHOD_VLLM_A2A, "decode", inputs, runners, 1
+    )
+    try:
+        check_result("a2a_graph_initial", *a2a_graph.replay(), *reference())
+        inputs.q_local.neg_()
+        inputs.v_history_local.mul_(0.625)
+        inputs.v_reference.mul_(0.625)
+        check_result("a2a_graph_in_place", *a2a_graph.replay(), *reference())
+    finally:
+        a2a_graph.close()
+    with capture_method(
+        METHOD_VLLM_A2A, "decode", inputs, runners, 1
+    ) as recaptured_a2a:
+        check_result("a2a_graph_recapture", *recaptured_a2a.replay(), *reference())
+
+    for method in (METHOD_VLLM, METHOD_VLLM_A2A, METHOD_SGLANG):
         sequential = runners[method]
         expect_error(
             f"{method} overlap",
@@ -626,6 +680,7 @@ def check_graph_lifecycle(
         "dynamic_dense_seqlens": "ok",
         "active_graph_exclusion": "ok",
         "close_and_recapture": "ok",
+        "a2a_graph_private_buffers": "ok",
         "overlap_fork_join": "ok",
         "sequential_overlap_rejection": "ok",
     }
@@ -720,6 +775,7 @@ def main() -> None:
                 cached = {
                     METHOD_OURS_OVERLAP: DCPAttentionRunner(group),
                     METHOD_VLLM: VLLMDCPAttentionRunner(group),
+                    METHOD_VLLM_A2A: VLLMA2ADCPAttentionRunner(group),
                     METHOD_SGLANG: SGLangDCPAttentionRunner(group),
                 }
                 runner_cache[dcp_size] = cached

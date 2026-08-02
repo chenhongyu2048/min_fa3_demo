@@ -21,7 +21,9 @@ from min_fa3_dcp import (
     DCPAttentionCUDAGraph,
     DCPAttentionRunner,
     SGLangDCPAttentionRunner,
+    VLLMA2ADCPAttentionRunner,
     VLLMDCPAttentionRunner,
+    _dcp_a2a_payload_bytes,
     make_topology,
 )
 
@@ -32,6 +34,7 @@ SGLANG_COMMIT = "8d6549bc4039d33635844495d86684677a4f0df8"
 METHOD_OURS_OVERLAP = "ours_overlap_varlen"
 METHOD_OURS_NO_OVERLAP = "ours_no_overlap_varlen"
 METHOD_VLLM = "vllm_ag_rs_min_fa3_varlen"
+METHOD_VLLM_A2A = "vllm_a2a_min_fa3_varlen"
 METHOD_SGLANG = "sglang_mha_ag_ar_min_fa3_varlen"
 METHOD_FULL = "full_kv_min_fa3_varlen"
 
@@ -44,6 +47,10 @@ STAGES = (
     "local_history_attention_ms",
     "lse_allgather_correct_ms",
     "output_collective_ms",
+    "output_reduce_scatter_ms",
+    "a2a_pack_ms",
+    "a2a_all_to_all_ms",
+    "a2a_unpack_combine_ms",
     "state_merge_ms",
 )
 CAPTURE_EAGER_WARMUP = 3
@@ -92,6 +99,19 @@ def parse_implementations(spec: str) -> tuple[str, ...]:
             "--implementations must contain ours,vllm,sglang,full entries"
         )
     return tuple(dict.fromkeys(values))
+
+
+def expanded_method_labels(implementations: tuple[str, ...]) -> tuple[str, ...]:
+    methods: list[str] = []
+    if "ours" in implementations:
+        methods.extend((METHOD_OURS_NO_OVERLAP, METHOD_OURS_OVERLAP))
+    if "vllm" in implementations:
+        methods.extend((METHOD_VLLM, METHOD_VLLM_A2A))
+    if "sglang" in implementations:
+        methods.append(METHOD_SGLANG)
+    if "full" in implementations:
+        methods.append(METHOD_FULL)
+    return tuple(methods)
 
 
 def make_cu(lengths: list[int], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -388,10 +408,14 @@ def measure_runner(
     overlap: bool,
     expected: torch.Tensor,
 ) -> tuple[dict[str, dict[str, float]], dict[str, object]]:
+    method_name = (
+        runner.varlen_overlap_method_name if overlap else runner.varlen_method_name
+    )
+    check_output(f"{method_name}_eager", call(False), expected)
     captured = capture_runner(runner, inputs, args, overlap) if args.cuda_graph else None
     try:
         check_output(
-            runner.varlen_overlap_method_name if overlap else runner.varlen_method_name,
+            method_name,
             captured.replay() if captured is not None else call(False),
             expected,
         )
@@ -565,6 +589,53 @@ def effective_pairs(inputs: Inputs, workload: str) -> int:
     )
 
 
+def communication_report(
+    method: str,
+    total_q: int,
+    h_local: int,
+    head_dim: int,
+    dcp_size: int,
+) -> dict[str, object]:
+    if method == METHOD_FULL:
+        return {
+            "output_collective": "none",
+            "q_allgather_receive_bytes_per_rank": 0,
+            "lse_allgather_receive_bytes_per_rank": 0,
+            "output_collective_buffer_bytes_per_rank": 0,
+            "output_collective_remote_bytes_per_rank": 0,
+            "output_collective_payload_bytes_per_rank": 0,
+            "collective_payload_bytes_per_rank_total": 0,
+        }
+    h_group = h_local * dcp_size
+    q_receive = (dcp_size - 1) * total_q * h_local * head_dim * 2
+    lse_receive = (dcp_size - 1) * total_q * h_group * 4
+    if method == METHOD_VLLM_A2A:
+        output_kind = "bf16_packed_all_to_all"
+        output_buffer, output_remote = _dcp_a2a_payload_bytes(
+            total_q, h_local, head_dim, dcp_size
+        )
+        lse_receive = 0
+    elif method == METHOD_SGLANG:
+        output_kind = "fp32_all_reduce"
+        output_buffer = total_q * h_group * head_dim * 4
+        output_remote = 2.0 * (dcp_size - 1) / dcp_size * output_buffer
+    else:
+        output_kind = "bf16_reduce_scatter"
+        output_buffer = total_q * h_group * head_dim * 2
+        output_remote = (dcp_size - 1) / dcp_size * output_buffer
+    return {
+        "output_collective": output_kind,
+        "q_allgather_receive_bytes_per_rank": float(q_receive),
+        "lse_allgather_receive_bytes_per_rank": float(lse_receive),
+        "output_collective_buffer_bytes_per_rank": float(output_buffer),
+        "output_collective_remote_bytes_per_rank": float(output_remote),
+        "output_collective_payload_bytes_per_rank": float(output_remote),
+        "collective_payload_bytes_per_rank_total": float(
+            q_receive + lse_receive + output_remote
+        ),
+    }
+
+
 def git_commit() -> str | None:
     try:
         return subprocess.check_output(
@@ -669,6 +740,7 @@ def main() -> None:
             runners[METHOD_OURS_OVERLAP] = DCPAttentionRunner(process_group)
         if "vllm" in implementations:
             runners[METHOD_VLLM] = VLLMDCPAttentionRunner(process_group)
+            runners[METHOD_VLLM_A2A] = VLLMA2ADCPAttentionRunner(process_group)
         if "sglang" in implementations:
             runners[METHOD_SGLANG] = SGLangDCPAttentionRunner(process_group)
 
@@ -692,6 +764,13 @@ def main() -> None:
                 "stages_ms": stages,
                 "output_collective_kind": runner.output_collective_kind,
                 "workspace_policy": runner.workspace_policy,
+                "communication": communication_report(
+                    method,
+                    sum(inputs.q_lengths),
+                    topology.q_heads_local,
+                    args.headdim,
+                    args.dcp_size,
+                ),
                 "execution": execution,
             }
             if method == METHOD_OURS_OVERLAP and args.workload == "chunk":
@@ -709,6 +788,13 @@ def main() -> None:
                 "stages_ms": stages,
                 "output_collective_kind": "none",
                 "workspace_policy": "operator_managed",
+                "communication": communication_report(
+                    METHOD_FULL,
+                    sum(inputs.q_lengths),
+                    topology.q_heads_local,
+                    args.headdim,
+                    args.dcp_size,
+                ),
                 "execution": execution,
             }
 
@@ -746,6 +832,9 @@ def main() -> None:
         ]
         h_local = topology.q_heads_local
         h_group = h_local * args.dcp_size
+        a2a_buffer_bytes, a2a_remote_bytes = _dcp_a2a_payload_bytes(
+            sum(inputs.q_lengths), h_local, args.headdim, args.dcp_size
+        )
         collectives = {
             "q_allgather_input_bytes_per_rank": sum(inputs.q_lengths)
             * h_local
@@ -758,9 +847,11 @@ def main() -> None:
             * h_local
             * args.headdim
             * bf16_bytes,
+            "a2a_buffer_bytes_per_rank": a2a_buffer_bytes,
+            "a2a_remote_bytes_per_rank": a2a_remote_bytes,
         }
         result = {
-            "schema_version": 2,
+            "schema_version": 3,
             "comparison_scope": (
                 "Same min_fa3_op.forward_kvcache_varlen kernel; orchestration "
                 "baseline only, not native vLLM/SGLang backend performance."
@@ -779,6 +870,7 @@ def main() -> None:
                 **vars(args),
                 "output_json": str(args.output_json) if args.output_json else None,
                 "implementations": list(implementations),
+                "method_labels": list(expanded_method_labels(implementations)),
             },
             "topology": topology.to_dict(),
             "lengths": {

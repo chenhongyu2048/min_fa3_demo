@@ -24,7 +24,9 @@ from min_fa3_dcp import (
     DCPAttentionRunner,
     DCPTopology,
     SGLangDCPAttentionRunner,
+    VLLMA2ADCPAttentionRunner,
     VLLMDCPAttentionRunner,
+    _dcp_a2a_payload_bytes,
     make_topology,
     validate_topology,
 )
@@ -35,6 +37,7 @@ SGLANG_COMMIT = "8d6549bc4039d33635844495d86684677a4f0df8"
 METHOD_OURS_OVERLAP = "ours_overlap"
 METHOD_OURS_NO_OVERLAP = "ours_no_overlap"
 METHOD_VLLM = "vllm_ag_rs_min_fa3"
+METHOD_VLLM_A2A = "vllm_a2a_min_fa3"
 METHOD_SGLANG = "sglang_mha_ag_ar_min_fa3"
 METHOD_FULL = "full_kv_min_fa3"
 PHASE_NAMES = (
@@ -44,6 +47,10 @@ PHASE_NAMES = (
     "local_history_attention_ms",
     "lse_allgather_correct_ms",
     "output_collective_ms",
+    "output_reduce_scatter_ms",
+    "a2a_pack_ms",
+    "a2a_all_to_all_ms",
+    "a2a_unpack_combine_ms",
     "state_merge_ms",
     "attention_end_to_end_ms",
 )
@@ -98,6 +105,18 @@ def parse_implementations(spec: str) -> tuple[str, ...]:
             f"unknown={unknown}"
         )
     return tuple(dict.fromkeys(values))
+
+
+def expanded_method_labels(implementations: tuple[str, ...]) -> tuple[str, ...]:
+    methods: list[str] = []
+    if "ours" in implementations:
+        methods.extend((METHOD_OURS_NO_OVERLAP, METHOD_OURS_OVERLAP))
+    if "vllm" in implementations:
+        methods.extend((METHOD_VLLM, METHOD_VLLM_A2A))
+    if "sglang" in implementations:
+        methods.append(METHOD_SGLANG)
+    methods.append(METHOD_FULL)
+    return tuple(methods)
 
 
 def make_dcp_groups(sizes: Iterable[int], device: torch.device) -> dict[int, DCPGroup]:
@@ -326,7 +345,11 @@ def benchmark_full_kv(
             "overlap_q_allgather": False,
             "graph_static_signature": signature if cuda_graph else None,
         }
-        return {"attention_end_to_end_ms": samples}, execution
+        phase_samples = {
+            name: [0.0] * iterations for name in PHASE_NAMES
+        }
+        phase_samples["attention_end_to_end_ms"] = samples
+        return phase_samples, execution
     finally:
         if graph is not None:
             torch.cuda.synchronize(device)
@@ -430,6 +453,8 @@ def communication_report(
             "output_collective": "none",
             "q_allgather_receive_bytes_per_rank": 0.0,
             "lse_allgather_receive_bytes_per_rank": 0.0,
+            "output_collective_buffer_bytes_per_rank": 0.0,
+            "output_collective_remote_bytes_per_rank": 0.0,
             "output_collective_payload_bytes_per_rank": 0.0,
             "collective_payload_bytes_per_rank_total": 0.0,
         }
@@ -440,18 +465,28 @@ def communication_report(
     lse_local_bytes = batch_size * sq * h_group * 4
     q_receive = (n - 1) * q_local_bytes
     lse_receive = (n - 1) * lse_local_bytes
-    if method == METHOD_SGLANG:
+    if method == METHOD_VLLM_A2A:
+        output_kind = "bf16_packed_all_to_all"
+        output_buffer, output_payload = _dcp_a2a_payload_bytes(
+            batch_size * sq, h_local, head_dim, n
+        )
+        lse_receive = 0
+    elif method == METHOD_SGLANG:
         output_kind = "fp32_all_reduce"
         output_tensor_bytes = batch_size * sq * h_group * head_dim * 4
+        output_buffer = output_tensor_bytes
         output_payload = 2.0 * (n - 1) / n * output_tensor_bytes
     else:
         output_kind = "bf16_reduce_scatter"
         output_tensor_bytes = batch_size * sq * h_group * head_dim * 2
+        output_buffer = output_tensor_bytes
         output_payload = (n - 1) / n * output_tensor_bytes
     return {
         "output_collective": output_kind,
         "q_allgather_receive_bytes_per_rank": float(q_receive),
         "lse_allgather_receive_bytes_per_rank": float(lse_receive),
+        "output_collective_buffer_bytes_per_rank": float(output_buffer),
+        "output_collective_remote_bytes_per_rank": float(output_payload),
         "output_collective_payload_bytes_per_rank": float(output_payload),
         "collective_payload_bytes_per_rank_total": float(
             q_receive + lse_receive + output_payload
@@ -485,6 +520,13 @@ def method_metadata(method: str) -> dict[str, str]:
             "source": f"vLLM {VLLM_COMMIT} default ag_rs, copied and trimmed",
             "workspace_policy": "framework-style per-call layout/collective tensors",
             "chunk_schedule": "context path then local causal chunk attention",
+        },
+        METHOD_VLLM_A2A: {
+            "source": f"vLLM {VLLM_COMMIT} a2a, copied and trimmed",
+            "workspace_policy": (
+                "per-call graph-private send/recv tensors; no growable workspace"
+            ),
+            "chunk_schedule": "context A2A then local causal chunk attention",
         },
         METHOD_SGLANG: {
             "source": f"SGLang {SGLANG_COMMIT} MHA DCP path, copied and trimmed",
@@ -645,7 +687,11 @@ def make_method_calls(
                 )
             )
 
-    for implementation, method in (("vllm", METHOD_VLLM), ("sglang", METHOD_SGLANG)):
+    for implementation, method in (
+        ("vllm", METHOD_VLLM),
+        ("vllm", METHOD_VLLM_A2A),
+        ("sglang", METHOD_SGLANG),
+    ):
         if implementation not in implementations:
             continue
         runner = runners[method]
@@ -711,6 +757,23 @@ def capture_method(
     )
 
 
+def check_output(
+    name: str, actual: torch.Tensor, expected: torch.Tensor
+) -> None:
+    close = torch.tensor(
+        int(
+            torch.isclose(
+                actual.float(), expected.float(), atol=3.0e-2, rtol=3.0e-2
+            ).all()
+        ),
+        device=actual.device,
+        dtype=torch.int32,
+    )
+    dist.all_reduce(close, op=dist.ReduceOp.MIN)
+    if not close.item():
+        raise RuntimeError(f"{name} failed the pre-benchmark correctness check")
+
+
 def run_case(
     topology: DCPTopology,
     case_kind: str,
@@ -763,6 +826,7 @@ def run_case(
             "is_causal": workload == "chunk",
         },
     )
+    reference_output = full_call()
     method_samples: dict[str, dict[str, list[float]]] = {
         METHOD_FULL: full_samples
     }
@@ -771,6 +835,7 @@ def run_case(
         implementations, workload, inputs, runners, num_splits
     ):
         assert runner is not None
+        check_output(method, call(False), reference_output)
         overlap = method == METHOD_OURS_OVERLAP
         samples, execution = benchmark_runner(
             runner,
@@ -1044,6 +1109,7 @@ def main() -> None:
                 cached[METHOD_OURS_NO_OVERLAP] = DCPAttentionRunner(group)
             if "vllm" in implementations:
                 cached[METHOD_VLLM] = VLLMDCPAttentionRunner(group)
+                cached[METHOD_VLLM_A2A] = VLLMA2ADCPAttentionRunner(group)
             if "sglang" in implementations:
                 cached[METHOD_SGLANG] = SGLangDCPAttentionRunner(group)
             runner_cache[dcp_size] = cached
@@ -1164,7 +1230,7 @@ def main() -> None:
                     print_case(case, case_index, case_total)
 
         result = {
-            "schema_version": 3,
+            "schema_version": 4,
             "comparison_scope": (
                 "DCP orchestration comparison under the same "
                 "min_fa3_op.forward_kvcache kernel; not end-to-end vLLM or "
@@ -1184,6 +1250,7 @@ def main() -> None:
                 **vars(args),
                 "output_json": str(args.output_json) if args.output_json else None,
                 "implementations": list(implementations),
+                "method_labels": list(expanded_method_labels(implementations)),
             },
             "topologies": topology_records,
             "cases": cases,

@@ -425,9 +425,11 @@ replicas, and DCP rank. The default 8-GPU launch covers the six legal
 chunk sizes 2/8/32/128, `num_splits=0/1/2`, repeated forwards, both local
 overlap modes, and the pinned vLLM/SGLang runners. It compares every method
 with the complete-KV min FA3 reference and records global max/mean output and
-LSE absolute error. CUDA Graph capture/replay is the default and additionally
-checks in-place input updates, dynamic dense effective lengths, overlap
-fork/join, active-graph exclusion, and close-then-recapture. Use
+LSE absolute error. The vLLM coverage includes both AG+RS and packed A2A.
+CUDA Graph capture/replay is the default; each method is first checked once in
+eager mode in the same process group. The suite additionally checks in-place
+input updates, dynamic dense effective lengths, A2A graph-private buffer
+lifetime, overlap fork/join, active-graph exclusion, and close-then-recapture. Use
 `--no-cuda-graph` for the eager fallback smoke:
 
 ```bash
@@ -441,7 +443,7 @@ The packed DCP sibling suite uses a full-KV
 `forward_kvcache_varlen` call as each TP rank's reference. Its default matrix
 covers decode, mixed chunk lengths `[1,8,32]`, ragged history, GQA and MQA,
 DCP `2/4/8`, `num_splits=0/1/2/8`, both ours overlap modes, pinned
-vLLM/SGLang orchestration, returned LSE, repeated calls on alternating caller
+vLLM AG+RS/A2A and SGLang orchestration, returned LSE, repeated calls on alternating caller
 streams, grow-only workspace reuse, uniform packed-vs-dense parity, and input
 contract failures. Its default graph checks also freeze and report the packed
 cumulative-length metadata while allowing Q/K/V contents to change in place:
@@ -860,11 +862,12 @@ one fused packed call against a loop of `B` calls to the dense
 `forward_kvcache`, using the same split and mask selection. Optional profiling
 reports the packed call's prepare, attention, and combine CUDA kernel time.
 
-The DCP attention-only benchmark compares five method labels while holding the
+The DCP attention-only benchmark compares six method labels while holding the
 local attention kernel fixed: default `ours_no_overlap`, explicit
-`ours_overlap`,
-`vllm_ag_rs_min_fa3`, `sglang_mha_ag_ar_min_fa3`, and
-`full_kv_min_fa3`. It uses global model head counts and defaults to `TP=8`,
+`ours_overlap`, `vllm_ag_rs_min_fa3`, `vllm_a2a_min_fa3`,
+`sglang_mha_ag_ar_min_fa3`, and `full_kv_min_fa3`. The `vllm` implementation
+category expands to both vLLM labels without an additional CLI switch. It uses
+global model head counts and defaults to `TP=8`,
 `Hq=32/64`, `Hkv=2/4`, and candidate `DCP=2/4/8`. Production topology checks
 select exactly six legal GQA combinations; every rejected combination is
 written as `skipped_topology` with structured reasons.
@@ -893,12 +896,20 @@ against a complete cache for that rank's global KV head. For chunk prefill it
 concatenates full history and current chunk and runs bottom-right causal min
 FA3. This isolates the latency exchanged for KV-memory reduction.
 
-CUDA Graph is the benchmark default for all five methods, including full-KV.
+CUDA Graph is the benchmark default for all six methods, including full-KV.
 Each fixed case performs three eager capture warmups before capture, then
 `--warmup` unmeasured graph replays, followed by timed replays. Use
 `--no-cuda-graph` to run the same methods eagerly; in that mode `--warmup`
 counts eager calls. The local no-overlap, vLLM, SGLang, and full-KV paths use
 one stream. `ours_overlap` alone captures compute plus communication streams.
+
+The A2A path is copied and trimmed from vLLM commit
+`a89015c6df8eeb37a843b717c97a5be1355de83d`, including the ordinary GQA/MQA
+backend integration rather than only MLA. Its packed combine originates in PR
+#41160; the per-call `torch.empty` graph-private buffer policy follows PR
+#45487, and LSE is forced to FP32 before bit packing as in PR #47801. It issues
+one Q all-gather and one packed `all_to_all_single`; it does not issue the
+AG+RS path's LSE all-gather or output reduce-scatter.
 
 All DCP subgroups for a topology run concurrently. Every sample is reduced to
 the maximum over all eight global ranks before p50/p90 aggregation, and only
@@ -906,7 +917,11 @@ global rank 0 emits a case. The JSON records full parameters, environment and
 pinned commits, topology decisions, raw samples, stage p50/p90, effective
 global-model TFLOP/s, full/local KV bytes, speedups, and method-specific
 collective payload. SGLang's output collective is modeled as an FP32 ring
-all-reduce; current/vLLM output collectives are BF16 reduce-scatter.
+all-reduce; current/vLLM AG+RS output collectives are BF16 reduce-scatter.
+The A2A report separates pack, pure all-to-all, and unpack/combine time;
+`output_collective_ms` is the pure all-to-all interval. Its payload records
+both the full send/receive buffer size and remote bytes excluding self-copy:
+`DCP*T*H_local*(D+2)*2` and `(DCP-1)*T*H_local*(D+2)*2`, respectively.
 Per-method execution metadata records the mode, capture warmup, stream policy,
 overlap flag, and graph-static tensor/scalar signature. Primary comparison
 fields use `ours_no_overlap_speedup_vs_method`; overlap latency and hidden-time
@@ -930,20 +945,21 @@ Results default to the ignored timestamped path
 DCP orchestration comparison under one min FA3 kernel, not an end-to-end
 serving-engine or native backend benchmark for vLLM or SGLang.
 
-A short three-method smoke run can use:
+A short vLLM dual-baseline smoke run can use:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 --module \
   dcp_test.benchmark_dcp \
   --qhead 32 --kvhead 2 --tp-size 8 --dcp-sizes 2 \
+  --implementations vllm \
   --workload both --decode-b 1 --chunk-b 1 \
   --seqlen 4096 --sq 8 --warmup 1 --iters 3 --no-mqa-control
 ```
 
-The independent packed-varlen DCP benchmark uses the sibling method labels
+The independent packed-varlen DCP benchmark uses the six sibling method labels
 `ours_no_overlap_varlen`, explicit `ours_overlap_varlen`,
-`vllm_ag_rs_min_fa3_varlen`, `sglang_mha_ag_ar_min_fa3_varlen`, and
-`full_kv_min_fa3_varlen`. `--sq` and `--seqlen` each accept one broadcast
+`vllm_ag_rs_min_fa3_varlen`, `vllm_a2a_min_fa3_varlen`,
+`sglang_mha_ag_ar_min_fa3_varlen`, and `full_kv_min_fa3_varlen`. `--sq` and `--seqlen` each accept one broadcast
 value or exactly `B` comma-separated values. Decode requires `--sq 1`, and
 its cache lengths include the current token. Chunk `--seqlen` values are
 history lengths and exclude the supplied chunk.
@@ -952,7 +968,9 @@ Packing, host cumulative-length construction, and interleaved DCP sharding
 occur before timing. Each latency sample is the maximum across every TP rank.
 Useful FLOPs, KV bytes, collective payload, and throughput use `sum(q_len)`,
 actual packed local K tokens, and per-sequence effective decode/causal pairs.
-JSON records global and rank-local lengths, packed token counts, stage p50/p90,
+Dense JSON schema version 4 and packed-varlen schema version 3 preserve the
+older method fields while adding A2A stages and payload details. JSON records
+global and rank-local lengths, packed token counts, stage p50/p90,
 speedup, effective TFLOP/s, memory reduction, and both pinned source commits.
 It uses the same default CUDA Graph policy, fixed three-call capture warmup,
 post-capture `--warmup` semantics, full-KV graph baseline, execution metadata,
