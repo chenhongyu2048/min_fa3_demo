@@ -339,6 +339,17 @@ def build_dcp_mega_metadata(
         num_sms=num_sms,
         block_n=dispatch.block_n,
     )
+    if all(split == 1 for split in chunk_sequence_splits) and all(
+        split == 1 for split in history_sequence_splits
+    ):
+        dispatch = DCPMegaDispatch(
+            effective_num_splits=1,
+            chunk_num_splits=1,
+            history_num_splits=1,
+            pack_gqa=dispatch.pack_gqa,
+            split=False,
+            block_n=dispatch.block_n,
+        )
 
     total_q = cu_q[-1]
     num_token_subtiles = _ceil_div(total_q, 16)

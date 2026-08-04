@@ -123,6 +123,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         )
         self.assertTrue(metadata.dispatch.pack_gqa)
         self.assertTrue(metadata.dispatch.split)
+        self.assertTrue(any(split > 1 for split in metadata.history_sequence_splits))
         self._assert_attention_tiles_once(metadata, cu_q, 4, 8)
         self._assert_publish_receive_mapping(metadata, 8)
         history = [row for row in metadata.attention if row[0] == HISTORY]
@@ -172,6 +173,39 @@ class DCPMegaMetadataTest(unittest.TestCase):
                 )
                 self.assertEqual(metadata.dispatch.block_n, block_n)
                 self.assertGreaterEqual(metadata.dispatch.effective_num_splits, 1)
+
+    def test_auto_dispatch_collapses_when_all_dynamic_splits_are_one(self):
+        cu_q = tuple(batch_idx * 128 for batch_idx in range(17))
+        cu_history = tuple(batch_idx * 8192 for batch_idx in range(17))
+        upper_bound = choose_dispatch(
+            max_seqlen_q=128,
+            max_seqlen_history=8192,
+            hq_local=4,
+            dcp_size=8,
+            num_sms=132,
+            requested_num_splits=0,
+            block_n_override=128,
+        )
+        self.assertEqual(upper_bound.history_num_splits, 4)
+        self.assertTrue(upper_bound.split)
+
+        metadata = build_dcp_mega_metadata(
+            cu_q,
+            cu_history,
+            hq_local=4,
+            dcp_size=8,
+            num_sms=132,
+            requested_num_splits=0,
+            block_n_override=128,
+        )
+        self.assertEqual(metadata.chunk_sequence_splits, (1,) * 16)
+        self.assertEqual(metadata.history_sequence_splits, (1,) * 16)
+        self.assertEqual(metadata.dispatch.effective_num_splits, 1)
+        self.assertEqual(metadata.dispatch.chunk_num_splits, 1)
+        self.assertEqual(metadata.dispatch.history_num_splits, 1)
+        self.assertFalse(metadata.dispatch.split)
+        self.assertTrue(metadata.dispatch.pack_gqa)
+        self.assertEqual(metadata.dispatch.block_n, 128)
 
     def test_block_override_controls_both_split_heuristics(self):
         for block_n in (128, 176):

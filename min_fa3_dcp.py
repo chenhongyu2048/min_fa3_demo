@@ -4309,8 +4309,9 @@ class DCPMegaAttentionRunner:
         self,
         *,
         return_timing_ms: bool = False,
+        run_pre_barrier: bool = True,
     ):
-        """Run pre-barrier + mega, then enqueue the untimed post-barrier."""
+        """Run the prepared mega replay, then enqueue the untimed post-barrier."""
         pending = self._replay_pending
         if pending is None:
             raise RuntimeError("prepare_last_forward_replay must be called first")
@@ -4325,6 +4326,7 @@ class DCPMegaAttentionRunner:
                 True,
                 pending.pre_phase,
                 False,
+                run_pre_barrier,
                 return_timing_ms,
             )
             min_fa3_op._dcp_mega_varlen_barrier(

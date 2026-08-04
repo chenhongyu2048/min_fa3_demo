@@ -611,18 +611,25 @@ def measure_mega(
     device: torch.device,
     expected: torch.Tensor | None,
 ) -> tuple[dict[str, dict[str, float]], dict[str, object]]:
+    def replay_after_distributed_barrier(*, return_timing_ms: bool = False):
+        dist.barrier(group=runner.process_group, device_ids=[device.index])
+        return runner.replay_last_forward(
+            return_timing_ms=return_timing_ms,
+            run_pre_barrier=False,
+        )
+
     initial_output = call()
     if expected is not None:
         check_output(f"{METHOD_MEGA}_eager", initial_output, expected)
         runner.prepare_last_forward_replay()
         check_output(
             f"{METHOD_MEGA}_prepared_replay",
-            runner.replay_last_forward(),
+            replay_after_distributed_barrier(),
             expected,
         )
     for _ in range(args.warmup):
         runner.prepare_last_forward_replay()
-        runner.replay_last_forward()
+        replay_after_distributed_barrier()
     torch.cuda.synchronize(device)
 
     samples = []
@@ -636,7 +643,7 @@ def measure_mega(
         )
     for sample_idx in range(args.iters):
         runner.prepare_last_forward_replay()
-        _, elapsed_ms = runner.replay_last_forward(return_timing_ms=True)
+        _, elapsed_ms = replay_after_distributed_barrier(return_timing_ms=True)
         local_latency_samples.append(elapsed_ms)
         total = torch.tensor(elapsed_ms, device=device, dtype=torch.float64)
         dist.all_reduce(total, op=dist.ReduceOp.MAX)
@@ -704,8 +711,10 @@ def measure_mega(
         "overlap_q_allgather": True,
         "graph_static_signature": None,
         "num_comm_sm": runner.num_comm_sm,
-        "timing_boundary": "pre_barrier_plus_mega_kernel",
+        "timing_boundary": "mega_kernel_only",
         "timing_source": "internal_cpp_cuda_events",
+        "pre_barrier": "torch_distributed_outside_timing",
+        "pre_barrier_timed": False,
         "metadata_policy": "generated_and_uploaded_once_before_timing",
         "prepared_replay_correctness_checked": expected is not None,
         "workspace_reset_timed": False,

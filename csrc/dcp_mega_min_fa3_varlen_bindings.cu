@@ -311,7 +311,8 @@ double forward_chunk_prefill_varlen_dcp_mega(
     bool metadata_prepared,
     int64_t pre_phase,
     bool run_post_barrier,
-    bool measure_pre_barrier_and_kernel) {
+    bool run_pre_barrier,
+    bool measure_kernel) {
     check_packed_bf16(q, "q");
     check_packed_bf16(k_history, "k_history");
     check_packed_bf16(v_history, "v_history");
@@ -651,15 +652,17 @@ double forward_chunk_prefill_varlen_dcp_mega(
 
     cudaEvent_t timing_start = nullptr;
     cudaEvent_t timing_end = nullptr;
-    if (measure_pre_barrier_and_kernel) {
+    if (run_pre_barrier) {
+        min_fa3_varlen_demo::dcp_mega::run_dcp_mega_barrier(
+            params, metadata_prepared ? int(pre_phase) : header.pre_phase, stream);
+    }
+    if (measure_kernel) {
         C10_CUDA_CHECK(cudaEventCreate(&timing_start));
         C10_CUDA_CHECK(cudaEventCreate(&timing_end));
         C10_CUDA_CHECK(cudaEventRecord(timing_start, stream));
     }
-    min_fa3_varlen_demo::dcp_mega::run_dcp_mega_barrier(
-        params, metadata_prepared ? int(pre_phase) : header.pre_phase, stream);
     min_fa3_varlen_demo::dcp_mega::run_dcp_mega_varlen_fwd(params, stream);
-    if (measure_pre_barrier_and_kernel) {
+    if (measure_kernel) {
         C10_CUDA_CHECK(cudaEventRecord(timing_end, stream));
     }
     if (run_post_barrier) {
@@ -668,7 +671,7 @@ double forward_chunk_prefill_varlen_dcp_mega(
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     double elapsed_ms = 0.0;
-    if (measure_pre_barrier_and_kernel) {
+    if (measure_kernel) {
         C10_CUDA_CHECK(cudaEventSynchronize(timing_end));
         float elapsed_ms_float = 0.0f;
         C10_CUDA_CHECK(cudaEventElapsedTime(
@@ -779,7 +782,8 @@ void bind_dcp_mega_varlen(py::module_& module) {
         py::arg("metadata_prepared") = false,
         py::arg("pre_phase") = 0,
         py::arg("run_post_barrier") = true,
-        py::arg("measure_pre_barrier_and_kernel") = false,
+        py::arg("run_pre_barrier") = true,
+        py::arg("measure_kernel") = false,
         "Persistent single-node SM90 BF16 D=128 batched varlen DCP mega forward.");
     module.def(
         "_dcp_mega_varlen_barrier",

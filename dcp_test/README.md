@@ -42,9 +42,10 @@ monotonic ready phase directly, so communication CTAs proceed from Q
 all-gather to receive without a separate publish pass. The existing default method
 list remains unchanged. Its first eager
 correctness call builds and uploads fixed-shape metadata. Benchmark replays
-reuse that device image. Internal CUDA events measure only pre-barrier plus the
-persistent mega kernel; workspace reset and post-barrier remain required but
-are outside the measured interval. Add `--mega-phase-timestamps` to include
+reuse that device image. Internal CUDA events measure only the persistent mega
+kernel. Each replay completes a `torch.distributed.barrier` on the DCP process
+group before the start event; workspace reset and both barriers remain outside
+the measured interval. Add `--mega-phase-timestamps` to include
 optional `%globaltimer` milestones in JSON. Fused `history_combine_done` and
 `publish_done` are intentionally identical; `publish_done` means every remote
 ready release has been issued.
@@ -94,6 +95,15 @@ torchrun --standalone --nproc_per_node=8 --module dcp_test.benchmark_dcp_varlen 
   --workload chunk --implementations ours,vllm,sglang,full \
   --num-splits 0 --warmup 2 --iters 5
 ```
+
+The repository-root `benchmark_dcp_mega_six_loads.sh` script runs the six
+standard small/medium/large chunk workloads for `DCP/Hkv=2/4,4/2,8/1`.
+By default it runs eager Mega and orchestration baselines followed by the
+non-Mega CUDA Graph baselines, using 500 warmups and 100 samples. Per-job logs,
+JSON results, and a master log are written below a timestamped
+`benchmark_logs/dcp_mega_six_loads_*` directory. Use `DRY_RUN=1` to print the
+full command matrix without launching it; `LOADS=large2`, `MODES=eager`, or
+`DCP_SIZES=8` restricts the matrix.
 
 Packed-varlen decode requires every `--sq` value to be `1`. Both benchmarks
 also accept `--output-json PATH`. See the repository `README.md` for topology,
@@ -151,12 +161,13 @@ milliseconds. The final runs use 500 eager warmups and 100 measured calls
 because 5-20 warmups were insufficient to stabilize clocks for sub-ms jobs.
 
 Mega timings use CUDA events created inside the C++ binding after argument
-validation. The start event immediately precedes the pre-phase barrier and the
-end event immediately follows the mega kernel. Host metadata generation,
-metadata H2D copy, workspace reset, Python/C++ dispatch delay, and post-phase
-barrier are excluded. The other methods retain their existing dcp_test timing
-boundaries, so comparisons against A2A/AG+RS are informative but not identical
-end-to-end orchestration measurements.
+validation. Benchmark replays first complete a `torch.distributed.barrier`
+outside the timed interval, skip the binding's IPC pre-phase barrier, then place
+the start and end events immediately around the mega kernel. Host metadata
+generation, metadata H2D copy, workspace reset, Python/C++ dispatch delay, and
+both barriers are excluded. The other methods retain their existing dcp_test
+timing boundaries, so comparisons against A2A/AG+RS are informative but not
+identical end-to-end orchestration measurements.
 
 The imbalance workload was `B=3`, `Sq=[1,1,1]`,
 `Sk_history=[4097,32769,180225]`, `Hq=32`, `Hkv=1`, and `TP=8`. A representative
