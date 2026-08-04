@@ -95,6 +95,12 @@ class DCPTopologyTest(unittest.TestCase):
             ("vllm_ag_rs_min_fa3_varlen", "vllm_a2a_min_fa3_varlen"),
         )
 
+    def test_varlen_mega_category_precedes_full_reference(self) -> None:
+        self.assertEqual(
+            varlen_method_labels(("mega", "full")),
+            ("dcp_mega_varlen", "full_kv_min_fa3_varlen"),
+        )
+
     def test_a2a_lse_weighted_equal_states(self) -> None:
         outputs = torch.tensor([[[[1.0]]], [[[3.0]]]])
         lses = torch.zeros((2, 1, 1), dtype=torch.float32)

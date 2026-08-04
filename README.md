@@ -956,7 +956,7 @@ torchrun --standalone --nproc_per_node=8 --module \
   --seqlen 4096 --sq 8 --warmup 1 --iters 3 --no-mqa-control
 ```
 
-The independent packed-varlen DCP benchmark uses the six sibling method labels
+The independent packed-varlen DCP benchmark uses the six default sibling method labels
 `ours_no_overlap_varlen`, explicit `ours_overlap_varlen`,
 `vllm_ag_rs_min_fa3_varlen`, `vllm_a2a_min_fa3_varlen`,
 `sglang_mha_ag_ar_min_fa3_varlen`, and `full_kv_min_fa3_varlen`. `--sq` and `--seqlen` each accept one broadcast
@@ -975,6 +975,42 @@ speedup, effective TFLOP/s, memory reduction, and both pinned source commits.
 It uses the same default CUDA Graph policy, fixed three-call capture warmup,
 post-capture `--warmup` semantics, full-KV graph baseline, execution metadata,
 and `--no-cuda-graph` eager fallback as the dense benchmark.
+Packed-varlen accepts `--no-check` to skip the eager full-KV correctness
+precheck for performance-only runs.
+
+The optional `--implementations mega` category adds the experimental
+`dcp_mega_varlen` path for chunk prefill only. It requires `--no-cuda-graph`;
+`--mega-block-n 128|176` and `--mega-num-comm-sm N` select its isolated kernel
+instance and explicit communication-CTA budget. The default remains 8 and
+there is no `0/auto` mode. Mega uses fixed `[16,Hq_local,128]` Q/O
+communication tiles and requires PackGQA with `Hq_local` 4 or 8. History
+combine publishes each completed remote tile directly with a monotonic phase
+signal; there is no separate communication-granularity mode or publish pass.
+Fixed-shape benchmark replay builds and
+uploads metadata once. Its internal CUDA events measure only the pre-barrier
+and persistent mega kernel; workspace clears happen before the start event and
+the post-barrier happens after the end event. Existing default benchmark
+methods are unchanged. `--mega-phase-timestamps` records optional in-kernel
+`%globaltimer` milestones; fused `history_combine_done` and `publish_done`
+share the same timestamp, with the latter meaning all remote ready releases
+have been issued.
+
+```bash
+torchrun --standalone --nproc_per_node=8 --module \
+  dcp_test.benchmark_dcp_varlen \
+  --b 3 --sq 1,8,32 --seqlen 129,1024,3131 \
+  --qhead 32 --kvhead 1 --headdim 128 --tp-size 8 --dcp-size 8 \
+  --workload chunk --implementations mega,vllm,full --no-cuda-graph \
+  --mega-block-n 128 --mega-num-comm-sm 8 \
+  --num-splits 0 --warmup 5 --iters 20
+```
+
+Run the one-process-group correctness matrix with:
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  scripts/test_min_fa3/test_dcp_mega_varlen_multi_rank.py --matrix
+```
 
 Mixed chunk and ragged decode smoke runs:
 

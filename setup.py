@@ -98,6 +98,13 @@ ext_modules = [
             "csrc/min_fa3_kvcache_packgqa_kernel.cu",
             "csrc/min_fa3_kvcache_split_kernel.cu",
             "csrc/min_fa3_kvcache_combine.cu",
+            # DCP_MEGA: isolated Pack/Split/BlockN instances and bindings.
+            "csrc/dcp_mega_min_fa3_varlen_bindings.cu",
+            "csrc/dcp_mega_min_fa3_varlen_launch.cu",
+            "csrc/dcp_mega_min_fa3_varlen_kernel_pack_split_bn128.cu",
+            "csrc/dcp_mega_min_fa3_varlen_kernel_pack_split_bn176.cu",
+            "csrc/dcp_mega_min_fa3_varlen_kernel_pack_nosplit_bn128.cu",
+            "csrc/dcp_mega_min_fa3_varlen_kernel_pack_nosplit_bn176.cu",
             "csrc/backward/min_fa3_bwd_bindings.cu",
             "csrc/backward/min_fa3_bwd_launch.cu",
             "csrc/backward/min_fa3_bwd_kernel.cu",
@@ -145,5 +152,5 @@ setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension.with_options(no_python_abi_suffix=True)},
     packages=[],
-    py_modules=["min_fa3_op", "min_fa3_dcp"],
+    py_modules=["min_fa3_op", "min_fa3_dcp", "dcp_mega_metadata"],
 )

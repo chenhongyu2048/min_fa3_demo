@@ -31,6 +31,24 @@ ordinary GQA/MQA FlashAttention integration. It retains the packed-combine
 design from PR #41160, graph-private per-call buffers from PR #45487, and the
 FP32 LSE pack contract from PR #47801.
 
+Packed-varlen also accepts the explicit experimental category
+`--implementations mega`, reported as `dcp_mega_varlen`. It is chunk-only and
+eager-only, so pass `--no-cuda-graph`. `--mega-block-n 128|176` and
+`--mega-num-comm-sm N` select the isolated instance and communication-CTA
+budget. The communication path is fixed to PackGQA with `Hq_local` 4 or 8 and
+`[16,Hq_local,128]` Q/O tiles; there is no runtime communication-layout
+selection. History combine performs the remote TMA store and publishes a
+monotonic ready phase directly, so communication CTAs proceed from Q
+all-gather to receive without a separate publish pass. The existing default method
+list remains unchanged. Its first eager
+correctness call builds and uploads fixed-shape metadata. Benchmark replays
+reuse that device image. Internal CUDA events measure only pre-barrier plus the
+persistent mega kernel; workspace reset and post-barrier remain required but
+are outside the measured interval. Add `--mega-phase-timestamps` to include
+optional `%globaltimer` milestones in JSON. Fused `history_combine_done` and
+`publish_done` are intentionally identical; `publish_done` means every remote
+ready release has been issued.
+
 A2A stage timing separates pack, `all_to_all_single`, and unpack/FP32 base-e
 LSE-weighted combine. `output_collective_ms` covers only the all-to-all. The
 payload report distinguishes the full BF16 buffer
@@ -82,6 +100,95 @@ also accept `--output-json PATH`. See the repository `README.md` for topology,
 timing boundary, method-label, and JSON-schema details. These are
 attention-only, same-min-FA3 orchestration baselines, not native vLLM/SGLang
 serving-runtime benchmarks.
+
+Packed-varlen performs an eager full-KV correctness precheck by default. Pass
+`--no-check` for performance-only runs. Mega still performs one untimed setup
+call in that mode to build and upload its reusable metadata, but it does not
+compare the output or include that call in the measured interval.
+
+Experimental mega-kernel smoke example:
+
+```bash
+torchrun --standalone --nproc_per_node=8 --module dcp_test.benchmark_dcp_varlen \
+  --b 3 --sq 1,8,32 --seqlen 129,1024,3131 \
+  --qhead 32 --kvhead 1 --headdim 128 --tp-size 8 --dcp-size 8 \
+  --workload chunk --implementations mega,vllm,full --no-cuda-graph \
+  --mega-block-n 128 --mega-num-comm-sm 8 \
+  --num-splits 0 --warmup 5 --iters 20
+```
+
+The fixed eight-GPU correctness matrix runs DCP 2/4/8, Hq-local 4/8,
+BlockN 128/176, split/nosplit, and auto-split cases in a single process group.
+It uses ragged Q/history lengths,
+non-16 tails, BF16 O, FP32 LSE, and two forwards per case to cover workspace
+reuse:
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  scripts/test_min_fa3/test_dcp_mega_varlen_multi_rank.py --matrix
+```
+
+## Measured unified-queue mega run (2026-08-03)
+
+This rerun used the unified attention queue and single FA pipeline working tree
+on `zkrh-58` with 8 x H100 80GB HBM3, CUDA 12.8, PyTorch 2.10.0, BF16, and
+head dimension 128. Every method passed its eager full-KV correctness precheck.
+Each latency sample is the maximum over all eight global ranks; the tables show
+milliseconds. The final runs use 500 eager warmups and 100 measured calls
+because 5-20 warmups were insufficient to stabilize clocks for sub-ms jobs.
+
+Mega timings use CUDA events created inside the C++ binding after argument
+validation. The start event immediately precedes the pre-phase barrier and the
+end event immediately follows the mega kernel. Host metadata generation,
+metadata H2D copy, workspace reset, Python/C++ dispatch delay, and post-phase
+barrier are excluded. The other methods retain their existing dcp_test timing
+boundaries, so comparisons against A2A/AG+RS are informative but not identical
+end-to-end orchestration measurements.
+
+The imbalance workload was `B=3`, `Sq=[1,1,1]`,
+`Sk_history=[4097,32769,180225]`, `Hq=32`, `Hkv=1`, and `TP=8`. A representative
+command is:
+
+```bash
+torchrun --standalone --nproc_per_node=8 --module dcp_test.benchmark_dcp_varlen \
+  --b 3 --sq 1,1,1 --seqlen 4097,32769,180225 \
+  --qhead 32 --kvhead 1 --headdim 128 --tp-size 8 --dcp-size 8 \
+  --workload chunk --implementations mega,vllm,full --no-cuda-graph \
+  --mega-block-n 176 --mega-num-comm-sm 8 --num-splits 16 \
+  --warmup 500 --iters 100
+```
+
+Auto-split selected an effective upper bound of 109. With BlockN 176, its
+per-sequence chunk/history splits were `[1,1,1]` and `[3,17,94]`.
+
+| DCP | BlockN | mega p50 / p90 | vLLM A2A p50 | vLLM AG+RS p50 | full-KV p50 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 176 | 0.1930 / 0.1977 | 0.3341 | 0.3404 | 0.0708 |
+| 4 | 176 | 0.1796 / 0.1832 | 0.3368 | 0.3360 | 0.0703 |
+| 8 | 176 | 0.1539 / 0.1600 | 0.3452 | 0.3342 | 0.0712 |
+| 8 | 128 | 0.1680 / 0.1757 | 0.3498 | 0.3284 | 0.0717 |
+
+The split sweep fixed DCP=8, BlockN=176, and 8 communication CTAs:
+
+| requested splits | attention descriptors | mega p50 / p90 | vLLM A2A p50 | full-KV p50 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 6 | 0.2756 / 0.2826 | 0.4066 | 1.7636 |
+| 2 | 9 | 0.1853 / 0.1880 | 0.3544 | 1.0160 |
+| 8 | 22 | 0.1037 / 0.1067 | 0.3406 | 0.2786 |
+| 16 | 38 | 0.1009 / 0.1049 | 0.3443 | 0.1579 |
+| 32 | 55 | 0.1136 / 0.1225 | 0.3448 | 0.0938 |
+| 64 | 87 | 0.1539 / 0.1567 | 0.3583 | 0.0713 |
+| 128 | 117 | 0.1520 / 0.1545 | 0.3413 | 0.0696 |
+| auto (109) | 117 | 0.1539 / 0.1600 | 0.3452 | 0.0712 |
+
+For the best measured split value of 16, `num_comm_sm=4/8/16` produced mega
+p50 `0.1058/0.1009/0.0983` ms. The 16-CTA point was only 2.6% faster than the
+default 8-CTA point, which is too small and workload-specific to justify a
+default change. At the default 8 communication CTAs, mega was 3.41x faster
+than the same-run vLLM A2A p50 of 0.3443 ms under the differing timing
+boundaries described above. The legacy odd/even-role mega binary was not
+available, so these numbers compare the unified queue against the existing
+dcp_test baselines, not against a reconstructed old mega implementation.
 
 ## Measured eight-GPU reference run (2026-08-02)
 

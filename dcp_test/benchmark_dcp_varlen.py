@@ -8,7 +8,7 @@ import os
 import platform
 import socket
 import subprocess
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -20,6 +20,7 @@ import min_fa3_op
 from min_fa3_dcp import (
     DCPAttentionCUDAGraph,
     DCPAttentionRunner,
+    DCPMegaAttentionRunner,
     SGLangDCPAttentionRunner,
     VLLMA2ADCPAttentionRunner,
     VLLMDCPAttentionRunner,
@@ -37,6 +38,7 @@ METHOD_VLLM = "vllm_ag_rs_min_fa3_varlen"
 METHOD_VLLM_A2A = "vllm_a2a_min_fa3_varlen"
 METHOD_SGLANG = "sglang_mha_ag_ar_min_fa3_varlen"
 METHOD_FULL = "full_kv_min_fa3_varlen"
+METHOD_MEGA = "dcp_mega_varlen"
 
 STAGES = (
     "attention_end_to_end_ms",
@@ -93,10 +95,10 @@ def parse_lengths(spec: str, batch_size: int, name: str) -> list[int]:
 
 def parse_implementations(spec: str) -> tuple[str, ...]:
     values = tuple(token.strip().lower() for token in spec.split(",") if token.strip())
-    allowed = {"ours", "vllm", "sglang", "full"}
+    allowed = {"ours", "vllm", "sglang", "full", "mega"}
     if not values or any(value not in allowed for value in values):
         raise SystemExit(
-            "--implementations must contain ours,vllm,sglang,full entries"
+            "--implementations must contain ours,vllm,sglang,full,mega entries"
         )
     return tuple(dict.fromkeys(values))
 
@@ -109,6 +111,8 @@ def expanded_method_labels(implementations: tuple[str, ...]) -> tuple[str, ...]:
         methods.extend((METHOD_VLLM, METHOD_VLLM_A2A))
     if "sglang" in implementations:
         methods.append(METHOD_SGLANG)
+    if "mega" in implementations:
+        methods.append(METHOD_MEGA)
     if "full" in implementations:
         methods.append(METHOD_FULL)
     return tuple(methods)
@@ -398,6 +402,15 @@ def summarize_samples(samples: list[dict[str, float]]) -> dict[str, dict[str, fl
     }
 
 
+def summarize_series(values: list[float]) -> dict[str, float]:
+    return {
+        "p50": percentile(values, 0.50),
+        "p90": percentile(values, 0.90),
+        "min": min(values),
+        "max": max(values),
+    }
+
+
 def measure_runner(
     runner: DCPAttentionRunner,
     call: Callable[[bool], torch.Tensor],
@@ -406,19 +419,21 @@ def measure_runner(
     device: torch.device,
     *,
     overlap: bool,
-    expected: torch.Tensor,
+    expected: torch.Tensor | None,
 ) -> tuple[dict[str, dict[str, float]], dict[str, object]]:
     method_name = (
         runner.varlen_overlap_method_name if overlap else runner.varlen_method_name
     )
-    check_output(f"{method_name}_eager", call(False), expected)
+    if expected is not None:
+        check_output(f"{method_name}_eager", call(False), expected)
     captured = capture_runner(runner, inputs, args, overlap) if args.cuda_graph else None
     try:
-        check_output(
-            method_name,
-            captured.replay() if captured is not None else call(False),
-            expected,
-        )
+        if expected is not None:
+            check_output(
+                method_name,
+                captured.replay() if captured is not None else call(False),
+                expected,
+            )
         for _ in range(args.warmup):
             captured.replay() if captured is not None else call(False)
         torch.cuda.synchronize(device)
@@ -558,6 +573,117 @@ def measure_full(
             graph.reset()
 
 
+def measure_mega(
+    runner: DCPMegaAttentionRunner,
+    call: Callable[[], torch.Tensor],
+    args: argparse.Namespace,
+    device: torch.device,
+    expected: torch.Tensor | None,
+) -> tuple[dict[str, dict[str, float]], dict[str, object]]:
+    initial_output = call()
+    if expected is not None:
+        check_output(f"{METHOD_MEGA}_eager", initial_output, expected)
+        runner.prepare_last_forward_replay()
+        check_output(
+            f"{METHOD_MEGA}_prepared_replay",
+            runner.replay_last_forward(),
+            expected,
+        )
+    for _ in range(args.warmup):
+        runner.prepare_last_forward_replay()
+        runner.replay_last_forward()
+    torch.cuda.synchronize(device)
+
+    samples = []
+    phase_samples = None
+    if args.mega_phase_timestamps:
+        phase_samples = torch.empty(
+            (args.iters, len(runner.PHASE_TIMESTAMP_NAMES)),
+            device=device,
+            dtype=torch.int64,
+        )
+    for sample_idx in range(args.iters):
+        runner.prepare_last_forward_replay()
+        _, elapsed_ms = runner.replay_last_forward(return_timing_ms=True)
+        total = torch.tensor(elapsed_ms, device=device, dtype=torch.float64)
+        dist.all_reduce(total, op=dist.ReduceOp.MAX)
+        values = {stage: 0.0 for stage in STAGES}
+        values["attention_end_to_end_ms"] = float(total.item())
+        samples.append(values)
+        if phase_samples is not None:
+            runner.copy_last_phase_timestamps(phase_samples[sample_idx])
+
+    phase_profile = None
+    if phase_samples is not None:
+        torch.cuda.synchronize(device)
+        raw = phase_samples.cpu()
+        if bool((raw == 0).any()):
+            raise RuntimeError("mega phase timestamp buffer contains an unwritten slot")
+        if not torch.equal(raw[:, 3], raw[:, 4]):
+            raise RuntimeError(
+                "fused history_combine_done and publish_done timestamps differ"
+            )
+        relative_ns = raw - raw[:, :1]
+        relative_ns_device = relative_ns.to(device)
+        dist.all_reduce(relative_ns_device, op=dist.ReduceOp.MAX)
+        relative_us = relative_ns_device.cpu().to(torch.float64) / 1000.0
+        milestones = {
+            name: summarize_series(relative_us[:, index].tolist())
+            for index, name in enumerate(runner.PHASE_TIMESTAMP_NAMES)
+        }
+        tail_pairs = {
+            "q_done_to_publish_done": (1, 4),
+            "publish_done_to_receive_done": (4, 5),
+            "attention_done_to_history_combine_done": (2, 3),
+            "history_combine_done_to_final_combine_done": (3, 6),
+        }
+        local_tail_ns = torch.stack(
+            [raw[:, end] - raw[:, begin] for begin, end in tail_pairs.values()],
+            dim=1,
+        ).to(device)
+        dist.all_reduce(local_tail_ns, op=dist.ReduceOp.MAX)
+        tail_us = local_tail_ns.cpu().to(torch.float64) / 1000.0
+        phase_profile = {
+            "clock": (
+                "SM90 %globaltimer; microseconds relative to each rank's "
+                "kernel_start"
+            ),
+            "aggregation": (
+                "per-iteration MAX across DCP ranks, then percentile across iterations"
+            ),
+            "publish_done_semantics": (
+                "all fused remote ready releases issued; recorded from the same "
+                "%globaltimer read as history_combine_done"
+            ),
+            "milestones_us": milestones,
+            "post_global_completion_tails_us": {
+                name: summarize_series(tail_us[:, index].tolist())
+                for index, name in enumerate(tail_pairs)
+            },
+        }
+
+    dispatch = runner.last_dispatch
+    execution = {
+        "execution_mode": "eager",
+        "capture_eager_warmup": 0,
+        "post_capture_warmup": args.warmup,
+        "stream_policy": "single_stream_persistent_mega",
+        "overlap_q_allgather": True,
+        "graph_static_signature": None,
+        "num_comm_sm": runner.num_comm_sm,
+        "timing_boundary": "pre_barrier_plus_mega_kernel",
+        "timing_source": "internal_cpp_cuda_events",
+        "metadata_policy": "generated_and_uploaded_once_before_timing",
+        "prepared_replay_correctness_checked": expected is not None,
+        "workspace_reset_timed": False,
+        "post_barrier_timed": False,
+        "dispatch": asdict(dispatch) if dispatch is not None else None,
+        "queue_counts": runner.last_queue_counts,
+        "phase_profile": phase_profile,
+    }
+    return summarize_samples(samples), execution
+
+
 def check_output(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
     close = torch.tensor(
         int(torch.isclose(actual.float(), expected.float(), atol=3e-2, rtol=3e-2).all()),
@@ -604,12 +730,24 @@ def communication_report(
             "output_collective_buffer_bytes_per_rank": 0,
             "output_collective_remote_bytes_per_rank": 0,
             "output_collective_payload_bytes_per_rank": 0,
+            "tile_ready_remote_bytes_per_rank": 0,
             "collective_payload_bytes_per_rank_total": 0,
         }
     h_group = h_local * dcp_size
     q_receive = (dcp_size - 1) * total_q * h_local * head_dim * 2
     lse_receive = (dcp_size - 1) * total_q * h_group * 4
-    if method == METHOD_VLLM_A2A:
+    tile_ready_remote = 0
+    if method == METHOD_MEGA:
+        output_kind = "bf16_ipc_a2a"
+        output_buffer = total_q * h_local * head_dim * 2
+        output_remote = (dcp_size - 1) * output_buffer
+        lse_receive = (
+            (dcp_size - 1) * total_q * h_local * 4
+        )
+        tile_ready_remote = (
+            (dcp_size - 1) * ((total_q + 15) // 16) * 4
+        )
+    elif method == METHOD_VLLM_A2A:
         output_kind = "bf16_packed_all_to_all"
         output_buffer, output_remote = _dcp_a2a_payload_bytes(
             total_q, h_local, head_dim, dcp_size
@@ -630,8 +768,9 @@ def communication_report(
         "output_collective_buffer_bytes_per_rank": float(output_buffer),
         "output_collective_remote_bytes_per_rank": float(output_remote),
         "output_collective_payload_bytes_per_rank": float(output_remote),
+        "tile_ready_remote_bytes_per_rank": float(tile_ready_remote),
         "collective_payload_bytes_per_rank_total": float(
-            q_receive + lse_receive + output_remote
+            q_receive + lse_receive + output_remote + tile_ready_remote
         ),
     }
 
@@ -686,6 +825,14 @@ def parse_args() -> argparse.Namespace:
         "--implementations", type=str, default="ours,vllm,sglang,full"
     )
     parser.add_argument("--num-splits", type=int, default=0)
+    parser.add_argument("--mega-num-comm-sm", type=int, default=8)
+    parser.add_argument("--mega-block-n", type=int, choices=(128, 176), default=128)
+    parser.add_argument(
+        "--mega-phase-timestamps",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Record low-overhead mega-kernel phase completion timestamps",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument(
@@ -693,6 +840,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Capture each method and full-KV reference before timed replay",
+    )
+    parser.add_argument(
+        "--check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compare each method against full-KV before measurement",
     )
     parser.add_argument("--output-json", type=Path, default=None)
     return parser.parse_args()
@@ -704,6 +857,7 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     dist.init_process_group("nccl", device_id=device)
+    mega_runner: DCPMegaAttentionRunner | None = None
     try:
         world_size = dist.get_world_size()
         rank = dist.get_rank()
@@ -725,6 +879,13 @@ def main() -> None:
             raise SystemExit("decode requires every --sq value to be 1")
 
         implementations = parse_implementations(args.implementations)
+        if "mega" in implementations:
+            if args.workload != "chunk":
+                raise SystemExit("the DCP mega experimental path supports chunk only")
+            if args.cuda_graph:
+                raise SystemExit("the DCP mega experimental path requires --no-cuda-graph")
+            if args.dcp_size not in (2, 4, 8):
+                raise SystemExit("the DCP mega experimental path requires DCP size 2, 4, or 8")
         topology = make_topology(
             args.qhead, args.kvhead, args.tp_size, args.dcp_size
         )
@@ -743,8 +904,23 @@ def main() -> None:
             runners[METHOD_VLLM_A2A] = VLLMA2ADCPAttentionRunner(process_group)
         if "sglang" in implementations:
             runners[METHOD_SGLANG] = SGLangDCPAttentionRunner(process_group)
+        mega_q = None
+        if "mega" in implementations:
+            mega_runner = DCPMegaAttentionRunner(
+                process_group,
+                dist.group.WORLD,
+                max_total_q=sum(inputs.q_lengths),
+                max_batch=len(inputs.q_lengths),
+                Hq_local=topology.q_heads_local,
+                max_num_splits=128,
+                num_comm_sm=args.mega_num_comm_sm,
+                block_n_override=args.mega_block_n,
+                record_phase_timestamps=args.mega_phase_timestamps,
+            )
+            mega_q = mega_runner.q_local(sum(inputs.q_lengths))
+            mega_q.copy_(inputs.q_local)
 
-        reference_output = full_forward(inputs, args)
+        reference_output = full_forward(inputs, args) if args.check else None
         reports: dict[str, dict[str, object]] = {}
         for method, runner in runners.items():
             overlap = method == METHOD_OURS_OVERLAP
@@ -780,6 +956,43 @@ def main() -> None:
                         "overlapped_ag_chunk_window_ms"
                     ],
                 }
+        if mega_runner is not None:
+            assert mega_q is not None
+            assert inputs.k_chunk is not None and inputs.v_chunk is not None
+
+            def mega_call() -> torch.Tensor:
+                return mega_runner.forward_chunk_prefill_varlen(
+                    mega_q,
+                    inputs.k_history_local,
+                    inputs.v_history_local,
+                    inputs.k_chunk,
+                    inputs.v_chunk,
+                    inputs.cu_q,
+                    inputs.cu_history_local,
+                    max(inputs.q_lengths),
+                    max(inputs.local_history_lengths),
+                    cu_seqlens_q_host=inputs.cu_q_host,
+                    cu_seqlens_history_local_host=inputs.cu_history_local_host,
+                    num_splits=args.num_splits,
+                    return_lse=False,
+                )
+
+            stages, execution = measure_mega(
+                mega_runner, mega_call, args, device, reference_output
+            )
+            reports[METHOD_MEGA] = {
+                "stages_ms": stages,
+                "output_collective_kind": mega_runner.output_collective_kind,
+                "workspace_policy": mega_runner.workspace_policy,
+                "communication": communication_report(
+                    METHOD_MEGA,
+                    sum(inputs.q_lengths),
+                    topology.q_heads_local,
+                    args.headdim,
+                    args.dcp_size,
+                ),
+                "execution": execution,
+            }
         if "full" in implementations:
             stages, execution = measure_full(
                 lambda: full_forward(inputs, args), args, device, inputs
@@ -918,6 +1131,8 @@ def main() -> None:
             print(f"wrote {output_path}", flush=True)
         dist.barrier()
     finally:
+        if mega_runner is not None:
+            mega_runner.close()
         dist.destroy_process_group()
 
 

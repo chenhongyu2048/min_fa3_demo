@@ -35,6 +35,11 @@ import triton
 import triton.language as tl
 
 import min_fa3_op
+from dcp_mega_metadata import (
+    METADATA_HEADER_INTS,
+    build_dcp_mega_metadata,
+    pack_dcp_mega_metadata,
+)
 
 
 @dataclass(frozen=True)
@@ -3621,10 +3626,749 @@ class SGLangDCPAttentionRunner(_SequentialDCPAttentionRunnerBase):
         return values
 
 
+@dataclass(frozen=True)
+class _DCPMegaReplay:
+    backend: Callable[..., object]
+    backend_args: tuple[object, ...]
+    result: object
+    q_ready_count: int
+    attention_count: int
+    publish_count: int
+    receive_count: int
+
+
+@dataclass(frozen=True)
+class _DCPMegaReplayPending:
+    replay: _DCPMegaReplay
+    pre_phase: int
+    post_phase: int
+    stream: torch.cuda.Stream
+
+
+class DCPMegaAttentionRunner:
+    """Persistent single-node workspace for batched varlen DCP mega forward.
+
+    Construction is collective over ``node_process_group`` because the IPC
+    :class:`TKParallelTensor` arenas exchange handles exactly once.  The
+    workspace is intentionally eager-only and may not be used concurrently.
+    """
+
+    method_name = "dcp_mega_varlen"
+    supports_cuda_graph = False
+    supports_decode = False
+    output_collective_kind = "bf16_ipc_a2a"
+    workspace_policy = "runner_preallocated"
+
+    _METADATA_HEADER_INTS = METADATA_HEADER_INTS
+    _METADATA_HOST_SLOTS = 2
+    PHASE_TIMESTAMP_NAMES = (
+        "kernel_start",
+        "q_allgather_done",
+        "attention_done",
+        "history_combine_done",
+        "publish_done",
+        "receive_done",
+        "final_combine_done",
+        "kernel_done",
+    )
+
+    def __init__(
+        self,
+        process_group: dist.ProcessGroup,
+        node_process_group: dist.ProcessGroup,
+        *,
+        max_total_q: int,
+        max_batch: int,
+        Hq_local: int,
+        max_num_splits: int = 128,
+        num_comm_sm: int = 8,
+        block_n_override: Optional[int] = None,
+        record_phase_timestamps: bool = False,
+    ) -> None:
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError(
+                "torch.distributed must be initialized before DCPMegaAttentionRunner"
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError("DCPMegaAttentionRunner requires CUDA")
+        if block_n_override not in (None, 128, 176):
+            raise ValueError("block_n_override must be None, 128, or 176")
+        if Hq_local not in (4, 8):
+            raise ValueError("DCP mega requires PackGQA and Hq_local in {4, 8}")
+        values = {
+            "max_total_q": max_total_q,
+            "max_batch": max_batch,
+            "Hq_local": Hq_local,
+            "max_num_splits": max_num_splits,
+            "num_comm_sm": num_comm_sm,
+        }
+        if any(not isinstance(value, int) or value <= 0 for value in values.values()):
+            raise ValueError(f"runner capacities must be positive integers, got {values}")
+        if max_batch > max_total_q:
+            raise ValueError("positive-length varlen batches require max_batch <= max_total_q")
+        if max_num_splits > 128:
+            raise ValueError("max_num_splits must be in [1, 128]")
+
+        self.process_group = process_group
+        self.node_process_group = node_process_group
+        self.world_size = dist.get_world_size(process_group)
+        self.rank = dist.get_rank(process_group)
+        self.node_world_size = dist.get_world_size(node_process_group)
+        self.node_rank = dist.get_rank(node_process_group)
+        if self.world_size not in (2, 4, 8):
+            raise ValueError(
+                f"DCP mega only supports DCP size 2, 4, or 8, got {self.world_size}"
+            )
+        if self.node_world_size not in (2, 4, 8):
+            raise ValueError(
+                "node-wide TK IPC currently requires node TP size in {2, 4, 8}; "
+                f"got {self.node_world_size}"
+            )
+        if self.node_world_size < self.world_size:
+            raise ValueError("node TP group cannot be smaller than the DCP group")
+        for group, name in (
+            (process_group, "DCP"),
+            (node_process_group, "node TP"),
+        ):
+            backend = str(dist.get_backend(group)).lower()
+            if "nccl" not in backend:
+                raise RuntimeError(f"{name} process group must use NCCL, got {backend}")
+
+        self.device = torch.device("cuda", torch.cuda.current_device())
+        if self.node_rank != self.device.index:
+            raise ValueError(
+                "node TP group rank must equal the CUDA device index required by "
+                f"TKParallelTensor; got node_rank={self.node_rank}, device={self.device.index}"
+            )
+        node_global_ranks = tuple(dist.get_process_group_ranks(node_process_group))
+        dcp_global_ranks = tuple(dist.get_process_group_ranks(process_group))
+        node_index = {global_rank: idx for idx, global_rank in enumerate(node_global_ranks)}
+        try:
+            self.dcp_node_ranks = tuple(node_index[rank] for rank in dcp_global_ranks)
+        except KeyError as error:
+            raise ValueError("every DCP rank must belong to node_process_group") from error
+        if self.dcp_node_ranks[self.rank] != self.node_rank:
+            raise ValueError(
+                "DCP and node TP groups disagree about the current rank mapping: "
+                f"dcp_node_ranks={self.dcp_node_ranks}, dcp_rank={self.rank}, "
+                f"node_rank={self.node_rank}"
+            )
+
+        props = torch.cuda.get_device_properties(self.device)
+        if props.major != 9 or props.minor != 0:
+            raise RuntimeError(
+                "DCP mega only supports Hopper SM90; current capability is "
+                f"{props.major}.{props.minor}"
+            )
+        if num_comm_sm > props.multi_processor_count - 1:
+            raise ValueError(
+                "num_comm_sm must leave at least one compute SM; "
+                f"got num_comm_sm={num_comm_sm}, num_sms={props.multi_processor_count}"
+            )
+
+        self.max_total_q = max_total_q
+        self.max_batch = max_batch
+        self.Hq_local = Hq_local
+        self.max_num_splits = max_num_splits
+        self.num_comm_sm = num_comm_sm
+        self.block_n_override = block_n_override
+        self.record_phase_timestamps = bool(record_phase_timestamps)
+        self.num_sms = props.multi_processor_count
+        self._padded_total_q = ((max_total_q + 15) // 16) * 16
+        self._max_token_blocks = self._padded_total_q // 16
+
+        # DCP_MEGA: VMM-backed bases are page aligned. The logical Q view keeps
+        # max_total_q while the IPC allocation contains a 16-row tail pad.
+        self._ipc_q = min_fa3_op.TKParallelTensor(
+            [self._padded_total_q, Hq_local, 128],
+            torch.bfloat16,
+            self.node_rank,
+            self.node_world_size,
+            False,
+        )
+        self._ipc_history_send_o = min_fa3_op.TKParallelTensor(
+            [self.world_size, self._padded_total_q, Hq_local, 128],
+            torch.bfloat16,
+            self.node_rank,
+            self.node_world_size,
+            False,
+        )
+        self._ipc_history_send_lse = min_fa3_op.TKParallelTensor(
+            [self.world_size, self._padded_total_q, Hq_local],
+            torch.float32,
+            self.node_rank,
+            self.node_world_size,
+            False,
+        )
+        self._ipc_tile_ready = min_fa3_op.TKParallelTensor(
+            [self.world_size, self._max_token_blocks],
+            torch.int32,
+            self.node_rank,
+            self.node_world_size,
+            False,
+        )
+        self._ipc_barrier = min_fa3_op.TKParallelTensor(
+            [1],
+            torch.int32,
+            self.node_rank,
+            self.node_world_size,
+            False,
+        )
+
+        cuda = dict(device=self.device)
+        group_heads = self.world_size * Hq_local
+        self._q_group = torch.empty(
+            (self._padded_total_q, group_heads, 128),
+            dtype=torch.bfloat16,
+            **cuda,
+        )
+        self._chunk_o = torch.empty(
+            (max_total_q, Hq_local, 128), dtype=torch.bfloat16, **cuda
+        )
+        self._chunk_lse = torch.empty(
+            (Hq_local, max_total_q), dtype=torch.float32, **cuda
+        )
+        self._history_o = torch.empty(
+            (max_total_q, group_heads, 128), dtype=torch.bfloat16, **cuda
+        )
+        self._history_lse = torch.empty(
+            (group_heads, max_total_q), dtype=torch.float32, **cuda
+        )
+        self._history_receive_o = torch.empty(
+            (self.world_size, self._padded_total_q, Hq_local, 128),
+            dtype=torch.bfloat16,
+            **cuda,
+        )
+        self._history_receive_lse = torch.empty(
+            (self.world_size, self._padded_total_q, Hq_local),
+            dtype=torch.float32,
+            **cuda,
+        )
+        self._chunk_o_partial = torch.empty(
+            (max_num_splits, Hq_local, max_total_q, 128),
+            dtype=torch.float32,
+            **cuda,
+        )
+        self._chunk_lse_partial = torch.empty(
+            (max_num_splits, Hq_local, max_total_q),
+            dtype=torch.float32,
+            **cuda,
+        )
+        self._history_o_partial = torch.empty(
+            (max_num_splits, group_heads, max_total_q, 128),
+            dtype=torch.float32,
+            **cuda,
+        )
+        self._history_lse_partial = torch.empty(
+            (max_num_splits, group_heads, max_total_q),
+            dtype=torch.float32,
+            **cuda,
+        )
+        self._output = torch.empty(
+            (max_total_q, Hq_local, 128), dtype=torch.bfloat16, **cuda
+        )
+        self._output_lse = torch.empty(
+            (Hq_local, max_total_q), dtype=torch.float32, **cuda
+        )
+
+        max_group_heads = group_heads
+        max_pack_tiles = (
+            (max_total_q * max_group_heads + 127) // 128 + max_batch - 1
+        )
+        max_history_base_tiles = max_pack_tiles
+        max_chunk_base_tiles = (
+            (max_total_q * Hq_local + 127) // 128 + max_batch - 1
+        )
+        max_attention = (
+            max_history_base_tiles + max_chunk_base_tiles
+        ) * max_num_splits
+        max_q_tasks = self.world_size * self._max_token_blocks
+        max_q_ready = self._max_token_blocks
+        max_publish = self.world_size * self._max_token_blocks
+        max_final = self._max_token_blocks
+        vectors_per_work = 16 * Hq_local
+        max_q_dependencies = max_history_base_tiles * min(128, max_q_ready)
+        max_publish_dependencies = (
+            max_publish * vectors_per_work * max_num_splits
+        )
+        max_final_dependencies = max_final * vectors_per_work * max_num_splits
+        self._metadata_capacity = (
+            self._METADATA_HEADER_INTS
+            + max_attention * 8
+            + max_q_tasks * 4
+            + max_q_dependencies
+            + max_publish * 8
+            + max_publish_dependencies
+            + max_final * 8
+            + max_final_dependencies
+            + 2 * max_batch
+        )
+        self._metadata_hosts = tuple(
+            torch.empty(self._metadata_capacity, dtype=torch.int32, pin_memory=True)
+            for _ in range(self._METADATA_HOST_SLOTS)
+        )
+        self._metadata_host_arrays = tuple(
+            tensor.numpy() for tensor in self._metadata_hosts
+        )
+        self._metadata_device = torch.empty(
+            self._metadata_capacity, dtype=torch.int32, **cuda
+        )
+        self._q_ready = torch.empty(max_q_ready, dtype=torch.int32, **cuda)
+        self._attention_done = torch.empty(
+            max_attention, dtype=torch.int32, **cuda
+        )
+        self._publish_ready = torch.empty(
+            max_publish, dtype=torch.int32, **cuda
+        )
+        self._receive_ready = torch.empty(
+            max_final * (self.world_size - 1),
+            dtype=torch.int32,
+            **cuda,
+        )
+        self._queue_state = torch.empty(9, dtype=torch.int32, **cuda)
+        self._phase_timestamps = torch.empty(
+            len(self.PHASE_TIMESTAMP_NAMES), dtype=torch.int64, **cuda
+        )
+
+        self._enqueue_lock = threading.Lock()
+        self._completion_event = torch.cuda.Event()
+        self._metadata_slot_events = tuple(
+            torch.cuda.Event() for _ in range(self._METADATA_HOST_SLOTS)
+        )
+        self._metadata_slot_used = [False] * self._METADATA_HOST_SLOTS
+        self._next_metadata_slot = 0
+        self._has_completion = False
+        self._phase = 0
+        self._closed = False
+        self._last_dispatch = None
+        self._last_queue_counts: dict[str, object] | None = None
+        self._last_replay: _DCPMegaReplay | None = None
+        self._replay_pending: _DCPMegaReplayPending | None = None
+
+        # The arenas must be visibly initialized before any subgroup starts a
+        # forward. This is construction-time synchronization, not hot-path work.
+        stream = torch.cuda.current_stream(self.device)
+        self._ipc_tile_ready.data_.zero_()
+        self._ipc_barrier.data_.zero_()
+        stream.synchronize()
+        dist.barrier(group=self.node_process_group)
+
+    @property
+    def q_backing(self) -> torch.Tensor:
+        """Logical Q arena; pass only a prefix view to forward."""
+        return self._ipc_q.data_[: self.max_total_q]
+
+    def q_local(self, total_q: int) -> torch.Tensor:
+        if not isinstance(total_q, int) or not 0 < total_q <= self.max_total_q:
+            raise ValueError(f"total_q must be in [1, {self.max_total_q}]")
+        return self._ipc_q.data_[:total_q]
+
+    @property
+    def last_dispatch(self):
+        return self._last_dispatch
+
+    @property
+    def last_queue_counts(self) -> dict[str, object] | None:
+        return self._last_queue_counts
+
+    def copy_last_phase_timestamps(self, destination: torch.Tensor) -> None:
+        """Copy the last raw ``%globaltimer`` milestones without synchronizing."""
+        if not self.record_phase_timestamps:
+            raise RuntimeError("phase timestamp recording is disabled for this runner")
+        if (
+            destination.device != self.device
+            or destination.dtype != torch.int64
+            or destination.shape != self._phase_timestamps.shape
+            or not destination.is_contiguous()
+        ):
+            raise ValueError(
+                "destination must be a contiguous CUDA int64 tensor with shape "
+                f"{tuple(self._phase_timestamps.shape)} on {self.device}"
+            )
+        destination.copy_(self._phase_timestamps)
+
+    def _next_phases(self) -> tuple[int, int]:
+        if self._phase >= (1 << 31) - 4:
+            torch.cuda.synchronize(self.device)
+            dist.barrier(group=self.node_process_group)
+            self._ipc_barrier.data_.zero_()
+            self._ipc_tile_ready.data_.zero_()
+            torch.cuda.current_stream(self.device).synchronize()
+            dist.barrier(group=self.node_process_group)
+            self._phase = 0
+        self._phase += 2
+        return self._phase - 1, self._phase
+
+    def _pack_metadata(
+        self,
+        metadata,
+        pre_phase: int,
+        post_phase: int,
+        host_array,
+    ) -> int:
+        try:
+            payload = pack_dcp_mega_metadata(
+                metadata,
+                pre_phase=pre_phase,
+                post_phase=post_phase,
+                capacity=self._metadata_capacity,
+            )
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+        used = len(payload)
+        host_array[:used] = payload
+        return used
+
+    @staticmethod
+    def _check_packed_bf16(tensor: torch.Tensor, name: str) -> None:
+        if (
+            not tensor.is_cuda
+            or tensor.dtype != torch.bfloat16
+            or tensor.ndim != 3
+            or tensor.shape[2] != 128
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must be contiguous CUDA BF16 [total_tokens, heads, 128]"
+            )
+
+    @staticmethod
+    def _host_offsets(tensor: torch.Tensor, name: str) -> tuple[int, ...]:
+        if tensor.is_cuda or tensor.dtype != torch.int32 or tensor.ndim != 1:
+            raise ValueError(f"{name} must be a contiguous CPU int32 tensor")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+        return tuple(int(value) for value in tensor.tolist())
+
+    def forward_chunk_prefill_varlen(
+        self,
+        q_local: torch.Tensor,
+        k_history_local: torch.Tensor,
+        v_history_local: torch.Tensor,
+        k_chunk: torch.Tensor,
+        v_chunk: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_history_local: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_history_local: int,
+        *,
+        cu_seqlens_q_host: torch.Tensor,
+        cu_seqlens_history_local_host: torch.Tensor,
+        num_splits: int = 0,
+        return_lse: bool = False,
+    ) -> _DCPResult:
+        if self._closed:
+            raise RuntimeError("DCPMegaAttentionRunner is closed")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("DCP mega does not support CUDA Graph capture")
+        if not self._enqueue_lock.acquire(blocking=False):
+            raise RuntimeError("DCP mega workspace does not support concurrent forward")
+        try:
+            self._check_packed_bf16(q_local, "q_local")
+            self._check_packed_bf16(k_history_local, "k_history_local")
+            self._check_packed_bf16(v_history_local, "v_history_local")
+            self._check_packed_bf16(k_chunk, "k_chunk")
+            self._check_packed_bf16(v_chunk, "v_chunk")
+            total_q = q_local.shape[0]
+            if not 0 < total_q <= self.max_total_q:
+                raise ValueError(
+                    f"q_local total_q must be in [1, {self.max_total_q}], got {total_q}"
+                )
+            if q_local.shape[1] != self.Hq_local:
+                raise ValueError(
+                    f"q_local must have Hq_local={self.Hq_local}, got {q_local.shape[1]}"
+                )
+            if q_local.data_ptr() != self._ipc_q.data_.data_ptr():
+                raise ValueError(
+                    "q_local must be a prefix view of runner.q_backing; implicit Q copies "
+                    "are intentionally unsupported"
+                )
+            if any(tensor.device != self.device for tensor in (
+                q_local,
+                k_history_local,
+                v_history_local,
+                k_chunk,
+                v_chunk,
+                cu_seqlens_q,
+                cu_seqlens_history_local,
+            )):
+                raise ValueError("all CUDA inputs must be on the runner device")
+            for tensor, name in (
+                (k_history_local, "k_history_local"),
+                (v_history_local, "v_history_local"),
+                (k_chunk, "k_chunk"),
+                (v_chunk, "v_chunk"),
+            ):
+                if tensor.shape[1] != 1:
+                    raise ValueError(f"{name} must have Hkv_group == 1")
+            if k_history_local.shape != v_history_local.shape:
+                raise ValueError("history K and V must have identical shapes")
+            if k_chunk.shape != v_chunk.shape or k_chunk.shape[0] != total_q:
+                raise ValueError("chunk K/V must both have shape [total_q, 1, 128]")
+            for tensor, name in (
+                (cu_seqlens_q, "cu_seqlens_q"),
+                (cu_seqlens_history_local, "cu_seqlens_history_local"),
+            ):
+                if (
+                    not tensor.is_cuda
+                    or tensor.dtype != torch.int32
+                    or tensor.ndim != 1
+                    or not tensor.is_contiguous()
+                ):
+                    raise ValueError(f"{name} must be a contiguous CUDA int32 tensor")
+
+            q_offsets = self._host_offsets(cu_seqlens_q_host, "cu_seqlens_q_host")
+            history_offsets = self._host_offsets(
+                cu_seqlens_history_local_host,
+                "cu_seqlens_history_local_host",
+            )
+            if len(q_offsets) - 1 > self.max_batch:
+                raise ValueError(
+                    f"batch size exceeds runner max_batch={self.max_batch}"
+                )
+            if q_offsets[-1] != total_q:
+                raise ValueError("cu_seqlens_q_host[-1] must equal q_local.size(0)")
+            if history_offsets[-1] != k_history_local.shape[0]:
+                raise ValueError(
+                    "cu_seqlens_history_local_host[-1] must equal history token count"
+                )
+            actual_max_q = max(b - a for a, b in zip(q_offsets, q_offsets[1:]))
+            actual_max_history = max(
+                b - a for a, b in zip(history_offsets, history_offsets[1:])
+            )
+            if max_seqlen_q != actual_max_q:
+                raise ValueError(
+                    f"max_seqlen_q={max_seqlen_q} does not match host mirror {actual_max_q}"
+                )
+            if max_seqlen_history_local != actual_max_history:
+                raise ValueError(
+                    "max_seqlen_history_local does not match its host mirror: "
+                    f"{max_seqlen_history_local} vs {actual_max_history}"
+                )
+            if num_splits < 0 or num_splits > self.max_num_splits:
+                raise ValueError(
+                    f"num_splits must be 0 or in [1, {self.max_num_splits}]"
+                )
+
+            metadata = build_dcp_mega_metadata(
+                q_offsets,
+                history_offsets,
+                hq_local=self.Hq_local,
+                dcp_size=self.world_size,
+                num_sms=self.num_sms,
+                requested_num_splits=num_splits,
+                block_n_override=self.block_n_override,
+            )
+            if metadata.dispatch.effective_num_splits > self.max_num_splits:
+                raise ValueError(
+                    "automatic split heuristic exceeds runner max_num_splits: "
+                    f"{metadata.dispatch.effective_num_splits} > {self.max_num_splits}"
+                )
+            self._last_dispatch = metadata.dispatch
+            token_blocks = metadata.token_block_count
+            actual_counts = {
+                "q_transfer_tasks": len(metadata.q_tasks),
+                "publish_tasks": len(metadata.publish),
+                "receive_tasks": metadata.receive_count,
+                "final_tasks": len(metadata.final),
+                "system_ready_signals": metadata.tile_ready_count,
+            }
+            self._last_queue_counts = {
+                "token_blocks": token_blocks,
+                "q_ready_counters": metadata.q_ready_count,
+                "actual": actual_counts,
+            }
+            pre_phase, post_phase = self._next_phases()
+            metadata_slot = self._next_metadata_slot
+            if self._metadata_slot_used[metadata_slot]:
+                self._metadata_slot_events[metadata_slot].synchronize()
+            metadata_host = self._metadata_hosts[metadata_slot]
+            metadata_used = self._pack_metadata(
+                metadata,
+                pre_phase,
+                post_phase,
+                self._metadata_host_arrays[metadata_slot],
+            )
+
+            stream = torch.cuda.current_stream(self.device)
+            if self._has_completion:
+                stream.wait_event(self._completion_event)
+            output = self._output[:total_q]
+            output_lse = self._output_lse[:, :total_q]
+            backend = getattr(
+                min_fa3_op, "forward_chunk_prefill_varlen_dcp_mega", None
+            )
+            if backend is None:
+                raise RuntimeError(
+                    "the installed _min_fa3_op extension does not contain the DCP mega "
+                    "backend; rebuild the extension"
+                )
+            backend_args = (
+                q_local,
+                k_history_local,
+                v_history_local,
+                k_chunk,
+                v_chunk,
+                cu_seqlens_q,
+                cu_seqlens_history_local,
+                int(max_seqlen_q),
+                int(max_seqlen_history_local),
+                self._ipc_q,
+                self._ipc_history_send_o,
+                self._ipc_history_send_lse,
+                self._ipc_tile_ready,
+                self._ipc_barrier,
+                self._q_group,
+                self._chunk_o,
+                self._chunk_lse,
+                self._history_o,
+                self._history_lse,
+                self._history_receive_o,
+                self._history_receive_lse,
+                self._chunk_o_partial,
+                self._chunk_lse_partial,
+                self._history_o_partial,
+                self._history_lse_partial,
+                output,
+                output_lse,
+                metadata_host,
+                self._metadata_device,
+                metadata_used,
+                self._q_ready,
+                self._attention_done,
+                self._publish_ready,
+                self._receive_ready,
+                self._queue_state,
+                self._phase_timestamps,
+                self.record_phase_timestamps,
+                list(self.dcp_node_ranks),
+                self.rank,
+                self.num_comm_sm,
+                bool(return_lse),
+            )
+            try:
+                backend(*backend_args)
+            finally:
+                self._metadata_slot_events[metadata_slot].record(stream)
+                self._metadata_slot_used[metadata_slot] = True
+                self._next_metadata_slot = (
+                    metadata_slot + 1
+                ) % self._METADATA_HOST_SLOTS
+            self._completion_event.record(stream)
+            self._has_completion = True
+            result = (output, output_lse) if return_lse else output
+            self._last_replay = _DCPMegaReplay(
+                backend=backend,
+                backend_args=backend_args,
+                result=result,
+                q_ready_count=metadata.q_ready_count,
+                attention_count=len(metadata.attention),
+                publish_count=len(metadata.publish),
+                receive_count=metadata.receive_count,
+            )
+            return result
+        finally:
+            self._enqueue_lock.release()
+
+    forward_chunk_prefill_varlen_dcp_mega = forward_chunk_prefill_varlen
+
+    def prepare_last_forward_replay(self) -> None:
+        """Reset reusable state before timing the last prepared forward."""
+        if self._closed:
+            raise RuntimeError("DCPMegaAttentionRunner is closed")
+        if self._last_replay is None:
+            raise RuntimeError("no DCP mega forward is available for replay")
+        if not self._enqueue_lock.acquire(blocking=False):
+            raise RuntimeError("DCP mega workspace does not support concurrent forward")
+        try:
+            if self._replay_pending is not None:
+                raise RuntimeError("a prepared DCP mega replay is already pending")
+            stream = torch.cuda.current_stream(self.device)
+            if self._has_completion:
+                stream.wait_event(self._completion_event)
+            pre_phase, post_phase = self._next_phases()
+            replay = self._last_replay
+            self._q_ready[: replay.q_ready_count].zero_()
+            self._attention_done[: replay.attention_count].zero_()
+            self._publish_ready[: replay.publish_count].zero_()
+            self._receive_ready[: replay.receive_count].zero_()
+            self._queue_state.zero_()
+            if self.record_phase_timestamps:
+                self._phase_timestamps.zero_()
+            self._replay_pending = _DCPMegaReplayPending(
+                replay=replay,
+                pre_phase=pre_phase,
+                post_phase=post_phase,
+                stream=stream,
+            )
+        except Exception:
+            self._enqueue_lock.release()
+            raise
+
+    def replay_last_forward(
+        self,
+        *,
+        return_timing_ms: bool = False,
+    ):
+        """Run pre-barrier + mega, then enqueue the untimed post-barrier."""
+        pending = self._replay_pending
+        if pending is None:
+            raise RuntimeError("prepare_last_forward_replay must be called first")
+        stream = torch.cuda.current_stream(self.device)
+        if stream != pending.stream:
+            self._replay_pending = None
+            self._enqueue_lock.release()
+            raise RuntimeError("prepared DCP mega replay must use the preparing stream")
+        try:
+            elapsed_ms = pending.replay.backend(
+                *pending.replay.backend_args,
+                True,
+                pending.pre_phase,
+                False,
+                return_timing_ms,
+            )
+            min_fa3_op._dcp_mega_varlen_barrier(
+                self._ipc_barrier,
+                list(self.dcp_node_ranks),
+                self.rank,
+                pending.post_phase,
+            )
+            self._completion_event.record(stream)
+            self._has_completion = True
+            if return_timing_ms:
+                return pending.replay.result, float(elapsed_ms)
+            return pending.replay.result
+        finally:
+            self._replay_pending = None
+            self._enqueue_lock.release()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if self._replay_pending is not None:
+            raise RuntimeError("cannot close DCP mega runner with a pending replay")
+        if self._has_completion:
+            self._completion_event.synchronize()
+        for used, event in zip(self._metadata_slot_used, self._metadata_slot_events):
+            if used:
+                event.synchronize()
+        self._closed = True
+
+    def __enter__(self) -> "DCPMegaAttentionRunner":
+        if self._closed:
+            raise RuntimeError("DCPMegaAttentionRunner is closed")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        del exc_type, exc_value, traceback
+        self.close()
+
+
 __all__ = [
     "DCPTopology",
     "DCPAttentionCUDAGraph",
     "DCPAttentionRunner",
+    "DCPMegaAttentionRunner",
     "SGLangDCPAttentionRunner",
     "TopologyIssue",
     "VLLMA2ADCPAttentionRunner",

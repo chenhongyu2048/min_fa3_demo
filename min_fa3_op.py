@@ -9,6 +9,7 @@ import torch.distributed as dist
 from _min_fa3_op import (
     _BackwardVarlenMegaRingWorkspace,
     _create_backward_varlen_mega_ring_workspace as _create_backward_varlen_mega_ring_workspace_cuda,
+    _dcp_mega_varlen_barrier,
     TKParallelTensor,
     backward as _backward_cuda,
     backward_varlen as _backward_varlen_cuda,
@@ -17,6 +18,7 @@ from _min_fa3_op import (
     parallel_remote_load_vec_out as _parallel_remote_load_vec_out_cuda,
     forward,
     forward_kvcache,
+    forward_chunk_prefill_varlen_dcp_mega,
     forward_kvcache_varlen as _forward_kvcache_varlen_cuda,
     forward_varlen as _forward_varlen_cuda,
     forward_varlen_mega_ring as _forward_varlen_mega_ring_cuda,
@@ -476,6 +478,7 @@ __all__ = [
     "backward_varlen",
     "backward_varlen_mega_ring",
     "create_parallel_tensor",
+    "forward_chunk_prefill_varlen_dcp_mega",
     "forward",
     "forward_kvcache",
     "forward_kvcache_varlen",
