@@ -19,6 +19,11 @@ import torch
 import torch.distributed as dist
 
 import min_fa3_op
+from dcp_test.benchmark_output import (
+    DCPBenchmarkRow,
+    effective_kv_bandwidth_gbps_per_gpu,
+    print_benchmark_results,
+)
 from min_fa3_dcp import (
     DCPAttentionCUDAGraph,
     DCPAttentionRunner,
@@ -262,6 +267,21 @@ def quantiles(values: list[float]) -> dict[str, float]:
     }
 
 
+def all_rank_quantiles(
+    values: list[float], device: torch.device
+) -> dict[str, list[float]]:
+    local = quantiles(values)
+    local_tensor = torch.tensor(
+        [local["p50"], local["p90"]], device=device, dtype=torch.float64
+    )
+    gathered = [torch.empty_like(local_tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, local_tensor)
+    return {
+        "p50": [float(item[0].item()) for item in gathered],
+        "p90": [float(item[1].item()) for item in gathered],
+    }
+
+
 def synchronize_before_samples(device: torch.device) -> None:
     torch.cuda.synchronize(device)
     dist.barrier()
@@ -319,6 +339,7 @@ def benchmark_full_kv(
             replay()
         synchronize_before_samples(device)
         samples: list[float] = []
+        local_samples: list[float] = []
         for _ in range(iterations):
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
@@ -326,7 +347,9 @@ def benchmark_full_kv(
             replay()
             end.record()
             end.synchronize()
-            samples.append(global_rank_max(start.elapsed_time(end), device))
+            local_elapsed_ms = start.elapsed_time(end)
+            local_samples.append(local_elapsed_ms)
+            samples.append(global_rank_max(local_elapsed_ms, device))
         signature = {
             "operation": "full_kv",
             "bindings": {
@@ -344,6 +367,7 @@ def benchmark_full_kv(
             "stream_policy": "single_stream",
             "overlap_q_allgather": False,
             "graph_static_signature": signature if cuda_graph else None,
+            "rank_latency_ms": all_rank_quantiles(local_samples, device),
         }
         phase_samples = {
             name: [0.0] * iterations for name in PHASE_NAMES
@@ -373,12 +397,14 @@ def benchmark_runner(
             captured.replay() if captured is not None else call(False)
         synchronize_before_samples(device)
         samples: dict[str, list[float]] = {}
+        local_latency_samples: list[float] = []
         for _ in range(iterations):
             if captured is not None:
                 captured.replay()
             else:
                 call(True)
             local_timing = runner.last_timing_ms(synchronize=True)
+            local_latency_samples.append(local_timing["attention_end_to_end_ms"])
             timing = global_rank_max_dict(local_timing, device)
             for name, value in timing.items():
                 samples.setdefault(name, []).append(value)
@@ -394,6 +420,9 @@ def benchmark_runner(
             "overlap_q_allgather": overlap_q_allgather,
             "graph_static_signature": (
                 captured.signature if captured is not None else None
+            ),
+            "rank_latency_ms": all_rank_quantiles(
+                local_latency_samples, device
             ),
         }
         return samples, execution
@@ -439,6 +468,36 @@ def memory_report(
         "actual_kv_memory_reduction": full_per_rank / local_per_rank,
         "theoretical_history_kv_reduction": float(topology.dcp_size),
     }
+
+
+def logical_kv_bytes_by_tp_rank(
+    topology: DCPTopology,
+    workload: str,
+    batch_size: int,
+    sq: int,
+    sk: int,
+    head_dim: int,
+    *,
+    full_kv: bool,
+) -> list[float]:
+    current_tokens = sq if workload == "chunk" else 0
+    bytes_per_kv_token = head_dim * 2 * 2
+    if full_kv:
+        bytes_per_rank = batch_size * (sk + current_tokens) * bytes_per_kv_token
+        return [float(bytes_per_rank)] * topology.tp_size
+    return [
+        float(
+            batch_size
+            * (
+                interleaved_local_length(
+                    sk, topology.dcp_rank(tp_rank), topology.dcp_size
+                )
+                + current_tokens
+            )
+            * bytes_per_kv_token
+        )
+        for tp_rank in range(topology.tp_size)
+    ]
 
 
 def communication_report(
@@ -867,6 +926,27 @@ def run_case(
     }
     for method, report in methods.items():
         report["execution"] = method_execution[method]
+        kv_bytes_by_rank = logical_kv_bytes_by_tp_rank(
+            topology,
+            workload,
+            batch_size,
+            sq,
+            sk,
+            128,
+            full_kv=method == METHOD_FULL,
+        )
+        average_kv_bytes = sum(kv_bytes_by_rank) / len(kv_bytes_by_rank)
+        report["logical_kv_read"] = {
+            "bytes_by_tp_rank": kv_bytes_by_rank,
+            "average_bytes_per_gpu": average_kv_bytes,
+            "effective_bandwidth_gbps_per_gpu": (
+                effective_kv_bandwidth_gbps_per_gpu(
+                    kv_bytes_by_rank, report["latency_ms"]["p50"]
+                )
+            ),
+            "latency_basis": "p50_max_across_ranks",
+            "traffic_model": "logical BF16 K+V input bytes counted once",
+        }
     ours_report = methods.get(METHOD_OURS_NO_OVERLAP)
     full_report = methods[METHOD_FULL]
     for method, report in methods.items():
@@ -1010,17 +1090,46 @@ def print_case(case: dict[str, object], case_index: int, case_total: int) -> Non
     topology = case["topology"]
     shape = case["shape"]
     methods = case["methods"]
-    latency = ", ".join(
-        f"{name}={report['latency_ms']['p50']:.4f}ms"
-        for name, report in methods.items()
-    )
     print(
-        f"[{case_index}/{case_total}] {case['case_kind']} {case['workload']} "
-        f"Hq={topology['q_heads']} Hkv={topology['kv_heads']} "
-        f"DCP={topology['dcp_size']} B={shape['batch_size']} "
-        f"Sq={shape['sq']} Sk={shape['sk_history_or_cache']}: {latency}",
+        f"\n[{case_index}/{case_total}] Running {case['case_kind']} "
+        f"{case['workload']}",
         flush=True,
     )
+    mode = "causal" if case["workload"] == "chunk" else "decode"
+    title = (
+        f"B={shape['batch_size']}, Sq={shape['sq']}, "
+        f"Sk_history_or_cache={shape['sk_history_or_cache']}, "
+        f"QH={topology['q_heads']}, KVH={topology['kv_heads']}, "
+        f"D={shape['head_dim']}, TP={topology['tp_size']}, "
+        f"DCP={topology['dcp_size']}, mode={mode}"
+    )
+    rows = []
+    for name, report in methods.items():
+        execution = report["execution"]
+        metadata = report["metadata"]
+        output_kind = report["communication"]["output_collective"]
+        check = "reference" if name == METHOD_FULL else "ok"
+        rows.append(
+            DCPBenchmarkRow(
+                method=name,
+                p50_ms=report["latency_ms"]["p50"],
+                p90_ms=report["latency_ms"]["p90"],
+                aggregate_tflops=report["effective_tflops"]["p50"],
+                avg_gpu_tflops=(
+                    report["effective_tflops"]["p50"] / topology["tp_size"]
+                ),
+                kv_bandwidth_gbps_per_gpu=report["logical_kv_read"][
+                    "effective_bandwidth_gbps_per_gpu"
+                ],
+                check=check,
+                note=(
+                    f"{execution['execution_mode']}; output={output_kind}; "
+                    f"{metadata['source']}"
+                ),
+                rank_p50_ms=execution["rank_latency_ms"]["p50"],
+            )
+        )
+    print_benchmark_results(title, rows)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1155,6 +1264,34 @@ def main() -> None:
         )
         if run_mqa:
             case_total += sum(workload in workloads for workload in ("decode", "chunk"))
+
+        if global_rank == 0:
+            execution_mode = "cuda_graph" if args.cuda_graph else "eager"
+            valid_count = len(topologies)
+            skipped_count = len(topology_records) - valid_count
+            print(
+                f"Config: world_size={world_size}, "
+                f"methods={list(expanded_method_labels(implementations))}, "
+                f"QH={q_heads}, KVH={kv_heads}, D={args.headdim}, "
+                f"TP={args.tp_size}, DCP={dcp_sizes}, workload={args.workload}, "
+                f"execution={execution_mode}, warmup={args.warmup}, "
+                f"iters={args.iters}, check=True"
+            )
+            print(
+                f"Workload matrix: cases={case_total}, "
+                f"valid_topologies={valid_count}, "
+                f"skipped_topologies={skipped_count}, "
+                f"decode_B={decode_batches}, chunk_B={chunk_batches}, "
+                f"Sq={chunk_sqs}, Sk={seqlens}"
+            )
+            print(
+                "Agg TFLOPS uses useful attention work across all TP ranks and "
+                "p50(max_across_ranks); Avg/GPU divides it by world_size."
+            )
+            print(
+                "KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank "
+                "divided by p50(max_across_ranks); it is not hardware-counter HBM traffic."
+            )
 
         cases: list[dict[str, object]] = []
         case_index = 0

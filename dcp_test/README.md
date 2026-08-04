@@ -106,6 +106,19 @@ Packed-varlen performs an eager full-KV correctness precheck by default. Pass
 call in that mode to build and upload its reusable metadata, but it does not
 compare the output or include that call in the measured interval.
 
+Both benchmark entry points use the same rank-0 console layout as the forward
+benchmarks under `ring_test/`: configuration and workload lines followed by a
+`Method / Time ms / Agg TFLOPS / Avg/GPU / KV GB/s/GPU / Check / Note` table.
+DCP retains its existing percentile definition: each iteration is reduced with
+MAX across all TP ranks before p50/p90 are computed. The `t0=...` entries are
+each rank's local p50 and are diagnostic only; JSON stores them under
+`execution.rank_latency_ms`. `KV GB/s/GPU` divides the average logical BF16
+K+V input bytes per TP rank by `p50(max_across_ranks)`. It counts each K/V
+tensor element once and excludes Q/O, workspace, metadata, communication,
+split rereads, and cache effects, so it is an effective payload bandwidth, not
+NCU-measured HBM transaction bandwidth. The numerator and result are stored in
+each method's `logical_kv_read` JSON object.
+
 Experimental mega-kernel smoke example:
 
 ```bash

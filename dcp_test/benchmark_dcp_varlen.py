@@ -17,6 +17,11 @@ import torch
 import torch.distributed as dist
 
 import min_fa3_op
+from dcp_test.benchmark_output import (
+    DCPBenchmarkRow,
+    effective_kv_bandwidth_gbps_per_gpu,
+    print_benchmark_results,
+)
 from min_fa3_dcp import (
     DCPAttentionCUDAGraph,
     DCPAttentionRunner,
@@ -411,6 +416,21 @@ def summarize_series(values: list[float]) -> dict[str, float]:
     }
 
 
+def all_rank_quantiles(
+    values: list[float], device: torch.device
+) -> dict[str, list[float]]:
+    local = summarize_series(values)
+    local_tensor = torch.tensor(
+        [local["p50"], local["p90"]], device=device, dtype=torch.float64
+    )
+    gathered = [torch.empty_like(local_tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, local_tensor)
+    return {
+        "p50": [float(item[0].item()) for item in gathered],
+        "p90": [float(item[1].item()) for item in gathered],
+    }
+
+
 def measure_runner(
     runner: DCPAttentionRunner,
     call: Callable[[bool], torch.Tensor],
@@ -438,12 +458,14 @@ def measure_runner(
             captured.replay() if captured is not None else call(False)
         torch.cuda.synchronize(device)
         samples = []
+        local_latency_samples: list[float] = []
         for _ in range(args.iters):
             if captured is not None:
                 captured.replay()
             else:
                 call(True)
             local_timing = runner.last_timing_ms()
+            local_latency_samples.append(local_timing["attention_end_to_end_ms"])
             local_timing["overlap_hidden_time_ms"] = (
                 max(
                     0.0,
@@ -467,6 +489,9 @@ def measure_runner(
             "overlap_q_allgather": overlap,
             "graph_static_signature": (
                 captured.signature if captured is not None else None
+            ),
+            "rank_latency_ms": all_rank_quantiles(
+                local_latency_samples, device
             ),
         }
         return summarize_samples(samples), execution
@@ -524,12 +549,15 @@ def measure_full(
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         samples = []
+        local_latency_samples: list[float] = []
         for _ in range(args.iters):
             start.record()
             replay()
             end.record()
             end.synchronize()
-            total = torch.tensor(start.elapsed_time(end), device=device, dtype=torch.float64)
+            local_elapsed_ms = start.elapsed_time(end)
+            local_latency_samples.append(local_elapsed_ms)
+            total = torch.tensor(local_elapsed_ms, device=device, dtype=torch.float64)
             dist.all_reduce(total, op=dist.ReduceOp.MAX)
             values = {stage: 0.0 for stage in STAGES}
             values["attention_end_to_end_ms"] = float(total.item())
@@ -565,6 +593,9 @@ def measure_full(
             "stream_policy": "single_stream",
             "overlap_q_allgather": False,
             "graph_static_signature": signature if args.cuda_graph else None,
+            "rank_latency_ms": all_rank_quantiles(
+                local_latency_samples, device
+            ),
         }
         return summarize_samples(samples), execution
     finally:
@@ -595,6 +626,7 @@ def measure_mega(
     torch.cuda.synchronize(device)
 
     samples = []
+    local_latency_samples: list[float] = []
     phase_samples = None
     if args.mega_phase_timestamps:
         phase_samples = torch.empty(
@@ -605,6 +637,7 @@ def measure_mega(
     for sample_idx in range(args.iters):
         runner.prepare_last_forward_replay()
         _, elapsed_ms = runner.replay_last_forward(return_timing_ms=True)
+        local_latency_samples.append(elapsed_ms)
         total = torch.tensor(elapsed_ms, device=device, dtype=torch.float64)
         dist.all_reduce(total, op=dist.ReduceOp.MAX)
         values = {stage: 0.0 for stage in STAGES}
@@ -680,6 +713,7 @@ def measure_mega(
         "dispatch": asdict(dispatch) if dispatch is not None else None,
         "queue_counts": runner.last_queue_counts,
         "phase_profile": phase_profile,
+        "rank_latency_ms": all_rank_quantiles(local_latency_samples, device),
     }
     return summarize_samples(samples), execution
 
@@ -805,6 +839,53 @@ def default_output_path(workload: str) -> Path:
     return Path("benchmarks/results") / f"dcp_varlen_{workload}_{timestamp}.json"
 
 
+def print_results(
+    args: argparse.Namespace,
+    topology,
+    inputs: Inputs,
+    reports: dict[str, dict[str, object]],
+) -> None:
+    mode = "causal" if args.workload == "chunk" else "decode"
+    title = (
+        f"B={args.b}, q_tokens={sum(inputs.q_lengths)}, "
+        f"history_tokens={sum(inputs.history_lengths)}, "
+        f"QH={topology.q_heads}, KVH={topology.kv_heads}, D={args.headdim}, "
+        f"TP={topology.tp_size}, DCP={topology.dcp_size}, mode={mode}"
+    )
+    rows = []
+    for method, report in reports.items():
+        latency = report["stages_ms"]["attention_end_to_end_ms"]
+        execution = report["execution"]
+        if method == METHOD_FULL:
+            check = "reference"
+        else:
+            check = "ok" if args.check else "skip"
+        timing_boundary = execution.get("timing_boundary")
+        boundary_note = f"; timing={timing_boundary}" if timing_boundary else ""
+        rows.append(
+            DCPBenchmarkRow(
+                method=method,
+                p50_ms=latency["p50"],
+                p90_ms=latency["p90"],
+                aggregate_tflops=report["effective_tflops"],
+                avg_gpu_tflops=(
+                    report["effective_tflops"] / topology.tp_size
+                ),
+                kv_bandwidth_gbps_per_gpu=report["logical_kv_read"][
+                    "effective_bandwidth_gbps_per_gpu"
+                ],
+                check=check,
+                note=(
+                    f"{execution['execution_mode']}; "
+                    f"output={report['output_collective_kind']}; "
+                    f"{report['workspace_policy']}{boundary_note}"
+                ),
+                rank_p50_ms=execution["rank_latency_ms"]["p50"],
+            )
+        )
+    print_benchmark_results(title, rows)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -894,6 +975,37 @@ def main() -> None:
             raise RuntimeError("DCP process group crosses a KV replica boundary")
         inputs = build_inputs(args, topology, device)
         local_lengths_by_rank = all_rank_local_lengths(inputs, device)
+
+        if rank == 0:
+            execution_mode = "cuda_graph" if args.cuda_graph else "eager"
+            print(
+                f"Config: world_size={world_size}, "
+                f"methods={list(expanded_method_labels(implementations))}, "
+                f"QH={args.qhead}, KVH={args.kvhead}, D={args.headdim}, "
+                f"TP={args.tp_size}, DCP={args.dcp_size}, "
+                f"workload={args.workload}, execution={execution_mode}, "
+                f"warmup={args.warmup}, iters={args.iters}, check={args.check}"
+            )
+            print(
+                f"Workload: B={args.b}, q_tokens={sum(inputs.q_lengths)}, "
+                f"history_tokens={sum(inputs.history_lengths)}, "
+                f"q_seqlens={inputs.q_lengths}, "
+                f"history_seqlens={inputs.history_lengths}"
+            )
+            print(
+                "Agg TFLOPS uses useful attention work across all TP ranks and "
+                "p50(max_across_ranks); Avg/GPU divides it by world_size."
+            )
+            print(
+                "KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank "
+                "divided by p50(max_across_ranks); it is not hardware-counter HBM traffic."
+            )
+            print(
+                f"\nRunning B={args.b}, q_tokens={sum(inputs.q_lengths)}, "
+                f"history_tokens={sum(inputs.history_lengths)}, "
+                f"causal={args.workload == 'chunk'}",
+                flush=True,
+            )
 
         runners: dict[str, DCPAttentionRunner] = {}
         if "ours" in implementations:
@@ -1043,6 +1155,25 @@ def main() -> None:
             2 * sum(lengths) * args.headdim * bf16_bytes + replicated_chunk_bytes
             for lengths in local_lengths_by_rank
         ]
+        for method, report in reports.items():
+            kv_bytes_by_rank = (
+                [float(full_kv_bytes)] * topology.tp_size
+                if method == METHOD_FULL
+                else [float(value) for value in local_kv_bytes_by_rank]
+            )
+            average_kv_bytes = sum(kv_bytes_by_rank) / len(kv_bytes_by_rank)
+            report["logical_kv_read"] = {
+                "bytes_by_tp_rank": kv_bytes_by_rank,
+                "average_bytes_per_gpu": average_kv_bytes,
+                "effective_bandwidth_gbps_per_gpu": (
+                    effective_kv_bandwidth_gbps_per_gpu(
+                        kv_bytes_by_rank,
+                        report["stages_ms"]["attention_end_to_end_ms"]["p50"],
+                    )
+                ),
+                "latency_basis": "p50_max_across_ranks",
+                "traffic_model": "logical BF16 K+V input bytes counted once",
+            }
         h_local = topology.q_heads_local
         h_group = h_local * args.dcp_size
         a2a_buffer_bytes, a2a_remote_bytes = _dcp_a2a_payload_bytes(
@@ -1123,12 +1254,8 @@ def main() -> None:
                 json.dumps(result, indent=2, sort_keys=True, default=str) + "\n",
                 encoding="utf-8",
             )
-            latency = ", ".join(
-                f"{name}={report['stages_ms']['attention_end_to_end_ms']['p50']:.4f}ms"
-                for name, report in reports.items()
-            )
-            print(f"packed DCP {args.workload}: {latency}", flush=True)
-            print(f"wrote {output_path}", flush=True)
+            print_results(args, topology, inputs, reports)
+            print(f"Wrote benchmark JSON to {output_path}", flush=True)
         dist.barrier()
     finally:
         if mega_runner is not None:

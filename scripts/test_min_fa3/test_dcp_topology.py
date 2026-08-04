@@ -1,9 +1,16 @@
 import sys
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 
 import torch
 
 import min_fa3_dcp
+from dcp_test.benchmark_output import (
+    DCPBenchmarkRow,
+    effective_kv_bandwidth_gbps_per_gpu,
+    print_benchmark_results,
+)
 from dcp_test.benchmark_dcp import expanded_method_labels as dense_method_labels
 from dcp_test.benchmark_dcp_varlen import (
     expanded_method_labels as varlen_method_labels,
@@ -20,6 +27,46 @@ from min_fa3_dcp import (
 
 
 class DCPTopologyTest(unittest.TestCase):
+    def test_benchmark_console_format_matches_ring_table(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output):
+            print_benchmark_results(
+                "B=1, QH=32, KVH=1, D=128, mode=causal",
+                [
+                    DCPBenchmarkRow(
+                        method="dcp_mega_varlen",
+                        p50_ms=0.1254,
+                        p90_ms=0.1512,
+                        aggregate_tflops=42.25,
+                        avg_gpu_tflops=5.28125,
+                        kv_bandwidth_gbps_per_gpu=1234.5,
+                        check="ok",
+                        note="eager",
+                        rank_p50_ms=(0.12, 0.125),
+                    )
+                ],
+            )
+        rendered = output.getvalue()
+        self.assertIn("Method", rendered)
+        self.assertIn("Time ms", rendered)
+        self.assertIn("Agg TFLOPS", rendered)
+        self.assertIn("Avg/GPU", rendered)
+        self.assertIn("KV GB/s/GPU", rendered)
+        self.assertIn("1234.5", rendered)
+        self.assertIn("Check", rendered)
+        self.assertIn("Note", rendered)
+        self.assertIn("t0=0.120, t1=0.125", rendered)
+        self.assertIn("p50(max_across_ranks)=0.125", rendered)
+        self.assertIn("p90(max_across_ranks)=0.151", rendered)
+
+    def test_effective_kv_bandwidth_uses_average_rank_bytes(self) -> None:
+        self.assertEqual(
+            effective_kv_bandwidth_gbps_per_gpu(
+                (128.0e6, 256.0e6), p50_ms=0.125
+            ),
+            1536.0,
+        )
+
     def test_six_supported_gqa_topologies(self) -> None:
         expected = {
             (32, 4, 2),
