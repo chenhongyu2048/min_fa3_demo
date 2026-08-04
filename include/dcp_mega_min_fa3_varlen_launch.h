@@ -250,6 +250,7 @@ struct DCPMegaKernelConfig {
         int32_t* receive_ready = nullptr;
         int32_t* queue_state = nullptr;
         uint64_t* phase_timestamps = nullptr;
+        int32_t const* graph_post_phase = nullptr;
         int const* cu_seqlens_q = nullptr;
         int total_q = 0;
         int total_vectors = 0;
@@ -537,7 +538,9 @@ CUTLASS_DEVICE void run_history_combine(
                     params.tile_ready_remote[work.dst_rank]
                         + params.dcp_rank * params.token_block_capacity
                         + token_block,
-                    params.tile_ready_phase);
+                    params.graph_post_phase != nullptr
+                        ? *params.graph_post_phase - 1
+                        : params.tile_ready_phase);
             }
         }
         __syncthreads();
@@ -586,7 +589,9 @@ CUTLASS_DEVICE void run_history_receive(
                 wait_relaxed_then_acquire_system_s32(
                     params.tile_ready_remote[params.dcp_rank]
                         + source * params.token_block_capacity + token_block,
-                    params.tile_ready_phase);
+                    params.graph_post_phase != nullptr
+                        ? *params.graph_post_phase - 1
+                        : params.tile_ready_phase);
             }
             __syncwarp();
             for (int vector_in_task = lane;
@@ -1105,6 +1110,7 @@ void launch_dcp_mega_instance(
     kernel_params.receive_ready = params.receive_ready;
     kernel_params.queue_state = params.queue_state;
     kernel_params.phase_timestamps = params.phase_timestamps;
+    kernel_params.graph_post_phase = params.graph_post_phase;
     kernel_params.cu_seqlens_q = params.chunk.cu_seqlens_q;
     kernel_params.total_q = header.total_q;
     kernel_params.total_vectors = header.total_vectors;

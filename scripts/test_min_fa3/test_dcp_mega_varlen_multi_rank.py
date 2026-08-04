@@ -282,12 +282,42 @@ def run_case(
                         rtol=0,
                         atol=0,
                     )
+
+            graph = runner.capture_last_forward(capture_warmup=1)
+            try:
+                for graph_replay in range(2):
+                    graph_o, graph_lse = graph.replay()
+                    runner.copy_last_phase_timestamps(timestamps)
+                    torch.cuda.synchronize(device)
+                    torch.testing.assert_close(
+                        graph_o, expected_o, atol=3.0e-2, rtol=3.0e-2
+                    )
+                    torch.testing.assert_close(
+                        graph_lse, expected_lse, atol=3.0e-2, rtol=3.0e-2
+                    )
+                    if timestamps[3].item() != timestamps[4].item():
+                        raise AssertionError(
+                            "fused CUDA Graph history/publish timestamps differ "
+                            f"at replay {graph_replay}"
+                        )
+            finally:
+                graph.close()
+            graph_phase = runner._phase - 1
+            for source in range(case.dcp_size):
+                if source != dcp_rank:
+                    torch.testing.assert_close(
+                        ready[source],
+                        torch.full_like(ready[source], graph_phase),
+                        rtol=0,
+                        atol=0,
+                    )
             if dist.get_rank() == 0:
                 dispatch = runner.last_dispatch
                 print(
                     f"DCP mega ok: case={case.name} iteration={iteration} "
                     f"DCP={case.dcp_size} split={case.num_splits} "
-                    f"Pack={dispatch.pack_gqa} BlockN={dispatch.block_n}",
+                    f"Pack={dispatch.pack_gqa} BlockN={dispatch.block_n} "
+                    "CUDA_Graph=ok",
                     flush=True,
                 )
     finally:

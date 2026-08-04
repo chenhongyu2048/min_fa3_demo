@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Reproduce the six packed-varlen chunk workloads across DCP=2/4/8.
-# Mega runs in eager mode; the remaining baselines also run under CUDA Graph.
+# Run Mega and the orchestration baselines in both eager and CUDA Graph modes.
 
 set -euo pipefail
 
@@ -19,7 +19,7 @@ LOADS=${LOADS:-"small1,small2,medium1,medium2,large1,large2"}
 DCP_SIZES=${DCP_SIZES:-"2,4,8"}
 MODES=${MODES:-"eager,graph"}
 EAGER_IMPLEMENTATIONS=${EAGER_IMPLEMENTATIONS:-"mega,ours,vllm,sglang"}
-GRAPH_IMPLEMENTATIONS=${GRAPH_IMPLEMENTATIONS:-"ours,vllm,sglang"}
+GRAPH_IMPLEMENTATIONS=${GRAPH_IMPLEMENTATIONS:-"mega,ours,vllm,sglang"}
 WARMUP=${WARMUP:-500}
 ITERS=${ITERS:-100}
 CHECK=${CHECK:-1}

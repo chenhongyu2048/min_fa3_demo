@@ -627,104 +627,144 @@ def measure_mega(
             replay_after_distributed_barrier(),
             expected,
         )
-    for _ in range(args.warmup):
-        runner.prepare_last_forward_replay()
-        replay_after_distributed_barrier()
-    torch.cuda.synchronize(device)
-
-    samples = []
-    local_latency_samples: list[float] = []
-    phase_samples = None
-    if args.mega_phase_timestamps:
-        phase_samples = torch.empty(
-            (args.iters, len(runner.PHASE_TIMESTAMP_NAMES)),
-            device=device,
-            dtype=torch.int64,
-        )
-    for sample_idx in range(args.iters):
-        runner.prepare_last_forward_replay()
-        _, elapsed_ms = replay_after_distributed_barrier(return_timing_ms=True)
-        local_latency_samples.append(elapsed_ms)
-        total = torch.tensor(elapsed_ms, device=device, dtype=torch.float64)
-        dist.all_reduce(total, op=dist.ReduceOp.MAX)
-        values = {stage: 0.0 for stage in STAGES}
-        values["attention_end_to_end_ms"] = float(total.item())
-        samples.append(values)
-        if phase_samples is not None:
-            runner.copy_last_phase_timestamps(phase_samples[sample_idx])
-
-    phase_profile = None
-    if phase_samples is not None:
+    captured = (
+        runner.capture_last_forward(capture_warmup=CAPTURE_EAGER_WARMUP)
+        if args.cuda_graph else None
+    )
+    try:
+        if captured is not None and expected is not None:
+            check_output(f"{METHOD_MEGA}_cuda_graph", captured.replay(), expected)
+        for _ in range(args.warmup):
+            if captured is not None:
+                captured.replay()
+            else:
+                runner.prepare_last_forward_replay()
+                replay_after_distributed_barrier()
         torch.cuda.synchronize(device)
-        raw = phase_samples.cpu()
-        if bool((raw == 0).any()):
-            raise RuntimeError("mega phase timestamp buffer contains an unwritten slot")
-        if not torch.equal(raw[:, 3], raw[:, 4]):
-            raise RuntimeError(
-                "fused history_combine_done and publish_done timestamps differ"
-            )
-        relative_ns = raw - raw[:, :1]
-        relative_ns_device = relative_ns.to(device)
-        dist.all_reduce(relative_ns_device, op=dist.ReduceOp.MAX)
-        relative_us = relative_ns_device.cpu().to(torch.float64) / 1000.0
-        milestones = {
-            name: summarize_series(relative_us[:, index].tolist())
-            for index, name in enumerate(runner.PHASE_TIMESTAMP_NAMES)
-        }
-        tail_pairs = {
-            "q_done_to_publish_done": (1, 4),
-            "publish_done_to_receive_done": (4, 5),
-            "attention_done_to_history_combine_done": (2, 3),
-            "history_combine_done_to_final_combine_done": (3, 6),
-        }
-        local_tail_ns = torch.stack(
-            [raw[:, end] - raw[:, begin] for begin, end in tail_pairs.values()],
-            dim=1,
-        ).to(device)
-        dist.all_reduce(local_tail_ns, op=dist.ReduceOp.MAX)
-        tail_us = local_tail_ns.cpu().to(torch.float64) / 1000.0
-        phase_profile = {
-            "clock": (
-                "SM90 %globaltimer; microseconds relative to each rank's "
-                "kernel_start"
-            ),
-            "aggregation": (
-                "per-iteration MAX across DCP ranks, then percentile across iterations"
-            ),
-            "publish_done_semantics": (
-                "all fused remote ready releases issued; recorded from the same "
-                "%globaltimer read as history_combine_done"
-            ),
-            "milestones_us": milestones,
-            "post_global_completion_tails_us": {
-                name: summarize_series(tail_us[:, index].tolist())
-                for index, name in enumerate(tail_pairs)
-            },
-        }
 
-    dispatch = runner.last_dispatch
-    execution = {
-        "execution_mode": "eager",
-        "capture_eager_warmup": 0,
-        "post_capture_warmup": args.warmup,
-        "stream_policy": "single_stream_persistent_mega",
-        "overlap_q_allgather": True,
-        "graph_static_signature": None,
-        "num_comm_sm": runner.num_comm_sm,
-        "timing_boundary": "mega_kernel_only",
-        "timing_source": "internal_cpp_cuda_events",
-        "pre_barrier": "torch_distributed_outside_timing",
-        "pre_barrier_timed": False,
-        "metadata_policy": "generated_and_uploaded_once_before_timing",
-        "prepared_replay_correctness_checked": expected is not None,
-        "workspace_reset_timed": False,
-        "post_barrier_timed": False,
-        "dispatch": asdict(dispatch) if dispatch is not None else None,
-        "queue_counts": runner.last_queue_counts,
-        "phase_profile": phase_profile,
-        "rank_latency_ms": all_rank_quantiles(local_latency_samples, device),
-    }
-    return summarize_samples(samples), execution
+        samples = []
+        local_latency_samples: list[float] = []
+        phase_samples = None
+        if args.mega_phase_timestamps:
+            phase_samples = torch.empty(
+                (args.iters, len(runner.PHASE_TIMESTAMP_NAMES)),
+                device=device,
+                dtype=torch.int64,
+            )
+        graph_start = torch.cuda.Event(enable_timing=True)
+        graph_end = torch.cuda.Event(enable_timing=True)
+        for sample_idx in range(args.iters):
+            if captured is not None:
+                graph_start.record()
+                captured.replay()
+                graph_end.record()
+                graph_end.synchronize()
+                elapsed_ms = graph_start.elapsed_time(graph_end)
+            else:
+                runner.prepare_last_forward_replay()
+                _, elapsed_ms = replay_after_distributed_barrier(
+                    return_timing_ms=True
+                )
+            local_latency_samples.append(elapsed_ms)
+            total = torch.tensor(elapsed_ms, device=device, dtype=torch.float64)
+            dist.all_reduce(total, op=dist.ReduceOp.MAX)
+            values = {stage: 0.0 for stage in STAGES}
+            values["attention_end_to_end_ms"] = float(total.item())
+            samples.append(values)
+            if phase_samples is not None:
+                runner.copy_last_phase_timestamps(phase_samples[sample_idx])
+
+        phase_profile = None
+        if phase_samples is not None:
+            torch.cuda.synchronize(device)
+            raw = phase_samples.cpu()
+            if bool((raw == 0).any()):
+                raise RuntimeError("mega phase timestamp buffer contains an unwritten slot")
+            if not torch.equal(raw[:, 3], raw[:, 4]):
+                raise RuntimeError(
+                    "fused history_combine_done and publish_done timestamps differ"
+                )
+            relative_ns = raw - raw[:, :1]
+            relative_ns_device = relative_ns.to(device)
+            dist.all_reduce(relative_ns_device, op=dist.ReduceOp.MAX)
+            relative_us = relative_ns_device.cpu().to(torch.float64) / 1000.0
+            milestones = {
+                name: summarize_series(relative_us[:, index].tolist())
+                for index, name in enumerate(runner.PHASE_TIMESTAMP_NAMES)
+            }
+            tail_pairs = {
+                "q_done_to_publish_done": (1, 4),
+                "publish_done_to_receive_done": (4, 5),
+                "attention_done_to_history_combine_done": (2, 3),
+                "history_combine_done_to_final_combine_done": (3, 6),
+            }
+            local_tail_ns = torch.stack(
+                [raw[:, end] - raw[:, begin] for begin, end in tail_pairs.values()],
+                dim=1,
+            ).to(device)
+            dist.all_reduce(local_tail_ns, op=dist.ReduceOp.MAX)
+            tail_us = local_tail_ns.cpu().to(torch.float64) / 1000.0
+            phase_profile = {
+                "clock": (
+                    "SM90 %globaltimer; microseconds relative to each rank's "
+                    "kernel_start"
+                ),
+                "aggregation": (
+                    "per-iteration MAX across DCP ranks, then percentile across iterations"
+                ),
+                "publish_done_semantics": (
+                    "all fused remote ready releases issued; recorded from the same "
+                    "%globaltimer read as history_combine_done"
+                ),
+                "milestones_us": milestones,
+                "post_global_completion_tails_us": {
+                    name: summarize_series(tail_us[:, index].tolist())
+                    for index, name in enumerate(tail_pairs)
+                },
+            }
+
+        graph_mode = captured is not None
+        dispatch = runner.last_dispatch
+        execution = {
+            "execution_mode": "cuda_graph" if graph_mode else "eager",
+            "capture_eager_warmup": CAPTURE_EAGER_WARMUP if graph_mode else 0,
+            "post_capture_warmup": args.warmup,
+            "stream_policy": "single_stream_persistent_mega",
+            "overlap_q_allgather": True,
+            "graph_static_signature": captured.signature if graph_mode else None,
+            "num_comm_sm": runner.num_comm_sm,
+            "timing_boundary": (
+                "cuda_graph_replay" if graph_mode else "mega_kernel_only"
+            ),
+            "timing_source": (
+                "external_python_cuda_events"
+                if graph_mode else "internal_cpp_cuda_events"
+            ),
+            "pre_barrier": (
+                "captured_ipc_phase_barrier"
+                if graph_mode else "torch_distributed_outside_timing"
+            ),
+            "pre_barrier_timed": graph_mode,
+            "metadata_policy": (
+                "generated_and_uploaded_once_before_capture"
+                if graph_mode else "generated_and_uploaded_once_before_timing"
+            ),
+            "prepared_replay_correctness_checked": expected is not None,
+            "graph_replay_correctness_checked": graph_mode and expected is not None,
+            "workspace_reset_timed": graph_mode,
+            "post_barrier_timed": graph_mode,
+            "graph_phase_policy": (
+                "device_monotonic_int32_plus_2_per_replay" if graph_mode else None
+            ),
+            "dispatch": asdict(dispatch) if dispatch is not None else None,
+            "queue_counts": runner.last_queue_counts,
+            "phase_profile": phase_profile,
+            "rank_latency_ms": all_rank_quantiles(local_latency_samples, device),
+        }
+        return summarize_samples(samples), execution
+    finally:
+        if captured is not None:
+            captured.close()
 
 
 def check_output(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -972,8 +1012,6 @@ def main() -> None:
         if "mega" in implementations:
             if args.workload != "chunk":
                 raise SystemExit("the DCP mega experimental path supports chunk only")
-            if args.cuda_graph:
-                raise SystemExit("the DCP mega experimental path requires --no-cuda-graph")
             if args.dcp_size not in (2, 4, 8):
                 raise SystemExit("the DCP mega experimental path requires DCP size 2, 4, or 8")
         topology = make_topology(

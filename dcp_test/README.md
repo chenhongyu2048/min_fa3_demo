@@ -33,20 +33,23 @@ FP32 LSE pack contract from PR #47801.
 
 Packed-varlen also accepts the explicit experimental category
 `--implementations mega`, reported as `dcp_mega_varlen`. It is chunk-only and
-eager-only, so pass `--no-cuda-graph`. `--mega-block-n 128|176` and
-`--mega-num-comm-sm N` select the isolated instance and communication-CTA
-budget. The communication path is fixed to PackGQA with `Hq_local` 4 or 8 and
+supports both the default CUDA Graph mode and `--no-cuda-graph` eager mode.
+`--mega-block-n 128|176` and `--mega-num-comm-sm N` select the isolated
+instance and communication-CTA budget. The communication path is fixed to
+PackGQA with `Hq_local` 4 or 8 and
 `[16,Hq_local,128]` Q/O tiles; there is no runtime communication-layout
 selection. History combine performs the remote TMA store and publishes a
 monotonic ready phase directly, so communication CTAs proceed from Q
 all-gather to receive without a separate publish pass. The existing default method
 list remains unchanged. Its first eager
 correctness call builds and uploads fixed-shape metadata. Benchmark replays
-reuse that device image. Internal CUDA events measure only the persistent mega
-kernel. Each replay completes a `torch.distributed.barrier` on the DCP process
-group before the start event; workspace reset and both barriers remain outside
-the measured interval. Add `--mega-phase-timestamps` to include
-optional `%globaltimer` milestones in JSON. Fused `history_combine_done` and
+reuse that device image. Eager timing uses internal CUDA events around only the
+persistent mega kernel; workspace reset and both barriers remain outside that
+interval. CUDA Graph replay captures workspace reset, a device-side monotonic
+phase increment, pre/post IPC barriers, and the persistent kernel; external
+CUDA events time that complete graph replay. Add `--mega-phase-timestamps` to
+include optional `%globaltimer` milestones in JSON. Fused
+`history_combine_done` and
 `publish_done` are intentionally identical; `publish_done` means every remote
 ready release has been issued.
 
@@ -99,8 +102,8 @@ torchrun --standalone --nproc_per_node=8 --module dcp_test.benchmark_dcp_varlen 
 The repository-root `benchmark_dcp_mega_six_loads.sh` script runs the six
 standard small/medium/large chunk workloads for `DCP/Hkv=2/4,4/2,8/1`.
 By default it runs eager Mega and orchestration baselines followed by the
-non-Mega CUDA Graph baselines, using 500 warmups and 100 samples. Per-job logs,
-JSON results, and a master log are written below a timestamped
+same Mega and orchestration methods under CUDA Graph, using 500 warmups and
+100 samples. Per-job logs, JSON results, and a master log are written below a timestamped
 `benchmark_logs/dcp_mega_six_loads_*` directory. Use `DRY_RUN=1` to print the
 full command matrix without launching it; `LOADS=large2`, `MODES=eager`, or
 `DCP_SIZES=8` restricts the matrix.
@@ -135,7 +138,7 @@ Experimental mega-kernel smoke example:
 torchrun --standalone --nproc_per_node=8 --module dcp_test.benchmark_dcp_varlen \
   --b 3 --sq 1,8,32 --seqlen 129,1024,3131 \
   --qhead 32 --kvhead 1 --headdim 128 --tp-size 8 --dcp-size 8 \
-  --workload chunk --implementations mega,vllm,full --no-cuda-graph \
+  --workload chunk --implementations mega,vllm,full --cuda-graph \
   --mega-block-n 128 --mega-num-comm-sm 8 \
   --num-splits 0 --warmup 5 --iters 20
 ```
@@ -147,7 +150,7 @@ non-16 tails, BF16 O, FP32 LSE, and two forwards per case to cover workspace
 reuse:
 
 ```bash
-torchrun --standalone --nproc_per_node=8 \
+PYTHONPATH=. torchrun --standalone --nproc_per_node=8 \
   scripts/test_min_fa3/test_dcp_mega_varlen_multi_rank.py --matrix
 ```
 

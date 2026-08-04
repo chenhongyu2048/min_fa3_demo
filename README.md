@@ -979,7 +979,8 @@ Packed-varlen accepts `--no-check` to skip the eager full-KV correctness
 precheck for performance-only runs.
 
 The optional `--implementations mega` category adds the experimental
-`dcp_mega_varlen` path for chunk prefill only. It requires `--no-cuda-graph`;
+`dcp_mega_varlen` path for chunk prefill only. It supports the default CUDA
+Graph mode and the explicit `--no-cuda-graph` eager fallback;
 `--mega-block-n 128|176` and `--mega-num-comm-sm N` select its isolated kernel
 instance and explicit communication-CTA budget. The default remains 8 and
 there is no `0/auto` mode. Mega uses fixed `[16,Hq_local,128]` Q/O
@@ -987,10 +988,11 @@ communication tiles and requires PackGQA with `Hq_local` 4 or 8. History
 combine publishes each completed remote tile directly with a monotonic phase
 signal; there is no separate communication-granularity mode or publish pass.
 Fixed-shape benchmark replay builds and
-uploads metadata once. Its internal CUDA events measure only the pre-barrier
-and persistent mega kernel; workspace clears happen before the start event and
-the post-barrier happens after the end event. Existing default benchmark
-methods are unchanged. `--mega-phase-timestamps` records optional in-kernel
+uploads metadata once. Eager internal CUDA events measure only the persistent
+mega kernel. CUDA Graph replay captures workspace reset, a device-side
+monotonic phase increment, both IPC barriers, and the persistent kernel, and
+external CUDA events time that complete graph. Existing default benchmark methods
+are unchanged. `--mega-phase-timestamps` records optional in-kernel
 `%globaltimer` milestones; fused `history_combine_done` and `publish_done`
 share the same timestamp, with the latter meaning all remote ready releases
 have been issued.
@@ -1000,7 +1002,7 @@ torchrun --standalone --nproc_per_node=8 --module \
   dcp_test.benchmark_dcp_varlen \
   --b 3 --sq 1,8,32 --seqlen 129,1024,3131 \
   --qhead 32 --kvhead 1 --headdim 128 --tp-size 8 --dcp-size 8 \
-  --workload chunk --implementations mega,vllm,full --no-cuda-graph \
+  --workload chunk --implementations mega,vllm,full --cuda-graph \
   --mega-block-n 128 --mega-num-comm-sm 8 \
   --num-splits 0 --warmup 5 --iters 20
 ```
@@ -1008,7 +1010,7 @@ torchrun --standalone --nproc_per_node=8 --module \
 Run the one-process-group correctness matrix with:
 
 ```bash
-torchrun --standalone --nproc_per_node=8 \
+PYTHONPATH=. torchrun --standalone --nproc_per_node=8 \
   scripts/test_min_fa3/test_dcp_mega_varlen_multi_rank.py --matrix
 ```
 

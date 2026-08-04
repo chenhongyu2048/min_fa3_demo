@@ -3645,16 +3645,103 @@ class _DCPMegaReplayPending:
     stream: torch.cuda.Stream
 
 
+class DCPMegaAttentionCUDAGraph:
+    """One fixed-shape CUDA Graph captured from a prepared Mega forward."""
+
+    _MAX_PHASE = (1 << 31) - 1
+
+    def __init__(
+        self,
+        runner: "DCPMegaAttentionRunner",
+        graph: torch.cuda.CUDAGraph,
+        output: _DCPResult,
+        capture_stream: torch.cuda.Stream,
+        static_references: tuple[object, ...],
+        signature: dict[str, object],
+        initial_post_phase: int,
+    ) -> None:
+        self._runner: Optional[DCPMegaAttentionRunner] = runner
+        self._graph: Optional[torch.cuda.CUDAGraph] = graph
+        self._output: Optional[_DCPResult] = output
+        self._capture_stream: Optional[torch.cuda.Stream] = capture_stream
+        self._static_references = static_references
+        self.signature = signature
+        self._max_replays = (self._MAX_PHASE - initial_post_phase) // 2
+        self._replay_count = 0
+        self._closed = False
+
+    @property
+    def output(self) -> _DCPResult:
+        if self._closed or self._output is None:
+            raise RuntimeError("DCPMegaAttentionCUDAGraph is closed")
+        return self._output
+
+    def replay(self) -> _DCPResult:
+        """Enqueue one replay with a device-generated monotonic IPC phase."""
+        if self._closed or self._graph is None or self._runner is None:
+            raise RuntimeError("DCPMegaAttentionCUDAGraph is closed")
+        if self._replay_count >= self._max_replays:
+            raise RuntimeError(
+                "DCP mega CUDA Graph exhausted its safe int32 phase range; "
+                "close and recapture the graph"
+            )
+        capture_stream = self._capture_stream
+        assert capture_stream is not None
+        current_stream = torch.cuda.current_stream(self._runner.device)
+        if current_stream.cuda_stream != capture_stream.cuda_stream:
+            capture_stream.wait_stream(current_stream)
+            with torch.cuda.stream(capture_stream):
+                self._graph.replay()
+            current_stream.wait_stream(capture_stream)
+        else:
+            self._graph.replay()
+        self._replay_count += 1
+        return self.output
+
+    def close(self) -> None:
+        """Finish replay, recover the device phase, and release graph ownership."""
+        if self._closed:
+            return
+        runner = self._runner
+        graph = self._graph
+        final_post_phase = None
+        try:
+            if runner is not None:
+                torch.cuda.synchronize(runner.device)
+                final_post_phase = int(runner._graph_post_phase.item())
+            if graph is not None:
+                graph.reset()
+        finally:
+            if runner is not None:
+                runner._release_graph(self, final_post_phase)
+            self._static_references = ()
+            self._capture_stream = None
+            self._output = None
+            self._graph = None
+            self._runner = None
+            self._closed = True
+
+    def __enter__(self) -> "DCPMegaAttentionCUDAGraph":
+        if self._closed:
+            raise RuntimeError("DCPMegaAttentionCUDAGraph is closed")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        del exc_type, exc_value, traceback
+        self.close()
+
+
 class DCPMegaAttentionRunner:
     """Persistent single-node workspace for batched varlen DCP mega forward.
 
     Construction is collective over ``node_process_group`` because the IPC
     :class:`TKParallelTensor` arenas exchange handles exactly once.  The
-    workspace is intentionally eager-only and may not be used concurrently.
+    workspace may not be used concurrently. CUDA Graph capture replays one
+    prepared fixed-shape metadata image and advances IPC phases on device.
     """
 
     method_name = "dcp_mega_varlen"
-    supports_cuda_graph = False
+    supports_cuda_graph = True
     supports_decode = False
     output_collective_kind = "bf16_ipc_a2a"
     workspace_policy = "runner_preallocated"
@@ -3929,6 +4016,7 @@ class DCPMegaAttentionRunner:
         self._phase_timestamps = torch.empty(
             len(self.PHASE_TIMESTAMP_NAMES), dtype=torch.int64, **cuda
         )
+        self._graph_post_phase = torch.empty(1, dtype=torch.int32, **cuda)
 
         self._enqueue_lock = threading.Lock()
         self._completion_event = torch.cuda.Event()
@@ -3944,12 +4032,14 @@ class DCPMegaAttentionRunner:
         self._last_queue_counts: dict[str, object] | None = None
         self._last_replay: _DCPMegaReplay | None = None
         self._replay_pending: _DCPMegaReplayPending | None = None
+        self._active_graph: DCPMegaAttentionCUDAGraph | None = None
 
         # The arenas must be visibly initialized before any subgroup starts a
         # forward. This is construction-time synchronization, not hot-path work.
         stream = torch.cuda.current_stream(self.device)
         self._ipc_tile_ready.data_.zero_()
         self._ipc_barrier.data_.zero_()
+        self._graph_post_phase.zero_()
         stream.synchronize()
         dist.barrier(group=self.node_process_group)
 
@@ -4059,8 +4149,16 @@ class DCPMegaAttentionRunner:
     ) -> _DCPResult:
         if self._closed:
             raise RuntimeError("DCPMegaAttentionRunner is closed")
+        if self._active_graph is not None:
+            raise RuntimeError(
+                "This runner has an active CUDA Graph; replay or close it before "
+                "calling eager forward"
+            )
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("DCP mega does not support CUDA Graph capture")
+            raise RuntimeError(
+                "Direct CUDA Graph capture is unsupported; prepare one eager "
+                "forward, then use capture_last_forward()"
+            )
         if not self._enqueue_lock.acquire(blocking=False):
             raise RuntimeError("DCP mega workspace does not support concurrent forward")
         try:
@@ -4240,6 +4338,7 @@ class DCPMegaAttentionRunner:
                 self._receive_ready,
                 self._queue_state,
                 self._phase_timestamps,
+                self._graph_post_phase,
                 self.record_phase_timestamps,
                 list(self.dcp_node_ranks),
                 self.rank,
@@ -4272,10 +4371,131 @@ class DCPMegaAttentionRunner:
 
     forward_chunk_prefill_varlen_dcp_mega = forward_chunk_prefill_varlen
 
+    def capture_last_forward(
+        self,
+        *,
+        capture_warmup: int = 3,
+    ) -> DCPMegaAttentionCUDAGraph:
+        """Capture the last fixed-shape forward for repeated graph replay."""
+        if self._closed:
+            raise RuntimeError("DCPMegaAttentionRunner is closed")
+        if not isinstance(capture_warmup, int) or capture_warmup < 0:
+            raise ValueError("capture_warmup must be a nonnegative integer")
+        if self._last_replay is None:
+            raise RuntimeError(
+                "run one eager DCP mega forward before capture_last_forward()"
+            )
+        if self._active_graph is not None:
+            raise RuntimeError("This runner already has an active CUDA Graph")
+        if self._replay_pending is not None:
+            raise RuntimeError("cannot capture while a prepared eager replay is pending")
+
+        for _ in range(capture_warmup):
+            self.prepare_last_forward_replay()
+            self.replay_last_forward()
+        torch.cuda.synchronize(self.device)
+        dist.barrier(group=self.process_group, device_ids=[self.device.index])
+        torch.cuda.synchronize(self.device)
+        if self._phase > DCPMegaAttentionCUDAGraph._MAX_PHASE - 2:
+            raise RuntimeError(
+                "DCP mega phase is too close to int32 overflow for CUDA Graph capture"
+            )
+
+        replay = self._last_replay
+        self._graph_post_phase.fill_(self._phase)
+        torch.cuda.synchronize(self.device)
+        self._has_completion = False
+        caller_stream = torch.cuda.current_stream(self.device)
+        capture_stream = torch.cuda.Stream(device=self.device)
+        capture_stream.wait_stream(caller_stream)
+        graph: torch.cuda.CUDAGraph | None = None
+        try:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(
+                graph,
+                stream=capture_stream,
+                capture_error_mode="global",
+            ):
+                replay.backend(
+                    *replay.backend_args,
+                    True,
+                    0,
+                    True,
+                    True,
+                    False,
+                    True,
+                )
+            caller_stream.wait_stream(capture_stream)
+            signature = {
+                "operation": "dcp_mega_chunk_prefill_varlen",
+                "runner": type(self).__name__,
+                "world_size": self.world_size,
+                "rank": self.rank,
+                "bindings": {
+                    name: DCPAttentionRunner._tensor_signature(tensor)
+                    for name, tensor in {
+                        "q_local": replay.backend_args[0],
+                        "k_history_local": replay.backend_args[1],
+                        "v_history_local": replay.backend_args[2],
+                        "k_chunk": replay.backend_args[3],
+                        "v_chunk": replay.backend_args[4],
+                        "cu_seqlens_q": replay.backend_args[5],
+                        "cu_seqlens_history_local": replay.backend_args[6],
+                        "output": self._output[: replay.backend_args[0].shape[0]],
+                        "graph_post_phase": self._graph_post_phase,
+                    }.items()
+                },
+                "scalars": {
+                    "max_seqlen_q": replay.backend_args[7],
+                    "max_seqlen_history_local": replay.backend_args[8],
+                    "num_comm_sm": self.num_comm_sm,
+                    "record_phase_timestamps": self.record_phase_timestamps,
+                    "dispatch": (
+                        asdict(self._last_dispatch)
+                        if self._last_dispatch is not None else None
+                    ),
+                },
+                "phase_policy": "device_monotonic_int32_plus_2_per_replay",
+            }
+            captured = DCPMegaAttentionCUDAGraph(
+                self,
+                graph,
+                replay.result,
+                capture_stream,
+                (replay, replay.backend_args, self._graph_post_phase),
+                signature,
+                self._phase,
+            )
+            self._active_graph = captured
+            return captured
+        except Exception:
+            torch.cuda.synchronize(self.device)
+            if graph is not None:
+                graph.reset()
+            raise
+
+    def _release_graph(
+        self,
+        graph: DCPMegaAttentionCUDAGraph,
+        final_post_phase: int | None,
+    ) -> None:
+        if self._active_graph is not graph:
+            return
+        if final_post_phase is None or final_post_phase < self._phase:
+            raise RuntimeError("DCP mega CUDA Graph returned an invalid final phase")
+        self._phase = final_post_phase
+        self._has_completion = False
+        self._active_graph = None
+
     def prepare_last_forward_replay(self) -> None:
         """Reset reusable state before timing the last prepared forward."""
         if self._closed:
             raise RuntimeError("DCPMegaAttentionRunner is closed")
+        if self._active_graph is not None:
+            raise RuntimeError(
+                "This runner has an active CUDA Graph; replay or close it before "
+                "preparing an eager replay"
+            )
         if self._last_replay is None:
             raise RuntimeError("no DCP mega forward is available for replay")
         if not self._enqueue_lock.acquire(blocking=False):
@@ -4347,6 +4567,8 @@ class DCPMegaAttentionRunner:
     def close(self) -> None:
         if self._closed:
             return
+        if self._active_graph is not None:
+            raise RuntimeError("close the active DCP mega CUDA Graph before the runner")
         if self._replay_pending is not None:
             raise RuntimeError("cannot close DCP mega runner with a pending replay")
         if self._has_completion:
@@ -4370,6 +4592,7 @@ __all__ = [
     "DCPTopology",
     "DCPAttentionCUDAGraph",
     "DCPAttentionRunner",
+    "DCPMegaAttentionCUDAGraph",
     "DCPMegaAttentionRunner",
     "SGLangDCPAttentionRunner",
     "TopologyIssue",

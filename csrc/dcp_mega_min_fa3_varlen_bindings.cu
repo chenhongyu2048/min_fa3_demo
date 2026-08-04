@@ -303,6 +303,7 @@ double forward_chunk_prefill_varlen_dcp_mega(
     torch::Tensor receive_ready,
     torch::Tensor queue_state,
     torch::Tensor phase_timestamps,
+    torch::Tensor graph_post_phase,
     bool record_phase_timestamps,
     std::vector<int64_t> dcp_node_ranks,
     int64_t dcp_rank,
@@ -312,7 +313,8 @@ double forward_chunk_prefill_varlen_dcp_mega(
     int64_t pre_phase,
     bool run_post_barrier,
     bool run_pre_barrier,
-    bool measure_kernel) {
+    bool measure_kernel,
+    bool graph_replay) {
     check_packed_bf16(q, "q");
     check_packed_bf16(k_history, "k_history");
     check_packed_bf16(v_history, "v_history");
@@ -330,6 +332,7 @@ double forward_chunk_prefill_varlen_dcp_mega(
     check_cuda_int32(publish_ready, "publish_ready");
     check_cuda_int32(receive_ready, "receive_ready");
     check_cuda_int32(queue_state, "queue_state");
+    check_cuda_int32(graph_post_phase, "graph_post_phase");
     TORCH_CHECK(phase_timestamps.is_cuda()
                     && phase_timestamps.scalar_type() == torch::kInt64
                     && phase_timestamps.is_contiguous()
@@ -337,6 +340,12 @@ double forward_chunk_prefill_varlen_dcp_mega(
                     && phase_timestamps.numel() >= kPhaseTimestampCount,
                 "phase_timestamps must be a contiguous CUDA int64 buffer with at least ",
                 kPhaseTimestampCount, " slots");
+    TORCH_CHECK(graph_post_phase.numel() == 1,
+                "graph_post_phase must contain exactly one int32 value");
+    TORCH_CHECK(!graph_replay || metadata_prepared,
+                "DCP mega CUDA Graph replay requires prepared metadata");
+    TORCH_CHECK(!graph_replay || !measure_kernel,
+                "DCP mega CUDA Graph replay uses external graph timing events");
     TORCH_CHECK(!metadata_host.is_cuda()
                     && metadata_host.scalar_type() == torch::kInt32
                     && metadata_host.is_contiguous()
@@ -364,7 +373,8 @@ double forward_chunk_prefill_varlen_dcp_mega(
              {&attention_done, "attention_done"},
              {&publish_ready, "publish_ready"},
              {&receive_ready, "receive_ready"}, {&queue_state, "queue_state"},
-             {&phase_timestamps, "phase_timestamps"}}) {
+             {&phase_timestamps, "phase_timestamps"},
+             {&graph_post_phase, "graph_post_phase"}}) {
         check_same_device(q, *named.first, named.second);
     }
 
@@ -584,6 +594,8 @@ double forward_chunk_prefill_varlen_dcp_mega(
     params.phase_timestamps = record_phase_timestamps
         ? reinterpret_cast<uint64_t*>(phase_timestamps.data_ptr<int64_t>())
         : nullptr;
+    params.graph_post_phase = graph_replay
+        ? graph_post_phase.data_ptr<int32_t>() : nullptr;
     params.dcp_size = dcp_size;
     params.dcp_rank = dcp_rank;
     params.hq_local = q.size(1);
@@ -623,6 +635,8 @@ double forward_chunk_prefill_varlen_dcp_mega(
             metadata_used * sizeof(int32_t),
             cudaMemcpyHostToDevice,
             stream));
+    }
+    if (!metadata_prepared || graph_replay) {
         C10_CUDA_CHECK(cudaMemsetAsync(
             q_ready.data_ptr<int>(), 0,
             header.q_ready_count * sizeof(int32_t), stream));
@@ -643,18 +657,28 @@ double forward_chunk_prefill_varlen_dcp_mega(
                 kPhaseTimestampCount * sizeof(int64_t), stream));
         }
     }
-    int64_t const tile_ready_phase
-        = metadata_prepared ? pre_phase : header.pre_phase;
-    TORCH_CHECK(tile_ready_phase > 0
-                    && tile_ready_phase <= std::numeric_limits<int32_t>::max(),
-                "DCP mega requires a positive int32 tile-ready phase");
-    params.tile_ready_phase = int(tile_ready_phase);
+    if (graph_replay) {
+        min_fa3_varlen_demo::dcp_mega::advance_dcp_mega_graph_phase(
+            graph_post_phase.data_ptr<int32_t>(), stream);
+    } else {
+        int64_t const tile_ready_phase
+            = metadata_prepared ? pre_phase : header.pre_phase;
+        TORCH_CHECK(tile_ready_phase > 0
+                        && tile_ready_phase <= std::numeric_limits<int32_t>::max(),
+                    "DCP mega requires a positive int32 tile-ready phase");
+        params.tile_ready_phase = int(tile_ready_phase);
+    }
 
     cudaEvent_t timing_start = nullptr;
     cudaEvent_t timing_end = nullptr;
     if (run_pre_barrier) {
-        min_fa3_varlen_demo::dcp_mega::run_dcp_mega_barrier(
-            params, metadata_prepared ? int(pre_phase) : header.pre_phase, stream);
+        if (graph_replay) {
+            min_fa3_varlen_demo::dcp_mega::run_dcp_mega_graph_barrier(
+                params, -1, stream);
+        } else {
+            min_fa3_varlen_demo::dcp_mega::run_dcp_mega_barrier(
+                params, metadata_prepared ? int(pre_phase) : header.pre_phase, stream);
+        }
     }
     if (measure_kernel) {
         C10_CUDA_CHECK(cudaEventCreate(&timing_start));
@@ -666,8 +690,13 @@ double forward_chunk_prefill_varlen_dcp_mega(
         C10_CUDA_CHECK(cudaEventRecord(timing_end, stream));
     }
     if (run_post_barrier) {
-        min_fa3_varlen_demo::dcp_mega::run_dcp_mega_barrier(
-            params, header.post_phase, stream);
+        if (graph_replay) {
+            min_fa3_varlen_demo::dcp_mega::run_dcp_mega_graph_barrier(
+                params, 0, stream);
+        } else {
+            min_fa3_varlen_demo::dcp_mega::run_dcp_mega_barrier(
+                params, header.post_phase, stream);
+        }
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     double elapsed_ms = 0.0;
@@ -774,6 +803,7 @@ void bind_dcp_mega_varlen(py::module_& module) {
         py::arg("receive_ready"),
         py::arg("queue_state"),
         py::arg("phase_timestamps"),
+        py::arg("graph_post_phase"),
         py::arg("record_phase_timestamps"),
         py::arg("dcp_node_ranks"),
         py::arg("dcp_rank"),
@@ -784,6 +814,7 @@ void bind_dcp_mega_varlen(py::module_& module) {
         py::arg("run_post_barrier") = true,
         py::arg("run_pre_barrier") = true,
         py::arg("measure_kernel") = false,
+        py::arg("graph_replay") = false,
         "Persistent single-node SM90 BF16 D=128 batched varlen DCP mega forward.");
     module.def(
         "_dcp_mega_varlen_barrier",

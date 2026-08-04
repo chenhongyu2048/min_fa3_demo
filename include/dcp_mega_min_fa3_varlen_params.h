@@ -155,6 +155,7 @@ struct DCPMega_fwd_params {
     int32_t* receive_ready = nullptr;
     int32_t* queue_state = nullptr;
     uint64_t* phase_timestamps = nullptr;
+    int32_t const* graph_post_phase = nullptr;
 
     int dcp_size = 0;
     int dcp_rank = 0;
@@ -173,6 +174,15 @@ static_assert(alignof(DCPMega_fwd_params) >= alignof(void*));
 void run_dcp_mega_barrier(
     DCPMega_fwd_params const& params,
     int phase,
+    cudaStream_t stream);
+
+void advance_dcp_mega_graph_phase(
+    int32_t* graph_post_phase,
+    cudaStream_t stream);
+
+void run_dcp_mega_graph_barrier(
+    DCPMega_fwd_params const& params,
+    int phase_offset,
     cudaStream_t stream);
 
 void run_dcp_mega_varlen_fwd(
