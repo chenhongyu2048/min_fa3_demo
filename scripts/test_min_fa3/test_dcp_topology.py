@@ -218,8 +218,18 @@ class DCPTopologyTest(unittest.TestCase):
                         "attention_end_to_end_ms": {"p50": 4.0, "p90": 5.0},
                         "a2a_pack_ms": {"p50": 0.2, "p90": 0.3},
                         "a2a_all_to_all_ms": {"p50": 0.4, "p90": 0.5},
+                        "overlapped_ag_chunk_window_ms": {
+                            "p50": 3.0,
+                            "p90": 3.1,
+                        },
                         "output_collective_ms": {"p50": 0.4, "p90": 0.5},
                         "output_reduce_scatter_ms": {"p50": 0.0, "p90": 0.0},
+                    },
+                    "ours_overlap_varlen": {
+                        "overlapped_ag_chunk_window_ms": {
+                            "p50": 0.6,
+                            "p90": 0.7,
+                        },
                     },
                     "full_kv_min_fa3": {
                         "attention_end_to_end_ms": {"p50": 1.0, "p90": 1.1},
@@ -235,6 +245,8 @@ class DCPTopologyTest(unittest.TestCase):
         self.assertIn("a2a_all_to_all_ms", rendered)
         self.assertNotIn("attention_end_to_end_ms", rendered)
         self.assertNotIn("output_collective_ms", rendered)
+        self.assertEqual(rendered.count("overlapped_ag_chunk_window_ms"), 1)
+        self.assertIn("ours_overlap_varlen", rendered)
         self.assertNotIn("full_kv_min_fa3", rendered)
 
     def test_six_supported_gqa_topologies(self) -> None:

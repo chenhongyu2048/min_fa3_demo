@@ -59,9 +59,10 @@ instance and communication-CTA budget. The communication path is fixed to
 PackGQA with `Hq_local` 4 or 8 and
 `[16,Hq_local,128]` Q/O tiles; there is no runtime communication-layout
 selection. History combine performs the remote TMA store and publishes a
-monotonic ready phase directly, so communication CTAs proceed from Q
-all-gather to receive without a separate publish pass. The existing default method
-list remains unchanged. Its first eager
+monotonic ready phase directly. After Q all-gather, communication CTAs first
+receive any ready remote tiles and otherwise help the shared history-combine
+queue; compute CTAs drain the remaining combine work. There is no separate
+publish pass. The existing default method list remains unchanged. Its first eager
 correctness call builds and uploads fixed-shape metadata. Benchmark replays
 reuse that device image. Eager timing uses internal CUDA events around only the
 persistent mega kernel; workspace reset and both barriers remain outside that

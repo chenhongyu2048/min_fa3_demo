@@ -103,6 +103,11 @@ def print_timing_breakdowns(
         for phase, values in stages.items():
             if phase == "attention_end_to_end_ms":
                 continue
+            if (
+                phase == "overlapped_ag_chunk_window_ms"
+                and method not in {"ours_overlap", "ours_overlap_varlen"}
+            ):
+                continue
             if phase == "output_collective_ms" and has_output_substage:
                 continue
             p50 = values.get("p50", 0.0)
