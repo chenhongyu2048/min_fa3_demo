@@ -179,21 +179,15 @@ does not allocate a dense `B * max_seqlen_q` workspace.
 
 ## Head-sharded decode context parallel attention
 
-`min_fa3_dcp` provides three standalone Python/Triton DCP runners on top of
-the same dense and packed-varlen KV-cache siblings. `DCPAttentionRunner` is
-the local implementation, with single-stream execution by default and an
-explicit overlap mode. `VLLMDCPAttentionRunner` copies and trims vLLM's default
-`ag_rs` path at commit `a89015c6df8eeb37a843b717c97a5be1355de83d`.
-`SGLangDCPAttentionRunner` copies and trims SGLang's MHA DCP path at commit
-`8d6549bc4039d33635844495d86684677a4f0df8`. Neither comparison runner imports
-or installs its source serving runtime.
+`min_fa3_dcp` provides the local `DCPAttentionRunner`, its CUDA Graph wrapper,
+topology validation, and the packed-varlen `DCPMegaAttentionRunner`. The
+ordinary runner uses single-stream execution by default and exposes an
+explicit Q-all-gather overlap mode. Same-kernel vLLM/SGLang comparison runners
+live in the repository-only `dcp_test.baselines` module and are documented in
+`dcp_test/README.md`; they are not exported by the runtime module.
 
 ```python
-from min_fa3_dcp import (
-    DCPAttentionRunner,
-    SGLangDCPAttentionRunner,
-    VLLMDCPAttentionRunner,
-)
+from min_fa3_dcp import DCPAttentionRunner
 
 runner = DCPAttentionRunner(process_group)
 out = runner.forward_decode(
@@ -227,7 +221,7 @@ out = runner.forward_chunk_prefill_varlen(
 with runner.capture_decode(
     q_local, k_cache_local, v_cache_local, cache_seqlens_local,
     num_splits=0, return_lse=False, overlap_q_allgather=False,
-    record_timing=False, capture_warmup=3,
+    capture_warmup=3,
 ) as graph:
     q_local.copy_(next_q)
     cache_seqlens_local.copy_(next_cache_seqlens)
@@ -243,8 +237,8 @@ Decode assumes that the current token's K/V have already been written to the
 last valid position of `k_cache_local/v_cache_local` before any runner is
 called. Consequently, the local cache attention includes the current token's
 self-attention term; there is no separate current-token attention or cache
-append inside these runners. The local, vLLM, and SGLang same-kernel baselines
-all use this contract. They compare DCP communication, LSE correction, output
+append inside the runner. The repository comparison baselines use the same
+contract. They compare DCP communication, LSE correction, output
 reduction, layout, and scheduling after the cache update, not KV-cache
 insertion strategy. Accordingly, benchmark decode `Sk` is the inclusive cache
 length containing the current token, while chunk history length excludes the
@@ -258,18 +252,14 @@ must remain inside one KV-head replica group. Replicated current chunk K/V
 must contain identical values on all ranks in that group; cache insertion
 remains outside this API.
 
-All methods all-gather Q heads and run min FA3 over the local history shard.
-The local implementation fuses LSE correction with head packing and performs
+The runner all-gathers Q heads and runs min FA3 over the local history shard.
+It fuses LSE correction with head packing and performs
 a BF16 reduce-scatter. Decode and chunk calls default to non-overlap mode,
 which runs the full forward sequentially on the caller's compute stream
 without intra-forward dependency events. Passing `overlap_q_allgather=True`
-to the local runner uses its persistent communication stream and CUDA events;
-for chunk it overlaps Q all-gather with local chunk attention. The vLLM path uses a separate Triton
-correction followed by BF16 reduce-scatter and a Triton state merge. The
-SGLang MHA path uses natural-log Torch `logsumexp`, FP32 scaling and full-head
-all-reduce, slices local heads, and merges chunk states in FP32 Torch before
-converting output to BF16. vLLM and SGLang are always single-stream and reject
-`overlap_q_allgather=True`. All methods return BF16 `[B, Sq, Hq_local, 128]`
+uses its persistent communication stream and CUDA dependency events; for chunk
+it overlaps Q all-gather with local chunk attention. Calls return BF16
+`[B, Sq, Hq_local, 128]`
 and optional FP32 LSE `[B, Hq_local, Sq]`.
 
 The packed siblings use `q_local: [total_q, Hq_local, 128]`, tightly packed
@@ -287,8 +277,8 @@ the current token on the position-owner DCP rank. Packed chunk history excludes
 the current chunk, while replicated `k_chunk/v_chunk` has exactly `total_q`
 rows and uses the Q cumulative lengths. Q lengths and chunk values must agree
 inside a DCP group. Local history lengths may differ by rank but may not be
-empty. vLLM and SGLang runners retain their pinned `Hkv_group == 1` topology.
-The packed Q all-gather is rank-major `[DCP, total_q, Hq_local, 128]` before
+empty. The packed Q all-gather is rank-major
+`[DCP, total_q, Hq_local, 128]` before
 head reordering; no `B * max_seqlen_q` padding is introduced.
 
 The local `DCPAttentionRunner` owns one persistent communication stream,

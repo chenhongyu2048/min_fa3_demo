@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import platform
 import socket
 import subprocess
@@ -16,20 +15,36 @@ from typing import Callable
 import torch
 import torch.distributed as dist
 
-import min_fa3_op
 from dcp_test.benchmark_output import (
     DCPBenchmarkRow,
     effective_kv_bandwidth_gbps_per_gpu,
     print_benchmark_results,
+    print_timing_breakdowns,
+)
+from dcp_test.baselines import (
+    _dcp_a2a_payload_bytes,
+    full_kv_reference_varlen,
+)
+from dcp_test.utils import (
+    CAPTURE_EAGER_WARMUP,
+    all_rank_quantiles,
+    append_packed_chunk as append_chunk,
+    capture_cuda_graph_callable,
+    initialize_distributed_sm90,
+    make_cu_seqlens as make_cu,
+    make_dcp_group,
+    make_runner_set,
+    measure_timed_runner,
+    parse_lengths,
+    quantiles,
+    randn_bf16,
+    require_world_size,
+    shard_packed_interleaved as shard_interleaved,
 )
 from min_fa3_dcp import (
     DCPAttentionCUDAGraph,
     DCPAttentionRunner,
     DCPMegaAttentionRunner,
-    SGLangDCPAttentionRunner,
-    VLLMA2ADCPAttentionRunner,
-    VLLMDCPAttentionRunner,
-    _dcp_a2a_payload_bytes,
     make_topology,
 )
 
@@ -60,7 +75,6 @@ STAGES = (
     "a2a_unpack_combine_ms",
     "state_merge_ms",
 )
-CAPTURE_EAGER_WARMUP = 3
 
 
 @dataclass
@@ -82,20 +96,6 @@ class Inputs:
     cu_history_local_host: torch.Tensor
     cu_reference: torch.Tensor
     cu_reference_host: torch.Tensor
-
-
-def parse_lengths(spec: str, batch_size: int, name: str) -> list[int]:
-    try:
-        values = [int(token.strip()) for token in spec.split(",") if token.strip()]
-    except ValueError as error:
-        raise SystemExit(f"{name} must be a comma-separated integer list") from error
-    if len(values) == 1:
-        values *= batch_size
-    if len(values) != batch_size:
-        raise SystemExit(f"{name} must contain one value or exactly B={batch_size} values")
-    if any(value <= 0 for value in values):
-        raise SystemExit(f"{name} values must be positive")
-    return values
 
 
 def parse_implementations(spec: str) -> tuple[str, ...]:
@@ -121,71 +121,6 @@ def expanded_method_labels(implementations: tuple[str, ...]) -> tuple[str, ...]:
     if "full" in implementations:
         methods.append(METHOD_FULL)
     return tuple(methods)
-
-
-def make_cu(lengths: list[int], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    offsets = [0]
-    for length in lengths:
-        offsets.append(offsets[-1] + length)
-    host = torch.tensor(offsets, dtype=torch.int32)
-    return host.to(device), host
-
-
-def make_group(dcp_size: int, device: torch.device) -> tuple[dist.ProcessGroup, tuple[int, ...]]:
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
-    local_group = None
-    local_ranks: tuple[int, ...] | None = None
-    for start in range(0, world_size, dcp_size):
-        ranks = tuple(range(start, start + dcp_size))
-        group = dist.new_group(list(ranks), backend="nccl", device_id=device)
-        if rank in ranks:
-            local_group = group
-            local_ranks = ranks
-    assert local_group is not None and local_ranks is not None
-    return local_group, local_ranks
-
-
-def randn_bf16(
-    shape: tuple[int, ...], seed: int, device: torch.device
-) -> torch.Tensor:
-    generator = torch.Generator(device=device)
-    generator.manual_seed(seed)
-    return torch.randn(shape, generator=generator, device=device, dtype=torch.bfloat16)
-
-
-def shard_interleaved(
-    tensor: torch.Tensor,
-    lengths: list[int],
-    dcp_rank: int,
-    dcp_size: int,
-) -> tuple[torch.Tensor, list[int]]:
-    pieces = []
-    local_lengths = []
-    start = 0
-    for length in lengths:
-        piece = tensor[start : start + length][dcp_rank::dcp_size]
-        pieces.append(piece)
-        local_lengths.append(piece.shape[0])
-        start += length
-    return torch.cat(pieces).contiguous(), local_lengths
-
-
-def append_chunk(
-    history: torch.Tensor,
-    chunk: torch.Tensor,
-    history_lengths: list[int],
-    q_lengths: list[int],
-) -> torch.Tensor:
-    pieces = []
-    history_start = 0
-    q_start = 0
-    for history_length, q_length in zip(history_lengths, q_lengths):
-        pieces.append(history[history_start : history_start + history_length])
-        pieces.append(chunk[q_start : q_start + q_length])
-        history_start += history_length
-        q_start += q_length
-    return torch.cat(pieces).contiguous()
 
 
 def build_inputs(args: argparse.Namespace, topology, device: torch.device) -> Inputs:
@@ -277,7 +212,7 @@ def build_inputs(args: argparse.Namespace, topology, device: torch.device) -> In
 
 
 def full_forward(inputs: Inputs, args: argparse.Namespace):
-    return min_fa3_op.forward_kvcache_varlen(
+    return full_kv_reference_varlen(
         inputs.q_local,
         inputs.k_reference,
         inputs.v_reference,
@@ -298,13 +233,11 @@ def runner_call(
     inputs: Inputs,
     args: argparse.Namespace,
     overlap: bool,
-    timed: bool,
 ):
     common = dict(
         cu_seqlens_q_host=inputs.cu_q_host,
         num_splits=args.num_splits,
         return_lse=False,
-        _record_timing=timed,
     )
     if args.workload == "decode":
         return runner.forward_decode_varlen(
@@ -347,7 +280,6 @@ def capture_runner(
         num_splits=args.num_splits,
         return_lse=False,
         overlap_q_allgather=overlap,
-        record_timing=True,
         capture_warmup=CAPTURE_EAGER_WARMUP,
     )
     if args.workload == "decode":
@@ -378,62 +310,22 @@ def capture_runner(
     )
 
 
-def global_max_values(values: dict[str, float], device: torch.device) -> dict[str, float]:
-    tensor = torch.tensor(
-        [values.get(stage, 0.0) for stage in STAGES],
-        device=device,
-        dtype=torch.float64,
-    )
-    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
-    return {stage: float(value) for stage, value in zip(STAGES, tensor.tolist())}
-
-
-def percentile(values: list[float], probability: float) -> float:
-    ordered = sorted(values)
-    position = probability * (len(ordered) - 1)
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    weight = position - lower
-    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
-
-
 def summarize_samples(samples: list[dict[str, float]]) -> dict[str, dict[str, float]]:
     return {
-        stage: {
-            "p50": percentile([sample[stage] for sample in samples], 0.50),
-            "p90": percentile([sample[stage] for sample in samples], 0.90),
-        }
+        stage: quantiles([sample[stage] for sample in samples])
         for stage in STAGES
     }
 
 
 def summarize_series(values: list[float]) -> dict[str, float]:
-    return {
-        "p50": percentile(values, 0.50),
-        "p90": percentile(values, 0.90),
-        "min": min(values),
-        "max": max(values),
-    }
-
-
-def all_rank_quantiles(
-    values: list[float], device: torch.device
-) -> dict[str, list[float]]:
-    local = summarize_series(values)
-    local_tensor = torch.tensor(
-        [local["p50"], local["p90"]], device=device, dtype=torch.float64
-    )
-    gathered = [torch.empty_like(local_tensor) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered, local_tensor)
-    return {
-        "p50": [float(item[0].item()) for item in gathered],
-        "p90": [float(item[1].item()) for item in gathered],
-    }
+    summary = quantiles(values)
+    summary.update(min=min(values), max=max(values))
+    return summary
 
 
 def measure_runner(
     runner: DCPAttentionRunner,
-    call: Callable[[bool], torch.Tensor],
+    call: Callable[[], torch.Tensor],
     inputs: Inputs,
     args: argparse.Namespace,
     device: torch.device,
@@ -445,59 +337,52 @@ def measure_runner(
         runner.varlen_overlap_method_name if overlap else runner.varlen_method_name
     )
     if expected is not None:
-        check_output(f"{method_name}_eager", call(False), expected)
-    captured = capture_runner(runner, inputs, args, overlap) if args.cuda_graph else None
+        check_output(f"{method_name}_eager", call(), expected)
+    captured = (
+        capture_runner(runner, inputs, args, overlap) if args.cuda_graph else None
+    )
     try:
         if expected is not None:
             check_output(
                 method_name,
-                captured.replay() if captured is not None else call(False),
+                captured.replay() if captured is not None else call(),
                 expected,
             )
-        for _ in range(args.warmup):
-            captured.replay() if captured is not None else call(False)
-        torch.cuda.synchronize(device)
-        samples = []
-        local_latency_samples: list[float] = []
-        for _ in range(args.iters):
-            if captured is not None:
-                captured.replay()
-            else:
-                call(True)
-            local_timing = runner.last_timing_ms()
-            local_latency_samples.append(local_timing["attention_end_to_end_ms"])
-            local_timing["overlap_hidden_time_ms"] = (
-                max(
-                    0.0,
-                    local_timing["q_allgather_and_reorder_ms"]
-                    + local_timing["local_chunk_attention_ms"]
-                    - local_timing["overlapped_ag_chunk_window_ms"],
-                )
-                if overlap and args.workload == "chunk"
-                else 0.0
-            )
-            samples.append(global_max_values(local_timing, device))
-        execution = {
-            "execution_mode": "cuda_graph" if args.cuda_graph else "eager",
-            "capture_eager_warmup": (
-                CAPTURE_EAGER_WARMUP if args.cuda_graph else 0
-            ),
-            "post_capture_warmup": args.warmup,
-            "stream_policy": (
-                "compute_plus_communication" if overlap else "single_stream"
-            ),
-            "overlap_q_allgather": overlap,
-            "graph_static_signature": (
-                captured.signature if captured is not None else None
-            ),
-            "rank_latency_ms": all_rank_quantiles(
-                local_latency_samples, device
-            ),
-        }
-        return summarize_samples(samples), execution
-    finally:
+    except Exception:
         if captured is not None:
             captured.close()
+        raise
+
+    def add_overlap_hidden_time(local_timing: dict[str, float]) -> None:
+        local_timing["overlap_hidden_time_ms"] = (
+            max(
+                0.0,
+                local_timing["q_allgather_and_reorder_ms"]
+                + local_timing["local_chunk_attention_ms"]
+                - local_timing["overlapped_ag_chunk_window_ms"],
+            )
+            if overlap and args.workload == "chunk"
+            else 0.0
+        )
+
+    phase_samples, execution = measure_timed_runner(
+        runner,
+        call,
+        lambda: capture_runner(runner, inputs, args, overlap),
+        warmup=args.warmup,
+        iterations=args.iters,
+        device=device,
+        cuda_graph=args.cuda_graph,
+        overlap_q_allgather=overlap,
+        phase_names=STAGES,
+        transform_timing=add_overlap_hidden_time,
+        captured_graph=captured,
+    )
+    samples = [
+        {stage: phase_samples[stage][index] for stage in STAGES}
+        for index in range(args.iters)
+    ]
+    return summarize_samples(samples), execution
 
 
 def measure_full(
@@ -506,41 +391,11 @@ def measure_full(
     device: torch.device,
     inputs: Inputs,
 ) -> tuple[dict[str, dict[str, float]], dict[str, object]]:
-    graph: torch.cuda.CUDAGraph | None = None
-    capture_stream: torch.cuda.Stream | None = None
+    close_graph: Callable[[], None] = lambda: None
     if args.cuda_graph:
-        capture_stream = torch.cuda.Stream(device=device)
-        caller_stream = torch.cuda.current_stream(device)
-        capture_stream.wait_stream(caller_stream)
-        with torch.cuda.stream(capture_stream):
-            for _ in range(CAPTURE_EAGER_WARMUP):
-                call()
-        caller_stream.wait_stream(capture_stream)
-        torch.cuda.synchronize(device)
-        dist.barrier()
-        torch.cuda.synchronize(device)
-        graph = torch.cuda.CUDAGraph()
-        try:
-            with torch.cuda.graph(
-                graph, stream=capture_stream, capture_error_mode="global"
-            ):
-                static_output = call()
-        except Exception:
-            torch.cuda.synchronize(device)
-            graph.reset()
-            raise
+        replay, close_graph, _ = capture_cuda_graph_callable(call, device)
     else:
-        static_output = call()
-
-    def replay() -> torch.Tensor:
-        if graph is None or capture_stream is None:
-            return call()
-        current_stream = torch.cuda.current_stream(device)
-        capture_stream.wait_stream(current_stream)
-        with torch.cuda.stream(capture_stream):
-            graph.replay()
-        current_stream.wait_stream(capture_stream)
-        return static_output
+        replay = call
 
     try:
         for _ in range(args.warmup):
@@ -599,9 +454,7 @@ def measure_full(
         }
         return summarize_samples(samples), execution
     finally:
-        if graph is not None:
-            torch.cuda.synchronize(device)
-            graph.reset()
+        close_graph()
 
 
 def measure_mega(
@@ -933,6 +786,42 @@ def print_results(
             )
         )
     print_benchmark_results(title, rows)
+    print_timing_breakdowns(
+        "DCP CUDA-event phase breakdown",
+        {
+            method: report["stages_ms"]
+            for method, report in reports.items()
+            if report["execution"].get("phase_profile") is None
+        },
+        unit="ms",
+        aggregation=(
+            "per-iteration maximum across benchmark ranks, then p50/p90 across samples"
+        ),
+    )
+
+    mega_timestamps = {}
+    for method, report in reports.items():
+        phase_profile = report["execution"].get("phase_profile")
+        if phase_profile is None:
+            continue
+        mega_timestamps[method] = {
+            **phase_profile["milestones_us"],
+            **{
+                f"post_completion/{name}": values
+                for name, values in phase_profile[
+                    "post_global_completion_tails_us"
+                ].items()
+            },
+        }
+    print_timing_breakdowns(
+        "Mega %globaltimer phase timestamps",
+        mega_timestamps,
+        unit="us",
+        aggregation=(
+            "per-iteration maximum across benchmark ranks, then p50/p90 across samples"
+        ),
+        include_zero=True,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -983,18 +872,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
-    dist.init_process_group("nccl", device_id=device)
+    device = initialize_distributed_sm90("benchmark")
     mega_runner: DCPMegaAttentionRunner | None = None
     try:
         world_size = dist.get_world_size()
         rank = dist.get_rank()
-        if torch.cuda.get_device_capability(device) != (9, 0):
-            raise SystemExit("This benchmark requires SM90 Hopper")
-        if args.tp_size != world_size:
-            raise SystemExit(f"--tp-size must equal torchrun world size {world_size}")
+        require_world_size(args.tp_size)
         if args.headdim != 128 or args.b <= 0:
             raise SystemExit("--headdim must be 128 and --b must be positive")
         if args.dcp_size <= 0 or world_size % args.dcp_size:
@@ -1017,8 +900,9 @@ def main() -> None:
         topology = make_topology(
             args.qhead, args.kvhead, args.tp_size, args.dcp_size
         )
-        process_group, group_ranks = make_group(args.dcp_size, device)
-        if group_ranks != topology.dcp_group_ranks(rank):
+        dcp_group = make_dcp_group(args.dcp_size, device)
+        process_group = dcp_group.process_group
+        if dcp_group.ranks != topology.dcp_group_ranks(rank):
             raise RuntimeError("DCP process group crosses a KV replica boundary")
         inputs = build_inputs(args, topology, device)
         local_lengths_by_rank = all_rank_local_lengths(inputs, device)
@@ -1054,15 +938,9 @@ def main() -> None:
                 flush=True,
             )
 
-        runners: dict[str, DCPAttentionRunner] = {}
-        if "ours" in implementations:
-            runners[METHOD_OURS_NO_OVERLAP] = DCPAttentionRunner(process_group)
-            runners[METHOD_OURS_OVERLAP] = DCPAttentionRunner(process_group)
-        if "vllm" in implementations:
-            runners[METHOD_VLLM] = VLLMDCPAttentionRunner(process_group)
-            runners[METHOD_VLLM_A2A] = VLLMA2ADCPAttentionRunner(process_group)
-        if "sglang" in implementations:
-            runners[METHOD_SGLANG] = SGLangDCPAttentionRunner(process_group)
+        runners = make_runner_set(
+            process_group, implementations, timed=True, varlen=True
+        )
         mega_q = None
         if "mega" in implementations:
             mega_runner = DCPMegaAttentionRunner(
@@ -1083,8 +961,8 @@ def main() -> None:
         reports: dict[str, dict[str, object]] = {}
         for method, runner in runners.items():
             overlap = method == METHOD_OURS_OVERLAP
-            call = lambda timed, runner=runner, overlap=overlap: runner_call(
-                runner, inputs, args, overlap, timed
+            call = lambda runner=runner, overlap=overlap: runner_call(
+                runner, inputs, args, overlap
             )
             stages, execution = measure_runner(
                 runner,

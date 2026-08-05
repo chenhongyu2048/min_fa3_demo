@@ -15,6 +15,26 @@ The corresponding correctness matrices remain under `scripts/test_min_fa3/`:
 - `scripts/test_min_fa3/test_min_fa3_dcp.py`
 - `scripts/test_min_fa3/test_min_fa3_dcp_varlen.py`
 
+Comparison runners are repository test code, not part of the installed core
+module:
+
+```python
+from dcp_test.baselines import (
+    SGLangDCPAttentionRunner,
+    VLLMA2ADCPAttentionRunner,
+    VLLMDCPAttentionRunner,
+)
+```
+
+`dcp_test.baselines` also exports timed comparison variants;
+`dcp_test.utils` supplies their timing mixin, the timed ours variant, and the
+common runner factory. The mixin installs external CUDA events through the
+core runner's optional phase-recorder hook. Ordinary `DCPAttentionRunner` and
+baseline instances allocate no phase events. A timed runner captured with the
+formal CUDA Graph APIs automatically captures those event nodes, so replay
+timing is queried through `last_timing_ms()` without a `record_timing` capture
+argument or a private forward argument.
+
 CUDA Graph is enabled by default. Each fixed shape performs three eager
 capture warmups before capture, then `--warmup` unmeasured graph replays and
 `--iters` measured replays. Pass `--no-cuda-graph` to use eager execution.

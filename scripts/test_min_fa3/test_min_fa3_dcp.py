@@ -4,22 +4,35 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 import torch.distributed as dist
 
-import min_fa3_op
+from dcp_test.baselines import (
+    full_kv_reference_dense,
+)
+from dcp_test.utils import (
+    CAPTURE_EAGER_WARMUP,
+    initialize_distributed_sm90,
+    interleaved_local_length as local_length,
+    make_dcp_groups,
+    make_generator,
+    make_runner_set,
+    parse_int_list,
+    randn_bf16,
+    require_world_size,
+)
 from min_fa3_dcp import (
     DCPAttentionCUDAGraph,
     DCPAttentionRunner,
     DCPTopology,
-    SGLangDCPAttentionRunner,
-    VLLMA2ADCPAttentionRunner,
-    VLLMDCPAttentionRunner,
     make_topology,
     validate_topology,
 )
@@ -30,15 +43,6 @@ METHOD_OURS_NO_OVERLAP = "ours_no_overlap"
 METHOD_VLLM = "vllm_ag_rs_min_fa3"
 METHOD_VLLM_A2A = "vllm_a2a_min_fa3"
 METHOD_SGLANG = "sglang_mha_ag_ar_min_fa3"
-CAPTURE_EAGER_WARMUP = 3
-
-
-@dataclass(frozen=True)
-class DCPGroup:
-    size: int
-    start_rank: int
-    ranks: tuple[int, ...]
-    process_group: dist.ProcessGroup
 
 
 @dataclass
@@ -55,53 +59,6 @@ class CorrectnessInputs:
     k_reference: torch.Tensor | None = None
     v_reference: torch.Tensor | None = None
     reference_lengths: torch.Tensor | None = None
-
-
-def parse_int_list(spec: str, name: str) -> list[int]:
-    try:
-        values = [int(token.strip()) for token in spec.split(",") if token.strip()]
-    except ValueError as error:
-        raise SystemExit(f"{name} must be a comma-separated integer list") from error
-    if not values:
-        raise SystemExit(f"{name} must contain at least one integer")
-    return values
-
-
-def make_dcp_groups(sizes: Iterable[int], device: torch.device) -> dict[int, DCPGroup]:
-    world_size = dist.get_world_size()
-    global_rank = dist.get_rank()
-    local_groups: dict[int, DCPGroup] = {}
-    for size in sorted(set(sizes)):
-        if size <= 0 or size > world_size or world_size % size:
-            raise SystemExit(
-                f"every DCP size must divide torchrun world size {world_size}, got {size}"
-            )
-        for start_rank in range(0, world_size, size):
-            ranks = tuple(range(start_rank, start_rank + size))
-            process_group = dist.new_group(
-                list(ranks), backend="nccl", device_id=device
-            )
-            if global_rank in ranks:
-                local_groups[size] = DCPGroup(
-                    size, start_rank, ranks, process_group
-                )
-    return local_groups
-
-
-def make_generator(seed: int, device: torch.device) -> torch.Generator:
-    generator = torch.Generator(device=device)
-    generator.manual_seed(seed)
-    return generator
-
-
-def randn_bf16(
-    shape: tuple[int, ...], generator: torch.Generator, device: torch.device
-) -> torch.Tensor:
-    return torch.randn(shape, generator=generator, device=device, dtype=torch.bfloat16)
-
-
-def local_length(global_length: int, dcp_rank: int, dcp_size: int) -> int:
-    return max(0, (global_length + dcp_size - 1 - dcp_rank) // dcp_size)
 
 
 def make_full_chunk_cache(
@@ -475,7 +432,7 @@ def run_case(
     assert inputs.k_reference is not None
     assert inputs.v_reference is not None
     assert inputs.reference_lengths is not None
-    reference_output, reference_lse = min_fa3_op.forward_kvcache(
+    reference_output, reference_lse = full_kv_reference_dense(
         inputs.q_local,
         inputs.k_reference,
         inputs.v_reference,
@@ -569,7 +526,7 @@ def check_graph_lifecycle(
     runner = runners[METHOD_OURS_OVERLAP]
 
     def reference() -> tuple[torch.Tensor, torch.Tensor]:
-        return min_fa3_op.forward_kvcache(
+        return full_kv_reference_dense(
             inputs.q_local,
             inputs.k_reference,
             inputs.v_reference,
@@ -717,19 +674,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
-    dist.init_process_group("nccl", device_id=device)
+    device = initialize_distributed_sm90("test")
     try:
         world_size = dist.get_world_size()
         global_rank = dist.get_rank()
-        if torch.cuda.get_device_capability(device) != (9, 0):
-            raise SystemExit("This test requires SM90 Hopper")
-        if args.tp_size != world_size:
-            raise SystemExit(
-                f"--tp-size ({args.tp_size}) must equal torchrun world size ({world_size})"
-            )
+        require_world_size(args.tp_size)
         if args.repeat <= 0:
             raise SystemExit("--repeat must be positive")
 
@@ -772,12 +721,12 @@ def main() -> None:
             cached = runner_cache.get(dcp_size)
             if cached is None:
                 group = groups[dcp_size].process_group
-                cached = {
-                    METHOD_OURS_OVERLAP: DCPAttentionRunner(group),
-                    METHOD_VLLM: VLLMDCPAttentionRunner(group),
-                    METHOD_VLLM_A2A: VLLMA2ADCPAttentionRunner(group),
-                    METHOD_SGLANG: SGLangDCPAttentionRunner(group),
-                }
+                cached = make_runner_set(
+                    group,
+                    ("ours", "vllm", "sglang"),
+                    timed=False,
+                    varlen=False,
+                )
                 runner_cache[dcp_size] = cached
             return cached
 

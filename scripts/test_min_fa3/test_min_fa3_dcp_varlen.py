@@ -4,22 +4,37 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-from collections.abc import Callable, Iterable
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 import torch.distributed as dist
 
-import min_fa3_op
+from dcp_test.baselines import (
+    full_kv_reference_varlen,
+)
+from dcp_test.utils import (
+    CAPTURE_EAGER_WARMUP,
+    initialize_distributed_sm90,
+    append_packed_chunk,
+    make_cu_seqlens as make_cu,
+    make_dcp_groups,
+    make_runner_set,
+    parse_int_list,
+    parse_lengths,
+    randn_bf16,
+    require_world_size,
+    shard_packed_interleaved,
+)
 from min_fa3_dcp import (
     DCPAttentionCUDAGraph,
     DCPAttentionRunner,
     DCPTopology,
-    SGLangDCPAttentionRunner,
-    VLLMA2ADCPAttentionRunner,
-    VLLMDCPAttentionRunner,
     make_topology,
     validate_topology,
 )
@@ -30,13 +45,6 @@ METHOD_OURS_NO_OVERLAP = "ours_no_overlap_varlen"
 METHOD_VLLM = "vllm_ag_rs_min_fa3_varlen"
 METHOD_VLLM_A2A = "vllm_a2a_min_fa3_varlen"
 METHOD_SGLANG = "sglang_mha_ag_ar_min_fa3_varlen"
-CAPTURE_EAGER_WARMUP = 3
-
-
-@dataclass(frozen=True)
-class DCPGroup:
-    ranks: tuple[int, ...]
-    process_group: dist.ProcessGroup
 
 
 @dataclass
@@ -60,101 +68,6 @@ class PackedInputs:
     cu_history_local_host: torch.Tensor
     cu_reference: torch.Tensor
     cu_reference_host: torch.Tensor
-
-
-def parse_int_list(spec: str, name: str) -> list[int]:
-    try:
-        values = [int(token.strip()) for token in spec.split(",") if token.strip()]
-    except ValueError as error:
-        raise SystemExit(f"{name} must be a comma-separated integer list") from error
-    if not values:
-        raise SystemExit(f"{name} must contain at least one integer")
-    return values
-
-
-def parse_lengths(spec: str, batch_size: int, name: str) -> list[int]:
-    values = parse_int_list(spec, name)
-    if len(values) == 1:
-        values *= batch_size
-    if len(values) != batch_size:
-        raise SystemExit(f"{name} must contain one value or exactly B={batch_size} values")
-    if any(value <= 0 for value in values):
-        raise SystemExit(f"{name} values must be positive")
-    return values
-
-
-def make_cu(lengths: list[int], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    offsets = [0]
-    for length in lengths:
-        offsets.append(offsets[-1] + length)
-    host = torch.tensor(offsets, dtype=torch.int32)
-    return host.to(device), host
-
-
-def make_dcp_groups(sizes: Iterable[int], device: torch.device) -> dict[int, DCPGroup]:
-    world_size = dist.get_world_size()
-    global_rank = dist.get_rank()
-    local_groups: dict[int, DCPGroup] = {}
-    for size in sorted(set(sizes)):
-        if size <= 0 or size > world_size or world_size % size:
-            raise SystemExit(f"DCP size {size} must divide world size {world_size}")
-        for start in range(0, world_size, size):
-            ranks = tuple(range(start, start + size))
-            group = dist.new_group(list(ranks), backend="nccl", device_id=device)
-            if global_rank in ranks:
-                local_groups[size] = DCPGroup(ranks, group)
-    return local_groups
-
-
-def make_generator(seed: int, device: torch.device) -> torch.Generator:
-    generator = torch.Generator(device=device)
-    generator.manual_seed(seed)
-    return generator
-
-
-def randn_bf16(
-    shape: tuple[int, ...], seed: int, device: torch.device
-) -> torch.Tensor:
-    return torch.randn(
-        shape,
-        generator=make_generator(seed, device),
-        device=device,
-        dtype=torch.bfloat16,
-    )
-
-
-def shard_packed_interleaved(
-    tensor: torch.Tensor,
-    lengths: list[int],
-    dcp_rank: int,
-    dcp_size: int,
-) -> tuple[torch.Tensor, list[int]]:
-    pieces: list[torch.Tensor] = []
-    local_lengths: list[int] = []
-    start = 0
-    for length in lengths:
-        piece = tensor[start : start + length][dcp_rank::dcp_size]
-        pieces.append(piece)
-        local_lengths.append(piece.shape[0])
-        start += length
-    return torch.cat(pieces, dim=0).contiguous(), local_lengths
-
-
-def append_packed_chunk(
-    history: torch.Tensor,
-    chunk: torch.Tensor,
-    history_lengths: list[int],
-    q_lengths: list[int],
-) -> torch.Tensor:
-    pieces: list[torch.Tensor] = []
-    history_start = 0
-    chunk_start = 0
-    for history_length, q_length in zip(history_lengths, q_lengths):
-        pieces.append(history[history_start : history_start + history_length])
-        pieces.append(chunk[chunk_start : chunk_start + q_length])
-        history_start += history_length
-        chunk_start += q_length
-    return torch.cat(pieces, dim=0).contiguous()
 
 
 def build_inputs(
@@ -250,7 +163,7 @@ def build_inputs(
 
 
 def reference(inputs: PackedInputs, workload: str, num_splits: int):
-    return min_fa3_op.forward_kvcache_varlen(
+    return full_kv_reference_varlen(
         inputs.q_local,
         inputs.k_reference,
         inputs.v_reference,
@@ -792,17 +705,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
-    dist.init_process_group("nccl", device_id=device)
+    device = initialize_distributed_sm90("test")
     try:
         world_size = dist.get_world_size()
         global_rank = dist.get_rank()
-        if torch.cuda.get_device_capability(device) != (9, 0):
-            raise SystemExit("This test requires SM90 Hopper")
-        if args.tp_size != world_size:
-            raise SystemExit(f"--tp-size must equal torchrun world size {world_size}")
+        require_world_size(args.tp_size)
         if args.headdim != 128 or args.b <= 0 or args.repeat <= 0:
             raise SystemExit("--headdim must be 128 and B/repeat must be positive")
 
@@ -829,14 +736,12 @@ def main() -> None:
         def runners_for(dcp_size: int) -> dict[str, DCPAttentionRunner]:
             if dcp_size not in runner_cache:
                 group = groups[dcp_size].process_group
-                ours = DCPAttentionRunner(group)
-                runner_cache[dcp_size] = {
-                    METHOD_OURS_OVERLAP: ours,
-                    METHOD_OURS_NO_OVERLAP: ours,
-                    METHOD_VLLM: VLLMDCPAttentionRunner(group),
-                    METHOD_VLLM_A2A: VLLMA2ADCPAttentionRunner(group),
-                    METHOD_SGLANG: SGLangDCPAttentionRunner(group),
-                }
+                runner_cache[dcp_size] = make_runner_set(
+                    group,
+                    ("ours", "vllm", "sglang"),
+                    timed=False,
+                    varlen=True,
+                )
             return runner_cache[dcp_size]
 
         cases = []

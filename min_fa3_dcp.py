@@ -13,10 +13,6 @@ formal capture APIs include the local kernel, post-processing, NCCL
 collectives, and the optional communication-stream fork/join in one CUDA
 graph.  Its workspace must not be used concurrently.
 
-The module also contains standalone, copied-and-trimmed vLLM ``ag_rs`` and
-``a2a`` runners plus an SGLang MHA runner.  All runners invoke the same local
-dense or packed KV-cache kernel; only orchestration differs.
-
 The TP/DCP topology validation is copied and trimmed from the GQA/MQA
 constraints in the pinned vLLM commit and the contiguous DCP group
 construction in the pinned SGLang commit.
@@ -27,7 +23,7 @@ from __future__ import annotations
 import threading
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
-from typing import Callable, Iterable, Optional, Tuple, Union
+from typing import Callable, Iterable, Optional, Protocol, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -262,396 +258,11 @@ def validate_group_ranks(
 _DCPResult = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 
-# Copied and trimmed from vLLM commit
-# a89015c6df8eeb37a843b717c97a5be1355de83d,
-# vllm/v1/attention/ops/dcp_alltoall.py.  The packed A2A combine arrived in
-# vLLM PR #41160; PR #45487 made the per-call allocations CUDA-Graph safe and
-# PR #47801 restored the required FP32 LSE bit-cast contract.
-def _dcp_a2a_lse_weighted_combine_reference(
-    outputs: torch.Tensor,
-    lses: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pure-Torch base-e reference for the copied A2A combine."""
-    if outputs.ndim != 4 or lses.shape != outputs.shape[:3]:
-        raise ValueError("outputs must be [N, T, H, D] and lses must be [N, T, H]")
-    valid_lses = torch.where(
-        torch.isnan(lses) | torch.isinf(lses),
-        torch.full_like(lses, -float("inf")),
-        lses,
-    )
-    lse_max = valid_lses.max(dim=0).values
-    finite_max = torch.where(
-        lse_max == -float("inf"), torch.zeros_like(lse_max), lse_max
-    )
-    weights = torch.exp(valid_lses - finite_max.unsqueeze(0))
-    weights = torch.where(torch.isnan(weights), torch.zeros_like(weights), weights)
-    weight_sum = weights.sum(dim=0)
-    normalized = weights / weight_sum.clamp(min=1.0e-10).unsqueeze(0)
-    combined = (outputs * normalized.unsqueeze(-1)).sum(dim=0)
-    global_lse = torch.log(weight_sum) + finite_max
-    return combined, global_lse
+class _PhaseRecorder(Protocol):
+    def begin(self, kind: str, stream: torch.cuda.Stream) -> None: ...
 
+    def record(self, name: str, stream: torch.cuda.Stream) -> None: ...
 
-def _dcp_a2a_lse_pack_dim(output_dtype: torch.dtype) -> int:
-    bits = torch.finfo(output_dtype).bits
-    if bits == 16:
-        return 2
-    if bits == 32:
-        return 1
-    raise ValueError(f"Cannot pack fp32 LSE into output dtype {output_dtype}.")
-
-
-def _dcp_a2a_head_owner_ranges(
-    h_group: int, world_size: int
-) -> tuple[tuple[int, int], ...]:
-    if h_group <= 0 or world_size <= 0 or h_group % world_size:
-        raise ValueError(
-            f"H_group={h_group} must be positive and divisible by DCP={world_size}"
-        )
-    h_local = h_group // world_size
-    return tuple(
-        (rank * h_local, (rank + 1) * h_local) for rank in range(world_size)
-    )
-
-
-def _dcp_a2a_payload_bytes(
-    total_tokens: int,
-    h_local: int,
-    head_dim: int,
-    world_size: int,
-    element_size: int = 2,
-) -> tuple[int, int]:
-    values = (total_tokens, h_local, head_dim, world_size, element_size)
-    if any(value <= 0 for value in values):
-        raise ValueError("A2A payload dimensions and element_size must be positive")
-    per_owner = total_tokens * h_local * (head_dim + 2) * element_size
-    return world_size * per_owner, (world_size - 1) * per_owner
-
-
-@triton.jit
-def _dcp_a2a_pack_send_kernel(
-    out_ptr,
-    lse_ptr,
-    send_ptr,
-    out_stride_B,
-    out_stride_H,
-    out_stride_D,
-    lse_stride_B,
-    lse_stride_H,
-    send_stride_N,
-    send_stride_B,
-    send_stride_H,
-    send_stride_D,
-    N: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    H_PER_RANK: tl.constexpr,
-    LSE_PACK_DIM: tl.constexpr,
-):
-    batch_idx = tl.program_id(0).to(tl.int64)
-    local_head_idx = tl.program_id(1).to(tl.int64)
-    d_offsets = tl.arange(0, HEAD_DIM)
-
-    for rank_idx in tl.static_range(N):
-        src_head_idx = rank_idx * H_PER_RANK + local_head_idx
-        send_base = (
-            rank_idx * send_stride_N
-            + batch_idx * send_stride_B
-            + local_head_idx * send_stride_H
-        )
-        out_offsets = (
-            batch_idx * out_stride_B
-            + src_head_idx * out_stride_H
-            + d_offsets * out_stride_D
-        )
-        tl.store(
-            send_ptr + send_base + d_offsets * send_stride_D,
-            tl.load(out_ptr + out_offsets),
-        )
-
-        lse_val = tl.load(
-            lse_ptr + batch_idx * lse_stride_B + src_head_idx * lse_stride_H
-        )
-        if LSE_PACK_DIM == 1:
-            tl.store(
-                send_ptr + send_base + HEAD_DIM * send_stride_D,
-                lse_val.to(send_ptr.dtype.element_ty),
-            )
-        else:
-            lse_bits = lse_val.to(tl.uint32, bitcast=True)
-            lo = (lse_bits & 0xFFFF).to(tl.uint16)
-            hi = ((lse_bits >> 16) & 0xFFFF).to(tl.uint16)
-            tl.store(
-                send_ptr + send_base + HEAD_DIM * send_stride_D,
-                lo.to(send_ptr.dtype.element_ty, bitcast=True),
-            )
-            tl.store(
-                send_ptr + send_base + (HEAD_DIM + 1) * send_stride_D,
-                hi.to(send_ptr.dtype.element_ty, bitcast=True),
-            )
-
-
-@triton.jit
-def _dcp_a2a_unpack_combine_kernel(
-    recv_ptr,
-    out_ptr,
-    out_lse_ptr,
-    recv_stride_N,
-    recv_stride_B,
-    recv_stride_H,
-    recv_stride_D,
-    out_stride_B,
-    out_stride_H,
-    out_stride_D,
-    out_lse_stride_B,
-    out_lse_stride_H,
-    N: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    IS_BASE_E: tl.constexpr,
-    RETURN_LSE: tl.constexpr,
-    LSE_PACK_DIM: tl.constexpr,
-):
-    batch_idx = tl.program_id(0).to(tl.int64)
-    head_idx = tl.program_id(1).to(tl.int64)
-    d_offsets = tl.arange(0, HEAD_DIM)
-
-    lse_max = -float("inf")
-    for rank_idx in tl.static_range(N):
-        recv_base = (
-            rank_idx * recv_stride_N
-            + batch_idx * recv_stride_B
-            + head_idx * recv_stride_H
-        )
-        if LSE_PACK_DIM == 1:
-            lse_val = tl.load(
-                recv_ptr + recv_base + HEAD_DIM * recv_stride_D
-            ).to(tl.float32)
-        else:
-            lo_raw = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D)
-            hi_raw = tl.load(
-                recv_ptr + recv_base + (HEAD_DIM + 1) * recv_stride_D
-            )
-            lo = lo_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
-            hi = hi_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
-            lse_val = (lo | (hi << 16)).to(tl.float32, bitcast=True)
-        lse_val = tl.where(
-            (lse_val != lse_val) | (lse_val == float("inf")),
-            -float("inf"),
-            lse_val,
-        )
-        lse_max = tl.maximum(lse_max, lse_val)
-
-    lse_max = tl.where(lse_max == -float("inf"), 0.0, lse_max)
-    lse_sum = 0.0
-    for rank_idx in tl.static_range(N):
-        recv_base = (
-            rank_idx * recv_stride_N
-            + batch_idx * recv_stride_B
-            + head_idx * recv_stride_H
-        )
-        if LSE_PACK_DIM == 1:
-            lse_val = tl.load(
-                recv_ptr + recv_base + HEAD_DIM * recv_stride_D
-            ).to(tl.float32)
-        else:
-            lo_raw = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D)
-            hi_raw = tl.load(
-                recv_ptr + recv_base + (HEAD_DIM + 1) * recv_stride_D
-            )
-            lo = lo_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
-            hi = hi_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
-            lse_val = (lo | (hi << 16)).to(tl.float32, bitcast=True)
-        lse_val = tl.where(
-            (lse_val != lse_val) | (lse_val == float("inf")),
-            -float("inf"),
-            lse_val,
-        )
-        if IS_BASE_E:
-            lse_sum += tl.exp(lse_val - lse_max)
-        else:
-            lse_sum += tl.exp2(lse_val - lse_max)
-
-    if IS_BASE_E:
-        global_lse = tl.log(lse_sum) + lse_max
-    else:
-        global_lse = tl.log2(lse_sum) + lse_max
-
-    acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
-    for rank_idx in tl.static_range(N):
-        recv_base = (
-            rank_idx * recv_stride_N
-            + batch_idx * recv_stride_B
-            + head_idx * recv_stride_H
-        )
-        if LSE_PACK_DIM == 1:
-            lse_val = tl.load(
-                recv_ptr + recv_base + HEAD_DIM * recv_stride_D
-            ).to(tl.float32)
-        else:
-            lo_raw = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D)
-            hi_raw = tl.load(
-                recv_ptr + recv_base + (HEAD_DIM + 1) * recv_stride_D
-            )
-            lo = lo_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
-            hi = hi_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
-            lse_val = (lo | (hi << 16)).to(tl.float32, bitcast=True)
-        lse_val = tl.where(
-            (lse_val != lse_val) | (lse_val == float("inf")),
-            -float("inf"),
-            lse_val,
-        )
-        if IS_BASE_E:
-            weight = tl.exp(lse_val - global_lse)
-        else:
-            weight = tl.exp2(lse_val - global_lse)
-        weight = tl.where(weight != weight, 0.0, weight)
-        acc += (
-            tl.load(recv_ptr + recv_base + d_offsets * recv_stride_D).to(
-                tl.float32
-            )
-            * weight
-        )
-
-    final_offsets = (
-        batch_idx * out_stride_B
-        + head_idx * out_stride_H
-        + d_offsets * out_stride_D
-    )
-    tl.store(out_ptr + final_offsets, acc)
-    if RETURN_LSE:
-        out_lse_offset = (
-            batch_idx * out_lse_stride_B + head_idx * out_lse_stride_H
-        )
-        tl.store(out_lse_ptr + out_lse_offset, global_lse)
-
-
-def _dcp_a2a_pack_send(
-    partial_out: torch.Tensor,
-    partial_lse: torch.Tensor,
-    send_buffer: torch.Tensor,
-    world_size: int,
-    h_per_rank: int,
-    head_dim: int,
-    lse_pack_dim: int,
-) -> None:
-    grid = (partial_out.shape[0], h_per_rank, 1)
-    _dcp_a2a_pack_send_kernel[grid](
-        partial_out,
-        partial_lse,
-        send_buffer,
-        partial_out.stride(0),
-        partial_out.stride(1),
-        partial_out.stride(2),
-        partial_lse.stride(0),
-        partial_lse.stride(1),
-        send_buffer.stride(0),
-        send_buffer.stride(1),
-        send_buffer.stride(2),
-        send_buffer.stride(3),
-        N=world_size,
-        HEAD_DIM=head_dim,
-        H_PER_RANK=h_per_rank,
-        LSE_PACK_DIM=lse_pack_dim,
-    )
-
-
-def _dcp_a2a_unpack_combine(
-    recv_buffer: torch.Tensor,
-    head_dim: int,
-    lse_pack_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    world_size, total_tokens, h_per_rank, _ = recv_buffer.shape
-    output = torch.empty(
-        (total_tokens, h_per_rank, head_dim),
-        device=recv_buffer.device,
-        dtype=recv_buffer.dtype,
-    )
-    output_lse = torch.empty(
-        (total_tokens, h_per_rank),
-        device=recv_buffer.device,
-        dtype=torch.float32,
-    )
-    grid = (total_tokens, h_per_rank, 1)
-    _dcp_a2a_unpack_combine_kernel[grid](
-        recv_buffer,
-        output,
-        output_lse,
-        recv_buffer.stride(0),
-        recv_buffer.stride(1),
-        recv_buffer.stride(2),
-        recv_buffer.stride(3),
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        output_lse.stride(0),
-        output_lse.stride(1),
-        N=world_size,
-        HEAD_DIM=head_dim,
-        IS_BASE_E=True,
-        RETURN_LSE=True,
-        LSE_PACK_DIM=lse_pack_dim,
-    )
-    return output, output_lse
-
-
-@triton.jit
-def _vllm_correct_attn_cp_out_kernel(
-    partial_out_ptr,
-    gathered_lse_ptr,
-    corrected_out_ptr,
-    global_lse_ptr,
-    out_stride_t,
-    out_stride_h,
-    lse_stride_n,
-    lse_stride_t,
-    lse_stride_h,
-    T: tl.constexpr,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    WORLD_SIZE_ROUNDED: tl.constexpr,
-    RANK: tl.constexpr,
-):
-    """Trimmed from vLLM ``_correct_attn_cp_out_kernel`` at the pinned commit."""
-    token_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
-    rank_offsets = tl.arange(0, WORLD_SIZE_ROUNDED)
-    rank_mask = rank_offsets < WORLD_SIZE
-    lse_offsets = (
-        rank_offsets * lse_stride_n
-        + token_idx * lse_stride_t
-        + head_idx * lse_stride_h
-    )
-    partial_lses = tl.load(
-        gathered_lse_ptr + lse_offsets, mask=rank_mask, other=-float("inf")
-    )
-    partial_lses = tl.where(
-        (partial_lses != partial_lses) | (partial_lses == float("inf")),
-        -float("inf"),
-        partial_lses,
-    )
-    lse_max = tl.max(partial_lses, axis=0)
-    finite_max = tl.where(lse_max == -float("inf"), 0.0, lse_max)
-    lse_sum = tl.sum(tl.exp(partial_lses - finite_max), axis=0)
-    global_lse = tl.log(lse_sum) + finite_max
-    tl.store(global_lse_ptr + token_idx * H + head_idx, global_lse)
-
-    local_lse = tl.load(
-        gathered_lse_ptr
-        + RANK * lse_stride_n
-        + token_idx * lse_stride_t
-        + head_idx * lse_stride_h
-    )
-    log_weight = local_lse - global_lse
-    log_weight = tl.where(
-        (log_weight != log_weight) | (log_weight == float("inf")),
-        -float("inf"),
-        log_weight,
-    )
-    weight = tl.exp(log_weight)
-    dim_offsets = tl.arange(0, D)
-    out_offsets = token_idx * out_stride_t + head_idx * out_stride_h + dim_offsets
-    values = tl.load(partial_out_ptr + out_offsets).to(tl.float32) * weight
-    tl.store(corrected_out_ptr + out_offsets, tl.where(weight == 0.0, 0.0, values))
 
 
 @triton.jit
@@ -845,7 +456,6 @@ class DCPAttentionCUDAGraph:
         retained_works: tuple[dist.Work, ...],
         signature: dict[str, object],
         *,
-        record_timing: bool,
         overlap_q_allgather: bool,
     ) -> None:
         self._runner: Optional[DCPAttentionRunner] = runner
@@ -855,7 +465,6 @@ class DCPAttentionCUDAGraph:
         self._static_references = static_references
         self._retained_works = retained_works
         self.signature = signature
-        self.record_timing = record_timing
         self.overlap_q_allgather = overlap_q_allgather
         self._closed = False
 
@@ -963,36 +572,7 @@ class DCPAttentionRunner:
         self._capture_owner_thread: Optional[int] = None
         self._capture_in_progress = False
         self._capture_tensors: list[torch.Tensor] = []
-        self._timing_events = {
-            # External event nodes remain host-queryable after graph replay.
-            # Dependency-only events above intentionally retain the default
-            # internal capture semantics.
-            name: torch.cuda.Event(enable_timing=True, external=True)
-            for name in (
-                "attention_start",
-                "attention_end",
-                "q_ag_start",
-                "q_ag_end",
-                "chunk_start",
-                "chunk_end",
-                "ag_chunk_end",
-                "history_start",
-                "history_end",
-                "lse_correct_start",
-                "lse_correct_end",
-                "reduce_scatter_start",
-                "reduce_scatter_end",
-                "a2a_pack_start",
-                "a2a_pack_end",
-                "a2a_all_to_all_start",
-                "a2a_all_to_all_end",
-                "a2a_unpack_combine_start",
-                "a2a_unpack_combine_end",
-                "merge_start",
-                "merge_end",
-            )
-        }
-        self._last_timing_kind: Optional[str] = None
+        self._phase_recorder: Optional[_PhaseRecorder] = None
 
     @staticmethod
     def _tensor_signature(tensor: torch.Tensor) -> dict[str, object]:
@@ -1057,7 +637,6 @@ class DCPAttentionRunner:
         bindings: dict[str, object],
         *,
         overlap_q_allgather: bool,
-        record_timing: bool,
         capture_warmup: int,
     ) -> DCPAttentionCUDAGraph:
         if not isinstance(capture_warmup, int) or capture_warmup < 0:
@@ -1115,7 +694,6 @@ class DCPAttentionRunner:
                 static_references,
                 tuple(self._works),
                 self._graph_signature(operation, bindings),
-                record_timing=record_timing,
                 overlap_q_allgather=overlap_q_allgather,
             )
             self._active_graph = captured
@@ -1148,7 +726,6 @@ class DCPAttentionRunner:
         return_lse: bool = False,
         overlap_q_allgather: bool = False,
         *,
-        record_timing: bool = False,
         capture_warmup: int = 3,
     ) -> DCPAttentionCUDAGraph:
         bindings = dict(
@@ -1170,11 +747,9 @@ class DCPAttentionRunner:
                 num_splits=num_splits,
                 return_lse=return_lse,
                 overlap_q_allgather=overlap_q_allgather,
-                _record_timing=record_timing,
             ),
             bindings,
             overlap_q_allgather=overlap_q_allgather,
-            record_timing=record_timing,
             capture_warmup=capture_warmup,
         )
 
@@ -1190,7 +765,6 @@ class DCPAttentionRunner:
         return_lse: bool = False,
         overlap_q_allgather: bool = False,
         *,
-        record_timing: bool = False,
         capture_warmup: int = 3,
     ) -> DCPAttentionCUDAGraph:
         bindings = dict(
@@ -1216,11 +790,9 @@ class DCPAttentionRunner:
                 num_splits=num_splits,
                 return_lse=return_lse,
                 overlap_q_allgather=overlap_q_allgather,
-                _record_timing=record_timing,
             ),
             bindings,
             overlap_q_allgather=overlap_q_allgather,
-            record_timing=record_timing,
             capture_warmup=capture_warmup,
         )
 
@@ -1239,7 +811,6 @@ class DCPAttentionRunner:
         num_splits: int = 0,
         return_lse: bool = False,
         overlap_q_allgather: bool = False,
-        record_timing: bool = False,
         capture_warmup: int = 3,
     ) -> DCPAttentionCUDAGraph:
         bindings = dict(
@@ -1271,11 +842,9 @@ class DCPAttentionRunner:
                 num_splits=num_splits,
                 return_lse=return_lse,
                 overlap_q_allgather=overlap_q_allgather,
-                _record_timing=record_timing,
             ),
             bindings,
             overlap_q_allgather=overlap_q_allgather,
-            record_timing=record_timing,
             capture_warmup=capture_warmup,
         )
 
@@ -1296,7 +865,6 @@ class DCPAttentionRunner:
         num_splits: int = 0,
         return_lse: bool = False,
         overlap_q_allgather: bool = False,
-        record_timing: bool = False,
         capture_warmup: int = 3,
     ) -> DCPAttentionCUDAGraph:
         bindings = dict(
@@ -1332,11 +900,9 @@ class DCPAttentionRunner:
                 num_splits=num_splits,
                 return_lse=return_lse,
                 overlap_q_allgather=overlap_q_allgather,
-                _record_timing=record_timing,
             ),
             bindings,
             overlap_q_allgather=overlap_q_allgather,
-            record_timing=record_timing,
             capture_warmup=capture_warmup,
         )
 
@@ -1363,8 +929,24 @@ class DCPAttentionRunner:
             self._capture_tensors.append(result)
         return result
 
-    def _record_timing(self, name: str, stream: torch.cuda.Stream) -> None:
-        self._timing_events[name].record(stream)
+    def _install_phase_recorder(
+        self, recorder: Optional[_PhaseRecorder]
+    ) -> None:
+        if self._active_graph is not None or self._capture_in_progress:
+            raise RuntimeError("Cannot replace the phase recorder during CUDA Graph use")
+        self._phase_recorder = recorder
+
+    def _begin_phase_recording(
+        self, kind: str, stream: torch.cuda.Stream
+    ) -> None:
+        recorder = self._phase_recorder
+        if recorder is not None:
+            recorder.begin(kind, stream)
+
+    def _record_phase(self, name: str, stream: torch.cuda.Stream) -> None:
+        recorder = self._phase_recorder
+        if recorder is not None:
+            recorder.record(name, stream)
 
     def _retain_work(self, work: Optional[dist.Work]) -> None:
         if work is not None:
@@ -1599,15 +1181,20 @@ class DCPAttentionRunner:
                 f"[total_q, Hkv_group, 128]={expected}"
             )
         for tensor, name in ((k_chunk, "k_chunk"), (v_chunk, "v_chunk")):
-            if (
-                not tensor.is_cuda
-                or tensor.device != self.device
-                or tensor.dtype != torch.bfloat16
-                or not tensor.is_contiguous()
-            ):
-                raise ValueError(
-                    f"{name} must be contiguous CUDA BF16 on the runner device"
-                )
+            self._check_cuda_bf16_contiguous(tensor, name)
+
+    def _check_cuda_bf16_contiguous(
+        self, tensor: torch.Tensor, name: str
+    ) -> None:
+        if (
+            not tensor.is_cuda
+            or tensor.device != self.device
+            or tensor.dtype != torch.bfloat16
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must be contiguous CUDA BF16 on the runner device"
+            )
 
     def _check_packed_runner_topology(self, h_kv: int) -> None:
         del h_kv
@@ -1635,7 +1222,7 @@ class DCPAttentionRunner:
         with torch.cuda.stream(self.communication_stream):
             self.communication_stream.wait_event(self._input_ready)
             if timing:
-                self._record_timing("q_ag_start", self.communication_stream)
+                self._record_phase("q_ag_start", self.communication_stream)
             with _nvtx_range("dcp_q_allgather"):
                 work = dist.all_gather_into_tensor(
                     q_rank_major,
@@ -1663,7 +1250,7 @@ class DCPAttentionRunner:
                     d,
                 ).copy_(rank_major_view)
             if timing:
-                self._record_timing("q_ag_end", self.communication_stream)
+                self._record_phase("q_ag_end", self.communication_stream)
             self._q_group_ready.record(self.communication_stream)
         q_group.record_stream(compute_stream)
         return q_group
@@ -1685,7 +1272,7 @@ class DCPAttentionRunner:
             "q_group", (b, sq, self.world_size * h_local, d), q_local.dtype
         )
         if timing:
-            self._record_timing("q_ag_start", compute_stream)
+            self._record_phase("q_ag_start", compute_stream)
         with _nvtx_range("dcp_single_stream_q_allgather"):
             dist.all_gather_into_tensor(
                 q_rank_major,
@@ -1711,7 +1298,7 @@ class DCPAttentionRunner:
                 d,
             ).copy_(rank_major_view)
         if timing:
-            self._record_timing("q_ag_end", compute_stream)
+            self._record_phase("q_ag_end", compute_stream)
         return q_group
 
     def _start_q_allgather_varlen(
@@ -1771,7 +1358,7 @@ class DCPAttentionRunner:
         with torch.cuda.stream(self.communication_stream):
             self.communication_stream.wait_event(self._history_ready)
             if timing:
-                self._record_timing("lse_correct_start", self.communication_stream)
+                self._record_phase("lse_correct_start", self.communication_stream)
             with _nvtx_range("dcp_lse_allgather"):
                 work = dist.all_gather_into_tensor(
                     gathered_lse,
@@ -1803,8 +1390,8 @@ class DCPAttentionRunner:
                     num_warps=4,
                 )
             if timing:
-                self._record_timing("lse_correct_end", self.communication_stream)
-                self._record_timing("reduce_scatter_start", self.communication_stream)
+                self._record_phase("lse_correct_end", self.communication_stream)
+                self._record_phase("reduce_scatter_start", self.communication_stream)
             with _nvtx_range("dcp_output_reduce_scatter"):
                 work = dist.reduce_scatter_tensor(
                     output,
@@ -1815,7 +1402,7 @@ class DCPAttentionRunner:
                 )
                 self._retain_work(work)
             if timing:
-                self._record_timing("reduce_scatter_end", self.communication_stream)
+                self._record_phase("reduce_scatter_end", self.communication_stream)
             self._context_ready.record(self.communication_stream)
 
         output.record_stream(compute_stream)
@@ -1846,7 +1433,7 @@ class DCPAttentionRunner:
             torch.bfloat16,
         )
         if timing:
-            self._record_timing("lse_correct_start", compute_stream)
+            self._record_phase("lse_correct_start", compute_stream)
         with _nvtx_range("dcp_single_stream_lse_allgather"):
             dist.all_gather_into_tensor(
                 gathered_lse,
@@ -1876,8 +1463,8 @@ class DCPAttentionRunner:
                 num_warps=4,
             )
         if timing:
-            self._record_timing("lse_correct_end", compute_stream)
-            self._record_timing("reduce_scatter_start", compute_stream)
+            self._record_phase("lse_correct_end", compute_stream)
+            self._record_phase("reduce_scatter_start", compute_stream)
         with _nvtx_range("dcp_single_stream_output_reduce_scatter"):
             dist.reduce_scatter_tensor(
                 output,
@@ -1886,7 +1473,7 @@ class DCPAttentionRunner:
                 group=self.process_group,
             )
         if timing:
-            self._record_timing("reduce_scatter_end", compute_stream)
+            self._record_phase("reduce_scatter_end", compute_stream)
 
     def _run_context_attention(
         self,
@@ -1903,8 +1490,8 @@ class DCPAttentionRunner:
         if use_dependency_events:
             compute_stream.wait_event(self._q_group_ready)
         if timing:
-            self._record_timing("ag_chunk_end", compute_stream)
-            self._record_timing("history_start", compute_stream)
+            self._record_phase("ag_chunk_end", compute_stream)
+            self._record_phase("history_start", compute_stream)
         with _nvtx_range("dcp_local_history_attention"):
             history_out, history_lse = min_fa3_op.forward_kvcache(
                 q_group,
@@ -1916,7 +1503,7 @@ class DCPAttentionRunner:
                 is_causal=False,
             )
         if timing:
-            self._record_timing("history_end", compute_stream)
+            self._record_phase("history_end", compute_stream)
         if use_dependency_events:
             self._history_ready.record(compute_stream)
         return history_out, history_lse
@@ -1941,8 +1528,8 @@ class DCPAttentionRunner:
         if use_dependency_events:
             compute_stream.wait_event(self._q_group_ready)
         if timing:
-            self._record_timing("ag_chunk_end", compute_stream)
-            self._record_timing("history_start", compute_stream)
+            self._record_phase("ag_chunk_end", compute_stream)
+            self._record_phase("history_start", compute_stream)
         with _nvtx_range("dcp_varlen_local_history_attention"):
             history_out, history_lse = min_fa3_op.forward_kvcache_varlen(
                 q_group,
@@ -1959,7 +1546,7 @@ class DCPAttentionRunner:
                 is_causal=False,
             )
         if timing:
-            self._record_timing("history_end", compute_stream)
+            self._record_phase("history_end", compute_stream)
         if use_dependency_events:
             self._history_ready.record(compute_stream)
         return history_out, history_lse
@@ -1996,8 +1583,6 @@ class DCPAttentionRunner:
         num_splits: int = 0,
         return_lse: bool = False,
         overlap_q_allgather: bool = False,
-        *,
-        _record_timing: bool = False,
     ) -> _DCPResult:
         """Run DCP decode for ``q_local`` with shape ``[B, 1, Hq_local, 128]``."""
         if not self._enqueue_lock.acquire(blocking=False):
@@ -2010,16 +1595,16 @@ class DCPAttentionRunner:
             if sq != 1:
                 raise ValueError(f"forward_decode requires Sq=1, got {sq}")
             compute_stream = torch.cuda.current_stream(self.device)
-            if _record_timing:
-                self._last_timing_kind = "decode"
-                self._record_timing("attention_start", compute_stream)
+            timing = self._phase_recorder is not None
+            if timing:
+                self._begin_phase_recording("decode", compute_stream)
             use_side_stream = self.world_size > 1 and overlap_q_allgather
             if self.world_size == 1:
-                if _record_timing:
-                    self._record_timing("q_ag_start", compute_stream)
-                    self._record_timing("q_ag_end", compute_stream)
-                    self._record_timing("ag_chunk_end", compute_stream)
-                    self._record_timing("history_start", compute_stream)
+                if timing:
+                    self._record_phase("q_ag_start", compute_stream)
+                    self._record_phase("q_ag_end", compute_stream)
+                    self._record_phase("ag_chunk_end", compute_stream)
+                    self._record_phase("history_start", compute_stream)
                 with _nvtx_range("dcp_local_history_attention"):
                     result = min_fa3_op.forward_kvcache(
                         q_local,
@@ -2029,9 +1614,9 @@ class DCPAttentionRunner:
                         num_splits=num_splits,
                         return_lse=return_lse,
                     )
-                if _record_timing:
-                    self._record_timing("history_end", compute_stream)
-                    self._record_timing("attention_end", compute_stream)
+                if timing:
+                    self._record_phase("history_end", compute_stream)
+                    self._record_phase("attention_end", compute_stream)
                 return result
 
             if use_side_stream:
@@ -2039,14 +1624,14 @@ class DCPAttentionRunner:
                     q_local,
                     k_cache_local.shape[2],
                     compute_stream,
-                    timing=_record_timing,
+                    timing=timing,
                 )
             else:
                 q_group = self._gather_q_single_stream(
                     q_local,
                     k_cache_local.shape[2],
                     compute_stream,
-                    timing=_record_timing,
+                    timing=timing,
                 )
             history_out, history_lse = self._run_context_attention(
                 q_group,
@@ -2055,7 +1640,7 @@ class DCPAttentionRunner:
                 cache_seqlens_local,
                 num_splits,
                 compute_stream,
-                timing=_record_timing,
+                timing=timing,
                 use_dependency_events=use_side_stream,
             )
             output = torch.empty_like(q_local)
@@ -2072,7 +1657,7 @@ class DCPAttentionRunner:
                     local_lse,
                     k_cache_local.shape[2],
                     compute_stream,
-                    timing=_record_timing,
+                    timing=timing,
                 )
                 compute_stream.wait_event(self._context_ready)
                 completion = self._context_ready
@@ -2084,13 +1669,13 @@ class DCPAttentionRunner:
                     local_lse,
                     k_cache_local.shape[2],
                     compute_stream,
-                    timing=_record_timing,
+                    timing=timing,
                 )
                 completion = torch.cuda.Event()
                 completion.record(compute_stream)
             self._workspace_completion = (completion, compute_stream.cuda_stream)
-            if _record_timing:
-                self._record_timing("attention_end", compute_stream)
+            if timing:
+                self._record_phase("attention_end", compute_stream)
             return (output, local_lse) if return_lse else output
         finally:
             self._enqueue_lock.release()
@@ -2106,8 +1691,6 @@ class DCPAttentionRunner:
         num_splits: int = 0,
         return_lse: bool = False,
         overlap_q_allgather: bool = False,
-        *,
-        _record_timing: bool = False,
     ) -> _DCPResult:
         """Run split context/chunk prefill and stably merge both states."""
         if not self._enqueue_lock.acquire(blocking=False):
@@ -2124,18 +1707,12 @@ class DCPAttentionRunner:
             if v_chunk.shape != k_chunk.shape:
                 raise ValueError("v_chunk must have the same shape as k_chunk")
             for tensor, name in ((k_chunk, "k_chunk"), (v_chunk, "v_chunk")):
-                if (
-                    not tensor.is_cuda
-                    or tensor.device != self.device
-                    or tensor.dtype != torch.bfloat16
-                    or not tensor.is_contiguous()
-                ):
-                    raise ValueError(f"{name} must be contiguous CUDA BF16 on the runner device")
+                self._check_cuda_bf16_contiguous(tensor, name)
 
             compute_stream = torch.cuda.current_stream(self.device)
-            if _record_timing:
-                self._last_timing_kind = "chunk"
-                self._record_timing("attention_start", compute_stream)
+            timing = self._phase_recorder is not None
+            if timing:
+                self._begin_phase_recording("chunk", compute_stream)
             use_side_stream = self.world_size > 1 and overlap_q_allgather
 
             if use_side_stream:
@@ -2143,23 +1720,23 @@ class DCPAttentionRunner:
                     q_local,
                     k_history_local.shape[2],
                     compute_stream,
-                    timing=_record_timing,
+                    timing=timing,
                 )
             elif self.world_size > 1:
                 q_group = self._gather_q_single_stream(
                     q_local,
                     k_history_local.shape[2],
                     compute_stream,
-                    timing=_record_timing,
+                    timing=timing,
                 )
             else:
                 q_group = q_local
-                if _record_timing:
-                    self._record_timing("q_ag_start", compute_stream)
-                    self._record_timing("q_ag_end", compute_stream)
+                if timing:
+                    self._record_phase("q_ag_start", compute_stream)
+                    self._record_phase("q_ag_end", compute_stream)
 
-            if _record_timing:
-                self._record_timing("chunk_start", compute_stream)
+            if timing:
+                self._record_phase("chunk_start", compute_stream)
             chunk_lengths = torch.full(
                 (b,), sq, device=self.device, dtype=torch.int32
             )
@@ -2173,8 +1750,8 @@ class DCPAttentionRunner:
                     return_lse=True,
                     is_causal=True,
                 )
-            if _record_timing:
-                self._record_timing("chunk_end", compute_stream)
+            if timing:
+                self._record_phase("chunk_end", compute_stream)
 
             history_out, history_lse = self._run_context_attention(
                 q_group,
@@ -2183,7 +1760,7 @@ class DCPAttentionRunner:
                 history_seqlens_local,
                 num_splits,
                 compute_stream,
-                timing=_record_timing,
+                timing=timing,
                 use_dependency_events=use_side_stream,
             )
 
@@ -2202,7 +1779,7 @@ class DCPAttentionRunner:
                     context_lse,
                     k_history_local.shape[2],
                     compute_stream,
-                    timing=_record_timing,
+                    timing=timing,
                 )
                 compute_stream.wait_event(self._context_ready)
             else:
@@ -2213,7 +1790,7 @@ class DCPAttentionRunner:
                     context_lse,
                     k_history_local.shape[2],
                     compute_stream,
-                    timing=_record_timing,
+                    timing=timing,
                 )
 
             merged_out = torch.empty_like(q_local)
@@ -2222,8 +1799,8 @@ class DCPAttentionRunner:
                 if return_lse
                 else None
             )
-            if _record_timing:
-                self._record_timing("merge_start", compute_stream)
+            if timing:
+                self._record_phase("merge_start", compute_stream)
             with _nvtx_range("dcp_merge_context_chunk_states"):
                 merged_lse_arg = merged_lse if merged_lse is not None else context_lse
                 _merge_attn_states_kernel[(b * sq, h_local)](
@@ -2242,9 +1819,9 @@ class DCPAttentionRunner:
                     STORE_LSE=merged_lse is not None,
                     num_warps=4,
                 )
-            if _record_timing:
-                self._record_timing("merge_end", compute_stream)
-                self._record_timing("attention_end", compute_stream)
+            if timing:
+                self._record_phase("merge_end", compute_stream)
+                self._record_phase("attention_end", compute_stream)
             completion = self._retain_merge_inputs(
                 compute_stream,
                 context_out,
@@ -2276,7 +1853,6 @@ class DCPAttentionRunner:
         num_splits: int = 0,
         return_lse: bool = False,
         overlap_q_allgather: bool = False,
-        _record_timing: bool = False,
     ) -> _DCPResult:
         """Run packed DCP decode with one query token per sequence."""
         if not self._enqueue_lock.acquire(blocking=False):
@@ -2308,16 +1884,16 @@ class DCPAttentionRunner:
                 raise ValueError("forward_decode_varlen requires every q_len == 1")
 
             compute_stream = torch.cuda.current_stream(self.device)
-            if _record_timing:
-                self._last_timing_kind = "decode"
-                self._record_timing("attention_start", compute_stream)
+            timing = self._phase_recorder is not None
+            if timing:
+                self._begin_phase_recording("decode", compute_stream)
             use_side_stream = self.world_size > 1 and overlap_q_allgather
             if self.world_size == 1:
-                if _record_timing:
-                    self._record_timing("q_ag_start", compute_stream)
-                    self._record_timing("q_ag_end", compute_stream)
-                    self._record_timing("ag_chunk_end", compute_stream)
-                    self._record_timing("history_start", compute_stream)
+                if timing:
+                    self._record_phase("q_ag_start", compute_stream)
+                    self._record_phase("q_ag_end", compute_stream)
+                    self._record_phase("ag_chunk_end", compute_stream)
+                    self._record_phase("history_start", compute_stream)
                 with _nvtx_range("dcp_varlen_local_history_attention"):
                     result = min_fa3_op.forward_kvcache_varlen(
                         q_local,
@@ -2333,18 +1909,18 @@ class DCPAttentionRunner:
                         return_lse=return_lse,
                         is_causal=False,
                     )
-                if _record_timing:
-                    self._record_timing("history_end", compute_stream)
-                    self._record_timing("attention_end", compute_stream)
+                if timing:
+                    self._record_phase("history_end", compute_stream)
+                    self._record_phase("attention_end", compute_stream)
                 return result
 
             if use_side_stream:
                 q_group = self._start_q_allgather_varlen(
-                    q_local, h_kv, compute_stream, timing=_record_timing
+                    q_local, h_kv, compute_stream, timing=timing
                 )
             else:
                 q_group = self._gather_q_single_stream_varlen(
-                    q_local, h_kv, compute_stream, timing=_record_timing
+                    q_local, h_kv, compute_stream, timing=timing
                 )
             history_out, history_lse = self._run_context_attention_varlen(
                 q_group,
@@ -2358,7 +1934,7 @@ class DCPAttentionRunner:
                 cu_seqlens_k_local_host,
                 num_splits,
                 compute_stream,
-                timing=_record_timing,
+                timing=timing,
                 use_dependency_events=use_side_stream,
             )
             output = torch.empty_like(q_local)
@@ -2378,7 +1954,7 @@ class DCPAttentionRunner:
                 local_lse,
                 h_kv,
                 compute_stream,
-                timing=_record_timing,
+                timing=timing,
                 use_side_stream=use_side_stream,
             )
             if use_side_stream:
@@ -2388,8 +1964,8 @@ class DCPAttentionRunner:
                 completion = torch.cuda.Event()
                 completion.record(compute_stream)
             self._workspace_completion = (completion, compute_stream.cuda_stream)
-            if _record_timing:
-                self._record_timing("attention_end", compute_stream)
+            if timing:
+                self._record_phase("attention_end", compute_stream)
             return (output, local_lse) if return_lse else output
         finally:
             self._enqueue_lock.release()
@@ -2411,7 +1987,6 @@ class DCPAttentionRunner:
         num_splits: int = 0,
         return_lse: bool = False,
         overlap_q_allgather: bool = False,
-        _record_timing: bool = False,
     ) -> _DCPResult:
         """Run packed split history/chunk prefill and merge both states."""
         if not self._enqueue_lock.acquire(blocking=False):
@@ -2442,27 +2017,27 @@ class DCPAttentionRunner:
             self._check_packed_chunk_inputs(k_chunk, v_chunk, total_q, h_kv, d)
 
             compute_stream = torch.cuda.current_stream(self.device)
-            if _record_timing:
-                self._last_timing_kind = "chunk"
-                self._record_timing("attention_start", compute_stream)
+            timing = self._phase_recorder is not None
+            if timing:
+                self._begin_phase_recording("chunk", compute_stream)
             use_side_stream = self.world_size > 1 and overlap_q_allgather
 
             if use_side_stream:
                 q_group = self._start_q_allgather_varlen(
-                    q_local, h_kv, compute_stream, timing=_record_timing
+                    q_local, h_kv, compute_stream, timing=timing
                 )
             elif self.world_size > 1:
                 q_group = self._gather_q_single_stream_varlen(
-                    q_local, h_kv, compute_stream, timing=_record_timing
+                    q_local, h_kv, compute_stream, timing=timing
                 )
             else:
                 q_group = q_local
-                if _record_timing:
-                    self._record_timing("q_ag_start", compute_stream)
-                    self._record_timing("q_ag_end", compute_stream)
+                if timing:
+                    self._record_phase("q_ag_start", compute_stream)
+                    self._record_phase("q_ag_end", compute_stream)
 
-            if _record_timing:
-                self._record_timing("chunk_start", compute_stream)
+            if timing:
+                self._record_phase("chunk_start", compute_stream)
             with _nvtx_range("dcp_varlen_local_chunk_attention"):
                 chunk_out, chunk_lse = min_fa3_op.forward_kvcache_varlen(
                     q_local,
@@ -2478,8 +2053,8 @@ class DCPAttentionRunner:
                     return_lse=True,
                     is_causal=True,
                 )
-            if _record_timing:
-                self._record_timing("chunk_end", compute_stream)
+            if timing:
+                self._record_phase("chunk_end", compute_stream)
 
             history_out, history_lse = self._run_context_attention_varlen(
                 q_group,
@@ -2493,7 +2068,7 @@ class DCPAttentionRunner:
                 cu_seqlens_history_local_host,
                 num_splits,
                 compute_stream,
-                timing=_record_timing,
+                timing=timing,
                 use_dependency_events=use_side_stream,
             )
 
@@ -2512,7 +2087,7 @@ class DCPAttentionRunner:
                     context_lse,
                     h_kv,
                     compute_stream,
-                    timing=_record_timing,
+                    timing=timing,
                     use_side_stream=use_side_stream,
                 )
                 if use_side_stream:
@@ -2520,8 +2095,8 @@ class DCPAttentionRunner:
 
             merged_out = torch.empty_like(q_local)
             merged_lse = torch.empty_like(context_lse) if return_lse else None
-            if _record_timing:
-                self._record_timing("merge_start", compute_stream)
+            if timing:
+                self._record_phase("merge_start", compute_stream)
             with _nvtx_range("dcp_varlen_merge_context_chunk_states"):
                 merged_lse_arg = merged_lse if merged_lse is not None else context_lse
                 _merge_attn_states_kernel[(total_q, h_local)](
@@ -2540,9 +2115,9 @@ class DCPAttentionRunner:
                     STORE_LSE=merged_lse is not None,
                     num_warps=4,
                 )
-            if _record_timing:
-                self._record_timing("merge_end", compute_stream)
-                self._record_timing("attention_end", compute_stream)
+            if timing:
+                self._record_phase("merge_end", compute_stream)
+                self._record_phase("attention_end", compute_stream)
             completion = self._retain_merge_inputs(
                 compute_stream,
                 context_out,
@@ -2558,1073 +2133,6 @@ class DCPAttentionRunner:
             return (merged_out, merged_lse) if return_lse else merged_out
         finally:
             self._enqueue_lock.release()
-
-    def last_timing_ms(self, synchronize: bool = True) -> dict[str, float]:
-        """Return timings for the most recent call made with ``_record_timing=True``."""
-        if self._last_timing_kind is None:
-            raise RuntimeError("No timed DCP forward has been recorded")
-        if synchronize:
-            self._timing_events["attention_end"].synchronize()
-        events = self._timing_events
-        values = {
-            "q_allgather_and_reorder_ms": events["q_ag_start"].elapsed_time(events["q_ag_end"]),
-            "local_history_attention_ms": events["history_start"].elapsed_time(events["history_end"]),
-            "attention_end_to_end_ms": events["attention_start"].elapsed_time(events["attention_end"]),
-        }
-        if self._last_timing_kind == "chunk":
-            values.update(
-                local_chunk_attention_ms=events["chunk_start"].elapsed_time(events["chunk_end"]),
-                overlapped_ag_chunk_window_ms=events["q_ag_start"].elapsed_time(
-                    events["ag_chunk_end"]
-                ),
-                state_merge_ms=events["merge_start"].elapsed_time(events["merge_end"]),
-            )
-        else:
-            values.update(
-                local_chunk_attention_ms=0.0,
-                overlapped_ag_chunk_window_ms=values["q_allgather_and_reorder_ms"],
-                state_merge_ms=0.0,
-            )
-        is_a2a = self.output_collective_kind == "bf16_packed_all_to_all"
-        if self.world_size > 1 and not is_a2a:
-            values.update(
-                lse_allgather_correct_ms=events["lse_correct_start"].elapsed_time(
-                    events["lse_correct_end"]
-                ),
-                output_reduce_scatter_ms=events["reduce_scatter_start"].elapsed_time(
-                    events["reduce_scatter_end"]
-                ),
-            )
-        else:
-            values.update(lse_allgather_correct_ms=0.0, output_reduce_scatter_ms=0.0)
-        if self.world_size > 1 and is_a2a:
-            values.update(
-                a2a_pack_ms=events["a2a_pack_start"].elapsed_time(
-                    events["a2a_pack_end"]
-                ),
-                a2a_all_to_all_ms=events["a2a_all_to_all_start"].elapsed_time(
-                    events["a2a_all_to_all_end"]
-                ),
-                a2a_unpack_combine_ms=events[
-                    "a2a_unpack_combine_start"
-                ].elapsed_time(events["a2a_unpack_combine_end"]),
-            )
-        else:
-            values.update(
-                a2a_pack_ms=0.0,
-                a2a_all_to_all_ms=0.0,
-                a2a_unpack_combine_ms=0.0,
-            )
-        values["output_collective_ms"] = (
-            values["a2a_all_to_all_ms"]
-            if is_a2a
-            else values["output_reduce_scatter_ms"]
-        )
-        values["sequential_ag_plus_chunk_ms"] = (
-            values["q_allgather_and_reorder_ms"] + values["local_chunk_attention_ms"]
-        )
-        return values
-
-
-class _SequentialDCPAttentionRunnerBase(DCPAttentionRunner):
-    """Shared local-kernel plumbing for pinned production orchestration paths."""
-
-    chunk_before_context = False
-    workspace_policy = "framework_style_per_call"
-    supports_overlap_q_allgather = False
-
-    def _reject_overlap(self, overlap_q_allgather: bool) -> None:
-        if overlap_q_allgather:
-            raise ValueError(
-                f"{type(self).__name__} only supports single-stream execution; "
-                "overlap_q_allgather must be False"
-            )
-
-    def _check_packed_runner_topology(self, h_kv: int) -> None:
-        if h_kv != 1:
-            raise ValueError(
-                f"{type(self).__name__} models TP > global Hkv, so each rank must "
-                f"hold exactly one KV head; got {h_kv}"
-            )
-
-    def _check_reference_common(
-        self,
-        q_local: torch.Tensor,
-        k_local: torch.Tensor,
-        v_local: torch.Tensor,
-        seqlens_local: torch.Tensor,
-    ) -> tuple[int, int, int, int]:
-        shape = self._check_common(q_local, k_local, v_local, seqlens_local)
-        if k_local.shape[2] != 1:
-            raise ValueError(
-                f"{type(self).__name__} models TP > global Hkv, so each rank must "
-                f"hold exactly one KV head; got {k_local.shape[2]}"
-            )
-        return shape
-
-    def _check_chunk_inputs(
-        self,
-        k_chunk: torch.Tensor,
-        v_chunk: torch.Tensor,
-        b: int,
-        sq: int,
-        d: int,
-    ) -> None:
-        if k_chunk.shape != (b, sq, 1, d) or v_chunk.shape != k_chunk.shape:
-            raise ValueError("k_chunk and v_chunk must have shape [B, Sq, 1, 128]")
-        for tensor, name in ((k_chunk, "k_chunk"), (v_chunk, "v_chunk")):
-            if (
-                not tensor.is_cuda
-                or tensor.device != self.device
-                or tensor.dtype != torch.bfloat16
-                or not tensor.is_contiguous()
-            ):
-                raise ValueError(
-                    f"{name} must be contiguous CUDA BF16 on the runner device"
-                )
-
-    def _all_gather_q(
-        self,
-        q_local: torch.Tensor,
-        compute_stream: torch.cuda.Stream,
-        *,
-        timing: bool,
-    ) -> torch.Tensor:
-        if timing:
-            self._record_timing("q_ag_start", compute_stream)
-        if self.world_size == 1:
-            q_group = q_local
-        else:
-            b, sq, h_local, d = q_local.shape
-            q_rank_major = torch.empty(
-                (self.world_size * b, sq, h_local, d),
-                device=self.device,
-                dtype=q_local.dtype,
-            )
-            with _nvtx_range(f"{self.method_name}_q_allgather"):
-                dist.all_gather_into_tensor(
-                    q_rank_major, q_local, group=self.process_group
-                )
-                q_group = (
-                    q_rank_major.view(self.world_size, b, sq, h_local, d)
-                    .permute(1, 2, 0, 3, 4)
-                    .reshape(b, sq, self.world_size * h_local, d)
-                    .contiguous()
-                )
-        if timing:
-            self._record_timing("q_ag_end", compute_stream)
-        return q_group
-
-    def _all_gather_q_varlen_sequential(
-        self,
-        q_local: torch.Tensor,
-        compute_stream: torch.cuda.Stream,
-        *,
-        timing: bool,
-    ) -> torch.Tensor:
-        if timing:
-            self._record_timing("q_ag_start", compute_stream)
-        if self.world_size == 1:
-            q_group = q_local
-        else:
-            total_q, h_local, d = q_local.shape
-            q_rank_major = torch.empty(
-                (self.world_size * total_q, h_local, d),
-                device=self.device,
-                dtype=q_local.dtype,
-            )
-            with _nvtx_range(f"{self.method_name}_varlen_q_allgather"):
-                dist.all_gather_into_tensor(
-                    q_rank_major, q_local, group=self.process_group
-                )
-                q_group = (
-                    q_rank_major.view(self.world_size, total_q, h_local, d)
-                    .permute(1, 0, 2, 3)
-                    .reshape(total_q, self.world_size * h_local, d)
-                    .contiguous()
-                )
-        if timing:
-            self._record_timing("q_ag_end", compute_stream)
-        return q_group
-
-    def _run_history_attention_sequential(
-        self,
-        q_group: torch.Tensor,
-        k_local: torch.Tensor,
-        v_local: torch.Tensor,
-        seqlens_local: torch.Tensor,
-        num_splits: int,
-        compute_stream: torch.cuda.Stream,
-        *,
-        timing: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if timing:
-            self._record_timing("history_start", compute_stream)
-        with _nvtx_range(f"{self.method_name}_local_history_attention"):
-            history_out, history_lse = min_fa3_op.forward_kvcache(
-                q_group,
-                k_local,
-                v_local,
-                seqlens_local,
-                num_splits=num_splits,
-                return_lse=True,
-                is_causal=False,
-            )
-        if timing:
-            self._record_timing("history_end", compute_stream)
-        return history_out, history_lse
-
-    def _run_chunk_attention_sequential(
-        self,
-        q_local: torch.Tensor,
-        k_chunk: torch.Tensor,
-        v_chunk: torch.Tensor,
-        num_splits: int,
-        compute_stream: torch.cuda.Stream,
-        *,
-        timing: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if timing:
-            self._record_timing("chunk_start", compute_stream)
-        chunk_lengths = torch.full(
-            (q_local.shape[0],),
-            q_local.shape[1],
-            device=self.device,
-            dtype=torch.int32,
-        )
-        with _nvtx_range(f"{self.method_name}_local_chunk_attention"):
-            chunk_out, chunk_lse = min_fa3_op.forward_kvcache(
-                q_local,
-                k_chunk,
-                v_chunk,
-                chunk_lengths,
-                num_splits=num_splits,
-                return_lse=True,
-                is_causal=True,
-            )
-        if timing:
-            self._record_timing("chunk_end", compute_stream)
-        return chunk_out, chunk_lse
-
-    def _run_history_attention_varlen_sequential(
-        self,
-        q_group: torch.Tensor,
-        k_local: torch.Tensor,
-        v_local: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k_local: torch.Tensor,
-        max_seqlen_q: int,
-        max_seqlen_k_local: int,
-        cu_seqlens_q_host: torch.Tensor,
-        cu_seqlens_k_local_host: torch.Tensor,
-        num_splits: int,
-        compute_stream: torch.cuda.Stream,
-        *,
-        timing: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if timing:
-            self._record_timing("history_start", compute_stream)
-        with _nvtx_range(f"{self.method_name}_varlen_local_history_attention"):
-            history_out, history_lse = min_fa3_op.forward_kvcache_varlen(
-                q_group,
-                k_local,
-                v_local,
-                cu_seqlens_q,
-                cu_seqlens_k_local,
-                max_seqlen_q,
-                max_seqlen_k_local,
-                cu_seqlens_q_host=cu_seqlens_q_host,
-                cu_seqlens_k_host=cu_seqlens_k_local_host,
-                num_splits=num_splits,
-                return_lse=True,
-                is_causal=False,
-            )
-        if timing:
-            self._record_timing("history_end", compute_stream)
-        return history_out, history_lse
-
-    def _run_chunk_attention_varlen_sequential(
-        self,
-        q_local: torch.Tensor,
-        k_chunk: torch.Tensor,
-        v_chunk: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        max_seqlen_q: int,
-        cu_seqlens_q_host: torch.Tensor,
-        num_splits: int,
-        compute_stream: torch.cuda.Stream,
-        *,
-        timing: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if timing:
-            self._record_timing("chunk_start", compute_stream)
-        with _nvtx_range(f"{self.method_name}_varlen_local_chunk_attention"):
-            chunk_out, chunk_lse = min_fa3_op.forward_kvcache_varlen(
-                q_local,
-                k_chunk,
-                v_chunk,
-                cu_seqlens_q,
-                cu_seqlens_q,
-                max_seqlen_q,
-                max_seqlen_q,
-                cu_seqlens_q_host=cu_seqlens_q_host,
-                cu_seqlens_k_host=cu_seqlens_q_host,
-                num_splits=num_splits,
-                return_lse=True,
-                is_causal=True,
-            )
-        if timing:
-            self._record_timing("chunk_end", compute_stream)
-        return chunk_out, chunk_lse
-
-    def _combine_context(
-        self,
-        history_out: torch.Tensor,
-        history_lse: torch.Tensor,
-        compute_stream: torch.cuda.Stream,
-        *,
-        timing: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
-
-    def _merge_context_and_chunk(
-        self,
-        context_out: torch.Tensor,
-        context_lse: torch.Tensor,
-        chunk_out: torch.Tensor,
-        chunk_lse: torch.Tensor,
-        return_lse: bool,
-        compute_stream: torch.cuda.Stream,
-        *,
-        timing: bool,
-    ) -> _DCPResult:
-        raise NotImplementedError
-
-    def _combine_context_varlen_sequential(
-        self,
-        history_out: torch.Tensor,
-        history_lse: torch.Tensor,
-        compute_stream: torch.cuda.Stream,
-        *,
-        timing: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        output, lse = self._combine_context(
-            history_out.unsqueeze(0),
-            history_lse.unsqueeze(0),
-            compute_stream,
-            timing=timing,
-        )
-        return output.squeeze(0), lse.squeeze(0)
-
-    def _merge_context_and_chunk_varlen_sequential(
-        self,
-        context_out: torch.Tensor,
-        context_lse: torch.Tensor,
-        chunk_out: torch.Tensor,
-        chunk_lse: torch.Tensor,
-        return_lse: bool,
-        compute_stream: torch.cuda.Stream,
-        *,
-        timing: bool,
-    ) -> _DCPResult:
-        result = self._merge_context_and_chunk(
-            context_out.unsqueeze(0),
-            context_lse.unsqueeze(0),
-            chunk_out.unsqueeze(0),
-            chunk_lse.unsqueeze(0),
-            return_lse,
-            compute_stream,
-            timing=timing,
-        )
-        if return_lse:
-            output, lse = result
-            return output.squeeze(0), lse.squeeze(0)
-        return result.squeeze(0)
-
-    def forward_decode(
-        self,
-        q_local: torch.Tensor,
-        k_cache_local: torch.Tensor,
-        v_cache_local: torch.Tensor,
-        cache_seqlens_local: torch.Tensor,
-        num_splits: int = 0,
-        return_lse: bool = False,
-        overlap_q_allgather: bool = False,
-        *,
-        _record_timing: bool = False,
-    ) -> _DCPResult:
-        if not self._enqueue_lock.acquire(blocking=False):
-            raise RuntimeError(f"{type(self).__name__} does not support concurrent calls")
-        try:
-            self._reap_inflight_tensors()
-            self._reject_overlap(overlap_q_allgather)
-            _, sq, _, _ = self._check_reference_common(
-                q_local, k_cache_local, v_cache_local, cache_seqlens_local
-            )
-            if sq != 1:
-                raise ValueError(f"forward_decode requires Sq=1, got {sq}")
-            compute_stream = torch.cuda.current_stream(self.device)
-            if _record_timing:
-                self._last_timing_kind = "decode"
-                self._record_timing("attention_start", compute_stream)
-            q_group = self._all_gather_q(
-                q_local, compute_stream, timing=_record_timing
-            )
-            if _record_timing:
-                self._record_timing("ag_chunk_end", compute_stream)
-            history_out, history_lse = self._run_history_attention_sequential(
-                q_group,
-                k_cache_local,
-                v_cache_local,
-                cache_seqlens_local,
-                num_splits,
-                compute_stream,
-                timing=_record_timing,
-            )
-            output, lse = self._combine_context(
-                history_out,
-                history_lse,
-                compute_stream,
-                timing=_record_timing,
-            )
-            if _record_timing:
-                self._record_timing("attention_end", compute_stream)
-            return (output, lse) if return_lse else output
-        finally:
-            self._enqueue_lock.release()
-
-    def forward_chunk_prefill(
-        self,
-        q_local: torch.Tensor,
-        k_history_local: torch.Tensor,
-        v_history_local: torch.Tensor,
-        history_seqlens_local: torch.Tensor,
-        k_chunk: torch.Tensor,
-        v_chunk: torch.Tensor,
-        num_splits: int = 0,
-        return_lse: bool = False,
-        overlap_q_allgather: bool = False,
-        *,
-        _record_timing: bool = False,
-    ) -> _DCPResult:
-        if not self._enqueue_lock.acquire(blocking=False):
-            raise RuntimeError(f"{type(self).__name__} does not support concurrent calls")
-        try:
-            self._reap_inflight_tensors()
-            self._reject_overlap(overlap_q_allgather)
-            b, sq, _, d = self._check_reference_common(
-                q_local,
-                k_history_local,
-                v_history_local,
-                history_seqlens_local,
-            )
-            self._check_chunk_inputs(k_chunk, v_chunk, b, sq, d)
-            compute_stream = torch.cuda.current_stream(self.device)
-            if _record_timing:
-                self._last_timing_kind = "chunk"
-                self._record_timing("attention_start", compute_stream)
-
-            chunk_state: Optional[tuple[torch.Tensor, torch.Tensor]] = None
-            if self.chunk_before_context:
-                chunk_state = self._run_chunk_attention_sequential(
-                    q_local,
-                    k_chunk,
-                    v_chunk,
-                    num_splits,
-                    compute_stream,
-                    timing=_record_timing,
-                )
-
-            q_group = self._all_gather_q(
-                q_local, compute_stream, timing=_record_timing
-            )
-            if _record_timing and self.chunk_before_context:
-                self._record_timing("ag_chunk_end", compute_stream)
-            history_out, history_lse = self._run_history_attention_sequential(
-                q_group,
-                k_history_local,
-                v_history_local,
-                history_seqlens_local,
-                num_splits,
-                compute_stream,
-                timing=_record_timing,
-            )
-            context_out, context_lse = self._combine_context(
-                history_out,
-                history_lse,
-                compute_stream,
-                timing=_record_timing,
-            )
-
-            if chunk_state is None:
-                chunk_state = self._run_chunk_attention_sequential(
-                    q_local,
-                    k_chunk,
-                    v_chunk,
-                    num_splits,
-                    compute_stream,
-                    timing=_record_timing,
-                )
-                if _record_timing:
-                    self._record_timing("ag_chunk_end", compute_stream)
-            result = self._merge_context_and_chunk(
-                context_out,
-                context_lse,
-                *chunk_state,
-                return_lse,
-                compute_stream,
-                timing=_record_timing,
-            )
-            if _record_timing:
-                self._record_timing("attention_end", compute_stream)
-            return result
-        finally:
-            self._enqueue_lock.release()
-
-    def forward_decode_varlen(
-        self,
-        q_local: torch.Tensor,
-        k_cache_local: torch.Tensor,
-        v_cache_local: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k_local: torch.Tensor,
-        max_seqlen_q: int,
-        max_seqlen_k_local: int,
-        *,
-        cu_seqlens_q_host: torch.Tensor,
-        cu_seqlens_k_local_host: torch.Tensor,
-        num_splits: int = 0,
-        return_lse: bool = False,
-        overlap_q_allgather: bool = False,
-        _record_timing: bool = False,
-    ) -> _DCPResult:
-        if not self._enqueue_lock.acquire(blocking=False):
-            raise RuntimeError(f"{type(self).__name__} does not support concurrent calls")
-        try:
-            self._reap_inflight_tensors()
-            self._reject_overlap(overlap_q_allgather)
-            (
-                _,
-                _,
-                _,
-                h_kv,
-                _,
-                q_lengths,
-                _,
-            ) = self._check_packed_common(
-                q_local,
-                k_cache_local,
-                v_cache_local,
-                cu_seqlens_q,
-                cu_seqlens_k_local,
-                max_seqlen_q,
-                max_seqlen_k_local,
-                cu_seqlens_q_host,
-                cu_seqlens_k_local_host,
-                num_splits,
-            )
-            self._check_packed_runner_topology(h_kv)
-            if any(length != 1 for length in q_lengths):
-                raise ValueError("forward_decode_varlen requires every q_len == 1")
-
-            compute_stream = torch.cuda.current_stream(self.device)
-            if _record_timing:
-                self._last_timing_kind = "decode"
-                self._record_timing("attention_start", compute_stream)
-            q_group = self._all_gather_q_varlen_sequential(
-                q_local, compute_stream, timing=_record_timing
-            )
-            if _record_timing:
-                self._record_timing("ag_chunk_end", compute_stream)
-            history_out, history_lse = self._run_history_attention_varlen_sequential(
-                q_group,
-                k_cache_local,
-                v_cache_local,
-                cu_seqlens_q,
-                cu_seqlens_k_local,
-                max_seqlen_q,
-                max_seqlen_k_local,
-                cu_seqlens_q_host,
-                cu_seqlens_k_local_host,
-                num_splits,
-                compute_stream,
-                timing=_record_timing,
-            )
-            output, lse = self._combine_context_varlen_sequential(
-                history_out,
-                history_lse,
-                compute_stream,
-                timing=_record_timing,
-            )
-            if _record_timing:
-                self._record_timing("attention_end", compute_stream)
-            return (output, lse) if return_lse else output
-        finally:
-            self._enqueue_lock.release()
-
-    def forward_chunk_prefill_varlen(
-        self,
-        q_local: torch.Tensor,
-        k_history_local: torch.Tensor,
-        v_history_local: torch.Tensor,
-        k_chunk: torch.Tensor,
-        v_chunk: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_history_local: torch.Tensor,
-        max_seqlen_q: int,
-        max_seqlen_history_local: int,
-        *,
-        cu_seqlens_q_host: torch.Tensor,
-        cu_seqlens_history_local_host: torch.Tensor,
-        num_splits: int = 0,
-        return_lse: bool = False,
-        overlap_q_allgather: bool = False,
-        _record_timing: bool = False,
-    ) -> _DCPResult:
-        if not self._enqueue_lock.acquire(blocking=False):
-            raise RuntimeError(f"{type(self).__name__} does not support concurrent calls")
-        try:
-            self._reap_inflight_tensors()
-            self._reject_overlap(overlap_q_allgather)
-            (
-                total_q,
-                _,
-                d,
-                h_kv,
-                _,
-                _,
-                _,
-            ) = self._check_packed_common(
-                q_local,
-                k_history_local,
-                v_history_local,
-                cu_seqlens_q,
-                cu_seqlens_history_local,
-                max_seqlen_q,
-                max_seqlen_history_local,
-                cu_seqlens_q_host,
-                cu_seqlens_history_local_host,
-                num_splits,
-            )
-            self._check_packed_runner_topology(h_kv)
-            self._check_packed_chunk_inputs(k_chunk, v_chunk, total_q, h_kv, d)
-
-            compute_stream = torch.cuda.current_stream(self.device)
-            if _record_timing:
-                self._last_timing_kind = "chunk"
-                self._record_timing("attention_start", compute_stream)
-
-            chunk_state: Optional[tuple[torch.Tensor, torch.Tensor]] = None
-            if self.chunk_before_context:
-                chunk_state = self._run_chunk_attention_varlen_sequential(
-                    q_local,
-                    k_chunk,
-                    v_chunk,
-                    cu_seqlens_q,
-                    max_seqlen_q,
-                    cu_seqlens_q_host,
-                    num_splits,
-                    compute_stream,
-                    timing=_record_timing,
-                )
-
-            q_group = self._all_gather_q_varlen_sequential(
-                q_local, compute_stream, timing=_record_timing
-            )
-            if _record_timing and self.chunk_before_context:
-                self._record_timing("ag_chunk_end", compute_stream)
-            history_out, history_lse = self._run_history_attention_varlen_sequential(
-                q_group,
-                k_history_local,
-                v_history_local,
-                cu_seqlens_q,
-                cu_seqlens_history_local,
-                max_seqlen_q,
-                max_seqlen_history_local,
-                cu_seqlens_q_host,
-                cu_seqlens_history_local_host,
-                num_splits,
-                compute_stream,
-                timing=_record_timing,
-            )
-            context_out, context_lse = self._combine_context_varlen_sequential(
-                history_out,
-                history_lse,
-                compute_stream,
-                timing=_record_timing,
-            )
-
-            if chunk_state is None:
-                chunk_state = self._run_chunk_attention_varlen_sequential(
-                    q_local,
-                    k_chunk,
-                    v_chunk,
-                    cu_seqlens_q,
-                    max_seqlen_q,
-                    cu_seqlens_q_host,
-                    num_splits,
-                    compute_stream,
-                    timing=_record_timing,
-                )
-                if _record_timing:
-                    self._record_timing("ag_chunk_end", compute_stream)
-            result = self._merge_context_and_chunk_varlen_sequential(
-                context_out,
-                context_lse,
-                *chunk_state,
-                return_lse,
-                compute_stream,
-                timing=_record_timing,
-            )
-            if _record_timing:
-                self._record_timing("attention_end", compute_stream)
-            return result
-        finally:
-            self._enqueue_lock.release()
-
-
-class VLLMDCPAttentionRunner(_SequentialDCPAttentionRunnerBase):
-    """Pinned vLLM default AG+RS orchestration using the local min FA3 op."""
-
-    method_name = "vllm_ag_rs_min_fa3"
-    varlen_method_name = "vllm_ag_rs_min_fa3_varlen"
-    output_collective_kind = "bf16_reduce_scatter"
-
-    def _combine_context(
-        self,
-        history_out: torch.Tensor,
-        history_lse: torch.Tensor,
-        compute_stream: torch.cuda.Stream,
-        *,
-        timing: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        b, sq, h_group, d = history_out.shape
-        t = b * sq
-        h_local = h_group // self.world_size
-        if self.world_size == 1:
-            return history_out, history_lse
-
-        if timing:
-            self._record_timing("lse_correct_start", compute_stream)
-        with _nvtx_range("vllm_lse_allgather_and_triton_correction"):
-            lse_flat = history_lse.permute(0, 2, 1).contiguous().view(t, h_group)
-            gathered_lse = torch.empty(
-                (self.world_size * t, h_group),
-                device=self.device,
-                dtype=torch.float32,
-            )
-            dist.all_gather_into_tensor(
-                gathered_lse, lse_flat, group=self.process_group
-            )
-            gathered_lse_view = gathered_lse.view(self.world_size, t, h_group)
-            corrected = torch.empty_like(history_out)
-            global_lse_flat = torch.empty(
-                (t, h_group), device=self.device, dtype=torch.float32
-            )
-            _vllm_correct_attn_cp_out_kernel[(t, h_group)](
-                history_out.view(t, h_group, d),
-                gathered_lse_view,
-                corrected.view(t, h_group, d),
-                global_lse_flat,
-                *history_out.view(t, h_group, d).stride()[:2],
-                *gathered_lse_view.stride(),
-                T=t,
-                H=h_group,
-                D=d,
-                WORLD_SIZE=self.world_size,
-                WORLD_SIZE_ROUNDED=triton.next_power_of_2(self.world_size),
-                RANK=self.rank,
-                num_warps=4,
-            )
-        if timing:
-            self._record_timing("lse_correct_end", compute_stream)
-            self._record_timing("reduce_scatter_start", compute_stream)
-        with _nvtx_range("vllm_bf16_output_reduce_scatter"):
-            packed_head_major = corrected.view(t, h_group, d).movedim(0, 1).contiguous()
-            output_head_major = torch.empty(
-                (h_local, t, d), device=self.device, dtype=torch.bfloat16
-            )
-            dist.reduce_scatter_tensor(
-                output_head_major,
-                packed_head_major,
-                op=dist.ReduceOp.SUM,
-                group=self.process_group,
-            )
-            output = (
-                output_head_major.movedim(0, 1)
-                .contiguous()
-                .view(b, sq, h_local, d)
-            )
-        if timing:
-            self._record_timing("reduce_scatter_end", compute_stream)
-        head_start = self.rank * h_local
-        local_lse = (
-            global_lse_flat.view(b, sq, h_group)[:, :, head_start : head_start + h_local]
-            .permute(0, 2, 1)
-            .contiguous()
-        )
-        return output, local_lse
-
-    def _merge_context_and_chunk(
-        self,
-        context_out: torch.Tensor,
-        context_lse: torch.Tensor,
-        chunk_out: torch.Tensor,
-        chunk_lse: torch.Tensor,
-        return_lse: bool,
-        compute_stream: torch.cuda.Stream,
-        *,
-        timing: bool,
-    ) -> _DCPResult:
-        b, sq, h_local, d = context_out.shape
-        merged_out = torch.empty_like(context_out)
-        merged_lse = (
-            torch.empty_like(context_lse) if return_lse else context_lse
-        )
-        if timing:
-            self._record_timing("merge_start", compute_stream)
-        with _nvtx_range("vllm_triton_merge_attn_states"):
-            _merge_attn_states_kernel[(b * sq, h_local)](
-                context_out,
-                context_lse,
-                chunk_out,
-                chunk_lse,
-                merged_out,
-                merged_lse,
-                *merged_out.stride()[:3],
-                *context_lse.stride(),
-                B=b,
-                SQ=sq,
-                H=h_local,
-                D=d,
-                STORE_LSE=return_lse,
-                num_warps=4,
-            )
-        if timing:
-            self._record_timing("merge_end", compute_stream)
-        self._retain_merge_inputs(
-            compute_stream, context_out, context_lse, chunk_out, chunk_lse
-        )
-        return (merged_out, merged_lse) if return_lse else merged_out
-
-
-class VLLMA2ADCPAttentionRunner(VLLMDCPAttentionRunner):
-    """Pinned vLLM A2A orchestration using the local min FA3 op.
-
-    The data flow matches the ordinary GQA backend integration at
-    ``vllm/v1/attention/backends/flash_attn.py`` in pinned commit
-    ``a89015c6df8eeb37a843b717c97a5be1355de83d``.  Only the partial-state
-    combine differs from :class:`VLLMDCPAttentionRunner`.
-    """
-
-    method_name = "vllm_a2a_min_fa3"
-    varlen_method_name = "vllm_a2a_min_fa3_varlen"
-    output_collective_kind = "bf16_packed_all_to_all"
-
-    def _combine_context(
-        self,
-        history_out: torch.Tensor,
-        history_lse: torch.Tensor,
-        compute_stream: torch.cuda.Stream,
-        *,
-        timing: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if history_out.ndim != 4:
-            raise ValueError("A2A history output must have shape [B, S, H_group, D]")
-        b, sq, h_group, d = history_out.shape
-        if history_out.dtype != torch.bfloat16 or d != 128:
-            raise ValueError("A2A history output must be BF16 with head_dim 128")
-        if history_lse.shape != (b, h_group, sq):
-            raise ValueError(
-                "A2A history LSE must have shape "
-                f"[{b}, {h_group}, {sq}], got {tuple(history_lse.shape)}"
-            )
-        _dcp_a2a_head_owner_ranges(h_group, self.world_size)
-        if history_lse.dtype != torch.float32:
-            # vLLM PR #47801: the pack kernel bit-casts one FP32 LSE into two
-            # BF16 lanes even when an attention backend returned activation dtype.
-            history_lse = history_lse.to(torch.float32)
-        if self.world_size == 1:
-            return history_out, history_lse
-
-        total_tokens = b * sq
-        h_local = h_group // self.world_size
-        output_flat = history_out.view(total_tokens, h_group, d)
-        lse_flat = (
-            history_lse.permute(0, 2, 1)
-            .contiguous()
-            .view(total_tokens, h_group)
-        )
-        lse_pack_dim = _dcp_a2a_lse_pack_dim(history_out.dtype)
-        buffer_shape = (
-            self.world_size,
-            total_tokens,
-            h_local,
-            d + lse_pack_dim,
-        )
-        # vLLM PR #45487: graph-captured A2A buffers must be per-call tensors
-        # owned by the graph private pool, never slices of a growable workspace.
-        send_buffer = torch.empty(
-            buffer_shape, device=self.device, dtype=history_out.dtype
-        )
-        recv_buffer = torch.empty_like(send_buffer)
-        if self._capture_in_progress:
-            self._capture_tensors.extend((send_buffer, recv_buffer))
-
-        if timing:
-            self._record_timing("a2a_pack_start", compute_stream)
-        with _nvtx_range("vllm_a2a_pack_partial_states"):
-            _dcp_a2a_pack_send(
-                output_flat,
-                lse_flat,
-                send_buffer,
-                self.world_size,
-                h_local,
-                d,
-                lse_pack_dim,
-            )
-        if timing:
-            self._record_timing("a2a_pack_end", compute_stream)
-            self._record_timing("a2a_all_to_all_start", compute_stream)
-        with _nvtx_range("vllm_packed_output_lse_all_to_all"):
-            work = dist.all_to_all_single(
-                recv_buffer.view(-1),
-                send_buffer.view(-1),
-                group=self.process_group,
-                async_op=True,
-            )
-            work.wait()
-        if self._capture_in_progress:
-            self._works.append(work)
-        if timing:
-            self._record_timing("a2a_all_to_all_end", compute_stream)
-            self._record_timing("a2a_unpack_combine_start", compute_stream)
-        with _nvtx_range("vllm_a2a_unpack_lse_weighted_combine"):
-            output, output_lse = _dcp_a2a_unpack_combine(
-                recv_buffer, d, lse_pack_dim
-            )
-        if timing:
-            self._record_timing("a2a_unpack_combine_end", compute_stream)
-        self._retain_merge_inputs(
-            compute_stream,
-            history_out,
-            history_lse,
-            lse_flat,
-            send_buffer,
-            recv_buffer,
-        )
-        return (
-            output.view(b, sq, h_local, d),
-            output_lse.view(b, sq, h_local).permute(0, 2, 1).contiguous(),
-        )
-
-
-class SGLangDCPAttentionRunner(_SequentialDCPAttentionRunnerBase):
-    """Pinned SGLang MHA AG+FP32-AR orchestration using the local min FA3 op."""
-
-    method_name = "sglang_mha_ag_ar_min_fa3"
-    varlen_method_name = "sglang_mha_ag_ar_min_fa3_varlen"
-    output_collective_kind = "fp32_all_reduce"
-    chunk_before_context = True
-
-    def _combine_context(
-        self,
-        history_out: torch.Tensor,
-        history_lse: torch.Tensor,
-        compute_stream: torch.cuda.Stream,
-        *,
-        timing: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        b, sq, h_group, d = history_out.shape
-        t = b * sq
-        h_local = h_group // self.world_size
-        if self.world_size == 1:
-            return history_out, history_lse
-
-        if timing:
-            self._record_timing("lse_correct_start", compute_stream)
-        with _nvtx_range("sglang_lse_allgather_torch_correction"):
-            local_lse = history_lse.permute(0, 2, 1).contiguous().view(t, h_group)
-            gathered_lse = torch.empty(
-                (self.world_size * t, h_group),
-                device=self.device,
-                dtype=torch.float32,
-            )
-            dist.all_gather_into_tensor(
-                gathered_lse, local_lse, group=self.process_group
-            )
-            global_lse = torch.logsumexp(
-                gathered_lse.view(self.world_size, t, h_group), dim=0
-            )
-            scale = torch.exp(local_lse - global_lse).unsqueeze(-1)
-            scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
-            partial = torch.nan_to_num(
-                history_out.view(t, h_group, d).float(),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            ) * scale
-        if timing:
-            self._record_timing("lse_correct_end", compute_stream)
-            self._record_timing("reduce_scatter_start", compute_stream)
-        with _nvtx_range("sglang_fp32_output_allreduce"):
-            dist.all_reduce(partial, op=dist.ReduceOp.SUM, group=self.process_group)
-            head_start = self.rank * h_local
-            output = (
-                partial[:, head_start : head_start + h_local]
-                .contiguous()
-                .to(torch.bfloat16)
-                .view(b, sq, h_local, d)
-            )
-        if timing:
-            self._record_timing("reduce_scatter_end", compute_stream)
-        local_global_lse = (
-            global_lse.view(b, sq, h_group)[:, :, head_start : head_start + h_local]
-            .permute(0, 2, 1)
-            .contiguous()
-        )
-        return output, local_global_lse
-
-    def _merge_context_and_chunk(
-        self,
-        context_out: torch.Tensor,
-        context_lse: torch.Tensor,
-        chunk_out: torch.Tensor,
-        chunk_lse: torch.Tensor,
-        return_lse: bool,
-        compute_stream: torch.cuda.Stream,
-        *,
-        timing: bool,
-    ) -> _DCPResult:
-        if timing:
-            self._record_timing("merge_start", compute_stream)
-        with _nvtx_range("sglang_torch_fp32_merge_attn_states"):
-            merged_lse = torch.logaddexp(context_lse, chunk_lse)
-            context_scale = (
-                torch.exp(context_lse - merged_lse).permute(0, 2, 1).unsqueeze(-1)
-            )
-            chunk_scale = (
-                torch.exp(chunk_lse - merged_lse).permute(0, 2, 1).unsqueeze(-1)
-            )
-            context_scale = torch.nan_to_num(
-                context_scale, nan=0.0, posinf=0.0, neginf=0.0
-            )
-            chunk_scale = torch.nan_to_num(
-                chunk_scale, nan=0.0, posinf=0.0, neginf=0.0
-            )
-            merged_out = (
-                context_out.float() * context_scale + chunk_out.float() * chunk_scale
-            ).to(torch.bfloat16)
-        if timing:
-            self._record_timing("merge_end", compute_stream)
-        return (merged_out, merged_lse) if return_lse else merged_out
-
-    def last_timing_ms(self, synchronize: bool = True) -> dict[str, float]:
-        values = super().last_timing_ms(synchronize=synchronize)
-        values["output_allreduce_ms"] = values["output_collective_ms"]
-        values["output_reduce_scatter_ms"] = 0.0
-        return values
-
 
 @dataclass(frozen=True)
 class _DCPMegaReplay:
@@ -4594,10 +3102,7 @@ __all__ = [
     "DCPAttentionRunner",
     "DCPMegaAttentionCUDAGraph",
     "DCPMegaAttentionRunner",
-    "SGLangDCPAttentionRunner",
     "TopologyIssue",
-    "VLLMA2ADCPAttentionRunner",
-    "VLLMDCPAttentionRunner",
     "make_topology",
     "validate_group_ranks",
     "validate_topology",

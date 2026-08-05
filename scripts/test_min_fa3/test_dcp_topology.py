@@ -1,25 +1,39 @@
+import inspect
 import sys
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
+from unittest import mock
 
 import torch
 
 import min_fa3_dcp
+from dcp_test.baselines import (
+    SGLangDCPAttentionRunner,
+    VLLMA2ADCPAttentionRunner,
+    VLLMDCPAttentionRunner,
+    _dcp_a2a_head_owner_ranges,
+    _dcp_a2a_lse_weighted_combine_reference,
+    _dcp_a2a_payload_bytes,
+)
 from dcp_test.benchmark_output import (
     DCPBenchmarkRow,
     effective_kv_bandwidth_gbps_per_gpu,
     print_benchmark_results,
+    print_timing_breakdowns,
 )
 from dcp_test.benchmark_dcp import expanded_method_labels as dense_method_labels
 from dcp_test.benchmark_dcp_varlen import (
     expanded_method_labels as varlen_method_labels,
 )
+from dcp_test.utils import (
+    BenchmarkPhaseRecorder,
+    PHASE_EVENT_NAMES,
+    make_cu_seqlens,
+    parse_lengths,
+)
 from min_fa3_dcp import (
-    VLLMA2ADCPAttentionRunner,
-    _dcp_a2a_head_owner_ranges,
-    _dcp_a2a_lse_weighted_combine_reference,
-    _dcp_a2a_payload_bytes,
+    DCPAttentionRunner,
     make_topology,
     validate_group_ranks,
     validate_topology,
@@ -27,6 +41,133 @@ from min_fa3_dcp import (
 
 
 class DCPTopologyTest(unittest.TestCase):
+    def test_runtime_runner_has_no_benchmark_timing_api(self) -> None:
+        for name in (
+            "forward_decode",
+            "forward_chunk_prefill",
+            "forward_decode_varlen",
+            "forward_chunk_prefill_varlen",
+        ):
+            self.assertNotIn(
+                "_record_timing",
+                inspect.signature(getattr(DCPAttentionRunner, name)).parameters,
+            )
+        for name in (
+            "capture_decode",
+            "capture_chunk_prefill",
+            "capture_decode_varlen",
+            "capture_chunk_prefill_varlen",
+        ):
+            self.assertNotIn(
+                "record_timing",
+                inspect.signature(getattr(DCPAttentionRunner, name)).parameters,
+            )
+        self.assertFalse(hasattr(DCPAttentionRunner, "last_timing_ms"))
+
+    def test_runtime_runner_allocates_dependency_events_only(self) -> None:
+        event_kwargs: list[dict[str, object]] = []
+
+        def event(*args, **kwargs):
+            del args
+            event_kwargs.append(kwargs)
+            return object()
+
+        with (
+            mock.patch.object(torch.distributed, "is_available", return_value=True),
+            mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+            mock.patch.object(torch.distributed, "get_world_size", return_value=2),
+            mock.patch.object(torch.distributed, "get_rank", return_value=0),
+            mock.patch.object(torch.distributed, "get_backend", return_value="nccl"),
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+            mock.patch.object(torch.cuda, "Stream", return_value=object()),
+            mock.patch.object(torch.cuda, "Event", side_effect=event),
+        ):
+            for runner_type in (
+                DCPAttentionRunner,
+                VLLMDCPAttentionRunner,
+                VLLMA2ADCPAttentionRunner,
+                SGLangDCPAttentionRunner,
+            ):
+                with self.subTest(runner_type=runner_type.__name__):
+                    event_kwargs.clear()
+                    runner = runner_type(None)
+                    self.assertIsNone(runner._phase_recorder)
+                    self.assertFalse(hasattr(runner, "_timing_events"))
+                    self.assertEqual(len(event_kwargs), 4)
+                    self.assertTrue(
+                        all(
+                            not kwargs.get("enable_timing", False)
+                            for kwargs in event_kwargs
+                        )
+                    )
+
+    def test_benchmark_phase_recorder_collective_field_mapping(self) -> None:
+        class FakeEvent:
+            def __init__(self, timestamp: float) -> None:
+                self.timestamp = timestamp
+
+            def elapsed_time(self, other: "FakeEvent") -> float:
+                return other.timestamp - self.timestamp
+
+        timestamps = {
+            "attention_start": 0.0,
+            "attention_end": 30.0,
+            "q_ag_start": 1.0,
+            "q_ag_end": 5.0,
+            "chunk_start": 1.0,
+            "chunk_end": 7.0,
+            "ag_chunk_end": 8.0,
+            "history_start": 8.0,
+            "history_end": 14.0,
+            "lse_correct_start": 14.0,
+            "lse_correct_end": 17.0,
+            "reduce_scatter_start": 17.0,
+            "reduce_scatter_end": 23.0,
+            "a2a_pack_start": 14.0,
+            "a2a_pack_end": 16.0,
+            "a2a_all_to_all_start": 16.0,
+            "a2a_all_to_all_end": 22.0,
+            "a2a_unpack_combine_start": 22.0,
+            "a2a_unpack_combine_end": 27.0,
+            "merge_start": 23.0,
+            "merge_end": 28.0,
+        }
+
+        def elapsed(output_collective_kind: str) -> dict[str, float]:
+            recorder = BenchmarkPhaseRecorder.__new__(BenchmarkPhaseRecorder)
+            recorder.world_size = 2
+            recorder.output_collective_kind = output_collective_kind
+            recorder.events = {
+                name: FakeEvent(timestamps[name]) for name in PHASE_EVENT_NAMES
+            }
+            recorder.last_kind = "chunk"
+            return recorder.elapsed_ms(synchronize=False)
+
+        reduce_scatter = elapsed("bf16_reduce_scatter")
+        self.assertEqual(reduce_scatter["lse_allgather_correct_ms"], 3.0)
+        self.assertEqual(reduce_scatter["output_reduce_scatter_ms"], 6.0)
+        self.assertEqual(reduce_scatter["output_collective_ms"], 6.0)
+
+        all_to_all = elapsed("bf16_packed_all_to_all")
+        self.assertEqual(all_to_all["lse_allgather_correct_ms"], 0.0)
+        self.assertEqual(all_to_all["output_reduce_scatter_ms"], 0.0)
+        self.assertEqual(all_to_all["a2a_pack_ms"], 2.0)
+        self.assertEqual(all_to_all["a2a_all_to_all_ms"], 6.0)
+        self.assertEqual(all_to_all["a2a_unpack_combine_ms"], 5.0)
+        self.assertEqual(all_to_all["output_collective_ms"], 6.0)
+
+        all_reduce = elapsed("fp32_all_reduce")
+        self.assertEqual(all_reduce["output_allreduce_ms"], 6.0)
+        self.assertEqual(all_reduce["output_collective_ms"], 6.0)
+        self.assertEqual(all_reduce["output_reduce_scatter_ms"], 0.0)
+
+    def test_shared_length_and_cu_seqlens_helpers(self) -> None:
+        self.assertEqual(parse_lengths("3", 2, "--sq"), [3, 3])
+        device_cu, host_cu = make_cu_seqlens([3, 5], torch.device("cpu"))
+        self.assertEqual(host_cu.tolist(), [0, 3, 8])
+        self.assertEqual(device_cu.tolist(), host_cu.tolist())
+
     def test_benchmark_console_format_matches_ring_table(self) -> None:
         output = StringIO()
         with redirect_stdout(output):
@@ -66,6 +207,35 @@ class DCPTopologyTest(unittest.TestCase):
             ),
             1536.0,
         )
+
+    def test_timing_breakdowns_print_nonzero_phases_only(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output):
+            print_timing_breakdowns(
+                "DCP CUDA-event phase breakdown",
+                {
+                    "vllm_a2a_min_fa3": {
+                        "attention_end_to_end_ms": {"p50": 4.0, "p90": 5.0},
+                        "a2a_pack_ms": {"p50": 0.2, "p90": 0.3},
+                        "a2a_all_to_all_ms": {"p50": 0.4, "p90": 0.5},
+                        "output_collective_ms": {"p50": 0.4, "p90": 0.5},
+                        "output_reduce_scatter_ms": {"p50": 0.0, "p90": 0.0},
+                    },
+                    "full_kv_min_fa3": {
+                        "attention_end_to_end_ms": {"p50": 1.0, "p90": 1.1},
+                        "local_history_attention_ms": {"p50": 0.0, "p90": 0.0},
+                    },
+                },
+                unit="ms",
+                aggregation="per-iteration maximum across benchmark ranks",
+            )
+        rendered = output.getvalue()
+        self.assertIn("DCP CUDA-event phase breakdown", rendered)
+        self.assertIn("a2a_pack_ms", rendered)
+        self.assertIn("a2a_all_to_all_ms", rendered)
+        self.assertNotIn("attention_end_to_end_ms", rendered)
+        self.assertNotIn("output_collective_ms", rendered)
+        self.assertNotIn("full_kv_min_fa3", rendered)
 
     def test_six_supported_gqa_topologies(self) -> None:
         expected = {
@@ -173,8 +343,9 @@ class DCPTopologyTest(unittest.TestCase):
         self.assertTrue(torch.isneginf(lse).all())
 
     def test_a2a_runner_exports_without_vllm_runtime(self) -> None:
-        self.assertIs(min_fa3_dcp.VLLMA2ADCPAttentionRunner, VLLMA2ADCPAttentionRunner)
-        self.assertIn("VLLMA2ADCPAttentionRunner", min_fa3_dcp.__all__)
+        self.assertFalse(hasattr(min_fa3_dcp, "VLLMA2ADCPAttentionRunner"))
+        self.assertNotIn("VLLMA2ADCPAttentionRunner", min_fa3_dcp.__all__)
+        self.assertEqual(VLLMA2ADCPAttentionRunner.method_name, "vllm_a2a_min_fa3")
         self.assertFalse(any(name == "vllm" or name.startswith("vllm.") for name in sys.modules))
 
 

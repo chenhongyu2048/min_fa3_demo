@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
 
 @dataclass(frozen=True)
@@ -78,4 +78,53 @@ def print_benchmark_results(title: str, rows: Sequence[DCPBenchmarkRow]) -> None
             f"{method:<{method_width}} {time_s:<{time_width}} "
             f"{aggregate_s:>12} {per_gpu_s:>10} {kv_bandwidth_s:>12} "
             f"{check:>10}  {note}"
+        )
+
+
+def print_timing_breakdowns(
+    title: str,
+    breakdowns: Mapping[str, Mapping[str, Mapping[str, float]]],
+    *,
+    unit: str,
+    aggregation: str,
+    include_zero: bool = False,
+) -> None:
+    """Print per-method timing phases without widening the main table."""
+    formatted: list[tuple[str, str, str, str]] = []
+    for method, stages in breakdowns.items():
+        has_output_substage = any(
+            stages.get(name, {}).get("p50", 0.0) != 0.0
+            or stages.get(name, {}).get("p90", 0.0) != 0.0
+            for name in (
+                "output_reduce_scatter_ms",
+                "a2a_all_to_all_ms",
+            )
+        )
+        for phase, values in stages.items():
+            if phase == "attention_end_to_end_ms":
+                continue
+            if phase == "output_collective_ms" and has_output_substage:
+                continue
+            p50 = values.get("p50", 0.0)
+            p90 = values.get("p90", 0.0)
+            if not include_zero and p50 == 0.0 and p90 == 0.0:
+                continue
+            formatted.append(
+                (method, phase, f"{p50:.3f}", f"{p90:.3f}")
+            )
+
+    if not formatted:
+        return
+
+    method_width = max((24, *(len(row[0]) for row in formatted)))
+    phase_width = max((32, *(len(row[1]) for row in formatted)))
+    print(f"\n{title} ({aggregation}; {unit})")
+    print(
+        f"{'Method':<{method_width}} {'Phase':<{phase_width}} "
+        f"{'p50':>10} {'p90':>10}"
+    )
+    for method, phase, p50, p90 in formatted:
+        print(
+            f"{method:<{method_width}} {phase:<{phase_width}} "
+            f"{p50:>10} {p90:>10}"
         )
