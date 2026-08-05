@@ -254,6 +254,10 @@ def _append_attention_domain(
                 dependency_set: set[int] = set()
                 packed_begin = m_block * 128
                 packed_end = min(packed_begin + 128, q_len * heads)
+                # History Q TMA may speculatively read the rest of this 128-row
+                # tile, but only valid packed rows gate the existing q_ready data.
+                # Invalid tail rows must never enter a cross-row reduction or a
+                # predicated output store.
                 for packed in range(packed_begin, packed_end):
                     token_rel, _ = divmod(packed, heads)
                     dependency_set.add((q_begin + token_rel) // 16)

@@ -18,7 +18,7 @@ CUTLASS_DEVICE void run_prologue(Params const& params, SharedStorage& shared_sto
     }
 
     if (warp_idx == 0 && lane_predicate) {
-        shared_storage.pipelines.barrier_Q.init(CollectiveMainloop::Use_TMA_Q ? 1 : CollectiveMainloop::NumProducerThreads);
+        shared_storage.pipelines.barrier_Q.init(CollectiveMainloop::QBarrierArrivalCount);
         shared_storage.pipelines.barrier_O.init(cute::size(typename CollectiveMainloop::ClusterShape{})
                                                 * (CollectiveEpilogue::Use_TMA_O ? 1 : CollectiveMainloop::NumMmaThreads));
     }

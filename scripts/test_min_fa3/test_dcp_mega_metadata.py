@@ -380,6 +380,38 @@ class DCPMegaMetadataTest(unittest.TestCase):
                 referenced.update(dependencies)
         self.assertEqual(referenced, set(range(metadata.token_block_count)))
 
+    def test_history_q_tma_tail_dependencies_only_cover_valid_packed_rows(self):
+        # A full 128-row TMA footprint reaches q_ready block 1 in every case,
+        # but speculative tail rows belong to the next sequence and are invalid.
+        for valid_packed_rows, q_begin in ((24, 10), (64, 5), (120, 1)):
+            q_len = valid_packed_rows // 8
+            cu_q = (0, q_begin, q_begin + q_len, q_begin + q_len + 20)
+            metadata = build_dcp_mega_metadata(
+                cu_q,
+                (0, 129, 386, 899),
+                hq_local=4,
+                dcp_size=2,
+                num_sms=132,
+                requested_num_splits=1,
+            )
+            history_rows = [
+                row
+                for row in metadata.attention
+                if row[0] == HISTORY and row[1] == 1 and row[2] == 0
+            ]
+            self.assertTrue(history_rows)
+            for row in history_rows:
+                dependencies = metadata.q_dependencies[row[5] : row[5] + row[6]]
+                self.assertEqual(dependencies, (0,))
+                self.assertNotIn(1, dependencies)
+            self.assertTrue(
+                all(
+                    metadata.q_dependencies[row[5] : row[5] + row[6]] == ()
+                    for row in metadata.attention
+                    if row[0] == CHUNK
+                )
+            )
+
     def test_metadata_v2_header_offsets_counts_and_capacity(self):
         metadata = build_dcp_mega_metadata(
             (0, 3, 20, 53),

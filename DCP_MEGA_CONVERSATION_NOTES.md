@@ -1,552 +1,554 @@
-# DCP Mega 对话与技术分析记录
+# DCP Mega 实现与技术记录
 
-> 记录日期：2026-08-04  
-> 仓库目录：`/home/hychen/min_fa3_demo`  
-> 范围：DCP test 中 Mega DCP 的负载拆分、PackGQA、split、计算/通信任务队列，以及 packed-Q 使用 TMA 的可行性。  
-> 状态说明：本文区分“已经通过当前代码确认的事实”和“对话中提出、但仍需要继续读代码验证的问题”。本文不是实现方案提交，本轮没有修改 kernel 或 metadata 代码。
+> 状态：已实现并通过静态、编译和 8-GPU 正确性验证
+>
+> 更新日期：2026-08-05
+>
+> 适用范围：当前仓库中的 experimental `dcp_mega_varlen` forward 路径
 
-## 1. 对话背景和问题脉络
+本文档记录 DCP Mega 当前已经落地的实现，而不是未来设计草案。重点包括：
 
-本轮讨论从一个总问题开始：
+- causal chunk attention 与 noncausal history attention 共用一个 persistent kernel；
+- history PackGQA Q tile 使用 TMA，chunk PackGQA Q tile 继续使用 cp.async；
+- 通信 CTA 在 Q all-gather 后既负责 receive，也可以参与 history combine；
+- history combine 内直接执行 remote TMA store 和 ready publish，不存在单独的 publish pass；
+- history Q TMA 尾部允许 speculative overfetch，但 `q_ready` 仍只覆盖有效 packed rows。
 
-> 当前 `dcp test` 的 Mega DCP，是如何将输入的一组负载转化为计算 tile 和通信 tile 负载的？
+2026-08-04 版本中的 TMA 可行性推理仍有部分背景价值，但其中“尚未修改代码”“两条 Q 路径都需要改为 TMA”“TMA footprint 必须扩大 `q_ready` dependency”和“publish 调度尚待核查”等描述已经过时，以本文当前状态为准。
 
-随后问题被细化为六组调度和流水问题：
+## 1. 当前范围与约束
 
-1. 如果一组序列中只有一个序列需要 split，是否整个调用都会选择 split kernel 实例，即使其他序列并不需要 split？目前是否先逐序列计算 split 数，再取最大值作为实例上界，而不是把全部序列作为一个整体共同决定？
-2. PackGQA 的选择是整组序列统一选择，还是每条序列单独选择？
-3. 如何准确理解下面的 split 估算过程：
+DCP Mega 仍是一个窄范围的 Hopper 特化：
 
-   ```text
-   m_i = ceil(q_i * heads / 128)
-   n_i = ceil(k_i / BlockN)
+- GPU：SM90；
+- dtype：BF16；
+- head dimension：128；
+- forward only；
+- packed varlen；
+- `Hkv_group == 1`；
+- `DCPSize in {2, 4, 8}`；
+- `Hq_local in {4, 8}`；
+- `BlockN in {128, 176}`；
+- PackGQA 固定开启；
+- 支持 split-capable 和 no-split 两类 kernel 实例；
+- Q/O 通信 tile 固定为 `[16, Hq_local, 128]`。
 
-   blocks_per_sm =
-       ceil(1.1 * sum_i(m_i * n_i) / num_sms)    # PackGQA 情况
+本次 history Q-TMA 改动没有改变 Python/CUDA 公共 API、metadata header ABI、`q_group` 布局或这些输入约束。共享 mainloop 的其他 BSHD、varlen、ring 和普通 PackGQA 实例依靠默认关闭的 opt-in 保持原行为。
 
-   S_i = clamp(ceil(n_i / blocks_per_sm), 1, split_upper_bound)
-   ```
+关键输入和中间布局为：
 
-4. 是否可以让部分 publish 工作在对应 attention 完成后立即开始，而不是等待全部 attention 完成，从而使对应 receive 更早开始？
-5. 当前通信 CTA 等待远端 `tile_ready` 时，轮询的是本地映射/本地地址上的 ready，还是持续读取远端显存？
-6. 当前任务队列是否并不是严格的 `attention -> publish -> final combine` 三个全局阶段，而是依赖 `attention_done` 逐 tile 推进？理想目标是否应当是：例如 `seq0` 的 attention 完成后，立即进行该序列的 history combine，再 publish，而不必等待其他序列？
+```text
+local Q:   [total_q, Hq_local, 128]
+q_group:   [capacity_q, DCPSize * Hq_local, 128]
+chunk K/V: [total_q, 1, 128]
+history K/V:
+           [total_history_on_rank, 1, 128]
+```
 
-在此基础上，讨论进一步聚焦到 PackGQA 的 Q 加载：
+chunk attention 是 causal，读取本 rank 的 local Q 和 chunk K/V。history attention 是 noncausal，读取 all-gather 后的 `q_group` 和本 rank 的 history K/V。
 
-> 当前 PackGQA 的一个 attention tile，其 Q 是通过普通 load/cp.async 读取，而不是 TMA。假如可以保证 Q 长度至少为 8 且是 8 的倍数，每个 rank 至少有 4 个 Q head，并且 all-gather 时可以重排成每 token、每 Q head 的连续顺序，是否可以用 TMA 将 Q tile 加载到 shared memory？
+## 2. 总体任务与依赖图
 
-本文先完整记录目前已经确认的 packed-Q/TMA 结论，再列出前述调度问题的后续核查清单，避免将尚未验证的推断写成当前实现事实。
-
-## 2. 关键术语和符号
-
-- `q_i`：第 `i` 条序列的 Q token 数。
-- `k_i`：第 `i` 条序列对应的 K/V token 数。
-- `Hq_local`：每个 DCP rank 上的本地 Q head 数。当前 Mega DCP 代码只接受 4 或 8，不是任意“至少 4”。
-- `DCP`：参与当前 DCP group 的 rank 数；当前代码支持 2、4、8。
-- `G`：PackGQA 因子，即一个 KV head 对应的 Q head 数，通常为 `Hq / Hkv`。
-- `BlockM`：Q 的 packed-row tile 大小。当前 Mega DCP 使用 128。
-- `BlockN`：K/V 方向 tile 大小。当前配置支持 128 或 176。
-- `m_i`：序列 `i` 在 packed Q/M 方向上的 tile 数。
-- `n_i`：序列 `i` 在 K/V/N 方向上的 tile 数。
-- `S_i`：序列 `i` 最终采用的 split 数。
-- `q_group`：Q all-gather 后供 history attention 使用的本地连续缓冲区。
-
-## 3. 已确认：当前 PackGQA 的 attention Q 加载路径
-
-### 3.1 当前确实没有用 TMA 将 Q tile 搬入 shared memory
-
-主循环明确设置：
+一次 persistent launch 使用 `num_sms` 个 CTA。前 `num_comm_sm` 个 CTA 是通信 CTA，其余是计算 CTA：
 
 ```cpp
-static constexpr bool Use_TMA_Q = !PackGQA;
+bool const communication_cta = int(blockIdx.x) < params.num_comm_sm;
 ```
 
-见 [`include/min_fa3_mainloop.h`](include/min_fa3_mainloop.h#L62)。因此启用 PackGQA 时：
+当前执行关系可以概括为：
 
 ```text
-PackGQA == true
-Use_TMA_Q == false
+communication CTA:
+Q all-gather
+  -> 优先处理已经 ready 的 remote receive
+  -> 暂无 ready receive 时，尝试领取 ready history-combine task
+  -> history combine + remote TMA store + direct publish
+  -> 重复，直到 receive 和 combine 两个队列都完成
+
+compute CTA:
+unified chunk/history attention queue
+  -> 领取剩余 history-combine task
+  -> history combine + remote TMA store + direct publish
+  -> final combine
+
+每个 history 数据块的依赖：
+q_ready(valid packed rows)
+  -> history attention_done
+  -> history combine + publish_ready/tile_ready
+  -> receive_ready
+  -> final combine
 ```
 
-attention producer 随后进入 `Load Q with cp.async` 分支，并调用 `PackGQAManager::load_Q()`，见 [`include/min_fa3_mainloop.h`](include/min_fa3_mainloop.h#L1026)。
-
-需要准确区分以下两层：
-
-- Mega DCP 的 Q all-gather 本身已经通过 ThunderKittens TMA load/store 在通信路径中搬运数据。
-- all-gather 完成后，attention CTA 从本地 Q 或 `q_group` 将一个 Q tile 搬到 shared memory，目前使用的是 128-bit 向量化 `cp.async`，不是 TMA Q load。
-
-因此，将当前路径简称为“普通 load”不够准确；它是多线程协作、带 zero-fill copy atom 的异步全局到共享内存拷贝。
-
-### 3.2 当前 cp.async 路径如何定位每个 packed row
-
-`PackGQAManager::load_Q()` 把逻辑 packed row 编号还原成 token 和 group 内的 Q head：
+这不是一个全局严格分段的：
 
 ```text
-packed_row = token * G + group_head
-
-token, group_head = divmod(packed_row, G)
-q_ptr = &Q[token, group_head, 0]
+all attention -> all publish -> all receive -> all final combine
 ```
 
-对应代码位于 [`include/hopper_compat/pack_gqa.h`](include/hopper_compat/pack_gqa.h#L58)。它先为部分线程计算行指针，再通过 warp shuffle 将指针分发给负责同一行不同向量段的线程，最后发出 128-bit `cp.async`，见同文件的 [`load_Q`](include/hopper_compat/pack_gqa.h#L79)。
+通信 CTA 可以在计算 CTA 仍执行 attention 时参与已经 ready 的 history combine，也可以接收对端已经 publish 的 tile。计算 CTA 自身仍先耗尽统一 attention queue，再帮助清空 history-combine queue，最后执行 final combine。
 
-该路径的主要额外成本不是 Q 数据传输量，而是：
+## 3. Metadata 与任务粒度
 
-- 每个 packed row 的 `divmod`；
-- 行首地址计算；
-- warp shuffle 分发指针；
-- 由较多 producer threads 发出的 copy 指令。
+metadata ABI 仍使用 40 个 `int32_t` 的 `MetadataHeader`。主要 descriptor 粒度如下：
 
-## 4. 为什么通用 PackGQA 不能直接复用普通 Q 的 TMA descriptor
+| descriptor / signal | 粒度 | 作用 |
+|---|---|---|
+| `AttentionWorkDesc` | sequence x 128 packed-Q rows x split | 描述 chunk 或 history attention 工作和 completion ID |
+| `QTaskDesc` | source rank x 16 tokens | 将每个 rank 的 Q 搬到 `q_group` |
+| `PublishWorkDesc` | destination rank x 16 tokens x `Hq_local` | combine 对应 history contribution，并直接发布给目标 rank |
+| `FinalWorkDesc` | 16 tokens x `Hq_local` | 合并 local chunk、local history 和所有 remote history |
+| `q_ready` | 16-token block | 表示该 block 的各 rank Q 已写入 `q_group` |
+| `attention_done` | attention descriptor | 发布 chunk/history attention completion |
+| `publish_ready` | local publish descriptor | 表示本 rank 的 local history contribution 已 combine |
+| `tile_ready` | source rank x 16-token block，位于目标 rank IPC arena | 表示 remote history tile 已写入并可接收 |
+| `receive_ready` | final tile x remote source | 表示 remote tile 已落入本地 receive workspace |
 
-通用 GQA 的物理 Q 布局通常是：
+attention descriptors 仍按 chunk 在前、history 在后的顺序生成，completion ID 稠密且唯一。每个计算 CTA 先按 CTA ID 领取一个 initial descriptor，之后通过 `kAttentionDynamicCounter` 领取剩余 descriptor。
 
-```text
-Q[token][all_qheads][D]
-```
+chunk 和 history 使用同一个 scheduler 队列，但 descriptor 的 `kind` 决定：
 
-其中 `D = 128`。对于一个给定 KV head，只需要它对应的 `G = Hq / Hkv` 个 Q head。设该 KV head 对应 `kG ... kG+G-1`，packed 访问顺序为：
+- 选择 causal chunk mainloop 还是 noncausal history mainloop；
+- 选择对应的 sequence split 数；
+- 是否等待 `q_dependencies`；
+- completion 写入哪个 `attention_done[completion_id]`。
 
-```text
-token 0, head kG
-token 0, head kG+1
-...
-token 0, head kG+G-1
-token 1, head kG
-...
-```
+只有 history descriptor 等待 gathered Q；chunk descriptor 的 `q_dependency_count` 始终为 0。
 
-同一个 token 内，相邻 Q head 行的地址差是 `D` 个元素。但是从当前 token 的最后一个 group head 跳到下一个 token 的第一个 group head时，地址差是：
+### 3.1 Split 与 PackGQA 的选择粒度
 
-```text
-(Hq - G + 1) * D
-```
+`PackGQA=true` 是整个 launch 的 compile-time 选择，不是逐序列选择。
 
-因此，把 `(token, group_head)` 简单压平为一个 packed M 维后，这个 M 维通常不是固定 stride 的连续二维维度。当前普通 Q TMA descriptor 描述的是 token 维和单独的 head 维，不能仅通过把 `Use_TMA_Q` 改为 `true` 就正确加载 PackGQA tile。
+一次 launch 也只选择一个 `Split=true` 或 `Split=false` kernel 实例。选择 split-capable 实例时，各序列仍可通过 `chunk_sequence_splits[]` 和 `history_sequence_splits[]` 使用不同的实际 split 数，包括 1。
 
-这不是“TMA 原理上不支持 PackGQA”。仓库内 vendored MagiAttention 已经实现 packed-Q TMA：
-
-- 定义 `ShapeQPackedTMA = ((PackGQAFactor, seqlen), headdim, khead)`；
-- 为其构建 `TMA_Q_Packed`；
-- varlen 加载时把序列 offset 乘以 `PackGQAFactor`。
-
-相关代码见 [`third_party/MagiAttention/.../mainloop_fwd_sm90_tma_gmma_ws.hpp`](third_party/MagiAttention/magi_attention/csrc/flexible_flash_attention/mainloop_fwd_sm90_tma_gmma_ws.hpp#L257) 和同文件的 [descriptor 构建](third_party/MagiAttention/magi_attention/csrc/flexible_flash_attention/mainloop_fwd_sm90_tma_gmma_ws.hpp#L447)、[TMA Q 发射](third_party/MagiAttention/magi_attention/csrc/flexible_flash_attention/mainloop_fwd_sm90_tma_gmma_ws.hpp#L548)。
-
-这证明了：当 pack factor 和物理 stride 可以被 descriptor 正确表达时，PackGQA Q 使用 TMA 是可实现的。当前 minimal FA3 只是没有接入相应 descriptor 和同步路径。
-
-## 5. 为什么 Mega DCP 特化更适合 flattened packed-Q TMA
-
-当前 Mega DCP 对 chunk 和 history K/V 都要求：
-
-```text
-Hkv_group == 1
-```
-
-shape 检查见 [`csrc/dcp_mega_min_fa3_varlen_bindings.cu`](csrc/dcp_mega_min_fa3_varlen_bindings.cu#L381)。因此：
-
-```text
-chunk attention:
-    G_chunk = Hq_local
-
-history attention:
-    G_history = DCP * Hq_local
-```
-
-因为只有一个 KV head，当前 attention 调用里的全部 Q head 都属于同一个 PackGQA group。如果物理布局为连续的：
-
-```text
-Q[token][head][d]
-```
-
-那么元素地址为：
-
-```text
-address(token, head, d)
-    = ((token * G + head) * 128 + d)
-```
-
-定义：
-
-```text
-packed_row = token * G + head
-```
-
-就得到一个完全连续的二维矩阵：
-
-```text
-Q_packed[total_q * G][128]
-```
-
-因此可以用一个逻辑上的 `128 x 128` BF16 TMA tile，从下面的位置读取：
-
-```text
-packed_sequence_offset = cu_seqlens_q[batch] * G
-packed_tile_offset     = packed_sequence_offset + m_block * 128
-
-Q_packed[packed_tile_offset : packed_tile_offset + 128, 0 : 128]
-```
-
-这个方案不再需要逐 row `divmod` 来计算 Q 的全局内存地址。token/head 的反解仍可能用于 mask、输出地址和 epilogue，但不再位于 Q tile 的数据搬运热路径上。
-
-## 6. 已确认：当前 all-gather 输出已经基本是目标顺序
-
-当前绑定要求 `q_group` 的 shape 为：
-
-```text
-[capacity_q, DCP * Hq_local, 128]
-```
-
-见 [`csrc/dcp_mega_min_fa3_varlen_bindings.cu`](csrc/dcp_mega_min_fa3_varlen_bindings.cu#L495)。这些 Q tensor 还被要求是 contiguous，见同文件的 [`check_packed_bf16`](csrc/dcp_mega_min_fa3_varlen_bindings.cu#L43)。
-
-Q all-gather 把每个远端 rank 的 16-token、`Hq_local * 128` tile 存入 `q_group` 的 `src_rank` 槽位：
-
-```cpp
-params.q_group, shared.comm_tiles[chunk],
-{0, task.token_begin / 16, task.src_rank, 0}
-```
-
-见 [`include/dcp_mega_min_fa3_varlen_launch.h`](include/dcp_mega_min_fa3_varlen_launch.h#L353)。其物理顺序等价于：
-
-```text
-[token]
-    [src_rank 0][local_head 0 ... Hq_local-1]
-    [src_rank 1][local_head 0 ... Hq_local-1]
-    ...
-[d]
-```
-
-即：
-
-```text
-[token][global_qhead][d]
-```
-
-所以，如果目标只是让 history Q 成为每 token、每 Q head、每 head-dimension 连续，当前 `q_group` 实际上已经满足这个条件。当前本地 chunk Q 也是 contiguous 的 `[token, Hq_local, 128]`，同样可以压平为 `[total_q * Hq_local, 128]`。
-
-结论是：Mega DCP 的关键优势不是“未来可以重排”，而是当前单 KV-head 加上现有 contiguous layout 已经消除了通用 GQA 的 head-group 间空洞。
-
-## 7. `q_len >= 8` 且 `q_len % 8 == 0` 的真实作用
-
-Q attention tile 的 M 方向是 128 个 packed rows，不是固定 8 个 token。对序列 `i`：
-
-```text
-valid_packed_rows_i = q_i * G
-m_i = ceil(q_i * G / 128)
-```
-
-如果希望每条序列完全由整 tile 构成，不发生 partial tile，则要求：
-
-```text
-q_i * G % 128 == 0
-```
-
-当前 Mega DCP 实际支持 `Hq_local in {4, 8}`，见 [`csrc/dcp_mega_min_fa3_varlen_bindings.cu`](csrc/dcp_mega_min_fa3_varlen_bindings.cu#L136)，而不是任意 `Hq_local >= 4`。
-
-| 路径 | `G` | 一个 128-row tile 对应的 token 数 | 完全无尾部的条件 |
-|---|---:|---:|---:|
-| chunk，`Hq_local=4` | 4 | 32 | `q_i % 32 == 0` |
-| chunk，`Hq_local=8` | 8 | 16 | `q_i % 16 == 0` |
-| history，`DCP * Hq_local=8` | 8 | 16 | `q_i % 16 == 0` |
-| history，`G=16` | 16 | 8 | `q_i % 8 == 0` |
-| history，`G=32` | 32 | 4 | `q_i % 4 == 0` |
-| history，`G=64` | 64 | 2 | `q_i % 2 == 0` |
-
-所以 `q_i % 8 == 0` 的结论是：
-
-- 对 `G >= 16` 的 history attention，足以消除 Q 方向 partial tile。
-- 对最小 history 配置 `DCP=2, Hq_local=4, G=8`，仍需 `q_i % 16 == 0`。
-- 对 chunk attention，`Hq_local=4` 时仍需 `q_i % 32 == 0`，`Hq_local=8` 时仍需 `q_i % 16 == 0`。
-- `q_i >= 8` 本身不是 TMA 可用性的必要条件；它更多是在限制小序列和减少极低有效率 tile。
-
-因此，这组条件有利于 TMA，但既不是“能否用 TMA”的必要条件，也不足以保证所有路径都没有尾部。
-
-## 8. Varlen 尾部的三种可行策略
-
-### 8.1 每条序列按 128 个 packed rows 填充
-
-为每条序列分配：
-
-```text
-padded_rows_i = ceil(q_i * G / 128) * 128
-```
-
-优点：
-
-- 每次 TMA load 的 footprint 都完全位于本序列分配区间；
-- 不会读到下一条尚未 all-gather 完成的序列；
-- ready dependency 和内存正确性最容易证明。
-
-代价：
-
-- Q/all-gather buffer 增大；
-- 通信和显存流量包含 padding；
-- `cu_seqlens_q` 不能再直接作为物理 Q offset，需要额外 packed/padded offsets。
-
-### 8.2 完整 tile 用 TMA，末尾 partial tile 保留 cp.async
-
-优点：
-
-- 不需要改变 Q 的序列间物理布局；
-- 不发生跨序列读取；
-- 完整 tile 可以移除绝大多数逐 row 地址计算。
-
-代价：
-
-- kernel 内同时存在 TMA Q 和 cp.async Q 两套加载协议；
-- transaction barrier、cp.async barrier、phase 和 named barrier 的组合更复杂；
-- 小序列或大量短 varlen 序列下，可能有较高比例仍然走 cp.async。
-
-### 8.3 固定读取完整 TMA tile，允许越过当前序列尾部
-
-从 attention 数学看，不同 Q row 相互独立，无效 row 不会影响有效 row；当前 PackGQA epilogue 也不会写出序列范围外的 row。因此，只考虑算子数学，尾部加载到下一序列的 Q 不会污染当前序列的有效输出。
-
-但是 Mega DCP 的 Q all-gather 与 attention 是重叠执行的。若 TMA tile 越过当前序列边界，可能访问到尚未由 all-gather 发布的下一段 Q。当前 cp.async 实现对 `idx < seqlen_q * G` 做判断，不会产生这种访问；切换成固定大小 TMA 后必须额外处理。
-
-可选处理包括：
-
-- 把整个 TMA footprint 覆盖的 Q token block 都加入 `q_ready` dependency；
-- 保证被 overfetch 的下一段在 attention 发射前已发布；
-- 在序列之间增加 padding；
-- 只对最后一个 partial tile 回退到 cp.async。
-
-最后一条全局序列还需要保证 TMA tensor map 的全局 extent 能提供安全 OOB zero-fill，或者在分配末尾预留足够 padding。
-
-## 9. TMA Q 实现需要同时调整的组件
-
-这不是将 `Use_TMA_Q` 从 `false` 改成 `true` 的单行修改。完整实现至少涉及：
-
-1. 为 PackGQA/Mega DCP 引入 packed Q TMA descriptor。
-2. descriptor 应描述连续的 `[total_q * G, 128]`，或者等价的嵌套 `((G, total_q), 128, kvhead)`。
-3. chunk 和 history 需要分别构建 descriptor，因为二者的 `G` 分别是 `Hq_local` 和 `DCP * Hq_local`。
-4. varlen sequence offset 必须乘以 `G`：
-
-   ```text
-   packed_offset_q = cu_seqlens_q[batch] * G
-   ```
-
-5. tile 起点应为：
-
-   ```text
-   packed_offset_q + m_block * 128
-   ```
-
-6. Q shared-memory barrier 必须使用 transaction barrier。当前 kernel 已经通过 `Use_TMA_Q` 在 `ClusterTransactionBarrier` 和 `ClusterBarrier` 之间选择，见 [`include/min_fa3_kernel.h`](include/min_fa3_kernel.h#L69)。
-7. TMA issuer 需要调用：
-
-   ```text
-   arrive_and_expect_tx(128 * 128 * sizeof(bfloat16))
-   ```
-
-   一次完整 Q tile 的 transaction bytes 是 32768。
-8. shared-memory Q layout 必须由 TMA descriptor 正确映射，不能只假设它适用于 position-independent cp.async swizzle tensor。
-9. `NumProducerThreads`、`QueryEmpty` named barrier 的 arrival count 和 Q barrier 初始化必须随 TMA 路径一致变化。当前相关选择见 [`include/min_fa3_mainloop.h`](include/min_fa3_mainloop.h#L127) 和 [`include/min_fa3_prologue.h`](include/min_fa3_prologue.h#L21)。
-10. 必须保留 all-gather TMA store 完成、`fence.proxy.async.global`、release signal、attention acquire wait 和后续 TMA read 之间的可见性关系。
-11. metadata 中的 `q_dependencies` 必须覆盖实际 TMA load footprint，而不只是数学上的有效 Q row。
-12. chunk Q 和 history `q_group` 都要验证，不能只优化 all-gather 后的 history Q。
-
-## 10. Q all-gather 与 attention 的同步关系
-
-当前 Q all-gather 每次搬运一个 16-token communication tile。完成本地 `q_group` TMA store 后，代码执行：
-
-```text
-tma_store_async_wait
-fence.proxy.async.global
-signal_release(q_ready)
-```
-
-见 [`include/dcp_mega_min_fa3_varlen_launch.h`](include/dcp_mega_min_fa3_varlen_launch.h#L353)。
-
-history attention scheduler 在领取 descriptor 后，根据该 descriptor 的 `q_dependencies` 等待对应 `q_ready` 达到 `DCPSize`，见 [`include/dcp_mega_min_fa3_varlen_scheduler.h`](include/dcp_mega_min_fa3_varlen_scheduler.h#L105)。这意味着当前设计不是简单地“全部 Q all-gather 完成后再统一启动 history attention”，而是具备按 descriptor/Q block dependency 推进的结构。
-
-若改用 TMA Q load，最需要重新审计的是：
-
-```text
-metadata 声明的 ready footprint
-    是否覆盖
-实际 128 packed-row TMA load footprint
-```
-
-当 `128 / G` 个 token 与 16-token communication block 对齐时，依赖关系较简单；当序列起点、尾部或 overfetch 跨越 communication block 时，需要覆盖多个 ready 项。
-
-## 11. 性能判断
-
-一次完整 BF16 Q tile 的数据量固定为：
-
-```text
-128 * 128 * 2 bytes = 32 KiB
-```
-
-从 cp.async 改为 TMA 不会减少有效完整 tile 的字节数。主要潜在收益来自：
-
-- 去掉逐 packed row 的 `divmod`；
-- 去掉逐 row 指针计算和 warp shuffle；
-- 减少 producer 发出的 load/copy 指令；
-- 使用单线程 TMA issue 和 transaction barrier；
-- 可能降低 producer 路径的寄存器和指令压力。
-
-但现有 cp.async 已经是 16-byte 向量化、按 head dimension 合并的读取，因此不能只根据“TMA 指令更高级”就断定性能一定提高。还要考虑：
-
-- TMA descriptor 构建和访问形式；
-- partial tile 的额外流量；
-- split descriptor 是否重复读取同一个 Q tile；
-- Q all-gather/attention overlap 是否因更宽 dependency 而下降；
-- producer/consumer barrier 开销；
-- H200 上不同 `q_len`、`G`、`BlockN`、split 数下的实际测量。
-
-当前最合理的性能假设是：TMA Q 的收益主要是降低地址生成和 producer instruction overhead，而不是降低 HBM 字节数。
-
-## 12. packed-Q TMA 问题的最终结论
-
-可以将结论压缩为：
-
-> 对当前 Mega DCP 的 `Hkv_group == 1` 特化，连续的 `[token][qhead][128]` 可以直接压平为 `[q_len * G][128]`，因此 Q tile 从 global memory 到 shared memory 可以使用 TMA。当前 history `q_group` 的 all-gather 输出实际上已经接近或等同于所需顺序，本地 chunk Q 也满足连续条件。真正需要解决的不是 TMA 是否能够描述该布局，而是 varlen 尾部、跨序列 overfetch、Q readiness footprint、transaction barrier 和 producer 同步。
-
-同时：
-
-> `q_len >= 8`、`q_len % 8 == 0` 和每 rank 至少 4 个 Q head 并不是充分的“无尾部”条件。当前代码实际支持每 rank 4 或 8 个 Q head；是否恰好整 tile，应检查 `q_len * G % 128 == 0`。
-
-## 13. 尚待继续核查的原始调度问题
-
-以下问题在本轮可见对话中被明确提出，但尚未形成经过完整源码核查的最终答复。后续分析时应以 metadata 生成器、launch dispatch、scheduler 和 fused kernel 队列实现为依据。
-
-### 13.1 输入负载如何生成计算和通信 tile
-
-需要从 Python metadata 生成入口开始，逐层说明：
-
-```text
-输入序列集合
-  -> 每序列 q_i / history_k_i / chunk_k_i
-  -> PackGQA 决策与 BlockN 选择
-  -> m_i / n_i
-  -> 每序列 split S_i
-  -> chunk/history attention descriptors
-  -> Q all-gather tasks
-  -> history combine/publish tasks
-  -> receive/final combine tasks
-  -> dependency arrays 和 ready/completion IDs
-  -> compute CTA 与 communication CTA 的领取方式
-```
-
-核查时需要明确每个 task descriptor 的粒度究竟是：sequence、M tile、N split、16-token communication block，还是多个维度的组合。
-
-### 13.2 split kernel 实例是全局选择还是逐序列选择
-
-需要分别回答两个层次：
-
-- 编译/launch 层：一次 kernel launch 是否只能统一选择 `Split=true` 或 `Split=false` 的模板实例。
-- metadata/runtime 层：在 `Split=true` 实例内，是否允许某条序列的 `S_i=1`，而另一条序列 `S_j>1`。
-
-还需要确认 launch 使用的 `effective_num_splits` 是否是 `max_i(S_i)`，以及各序列实际 split 数是否保存在 `chunk_sequence_splits` 和 `history_sequence_splits` 中。不能把“选择 split-capable kernel”误解为“所有序列都必须真的拆成相同 split 数”。
-
-### 13.3 PackGQA 是统一还是逐序列选择
-
-需要确认 PackGQA 是否影响模板实例、tensor layout、scheduler 解释和 workspace shape。若它是 compile-time 模板参数，则同一次 launch 中通常必须统一；即使 metadata 的成本模型可以逐序列估算，也不能直接让一个 kernel 内部分序列 PackGQA、部分序列 non-PackGQA，除非存在显式的双路径 descriptor 或拆成两个 launch。
-
-需要从 metadata 的 `pack_gqa` 字段、bindings 的 dispatch 和 kernel specialization 三处交叉验证。
-
-### 13.4 split 公式的逐项含义
-
-待验证公式为：
+当前动态 split 估算使用：
 
 ```text
 m_i = ceil(q_i * heads / 128)
 n_i = ceil(k_i / BlockN)
 
-blocks_per_sm = ceil(1.1 * sum_i(m_i * n_i) / num_sms)
-
+total_blocks = sum_i(m_i * n_i)
+blocks_per_sm = max(ceil(1.1 * total_blocks / num_sms), 1)
 S_i = clamp(ceil(n_i / blocks_per_sm), 1, split_upper_bound)
 ```
 
-后续完整解释应回答：
+PackGQA 下 scheduler head 数折叠为 1。chunk 的 `heads=Hq_local`，history 的 `heads=DCPSize * Hq_local`；两者分别计算逐序列 split，launch 使用二者的有效上界选择模板实例。
 
-- `heads` 在 PackGQA 下究竟是 `Hq/Hkv`、本地 head 数，还是当前 attention group 的总 Q head 数；
-- `m_i * n_i` 为什么代表未 split 的 tile work；
-- `sum_i` 为什么在所有序列间聚合，用于估算整个 launch 的平均 CTA waves；
-- `1.1` 是怎样的 oversubscription/负载均衡安全系数；
-- `blocks_per_sm` 为什么反过来限制一个 split 应包含的 N blocks；
-- `ceil(n_i / blocks_per_sm)` 如何得到序列自己的 split 数；
-- `split_upper_bound`、空 history、causal chunk 和不同 BlockN 如何影响最终值；
-- chunk 和 history 是否分别计算 `S_i`，以及 launch 的 split 上界如何合并。
+## 4. 通信 CTA 与计算 CTA 的职责
 
-### 13.5 publish 是否可以按已完成 tile/序列提前执行
+### 4.1 通信 CTA
 
-需要检查：
-
-- `PublishWorkDesc` 的 dependency 是整个序列的所有 attention descriptors，还是单个 history/chunk tile；
-- compute CTA 在 attention 队列耗尽前是否允许领取 publish 队列；
-- publish counter 是否只在全局 attention phase 后开启；
-- `attention_done` 是否已经支持按 completion ID 细粒度等待；
-- 提前 publish 是否会与仍在写同一 output/LSE partial workspace 的 attention CTA 冲突。
-
-设计目标可以表述为：
+通信 CTA 完全不初始化 FlashAttention pipeline。其控制流是：
 
 ```text
-seq0 所需 attention descriptors 完成
-  -> seq0 history/split combine
-  -> seq0 publish
-  -> 对端 seq0 receive
-  -> seq0 final combine
-
-同时 seq1/seq2 的 attention 仍可继续
+run_q_allgather()
+  -> record q_allgather_done
+  -> run_communication_post_q()
+  -> record kernel_done
+  -> return
 ```
 
-是否已经做到这一点，必须区分“依赖结构允许”和“当前 CTA phase loop 实际会不会及时领取”。
+`run_q_allgather()` 对每个 16-token tile：
 
-### 13.6 `tile_ready` 位于哪里、通信 CTA 在读什么
+1. 从 source rank 的 IPC Q allocation 发起 TMA load 到 shared memory；
+2. 从 shared memory 发起 TMA store 到本地 `q_group` 的 source-rank head 槽；
+3. 等待 store 完成；
+4. 执行 `fence.proxy.async.global`；
+5. 对对应 `q_ready` 项执行 release signal。
 
-需要沿这些对象核查：
+history scheduler 使用 acquire wait，要求对应 `q_ready` 累积到 `DCPSize`，之后才允许该 history descriptor 发起 Q load。
 
-- `ipc_tile_ready` 的每 rank IPC allocation；
-- `tile_ready_remote[rank]` 指针数组如何建立；
-- publisher 写入目标 rank 的 ready 地址；
-- receiver 使用哪个 rank 视图轮询；
-- NVLink/IPC 映射下“本地虚拟地址”和“物理上位于远端 GPU 显存”之间的区别。
+### 4.2 计算 CTA
 
-准确回答应避免简单地说“本地”或“远端”。CUDA IPC/NVLink 场景中，指针对当前 GPU 是可访问的本地虚拟地址，但其 backing allocation 可能属于另一张 GPU；每次系统作用域 load 是否产生远端访问，还取决于 ready buffer 的所有权、映射方式和缓存/一致性协议。
-
-### 13.7 attention、publish、final combine 是否是严格分段队列
-
-需要结合 fused kernel 的实际控制流回答：
-
-- attention CTA 完成一个 descriptor 后是否只继续领取 attention；
-- attention queue 何时被判定耗尽；
-- publish/final counter 何时开始领取；
-- publish/final descriptor 虽然逐项等待 `attention_done`，是否仍因领取顺序形成宏观 phase barrier；
-- communication CTA 的 Q all-gather、receive 是否与 compute queue 并行；
-- graph replay phase signal 是否增加额外全局阶段。
-
-核心区别是：
+计算 CTA 的控制流是：
 
 ```text
-细粒度 dependency 存在
+unified chunk/history attention
+  -> __syncthreads()
+  -> run_history_combine()
+  -> run_final_combine()
 ```
 
-并不自动等价于：
+attention pipeline 结束后，CTA 全体线程同步，随后复用同一 dynamic shared-memory 区域执行 combine。计算 CTA 通过共享的 `kHistoryCombineCounter` 清空通信 CTA 未完成的 history-combine 工作。
+
+final combine 只由计算 CTA 执行。通信 CTA 不进入 FlashAttention mainloop，也不进入 final-combine queue。
+
+## 5. 通信 CTA 参与 History Combine
+
+### 5.1 Receive-first 策略
+
+`run_communication_post_q()` 同时推进 receive 和 history combine，但优先 receive：
+
+1. 每个 communication chunk 扫描自己负责的 receive tasks；
+2. 若发现对端 `tile_ready` 达到当前 monotonic phase，立即执行 receive；
+3. 只要本轮存在 ready receive，整个 CTA 先处理 receive，然后重新扫描；
+4. 若没有 ready receive，则调用 `try_run_ready_history_combine()`；
+5. receive 或 combine 尚未完成且无即时工作时，短暂 `__nanosleep(64)` 后重试。
+
+所以“通信 CTA 参与 combine”不是额外 kernel，也不是 Q all-gather 中插入的路径，而是 Q all-gather 完成后的 post-Q loop 中的 fallback 工作。
+
+### 5.2 共享 combine queue
+
+通信 CTA 和计算 CTA 共享 `queue_state[kHistoryCombineCounter]`。
+
+计算 CTA 的 `run_history_combine()` 使用 `atomicAdd` 直接领取 ticket；领取后等待该任务的全部 history `attention_done` dependencies。
+
+通信 CTA 使用非阻塞的 `try_run_ready_history_combine()`：
+
+- 先读取队首 ticket，不立即消费；
+- 检查该 publish descriptor 的全部 history attention dependencies；
+- 只有 ready 时才用 compare-exchange 消费 ticket；
+- 成功后执行一个完整 combine task。
+
+返回值语义为：
 
 ```text
-调度器会在 dependency 满足后立刻执行该任务
+publish_id >= 0 : 成功执行一个 ready history-combine task
+-1              : 队首 task 尚未 ready
+-2              : 所有 combine tickets 已被领取
 ```
 
-如果所有 compute CTA 必须先把 attention queue 取空，才切换到 publish/final counter，那么依赖虽然逐 tile，宏观上仍可能近似分段。若 CTA 可以在 attention 未全局结束时跨队列取任务，才是真正的序列级流水。
+当前通信 helper 只检查队首任务，不越过未 ready 的队首去扫描后续 combine task。这是当前明确的调度行为，不影响正确性，但可能影响不同序列完成时间差很大时的 overlap。
 
-## 14. 后续建议的源码核查顺序
+## 6. History Combine 与 Direct Publish
 
-为完整回答第 13 节的问题，建议按以下顺序继续，不先做代码修改：
+`run_history_combine_task()` 把 combine 和 publish 融合在同一个任务内。
 
-1. 阅读 `dcp_mega_metadata.py` 的输入规范、PackGQA/BlockN/split 决策和 descriptor 生成。
-2. 对照 metadata header、descriptor struct 和 dependency array 的 C++ 定义。
-3. 从 bindings dispatch 确认 `Split`、`BlockN`、`DCPSize`、`CommHeads` 和 PackGQA 的实例选择粒度。
-4. 展开 scheduler 的初始 descriptor、动态 counter 和 completion ID 映射。
-5. 展开 fused kernel 中 attention、history combine/publish、receive、final combine 的 phase/control flow。
-6. 逐项追踪 `q_ready`、`attention_done`、`publish_ready`、`tile_ready` 和 `receive_ready` 的 writer、reader、作用域及内存序。
-7. 用一个最小例子手工展开 metadata，例如两条序列、不同 `q_i/k_i`、仅一条需要 split，列出生成的全部 compute/communication tasks 和 dependency edges。
+对 `PublishWorkDesc(dst_rank, vector_begin, valid_vectors, ...)`：
 
-## 15. 本轮工作区变更
+1. 等待该 16-token tile 所需的 history attention completion IDs；
+2. 对每个有效 `(token, local_head)` 读取目标 `history_head = dst_rank * Hq_local + local_head`；
+3. 若 history kernel 使用 split，读取该序列的实际 split 数和 partial O/LSE；
+4. 使用 numerically stable 的 LSE 加权公式合并各 split；
+5. 将 BF16 O 写入 shared communication tile，将 FP32 combined LSE 写入 send workspace；
+6. 从 shared communication tile 发起 TMA store 到 `history_send_local[dst_rank]`；
+7. 等待 remote-visible store 完成；
+8. 发布对应 ready 状态。
 
-本轮只新增本文档：
+ready 发布分两类：
+
+- `dst_rank == dcp_rank`：对本地 `publish_ready[publish_id]` 执行 release store；
+- remote destination：对目标 rank 的 IPC `tile_ready` arena 执行 system-scope release store，值为当前 monotonic phase。
+
+因此没有单独的 publish descriptor 执行阶段或 publish kernel。metadata 中沿用 `PublishWorkDesc`、`publish_count` 和 `publish_dependencies` 命名，但运行时该任务就是“history combine + TMA store + ready release”的完整单元。
+
+计时中的 `history_combine_done` 和 `publish_done` 有意记录同一个时间戳：
 
 ```text
-DCP_MEGA_CONVERSATION_NOTES.md
+publish_done = 所有 remote ready release 已发出
 ```
 
-没有修改任何 C++、CUDA、Python、构建文件或测试文件，也没有改动工作区中原有的未跟踪 `test.sh`。
+它不表示另一个独立 publish pass 已结束。
+
+## 7. Receive 与 Final Combine
+
+receiver 使用当前 rank 的 IPC `tile_ready` 视图，按 source rank 和 token block 轮询 system-scope ready phase。ready 后：
+
+1. 读取 source rank 发布的 FP32 history LSE；
+2. 对 source rank 的 history O 发起 remote TMA load 到 shared memory；
+3. 把 O 从 shared memory TMA store 到本地 `history_receive_o[source]`；
+4. 写本地 `history_receive_lse[source]`；
+5. 等待本地 store 完成并执行 `fence.proxy.async.global`；
+6. release `receive_ready[task_id]`。
+
+每个 `FinalWorkDesc` 在计算前等待三类条件：
+
+- 对应 local chunk attention 的全部 `attention_done`；
+- 本 rank local history contribution 的 `publish_ready`；
+- 其他 `DCPSize - 1` 个 source 的全部 `receive_ready`。
+
+随后 final combine 用同样的 stable LSE-weighted 方式合并：
+
+```text
+local causal chunk
++ local noncausal history
++ every remote noncausal history contribution
+-> final_o / final_lse
+```
+
+无效 tail vectors 通过 `valid_vectors` predicate 排除，不写入有效输出之外的行。
+
+## 8. History PackGQA Q-TMA
+
+### 8.1 Compile-time opt-in
+
+`CollectiveMainloopFwdSm90` 新增了 trailing、默认关闭的模板参数：
+
+```cpp
+bool UseTmaPackGQAQ_ = false
+```
+
+它只在 `PackGQA` 且没有 Qv 时有效。Mega config 使用：
+
+```text
+Mainloop<true>  / causal chunk     : UseTmaPackGQAQ = false
+Mainloop<false> / noncausal history: UseTmaPackGQAQ = true
+```
+
+因此当前实际模式是：
+
+| attention domain | Q source | Q load |
+|---|---|---|
+| chunk | local `q` | `PackGQAManager::load_Q()` + cp.async |
+| history | gathered `q_group` | packed-Q TMA |
+
+这项改动仅针对 Mega history。普通 PackGQA、BSHD、varlen 和 ring mainloop 不会因为默认模板参数而改变。
+
+### 8.2 Descriptor 布局
+
+Mega 的 `Hkv_group == 1`，因此当前 attention group 的所有 Q heads 在物理内存中连续：
+
+```text
+Q[token][head][d]
+address = ((token * G + head) * 128 + d)
+
+chunk G   = Hq_local
+history G = DCPSize * Hq_local
+```
+
+history 使用已有的逻辑 `ShapeQPacked` / `StrideQPacked`：
+
+```text
+((G, total_q), 128, Hkv=1, batch=1)
+```
+
+CuTe TMA descriptor 构建时把连续的 `(G, total_q)` 暴露成一个 active row extent：
+
+```text
+[total_q * G, 128]
+```
+
+descriptor 通过 `make_tma_copy()`、`SmemLayoutQ` 和
+`select<0, 2>(TileShape_MNK{})` 构建。active extent 使用 `total_q * G`，不是 IPC allocation 的 capacity。
+
+### 8.3 Device tile 起点与传输大小
+
+history tile 的 packed row 起点是：
+
+```text
+packed_offset
+  = seqlen_info.offset_q * G
+  + m_block * 128
+```
+
+每次都发起完整的：
+
+```text
+128 rows x 128 BF16
+= 32768 bytes
+```
+
+实现不要求 `q_len * G` 整除 128，也不假定尾 tile 固定有 64 个有效 packed rows。最后一个全局 tile 超过 descriptor active extent 的部分由 TMA OOB zero-fill。
+
+## 9. cp.async / TMA 混合 Barrier 协议
+
+chunk 和 history 会在同一个 Hopper shared pipeline 中交替出现，所以两条 Q-load 路径必须满足同一个 producer hand-off 和 shared-storage contract。
+
+当前不变量为：
+
+- chunk 和 history 都保留 `NumProducerThreads = 128`；
+- 两者的 `QueryEmpty` arrival count 都是 `NumMmaThreadsQK + 128`；
+- 只要任一路径使用 TMA，fused kernel 的 Q barrier 类型就是 `ClusterTransactionBarrier`；
+- Q barrier 固定以 128 arrivals 初始化；
+- Q shared-memory swizzle alignment 在 PackGQA cp.async 和 opt-in TMA 路径间保持一致；
+- chunk/history 的 `TensorStorage` size、alignment 和 Q/K/V member offset 必须完全一致。
+
+chunk tile 的 producer 行为保持原样：
+
+```text
+128 producers:
+  QueryEmpty sync
+  -> PackGQAManager::load_Q()
+  -> cpasync_barrier_arrive()
+  -> barrier_Q.arrive()
+```
+
+history tile 的 producer 行为是：
+
+```text
+128 producers:
+  QueryEmpty sync
+  -> one elected thread:
+       barrier_Q.arrive_and_expect_tx(32768)
+       issue packed-Q TMA
+  -> other 127 producers:
+       barrier_Q.arrive()
+```
+
+fused Mega kernel 的 static assertions 明确要求 chunk 为 cp.async、history 为 packed-Q TMA，并同时检查 producer 数、named-barrier count、Q barrier arrivals、transaction bytes、shared layouts、storage size/alignment 和成员 offset。这样 phase 从 chunk 切到 history 或从 history 切回 chunk 时仍使用同一套合法的 hand-off。
+
+## 10. Speculative Overfetch 与 `q_ready` 不变量
+
+这是 history Q-TMA 正确性的核心约定。
+
+对某条序列的 history M tile，数学上有效的 packed rows 只有：
+
+```text
+[m_block * 128,
+ min((m_block + 1) * 128, q_len * G))
+```
+
+metadata 只把这些有效 rows 映射到现有 16-token `q_ready` blocks。它不会因为 TMA 总是读取完整 128-row footprint 而增加下一序列的依赖。
+
+因此一个尾 tile 可以发生：
+
+```text
+有效 rows:
+  已被 q_ready acquire wait 覆盖
+
+当前序列尾部之后、仍位于 descriptor active extent 内的 rows:
+  speculative overfetch
+  可能属于下一序列
+  可能尚未 ready
+  允许读取任意值
+
+超过最后一个全局 active row 的部分:
+  TMA OOB zero-fill
+```
+
+不扩大 dependency 的依据不是“overfetch 数据一定为零”，而是这些数据只落在当前 tile 的无效 M rows。正确性依赖以下既有语义继续成立：
+
+- attention mask 按 row 排除序列范围外的 Q rows；
+- softmax 和 QK/PV 计算不进行跨 Q-row reduction；
+- split history combine 只遍历 metadata 标记的有效 vectors；
+- `store_O()` 和 `store_LSE()` 使用有效-row predicate；
+- final combine 使用 `valid_vectors`，不会把无效 tail 写回有效输出。
+
+后续修改不得让 speculative rows 进入跨-row reduction、completion dependency 推导或有效输出写回。若未来引入这类行为，就必须重新设计 readiness 或 padding，而不能继续依赖当前约定。
+
+这个设计刻意不采用以下方案：
+
+- 不按 128 packed rows 给每条 sequence 增加物理 padding；
+- 不让尾 tile 回退到 cp.async；
+- 不把 `q_dependencies` 扩大到完整 TMA footprint；
+- 不增加 metadata 字段或 workspace capacity。
+
+## 11. 当前调度事实与性能含义
+
+已经确认的正确性事实：
+
+- history attention 可以按自己的有效 Q dependencies 提前开始，不等待全局 Q all-gather 完成；
+- history combine task 按自己的 history completion IDs gate；
+- 通信 CTA 可以在其他 attention descriptor 仍运行时执行 ready combine；
+- remote store 和 ready release 在同一个 combine task 中完成；
+- receiver 可以在其他 rank 仍计算其他 tile 时拉取已发布 tile；
+- final combine 仍由计算 CTA 在其 attention phase 结束后执行，并逐 tile 等待 chunk/local-history/remote-history 依赖。
+
+这提供了细粒度 overlap，但不等于每个可运行 task 都会立刻被调度：
+
+- compute CTA 在耗尽 attention queue 前不会帮助 combine；
+- communication CTA 优先 ready receive；
+- communication combine helper 只检查共享 combine queue 的队首；
+- final combine 要等计算 CTA 完成其 attention loop 后才开始领取。
+
+这些选择已经通过正确性验证，但其性能优劣仍应通过独立 benchmark 判断。
+
+一次完整 Q TMA tile 和原 cp.async 完整 tile 都搬运 32 KiB。history Q-TMA 的预期收益主要来自减少 packed-row `divmod`、逐行指针计算、warp shuffle 和 producer copy 指令，而不是减少有效 HBM 字节数。ragged tail overfetch、split 重复 Q load、barrier 成本、`num_comm_sm`、receive-first 策略和 combine 队首阻塞都可能影响最终收益。
+
+## 12. 验证状态
+
+history Q-TMA 实现后按“静态测试和完整编译通过，再运行 GPU”的顺序完成了验证。
+
+### 12.1 CPU metadata
+
+```bash
+python -m unittest scripts/test_min_fa3/test_dcp_mega_metadata.py
+```
+
+结果：14 tests passed。
+
+新增 tail dependency case 在同一个测试中覆盖 24、64、120 个有效 packed rows，确认：
+
+- 完整 128-row TMA footprint 即使越过当前序列尾部，也不会引用下一 `q_ready` block；
+- history dependency 只覆盖有效 packed rows；
+- chunk dependency 仍为空。
+
+### 12.2 完整编译
+
+```bash
+make -j2
+```
+
+结果：NVCC/PTXAS 编译和最终链接通过，共 17 个目标；覆盖 Mega 的：
+
+- split / no-split；
+- `BlockN=128 / 176`；
+- 共享 mainloop 的其他现有实例。
+
+编译期 static assertions 同时确认 Mega chunk 仍是 cp.async Q load、history 是 TMA Q load。
+
+### 12.3 8-GPU 正确性 matrix
+
+```bash
+PYTHONPATH=. torchrun --standalone --nproc-per-node=8 \
+  scripts/test_min_fa3/test_dcp_mega_varlen_multi_rank.py --matrix
+```
+
+四个 case 均通过，每个执行两轮：
+
+```text
+dcp2_h4_bn128_split1
+dcp4_h8_bn176_split2
+dcp8_h4_bn176_auto
+dcp2_h8_bn128_split2_tail
+```
+
+matrix 覆盖：
+
+- DCP 2/4/8；
+- `Hq_local` 4/8；
+- split/no-split；
+- `BlockN` 128/176；
+- ragged sequence tail；
+- output 和 LSE reference；
+- prepared replay；
+- monotonic phase wrap；
+- CUDA Graph replay；
+- fused `history_combine_done == publish_done` timing invariant。
+
+本文档更新本身只修改 Markdown，因此没有重复运行 CUDA 构建或 8-GPU matrix。
+
+## 13. 关键源码位置
+
+- `dcp_mega_metadata.py`
+  - dispatch、逐序列 split、attention/Q/publish/final descriptor 和 dependency 生成；
+  - history TMA tail 只对有效 packed rows 建立 `q_ready` dependency。
+- `include/dcp_mega_min_fa3_varlen_params.h`
+  - metadata ABI、descriptor 定义、ready/completion workspace。
+- `include/dcp_mega_min_fa3_varlen_scheduler.h`
+  - unified attention queue、history Q acquire wait、`attention_done` release。
+- `include/dcp_mega_min_fa3_varlen_launch.h`
+  - Mega mainloop 特化；
+  - Q all-gather；
+  - communication-assisted history combine；
+  - direct TMA publish；
+  - remote receive、final combine 和 persistent CTA 分工。
+- `include/dcp_mega_min_fa3_kernel.h`
+  - chunk/history mainloop 切换；
+  - mixed Q barrier 类型、初始化和 shared-storage compatibility assertions。
+- `include/min_fa3_mainloop.h`
+  - 默认关闭的 `UseTmaPackGQAQ`；
+  - packed-Q TMA descriptor、tile offset 和 mixed cp.async/TMA producer protocol。
+- `include/min_fa3_prologue.h`
+  - 通用 Q barrier 使用显式 `QBarrierArrivalCount` 初始化。
+- `scripts/test_min_fa3/test_dcp_mega_metadata.py`
+  - valid-row `q_ready` dependency 和 metadata invariants。
+- `scripts/test_min_fa3/test_dcp_mega_varlen_multi_rank.py`
+  - 多 rank output/LSE、replay、phase 和 CUDA Graph matrix。
+
+## 14. 后续工作边界
+
+当前 correctness implementation 已完成。后续工作应作为独立的性能阶段，不应再把下列事项描述成 correctness blocker：
+
+- history Q-TMA 相对 cp.async 的 H200 kernel-time 收益；
+- ragged tail overfetch 对带宽的影响；
+- split 场景下重复 Q load 的代价；
+- 最优 `num_comm_sm`；
+- receive-first 与 combine-first 的调度权衡；
+- combine 队首未 ready 时是否值得扫描后续任务；
+- phase timestamp 中 attention、combine/直接 publish、receive、final combine 的实际重叠程度。
+
+任何性能优化都必须继续保持以下三个已验证不变量：
+
+1. chunk Q 保持当前 cp.async 路径，除非另有独立设计和验证；
+2. history speculative tail rows 不参与有效输出或跨-row reduction；
+3. remote TMA store 完成、ready release、receiver acquire、local receive store 和 `receive_ready` 之间的内存可见性顺序不能削弱。

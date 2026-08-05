@@ -36,7 +36,7 @@ public:
     using TiledMmaPV = typename ChunkMainloop::TiledMmaPV;
     using SeqlenInfo_t = typename ChunkMainloop::SeqlenInfo_t;
     using BarrierQ = std::conditional_t<
-        ChunkMainloop::Use_TMA_Q,
+        ChunkMainloop::Use_TMA_Q || HistoryMainloop::Use_TMA_Q,
         cutlass::arch::ClusterTransactionBarrier,
         cutlass::arch::ClusterBarrier>;
 
@@ -76,7 +76,10 @@ private:
     static_assert(!ChunkMainloop::AppendKV && !HistoryMainloop::AppendKV);
     static_assert(!ChunkMainloop::HasQv && !HistoryMainloop::HasQv);
     static_assert(ChunkMainloop::Use_TMA_KV && HistoryMainloop::Use_TMA_KV);
-    static_assert(ChunkMainloop::Use_TMA_Q == HistoryMainloop::Use_TMA_Q);
+    static_assert(!ChunkMainloop::Use_TMA_Q);
+    static_assert(HistoryMainloop::Use_TMA_Q);
+    static_assert(!ChunkMainloop::UseTmaPackGQAQ);
+    static_assert(HistoryMainloop::UseTmaPackGQAQ);
     static_assert(ChunkMainloop::Transpose_V == HistoryMainloop::Transpose_V);
     static_assert(ChunkMainloop::SameHeadDim == HistoryMainloop::SameHeadDim);
     static_assert(ChunkMainloop::LargeHeadDimV == HistoryMainloop::LargeHeadDimV);
@@ -88,6 +91,14 @@ private:
     static_assert(ChunkMainloop::kHeadDim == HistoryMainloop::kHeadDim);
     static_assert(ChunkMainloop::NumProducerThreads
                   == HistoryMainloop::NumProducerThreads);
+    static_assert(ChunkMainloop::NumProducerThreads
+                  == cutlass::NumThreadsPerWarpGroup);
+    static_assert(ChunkMainloop::QueryBarrierArrivalCount
+                  == HistoryMainloop::QueryBarrierArrivalCount);
+    static_assert(ChunkMainloop::QBarrierArrivalCount
+                  == HistoryMainloop::QBarrierArrivalCount);
+    static_assert(ChunkMainloop::QBarrierArrivalCount
+                  == cutlass::NumThreadsPerWarpGroup);
     static_assert(ChunkMainloop::NumMmaThreads
                   == HistoryMainloop::NumMmaThreads);
     static_assert(CollectiveEpilogue::NumEpilogueThreads
@@ -243,7 +254,7 @@ public:
                 }
             }
             shared_storage.pipelines.barrier_Q.init(
-                ChunkMainloop::Use_TMA_Q ? 1 : NumProducerThreads);
+                ChunkMainloop::QBarrierArrivalCount);
             shared_storage.pipelines.barrier_O.init(
                 cute::size(ClusterShape{})
                 * (CollectiveEpilogue::Use_TMA_O ? 1 : NumMmaThreads));

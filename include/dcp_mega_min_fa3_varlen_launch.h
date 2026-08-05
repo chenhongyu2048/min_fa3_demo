@@ -128,7 +128,8 @@ struct DCPMegaKernelConfig {
         true,
         true,
         Split,
-        kVColMajor>;
+        kVColMajor,
+        !IsCausal>;
 
     template <bool IsCausal>
     using Epilogue = flash::CollectiveEpilogueFwd<
