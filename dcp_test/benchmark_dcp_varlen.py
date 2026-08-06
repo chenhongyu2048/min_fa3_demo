@@ -101,10 +101,11 @@ class Inputs:
 
 def parse_implementations(spec: str) -> tuple[str, ...]:
     values = tuple(token.strip().lower() for token in spec.split(",") if token.strip())
-    allowed = {"ours", "vllm", "sglang", "full", "mega"}
+    allowed = {"ours", "vllm", "vllm_a2a", "sglang", "full", "mega"}
     if not values or any(value not in allowed for value in values):
         raise SystemExit(
-            "--implementations must contain ours,vllm,sglang,full,mega entries"
+            "--implementations must contain "
+            "ours,vllm,vllm_a2a,sglang,full,mega entries"
         )
     return tuple(dict.fromkeys(values))
 
@@ -115,6 +116,8 @@ def expanded_method_labels(implementations: tuple[str, ...]) -> tuple[str, ...]:
         methods.extend((METHOD_OURS_NO_OVERLAP, METHOD_OURS_OVERLAP))
     if "vllm" in implementations:
         methods.extend((METHOD_VLLM, METHOD_VLLM_A2A))
+    elif "vllm_a2a" in implementations:
+        methods.append(METHOD_VLLM_A2A)
     if "sglang" in implementations:
         methods.append(METHOD_SGLANG)
     if "mega" in implementations:

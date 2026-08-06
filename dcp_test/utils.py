@@ -577,8 +577,11 @@ def make_runner_set(
         ("vllm_a2a", a2a_type),
         ("sglang", sglang_type),
     ):
-        implementation = "vllm" if name == "vllm_a2a" else name
-        if implementation not in selected:
+        if name == "vllm_a2a":
+            enabled = "vllm" in selected or "vllm_a2a" in selected
+        else:
+            enabled = name in selected
+        if not enabled:
             continue
         runner = runner_type(process_group, **runner_kwargs)
         label = runner.varlen_method_name if varlen else runner.method_name

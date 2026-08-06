@@ -51,11 +51,13 @@ handle that close ordering internally.
 The six dense labels are `ours_no_overlap`, `ours_overlap`,
 `vllm_ag_rs_min_fa3`, `vllm_a2a_min_fa3`, `sglang_mha_ag_ar_min_fa3`, and
 `full_kv_min_fa3`; packed-varlen appends `_varlen` to each label. Selecting
-`--implementations vllm` runs both vLLM baselines. The A2A code is copied and
-trimmed from vLLM commit `a89015c6df8eeb37a843b717c97a5be1355de83d` and its
-ordinary GQA/MQA FlashAttention integration. It retains the packed-combine
-design from PR #41160, graph-private per-call buffers from PR #45487, and the
-FP32 LSE pack contract from PR #47801.
+`--implementations vllm` runs both vLLM baselines. The packed-varlen benchmark
+also accepts `--implementations vllm_a2a` to isolate the A2A runner. The A2A
+code is copied and trimmed from vLLM commit
+`a89015c6df8eeb37a843b717c97a5be1355de83d` and its ordinary GQA/MQA
+FlashAttention integration. It retains the packed-combine design from PR
+#41160, graph-private per-call buffers from PR #45487, and the FP32 LSE pack
+contract from PR #47801.
 
 Packed-varlen also accepts the explicit experimental category
 `--implementations mega`, reported as `dcp_mega_varlen`. It is chunk-only and

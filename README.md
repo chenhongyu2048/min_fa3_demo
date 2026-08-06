@@ -956,7 +956,9 @@ The independent packed-varlen DCP benchmark uses the six default sibling method 
 `sglang_mha_ag_ar_min_fa3_varlen`, and `full_kv_min_fa3_varlen`. `--sq` and `--seqlen` each accept one broadcast
 value or exactly `B` comma-separated values. Decode requires `--sq 1`, and
 its cache lengths include the current token. Chunk `--seqlen` values are
-history lengths and exclude the supplied chunk.
+history lengths and exclude the supplied chunk. Use `--implementations
+vllm_a2a` to run only the packed-varlen vLLM A2A baseline; `vllm` continues to
+select both vLLM baselines.
 
 Packing, host cumulative-length construction, and interleaved DCP sharding
 occur before timing. Each latency sample is the maximum across every TP rank.

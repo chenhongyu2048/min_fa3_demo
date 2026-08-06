@@ -3,7 +3,7 @@
 set -euo pipefail
 
 cd /home/hychen/min_fa3_demo
-NUM_CASES=20
+NUM_CASES=10
 TRACE_CASES="/home/hychen/min_fa3_demo/dcp_test/mega_dcp_trace_cases.jsonl"
 
 python -m dcp_test.trace.generate \
@@ -19,7 +19,8 @@ GENERATE_TRACE=0 \
   WARMUP=40 \
   ITERS=60 \
   CHECK=0 \
-  BASELINE_PHASE_TIMING=0 \
+  MEGA_PHASE_TIMESTAMPS=1 \
+  BASELINE_PHASE_TIMING=1 \
   ./benchmark_dcp_mega_trace.sh
 
 ########################################
