@@ -59,12 +59,19 @@ class BenchmarkPhaseRecorder:
         *,
         world_size: int,
         output_collective_kind: str,
+        phase_timing: bool = True,
     ) -> None:
         self.world_size = world_size
         self.output_collective_kind = output_collective_kind
+        self.phase_timing = phase_timing
+        event_names = (
+            PHASE_EVENT_NAMES
+            if phase_timing
+            else ("attention_start", "attention_end")
+        )
         self.events = {
             name: torch.cuda.Event(enable_timing=True, external=True)
-            for name in PHASE_EVENT_NAMES
+            for name in event_names
         }
         self.last_kind: str | None = None
 
@@ -75,7 +82,12 @@ class BenchmarkPhaseRecorder:
         self.record("attention_start", stream)
 
     def record(self, name: str, stream: torch.cuda.Stream) -> None:
-        self.events[name].record(stream)
+        event = self.events.get(name)
+        if event is None:
+            if getattr(self, "phase_timing", True):
+                raise KeyError(name)
+            return
+        event.record(stream)
 
     def elapsed_ms(self, synchronize: bool = True) -> dict[str, float]:
         if self.last_kind is None:
@@ -83,6 +95,11 @@ class BenchmarkPhaseRecorder:
         if synchronize:
             self.events["attention_end"].synchronize()
         events = self.events
+        end_to_end_ms = events["attention_start"].elapsed_time(
+            events["attention_end"]
+        )
+        if not getattr(self, "phase_timing", True):
+            return {"attention_end_to_end_ms": end_to_end_ms}
         values = {
             "q_allgather_and_reorder_ms": events["q_ag_start"].elapsed_time(
                 events["q_ag_end"]
@@ -90,9 +107,7 @@ class BenchmarkPhaseRecorder:
             "local_history_attention_ms": events["history_start"].elapsed_time(
                 events["history_end"]
             ),
-            "attention_end_to_end_ms": events["attention_start"].elapsed_time(
-                events["attention_end"]
-            ),
+            "attention_end_to_end_ms": end_to_end_ms,
         }
         if self.last_kind == "chunk":
             values.update(
@@ -166,11 +181,14 @@ class BenchmarkPhaseRecorder:
 class BenchmarkTimingMixin:
     """Install benchmark phase events without adding them to runtime runners."""
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(
+        self, *args, benchmark_phase_timing: bool = True, **kwargs
+    ) -> None:
         super().__init__(*args, **kwargs)
         recorder = BenchmarkPhaseRecorder(
             world_size=self.world_size,
             output_collective_kind=self.output_collective_kind,
+            phase_timing=benchmark_phase_timing,
         )
         self._benchmark_phase_recorder = recorder
         self._install_phase_recorder(recorder)
@@ -452,6 +470,7 @@ def measure_timed_runner(
     device: torch.device,
     cuda_graph: bool,
     overlap_q_allgather: bool,
+    phase_timing: bool = True,
     phase_names: Iterable[str] | None = None,
     transform_timing: Callable[[dict[str, float]], None] | None = None,
     captured_graph: object | None = None,
@@ -490,6 +509,12 @@ def measure_timed_runner(
                 else "single_stream"
             ),
             "overlap_q_allgather": overlap_q_allgather,
+            "cuda_event_phase_timing_enabled": phase_timing,
+            "timing_source": (
+                "runner_cuda_event_phase_breakdown"
+                if phase_timing
+                else "runner_cuda_event_end_to_end_only"
+            ),
             "graph_static_signature": (
                 captured.signature if captured is not None else None  # type: ignore[attr-defined]
             ),
@@ -509,6 +534,7 @@ def make_runner_set(
     *,
     timed: bool,
     varlen: bool,
+    phase_timing: bool = True,
 ) -> dict[str, DCPAttentionRunner]:
     """Construct ours and selected comparison runners with stable labels."""
     from dcp_test.baselines import (
@@ -528,9 +554,12 @@ def make_runner_set(
         TimedSGLangDCPAttentionRunner if timed else SGLangDCPAttentionRunner
     )
     runners: dict[str, DCPAttentionRunner] = {}
+    runner_kwargs = (
+        {"benchmark_phase_timing": phase_timing} if timed else {}
+    )
     if "ours" in selected:
-        ours_no_overlap = ours_type(process_group)
-        ours_overlap = ours_type(process_group)
+        ours_no_overlap = ours_type(process_group, **runner_kwargs)
+        ours_overlap = ours_type(process_group, **runner_kwargs)
         no_overlap_label = (
             ours_no_overlap.varlen_method_name
             if varlen
@@ -551,7 +580,7 @@ def make_runner_set(
         implementation = "vllm" if name == "vllm_a2a" else name
         if implementation not in selected:
             continue
-        runner = runner_type(process_group)
+        runner = runner_type(process_group, **runner_kwargs)
         label = runner.varlen_method_name if varlen else runner.method_name
         runners[label] = runner
     return runners

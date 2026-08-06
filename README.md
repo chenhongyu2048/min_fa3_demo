@@ -364,6 +364,9 @@ the import path.
 | Entry point | Purpose |
 | --- | --- |
 | `benchmark_dataset.sh` | Recommended dataset-shaped forward/backward benchmark wrapper for 2, 4, or 8 GPUs |
+| `benchmark_dcp_mega_six_loads.sh` | Two-launch eager-Mega/graph-baseline wrapper for the JSON-defined 18-case DCP matrix |
+| `benchmark_dcp_mega_trace.sh` | Generate `NUM_CASES` trace snapshots, then run eager Mega/baselines and graph baselines in separate 8-rank launches |
+| `dcp_test/benchmark_dcp_mega_batch.py` | Reuse one 8-rank process group across a filtered packed-varlen Mega DCP case matrix |
 | `benchmark_load_balance.sh` | Dataset/GPU matrix wrapper for the metadata-only forward/backward load-balance benchmark |
 | `ring_test/load_balance_bench/run.sh` | Dataset/GPU wrapper for the fixed five-method runtime load-balance suite |
 | `ring_test/benchmark_dataset_{forward,backward}.py` | Dataset sampling, BR-PBS placement, and topology benchmark frontend |
@@ -391,7 +394,8 @@ require CUDA:
 ```bash
 python -m unittest balancer.test_balancer \
   ring_test.load_balance_bench.test_topology \
-  scripts.test_min_fa3.test_dcp_topology
+  scripts.test_min_fa3.test_dcp_topology \
+  scripts.test_min_fa3.test_dcp_mega_batch
 ```
 
 Fixed-layout and varlen kernel tests:
@@ -966,7 +970,73 @@ It uses the same default CUDA Graph policy, fixed three-call capture warmup,
 post-capture `--warmup` semantics, full-KV graph baseline, execution metadata,
 and `--no-cuda-graph` eager fallback as the dense benchmark.
 Packed-varlen accepts `--no-check` to skip the eager full-KV correctness
-precheck for performance-only runs.
+precheck for performance-only runs. Its non-Mega orchestration runners record
+the full CUDA-event phase breakdown by default. Pass
+`--no-baseline-phase-timing` to allocate and record only the start/end events
+needed for end-to-end latency; the omitted schema-version-3 phase fields remain
+present as zero.
+
+For multi-case Mega DCP measurements, the checked-in
+`dcp_test/configs/dcp_mega_six_loads.json` defines six workloads and three
+`DCP/Hkv` topologies. The batch frontend expands their 18-case Cartesian
+product and reuses one initialized 8-rank world plus cached DCP subgroups:
+
+```bash
+torchrun --standalone --nproc_per_node=8 --module \
+  dcp_test.benchmark_dcp_mega_batch \
+  --workloads small1,medium1 --dcp-sizes 2,8 \
+  --implementations mega,ours,vllm,sglang --no-cuda-graph \
+  --warmup 5 --iters 20 --output-dir benchmarks/results/dcp_batch_eager
+```
+
+`benchmark_dcp_mega_six_loads.sh` is the recommended full wrapper. By default
+it launches `torchrun` exactly twice: the eager batch runs Mega plus `ours`,
+vLLM, and SGLang, while the CUDA Graph batch runs only those three baselines.
+`LOADS`, `DCP_SIZES`, and `MODES` select a submatrix;
+`DRY_RUN=1` prints both launcher commands and their expanded cases. Each mode
+writes unchanged packed-varlen schema-version-3 case JSON files and one
+schema-version-1 manifest containing the stable case order, result paths, and
+method summaries. `BASELINE_PHASE_TIMING=0` forwards
+`--no-baseline-phase-timing` to both launches while preserving end-to-end CUDA
+Event timing. It does not affect Mega timing; `MEGA_PHASE_TIMESTAMPS` remains
+the independent control for optional Mega `%globaltimer` milestones.
+
+`benchmark_dcp_mega_trace.sh` applies the same one-launch-per-mode and
+eager-only Mega grouping to the Mooncake-derived scheduler replay under
+`dcp_test/trace`. For example:
+
+```bash
+NUM_CASES=20 MODES=eager,graph ./benchmark_dcp_mega_trace.sh
+```
+
+To materialize the sampled workload in the current directory first and then
+run the batch wrapper without regenerating it:
+
+```bash
+cd /home/hychen/min_fa3_demo
+
+NUM_CASES=20
+TRACE_CASES=./mega_dcp_trace_cases.jsonl
+
+python -m dcp_test.trace.generate \
+  --config dcp_test/trace/example_config.json \
+  --output "$TRACE_CASES" --num-cases "$NUM_CASES"
+
+GENERATE_TRACE=0 TRACE_CASES="$TRACE_CASES" NUM_CASES="$NUM_CASES" \
+  MODES=eager,graph ./benchmark_dcp_mega_trace.sh
+```
+
+The second command requires the existing JSONL and validates its case count
+and effective config SHA before benchmarking. The default
+`GENERATE_TRACE=1` keeps the one-command generate-and-run behavior.
+
+`NUM_CASES` overrides the replay config before reservoir sampling and is
+included in the effective config SHA; it is not a prefix truncation of a fixed
+case file. The trace config's DCP selects the matching `DCP/Hkv` topology. Each
+completed mode manifest contains trace provenance, per-case results, and a
+`weighted_summary` grouped by topology and method. Workload-weighted TFLOPS is
+computed as `sum(global_effective_flops) / sum(case_p50_seconds)`, equivalent
+to the p50-latency-weighted mean used by the ring dataset benchmark.
 
 The optional `--implementations mega` category adds the experimental
 `dcp_mega_varlen` path for chunk prefill only. It supports the default CUDA

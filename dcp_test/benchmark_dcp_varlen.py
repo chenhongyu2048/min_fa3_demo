@@ -10,7 +10,7 @@ import subprocess
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 import torch
 import torch.distributed as dist
@@ -27,6 +27,7 @@ from dcp_test.baselines import (
 )
 from dcp_test.utils import (
     CAPTURE_EAGER_WARMUP,
+    DCPGroup,
     all_rank_quantiles,
     append_packed_chunk as append_chunk,
     capture_cuda_graph_callable,
@@ -374,8 +375,11 @@ def measure_runner(
         device=device,
         cuda_graph=args.cuda_graph,
         overlap_q_allgather=overlap,
+        phase_timing=args.baseline_phase_timing,
         phase_names=STAGES,
-        transform_timing=add_overlap_hidden_time,
+        transform_timing=(
+            add_overlap_hidden_time if args.baseline_phase_timing else None
+        ),
         captured_graph=captured,
     )
     samples = [
@@ -824,7 +828,7 @@ def print_results(
     )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Compare packed-varlen DCP orchestration with one local min FA3 kernel; "
@@ -852,6 +856,15 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Record low-overhead mega-kernel phase completion timestamps",
     )
+    parser.add_argument(
+        "--baseline-phase-timing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Record non-Mega CUDA-event phase breakdowns; disabling keeps only "
+            "the attention start/end events used for end-to-end latency"
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument(
@@ -867,13 +880,23 @@ def parse_args() -> argparse.Namespace:
         help="Compare each method against full-KV before measurement",
     )
     parser.add_argument("--output-json", type=Path, default=None)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
-    device = initialize_distributed_sm90("benchmark")
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    device: torch.device | None = None,
+    dcp_group: DCPGroup | None = None,
+    manage_process_group: bool = True,
+) -> dict[str, object]:
+    args = parse_args(argv)
+    if device is None:
+        device = initialize_distributed_sm90("benchmark")
+    elif not dist.is_initialized():
+        raise RuntimeError("an externally supplied device requires an initialized process group")
     mega_runner: DCPMegaAttentionRunner | None = None
+    case_completed = False
     try:
         world_size = dist.get_world_size()
         rank = dist.get_rank()
@@ -900,7 +923,13 @@ def main() -> None:
         topology = make_topology(
             args.qhead, args.kvhead, args.tp_size, args.dcp_size
         )
-        dcp_group = make_dcp_group(args.dcp_size, device)
+        if dcp_group is None:
+            dcp_group = make_dcp_group(args.dcp_size, device)
+        elif dcp_group.size != args.dcp_size:
+            raise RuntimeError(
+                f"supplied DCP group size {dcp_group.size} does not match "
+                f"--dcp-size={args.dcp_size}"
+            )
         process_group = dcp_group.process_group
         if dcp_group.ranks != topology.dcp_group_ranks(rank):
             raise RuntimeError("DCP process group crosses a KV replica boundary")
@@ -915,6 +944,7 @@ def main() -> None:
                 f"QH={args.qhead}, KVH={args.kvhead}, D={args.headdim}, "
                 f"TP={args.tp_size}, DCP={args.dcp_size}, "
                 f"workload={args.workload}, execution={execution_mode}, "
+                f"baseline_phase_timing={args.baseline_phase_timing}, "
                 f"warmup={args.warmup}, iters={args.iters}, check={args.check}"
             )
             print(
@@ -939,7 +969,11 @@ def main() -> None:
             )
 
         runners = make_runner_set(
-            process_group, implementations, timed=True, varlen=True
+            process_group,
+            implementations,
+            timed=True,
+            varlen=True,
+            phase_timing=args.baseline_phase_timing,
         )
         mega_q = None
         if "mega" in implementations:
@@ -1181,11 +1215,15 @@ def main() -> None:
             )
             print_results(args, topology, inputs, reports)
             print(f"Wrote benchmark JSON to {output_path}", flush=True)
-        dist.barrier()
+        case_completed = True
+        return result
     finally:
         if mega_runner is not None:
             mega_runner.close()
-        dist.destroy_process_group()
+        if case_completed and dist.is_initialized():
+            dist.barrier()
+        if manage_process_group and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

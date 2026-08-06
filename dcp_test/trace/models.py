@@ -137,8 +137,12 @@ def _probabilities(raw: dict[str, Any], expected: int) -> tuple[float, ...]:
     return tuple(probabilities)
 
 
-def load_config(path: str | Path) -> ReplayConfig:
-    """Load a strict JSON config, resolving trace_path beside the config file."""
+def load_config(
+    path: str | Path,
+    *,
+    num_cases: int | None = None,
+) -> ReplayConfig:
+    """Load a strict JSON config, applying an optional case-count override."""
     config_path = Path(path).resolve()
     try:
         with config_path.open("r", encoding="utf-8") as handle:
@@ -153,6 +157,12 @@ def load_config(path: str | Path) -> ReplayConfig:
         raise ConfigError(f"missing configuration fields: {', '.join(missing)}")
     if extra:
         raise ConfigError(f"unknown configuration fields: {', '.join(extra)}")
+    if num_cases is not None:
+        if isinstance(num_cases, bool) or not isinstance(num_cases, int):
+            raise ConfigError("num_cases override must be an integer")
+        if num_cases < 1:
+            raise ConfigError("num_cases override must be >= 1")
+        raw["num_cases"] = num_cases
 
     trace_path_value = raw["trace_path"]
     if not isinstance(trace_path_value, str) or not trace_path_value:

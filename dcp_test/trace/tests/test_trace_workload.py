@@ -109,9 +109,16 @@ class TraceWorkloadTest(unittest.TestCase):
 
     def test_config_validation_and_query_rules(self) -> None:
         rows = [_row(0, 4, 2)]
-        config = load_config(self._config_path(rows))
+        config_path = self._config_path(rows)
+        config = load_config(config_path)
         self.assertEqual(config.mtp_query_len, 1)
         self.assertEqual(config.max_accepted_drafts, 0)
+
+        overridden = load_config(config_path, num_cases=3)
+        self.assertEqual(overridden.num_cases, 3)
+        self.assertNotEqual(overridden.config_sha256, config.config_sha256)
+        with self.assertRaisesRegex(ConfigError, "num_cases override must be >= 1"):
+            load_config(config_path, num_cases=0)
 
         drafts_only = load_config(
             self._config_path(
@@ -334,6 +341,26 @@ class TraceWorkloadTest(unittest.TestCase):
             run(config_path, output, force=False)
         run(config_path, output, force=True)
         self.assertEqual(output.read_bytes(), first_bytes)
+
+        override_output = self.root / "override_cases.jsonl"
+        override_summary = run(
+            config_path,
+            override_output,
+            force=False,
+            num_cases=2,
+        )
+        self.assertEqual(override_summary["num_cases"], 2)
+        self.assertEqual(override_summary["cases_written"], 2)
+        override_cases = [
+            json.loads(line) for line in override_output.read_text().splitlines()
+        ]
+        self.assertEqual(len(override_cases), 2)
+        self.assertTrue(
+            all(
+                case["config_sha256"] == override_summary["config_sha256"]
+                for case in override_cases
+            )
+        )
 
     def test_show_examples_is_focused_deterministic_and_capped(self) -> None:
         config_path = self._config_path(

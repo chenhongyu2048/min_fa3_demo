@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Run eager Mega/baselines and graph baselines in one torchrun per mode.
+# Generate trace cases, then run eager Mega/baselines and graph baselines.
 
 set -euo pipefail
 
@@ -15,24 +15,27 @@ export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
 
 PYTHON=${PYTHON:-python}
 TORCHRUN=${TORCHRUN:-torchrun}
-CONFIG=${CONFIG:-dcp_test/configs/dcp_mega_six_loads.json}
-LOADS=${LOADS:-"small1,small2,medium1,medium2,large1,large2"}
-DCP_SIZES=${DCP_SIZES:-"2,4,8"}
+TRACE_CONFIG=${TRACE_CONFIG:-dcp_test/trace/example_config.json}
+BATCH_CONFIG=${BATCH_CONFIG:-dcp_test/configs/dcp_mega_six_loads.json}
+NUM_CASES=${NUM_CASES:-20}
 MODES=${MODES:-"eager,graph"}
 EAGER_IMPLEMENTATIONS=${EAGER_IMPLEMENTATIONS:-"mega,ours,vllm,sglang"}
 GRAPH_IMPLEMENTATIONS=${GRAPH_IMPLEMENTATIONS:-"ours,vllm,sglang"}
-WARMUP=${WARMUP:-500}
-ITERS=${ITERS:-100}
-CHECK=${CHECK:-1}
+WARMUP=${WARMUP:-10}
+ITERS=${ITERS:-40}
+CHECK=${CHECK:-0}
 NUM_SPLITS=${NUM_SPLITS:-0}
 MEGA_BLOCK_N=${MEGA_BLOCK_N:-128}
 MEGA_NUM_COMM_SM=${MEGA_NUM_COMM_SM:-8}
 MEGA_PHASE_TIMESTAMPS=${MEGA_PHASE_TIMESTAMPS:-0}
 BASELINE_PHASE_TIMING=${BASELINE_PHASE_TIMING:-0}
+GENERATE_TRACE=${GENERATE_TRACE:-1}
+FORCE_TRACE=${FORCE_TRACE:-0}
 DRY_RUN=${DRY_RUN:-0}
-LOG_DIR=${LOG_DIR:-"benchmark_logs/dcp_mega_six_loads_$(date +%Y%m%d-%H%M%S)"}
+LOG_DIR=${LOG_DIR:-"benchmark_logs/dcp_mega_trace_$(date +%Y%m%d-%H%M%S)"}
 RESULT_DIR=${RESULT_DIR:-"$LOG_DIR/results"}
-MASTER_LOG=${MASTER_LOG:-"$LOG_DIR/benchmark_dcp_mega_six_loads.log"}
+TRACE_CASES=${TRACE_CASES:-"$RESULT_DIR/trace_cases.jsonl"}
+MASTER_LOG=${MASTER_LOG:-"$LOG_DIR/benchmark_dcp_mega_trace.log"}
 
 TP_SIZE=8
 
@@ -71,11 +74,22 @@ case "$BASELINE_PHASE_TIMING" in
     *) die "BASELINE_PHASE_TIMING must be 0 or 1, got '$BASELINE_PHASE_TIMING'" ;;
 esac
 
+case "$FORCE_TRACE" in
+    0|1) ;;
+    *) die "FORCE_TRACE must be 0 or 1, got '$FORCE_TRACE'" ;;
+esac
+
+case "$GENERATE_TRACE" in
+    0|1) ;;
+    *) die "GENERATE_TRACE must be 0 or 1, got '$GENERATE_TRACE'" ;;
+esac
+
 case "$DRY_RUN" in
     0|1) ;;
     *) die "DRY_RUN must be 0 or 1, got '$DRY_RUN'" ;;
 esac
 
+require_positive_integer NUM_CASES "$NUM_CASES"
 require_nonnegative_integer WARMUP "$WARMUP"
 require_positive_integer ITERS "$ITERS"
 require_nonnegative_integer NUM_SPLITS "$NUM_SPLITS"
@@ -108,9 +122,27 @@ fi
 export CUDA_VISIBLE_DEVICES
 
 print_command() {
-    printf 'CUDA_VISIBLE_DEVICES=%q' "$CUDA_VISIBLE_DEVICES"
+    printf '%q' "$1"
+    shift
     printf ' %q' "$@"
     printf '\n'
+}
+
+print_cuda_command() {
+    printf 'CUDA_VISIBLE_DEVICES=%q ' "$CUDA_VISIBLE_DEVICES"
+    print_command "$@"
+}
+
+build_generate_command() {
+    GENERATE_COMMAND=(
+        "$PYTHON" -m dcp_test.trace.generate
+        --config "$TRACE_CONFIG"
+        --output "$TRACE_CASES"
+        --num-cases "$NUM_CASES"
+    )
+    if ((FORCE_TRACE)); then
+        GENERATE_COMMAND+=(--force)
+    fi
 }
 
 build_batch_args() {
@@ -128,9 +160,10 @@ build_batch_args() {
         phase_arg=--no-mega-phase-timestamps
     fi
     BATCH_ARGS=(
-        --config "$CONFIG"
-        --workloads "$LOADS"
-        --dcp-sizes "$DCP_SIZES"
+        --config "$BATCH_CONFIG"
+        --trace-config "$TRACE_CONFIG"
+        --trace-cases "$TRACE_CASES"
+        --num-cases "$NUM_CASES"
         --implementations "$implementations"
         --num-splits "$NUM_SPLITS"
         --mega-block-n "$MEGA_BLOCK_N"
@@ -146,6 +179,38 @@ build_batch_args() {
     )
 }
 
+generate_trace_cases() {
+    if ((GENERATE_TRACE == 0)); then
+        [[ -f "$TRACE_CASES" ]] || die \
+            "TRACE_CASES does not exist with GENERATE_TRACE=0: '$TRACE_CASES'"
+        printf '\n[trace input]\nUsing existing cases: %s\n' "$TRACE_CASES"
+        return
+    fi
+
+    build_generate_command
+    if ((DRY_RUN)); then
+        printf '\n[trace generation]\n'
+        print_command "${GENERATE_COMMAND[@]}"
+        return
+    fi
+
+    {
+        printf '\n================================================================================\n'
+        printf '[trace generation] started=%s\n' "$(date --iso-8601=seconds)"
+        printf '================================================================================\n'
+        print_command "${GENERATE_COMMAND[@]}"
+    } | tee -a "$MASTER_LOG"
+    if "${GENERATE_COMMAND[@]}" 2>&1 | tee -a "$MASTER_LOG"; then
+        printf '[trace generation] completed=%s\n' "$(date --iso-8601=seconds)" \
+            | tee -a "$MASTER_LOG"
+    else
+        local status=$?
+        printf '[trace generation] failed status=%s time=%s\n' \
+            "$status" "$(date --iso-8601=seconds)" | tee -a "$MASTER_LOG"
+        return "$status"
+    fi
+}
+
 run_mode() {
     local mode=$1
     local mode_log="$LOG_DIR/${mode}.log"
@@ -158,26 +223,24 @@ run_mode() {
     )
 
     if ((DRY_RUN)); then
-        printf '\n[%s batch]\n' "$mode"
-        print_command "${command[@]}"
-        "$PYTHON" -m dcp_test.benchmark_dcp_mega_batch \
-            "${BATCH_ARGS[@]}" --print-cases
+        printf '\n[%s trace batch]\n' "$mode"
+        print_cuda_command "${command[@]}"
         return
     fi
 
     {
         printf '\n================================================================================\n'
-        printf '[%s batch] started=%s\n' "$mode" "$(date --iso-8601=seconds)"
+        printf '[%s trace batch] started=%s\n' "$mode" "$(date --iso-8601=seconds)"
         printf '================================================================================\n'
-        print_command "${command[@]}"
+        print_cuda_command "${command[@]}"
     } | tee -a "$MASTER_LOG" "$mode_log"
 
     if "${command[@]}" 2>&1 | tee -a "$MASTER_LOG" "$mode_log"; then
-        printf '[%s batch] completed=%s\n' "$mode" "$(date --iso-8601=seconds)" \
+        printf '[%s trace batch] completed=%s\n' "$mode" "$(date --iso-8601=seconds)" \
             | tee -a "$MASTER_LOG" "$mode_log"
     else
         local status=$?
-        printf '[%s batch] failed status=%s time=%s\n' \
+        printf '[%s trace batch] failed status=%s time=%s\n' \
             "$mode" "$status" "$(date --iso-8601=seconds)" \
             | tee -a "$MASTER_LOG" "$mode_log"
         return "$status"
@@ -187,11 +250,13 @@ run_mode() {
 if ((DRY_RUN == 0)); then
     mkdir -p "$RESULT_DIR"
     {
-        printf 'DCP Mega multi-case benchmark\n'
+        printf 'DCP Mega trace benchmark\n'
         printf 'started=%s\n' "$(date --iso-8601=seconds)"
         printf 'cuda_visible_devices=%s\n' "$CUDA_VISIBLE_DEVICES"
-        printf 'config=%s loads=%s dcp_sizes=%s modes=%s warmup=%s iters=%s check=%s\n' \
-            "$CONFIG" "$LOADS" "$DCP_SIZES" "$MODES" "$WARMUP" "$ITERS" "$CHECK"
+        printf 'trace_config=%s trace_cases=%s num_cases=%s modes=%s\n' \
+            "$TRACE_CONFIG" "$TRACE_CASES" "$NUM_CASES" "$MODES"
+        printf 'generate_trace=%s force_trace=%s\n' "$GENERATE_TRACE" "$FORCE_TRACE"
+        printf 'warmup=%s iters=%s check=%s\n' "$WARMUP" "$ITERS" "$CHECK"
         printf 'eager_implementations=%s\n' "$EAGER_IMPLEMENTATIONS"
         printf 'graph_implementations=%s\n' "$GRAPH_IMPLEMENTATIONS"
         printf 'num_splits=%s block_n=%s comm_sm=%s mega_phase_timestamps=%s baseline_phase_timing=%s\n' \
@@ -200,11 +265,12 @@ if ((DRY_RUN == 0)); then
     } | tee "$MASTER_LOG"
 fi
 
+generate_trace_cases
 for mode in "${MODE_LIST[@]}"; do
     run_mode "$mode"
 done
 
 if ((DRY_RUN == 0)); then
-    printf '\nAll mode batches completed at %s\nResults: %s\n' \
+    printf '\nAll trace batches completed at %s\nResults: %s\n' \
         "$(date --iso-8601=seconds)" "$LOG_DIR" | tee -a "$MASTER_LOG"
 fi

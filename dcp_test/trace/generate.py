@@ -21,9 +21,25 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
+        "--num-cases",
+        type=_positive_integer,
+        default=None,
+        help="override num_cases from the trace replay config",
+    )
+    parser.add_argument(
         "--force", action="store_true", help="replace an existing output file"
     )
     return parser
+
+
+def _positive_integer(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
 
 
 def write_cases(cases: tuple[dict[str, object], ...], output: Path) -> None:
@@ -58,8 +74,14 @@ def write_cases(cases: tuple[dict[str, object], ...], output: Path) -> None:
         raise
 
 
-def run(config_path: Path, output: Path, *, force: bool) -> dict[str, object]:
-    config = load_config(config_path)
+def run(
+    config_path: Path,
+    output: Path,
+    *,
+    force: bool,
+    num_cases: int | None = None,
+) -> dict[str, object]:
+    config = load_config(config_path, num_cases=num_cases)
     output = output.resolve()
     if output.exists() and not force:
         raise ConfigError(f"output already exists: {output}; pass --force to replace it")
@@ -74,6 +96,8 @@ def run(config_path: Path, output: Path, *, force: bool) -> dict[str, object]:
     return {
         "output": str(output),
         "cases_written": len(result.cases),
+        "num_cases": config.num_cases,
+        "config_sha256": config.config_sha256,
         "stats": stats_dict(result.stats),
     }
 
@@ -81,7 +105,12 @@ def run(config_path: Path, output: Path, *, force: bool) -> dict[str, object]:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        summary = run(args.config, args.output, force=args.force)
+        summary = run(
+            args.config,
+            args.output,
+            force=args.force,
+            num_cases=args.num_cases,
+        )
     except (ConfigError, TraceError, ReplayError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

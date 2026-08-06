@@ -9,6 +9,7 @@ The benchmark files are:
 
 - `benchmark_dcp.py`: dense BSHD decode and chunk-prefill comparison
 - `benchmark_dcp_varlen.py`: packed-varlen decode or chunk-prefill comparison
+- `benchmark_dcp_mega_batch.py`: JSON-defined multi-case Mega DCP chunk benchmark
 
 The corresponding correctness matrices remain under `scripts/test_min_fa3/`:
 
@@ -33,7 +34,12 @@ core runner's optional phase-recorder hook. Ordinary `DCPAttentionRunner` and
 baseline instances allocate no phase events. A timed runner captured with the
 formal CUDA Graph APIs automatically captures those event nodes, so replay
 timing is queried through `last_timing_ms()` without a `record_timing` capture
-argument or a private forward argument.
+argument or a private forward argument. Packed-varlen additionally accepts
+`--no-baseline-phase-timing`. The default `--baseline-phase-timing` preserves
+the full non-Mega phase breakdown. Disabling it constructs only the
+`attention_start` and `attention_end` events needed for end-to-end latency;
+the other phase events are neither allocated nor recorded, and their existing
+schema-version-3 fields are reported as zero.
 
 CUDA Graph is enabled by default. Each fixed shape performs three eager
 capture warmups before capture, then `--warmup` unmeasured graph replays and
@@ -120,14 +126,128 @@ torchrun --standalone --nproc_per_node=8 --module dcp_test.benchmark_dcp_varlen 
   --num-splits 0 --warmup 2 --iters 5
 ```
 
-The repository-root `benchmark_dcp_mega_six_loads.sh` script runs the six
-standard small/medium/large chunk workloads for `DCP/Hkv=2/4,4/2,8/1`.
-By default it runs eager Mega and orchestration baselines followed by the
-same Mega and orchestration methods under CUDA Graph, using 500 warmups and
-100 samples. Per-job logs, JSON results, and a master log are written below a timestamped
-`benchmark_logs/dcp_mega_six_loads_*` directory. Use `DRY_RUN=1` to print the
-full command matrix without launching it; `LOADS=large2`, `MODES=eager`, or
-`DCP_SIZES=8` restricts the matrix.
+The repository-root `benchmark_dcp_mega_six_loads.sh` script reads
+`dcp_test/configs/dcp_mega_six_loads.json` and expands six standard
+small/medium/large chunk workloads across `DCP/Hkv=2/4,4/2,8/1`. The default
+18-case matrix is run with exactly two `torchrun` launches: the first process
+group runs eager Mega plus `ours`, vLLM, and SGLang, while the second runs only
+those three baselines under CUDA Graph. Each launch creates the needed
+DCP=2/4/8 subgroups once and reuses them while cases run sequentially. Defaults
+remain 500 warmups and 100 samples.
+
+Each mode writes one console log, one schema-version-1 manifest, and one
+unchanged schema-version-3 JSON result per case below a timestamped
+`benchmark_logs/dcp_mega_six_loads_*` directory. The manifest is updated after
+each successful case and includes result paths plus method p50/p90/TFLOPS
+summaries. A completed manifest also contains `weighted_summary`, grouped by
+topology and method. Its workload-weighted TFLOPS is
+`sum(global_effective_flops) / sum(case_p50_seconds)`, matching the ring
+benchmark's total-work-over-total-time definition. Use `DRY_RUN=1` to validate
+and print the expanded matrix without
+initializing CUDA. `LOADS=large2`, `MODES=eager`, or `DCP_SIZES=8` restricts
+the matrix; selecting one mode produces only one `torchrun` launch. Set
+`BASELINE_PHASE_TIMING=0` to pass `--no-baseline-phase-timing` to both launches:
+
+```bash
+BASELINE_PHASE_TIMING=0 ./benchmark_dcp_mega_six_loads.sh
+```
+
+This switch affects the CUDA-event phase breakdown for `ours`, vLLM, and
+SGLang only. Their end-to-end CUDA-event latency remains measured. It does not
+change Mega eager timing or `MEGA_PHASE_TIMESTAMPS`, which independently
+controls optional in-kernel Mega `%globaltimer` milestones. The selected value
+is recorded in every case JSON and the mode manifest.
+
+The batch frontend also accepts another schema-version-1 JSON config. `sq` and
+`seqlen` may be broadcast positive integers or explicit length-`B` arrays;
+workloads are expanded against topologies in file order:
+
+```json
+{
+  "schema_version": 1,
+  "name": "example",
+  "tp_size": 8,
+  "qhead": 32,
+  "headdim": 128,
+  "workloads": [{"name": "ragged", "b": 2, "sq": [1, 8], "seqlen": 4096}],
+  "topologies": [{"name": "dcp8_hkv1", "dcp_size": 8, "kvhead": 1}]
+}
+```
+
+Run one custom execution mode directly with:
+
+```bash
+torchrun --standalone --nproc_per_node=8 --module \
+  dcp_test.benchmark_dcp_mega_batch \
+  --config path/to/cases.json --implementations ours,vllm,sglang \
+  --cuda-graph --no-baseline-phase-timing --warmup 5 --iters 20 \
+  --output-dir benchmarks/results/custom_graph
+```
+
+The trace research, replay model, JSONL contract, benchmark integration, and
+complete usage reference are documented in `trace/DESIGN.md`.
+
+For trace-driven workloads, use the repository-root wrapper:
+
+```bash
+NUM_CASES=20 ./benchmark_dcp_mega_trace.sh
+```
+
+A complete two-step example that first writes the sampled trace workload into
+the current repository directory and then invokes the batch wrapper is:
+
+```bash
+cd /home/hychen/min_fa3_demo
+
+NUM_CASES=20
+TRACE_CASES=./mega_dcp_trace_cases.jsonl
+
+python -m dcp_test.trace.generate \
+  --config dcp_test/trace/example_config.json \
+  --output "$TRACE_CASES" \
+  --num-cases "$NUM_CASES"
+
+GENERATE_TRACE=0 \
+TRACE_CONFIG=dcp_test/trace/example_config.json \
+TRACE_CASES="$TRACE_CASES" \
+NUM_CASES="$NUM_CASES" \
+MODES=eager,graph \
+./benchmark_dcp_mega_trace.sh
+```
+
+`GENERATE_TRACE=0` tells the wrapper to reuse the file produced by the first
+command. It verifies the file exists before `torchrun`; the Python batch
+frontend then verifies that it contains exactly `NUM_CASES` cases and that its
+trace/config SHA matches the effective replay config. To repeat the generation
+command with the same output filename, pass `--force` explicitly.
+
+The wrapper first replays `dcp_test/trace/example_config.json` and writes one
+JSONL containing exactly `NUM_CASES` uniformly reservoir-sampled eligible
+scheduler steps. It then runs all selected trace cases in one eager `torchrun`
+and one CUDA Graph `torchrun`. Mega belongs only to the eager batch; the graph
+batch defaults to `ours,vllm,sglang`. Setting `MODES=eager` or `MODES=graph`
+restricts that to one launch. `WARMUP`, `ITERS`, `CHECK`, implementation lists, Mega
+kernel controls, and `BASELINE_PHASE_TIMING` use the same environment-variable
+interface as the six-load wrapper. Trace defaults are 20 cases, 10 warmups, 40
+measured iterations, correctness disabled, and baseline phase timing disabled.
+The default `GENERATE_TRACE=1` retains this one-command behavior.
+
+`NUM_CASES` is forwarded both to `dcp_test.trace.generate` and the distributed
+batch frontend. The override becomes part of the effective trace config hash,
+so stale JSONL files with a different count or provenance are rejected. The
+trace config's DCP size automatically selects the matching topology from
+`BATCH_CONFIG`; an explicit mismatched `--dcp-sizes` is rejected. Results live
+under `benchmark_logs/dcp_mega_trace_*`. Each mode manifest keeps the trace
+provenance and per-case scheduler metadata in addition to the topology/method
+weighted summary.
+
+The underlying trace generator can also be used directly with an override:
+
+```bash
+python -m dcp_test.trace.generate \
+  --config dcp_test/trace/example_config.json \
+  --output /tmp/mega_dcp_trace_cases.jsonl --num-cases 20
+```
 
 Packed-varlen decode requires every `--sq` value to be `1`. Both benchmarks
 also accept `--output-json PATH`. See the repository `README.md` for topology,
