@@ -366,7 +366,9 @@ the import path.
 | `benchmark_dataset.sh` | Recommended dataset-shaped forward/backward benchmark wrapper for 2, 4, or 8 GPUs |
 | `benchmark_dcp_mega_six_loads.sh` | Two-launch eager-Mega/graph-baseline wrapper for the JSON-defined 18-case DCP matrix |
 | `benchmark_dcp_mega_trace.sh` | Generate `NUM_CASES` trace snapshots, then run eager Mega/baselines and graph baselines in separate 8-rank launches |
+| `benchmark_dcp_mega_arrival_matrix.sh` | Run the 3-arrival x 3-DCP trace matrix with one eager Mega comm-SM sweep plus eager/graph baselines per combination |
 | `dcp_test/benchmark_dcp_mega_batch.py` | Reuse one 8-rank process group across a filtered packed-varlen Mega DCP case matrix |
+| `dcp_test/summarize_dcp_mega_matrix.py` | Validate matrix manifests and flatten workload-weighted summaries to JSON and CSV |
 | `benchmark_load_balance.sh` | Dataset/GPU matrix wrapper for the metadata-only forward/backward load-balance benchmark |
 | `ring_test/load_balance_bench/run.sh` | Dataset/GPU wrapper for the fixed five-method runtime load-balance suite |
 | `ring_test/benchmark_dataset_{forward,backward}.py` | Dataset sampling, BR-PBS placement, and topology benchmark frontend |
@@ -1039,6 +1041,72 @@ completed mode manifest contains trace provenance, per-case results, and a
 `weighted_summary` grouped by topology and method. Workload-weighted TFLOPS is
 computed as `sum(global_effective_flops) / sum(case_p50_seconds)`, equivalent
 to the p50-latency-weighted mean used by the ring dataset benchmark.
+
+The larger arrival/DCP matrix has a separate wrapper:
+
+```bash
+./benchmark_dcp_mega_arrival_matrix.sh
+```
+
+Its defaults independently replay and reservoir-sample 100 cases for every
+`arrival_time_scale=1,2,4` and `DCP=2,4,8` combination. Each combination uses
+three 8-rank launches: one eager Mega launch sweeps
+`num_comm_sms=4,8,12,16,20` inside the same process group, one launch runs the
+six eager baseline method labels (including full-KV), and one runs the same
+six baselines under CUDA Graph. Thus the default run has 9 trace generations,
+27 launches, and 153 aggregate summary rows. Different DCP values deliberately
+use independently sampled workloads; the three launches within one
+arrival/DCP combination reuse exactly the same JSONL.
+
+Each run is written below `benchmark_logs/bench_dcp/<timestamp>/`. The wrapper
+writes incremental per-case and per-launch manifests plus
+`matrix_manifest.json` and `matrix_summary.csv`. An abnormal exit still scans
+the completed manifests and marks missing, failed, or invalid launches in the
+top-level JSON.
+
+On eight H100 GPUs, the default 100-case matrix is expected to take roughly
+5 hours; reserve 5-8 hours for trace-shape variance, CUDA/NCCL initialization,
+and host scheduling noise. This estimate is based on the checked two-case
+H100 smoke: each Mega case/comm-SM pair took about 3.2-3.9 seconds after the
+first initialization, while each of the 27 launches also pays roughly
+40-50 seconds of process-group/JIT setup. A two-case, one-combination Hopper
+smoke can be launched with:
+
+```bash
+ARRIVAL_TIME_SCALES=4 DCP_SIZES=2 MEGA_NUM_COMM_SMS=4,8 \
+  NUM_CASES=2 WARMUP=1 ITERS=2 CHECK=1 \
+  ./benchmark_dcp_mega_arrival_matrix.sh
+```
+
+Use `DRY_RUN=1` to print the expanded generator, launcher, and summarizer
+commands without creating result files or initializing CUDA.
+
+Plot the completed matrix as 1-by-3 grouped bar charts with one panel per DCP
+size:
+
+```bash
+python -m dcp_test.plot_dcp_mega_latency \
+  benchmark_logs/bench_dcp/<timestamp>
+```
+
+One invocation writes three figures: latency in microseconds, workload-weighted
+effective TFLOPS/GPU, and workload-weighted effective KV GB/s/GPU. Each
+arrival-scale group compares eager and CUDA Graph versions of vLLM AG+RS, vLLM
+A2A, and SGLang, plus eager Mega DCP. Mega defaults to the lowest-latency
+measured comm-SM value for each arrival/DCP workload, and all three figures use
+that same selection. The Mega annotation reports its improvement over the best
+of the six baseline bars: `baseline / Mega` for latency and `Mega / baseline`
+for TFLOPS and bandwidth. Use `--mega-num-comm-sm 8` to select one fixed value,
+or `--latency-stat p50` to plot the median instead of the mean of the per-case
+p50 latency distribution. With no input argument, the plotter selects the
+newest run below `benchmark_logs/bench_dcp`. Incomplete matrices are rejected
+unless `--allow-incomplete` is passed; missing bars are then marked `N/A`.
+
+The bandwidth metric is `sum(average logical BF16 K+V bytes per GPU) /
+sum(case p50 latency)`. It is an effective payload rate under the benchmark's
+logical traffic model, not NCU-measured HBM transaction bandwidth. New batch
+manifests store the required byte totals directly; the matrix summarizer can
+also recover them from retained per-case JSON files produced by older runs.
 
 The optional `--implementations mega` category adds the experimental
 `dcp_mega_varlen` path for chunk prefill only. It supports the default CUDA

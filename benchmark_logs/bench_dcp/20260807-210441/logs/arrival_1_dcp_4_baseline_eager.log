@@ -1,0 +1,535 @@
+CUDA_VISIBLE_DEVICES=0\,1\,2\,3\,4\,5\,6\,7 torchrun --standalone --nproc_per_node=8 --module dcp_test.benchmark_dcp_mega_batch --config dcp_test/configs/dcp_mega_six_loads.json --trace-config dcp_test/trace/example_config.json --trace-cases benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/trace/cases.jsonl --trace-arrival-time-scale 1 --trace-dcp-size 4 --num-cases 20 --dcp-sizes 4 --implementations ours\,vllm\,sglang\,full --num-splits 0 --mega-block-n 128 --warmup 10 --iters 30 --no-check --no-cuda-graph --no-mega-phase-timestamps --no-baseline-phase-timing --output-dir benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager --manifest benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/manifest.json
+Mega DCP batch: name=dcp_mega_trace, mode=eager, cases=20, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], comm_sm_sweep=None, baseline_phase_timing=False
+
+================================================================================
+Batch case 1/20: case_000000_dcp4_hkv2: B=5, Sq=[16, 16, 16, 16, 16], Sk=[8233, 16098, 5997, 5375, 19519], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=5, q_tokens=80, history_tokens=55222, q_seqlens=[16, 16, 16, 16, 16], history_seqlens=[8233, 16098, 5997, 5375, 19519]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=5, q_tokens=80, history_tokens=55222, causal=True
+
+B=5, q_tokens=80, history_tokens=55222, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.484, t1=0.480, t2=0.509, t3=0.483, t4=0.483, t5=0.482, t6=0.509, t7=0.481 | p50(max_across_ranks)=0.510, p90(max_across_ranks)=0.521         28.4        3.6         14.0       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.605, t1=0.603, t2=0.656, t3=0.604, t4=0.606, t5=0.606, t6=0.657, t7=0.604 | p50(max_across_ranks)=0.658, p90(max_across_ranks)=0.725         22.0        2.8         10.8       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.490, t1=0.486, t2=0.616, t3=0.490, t4=0.485, t5=0.489, t6=0.616, t7=0.488 | p50(max_across_ranks)=0.617, p90(max_across_ranks)=0.627         23.5        2.9         11.5       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.297, t1=0.327, t2=0.300, t3=0.312, t4=0.323, t5=0.297, t6=0.306, t7=0.313 | p50(max_across_ranks)=0.340, p90(max_across_ranks)=0.373         42.7        5.3         20.9       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.391, t1=0.464, t2=0.407, t3=0.434, t4=0.438, t5=0.399, t6=0.417, t7=0.421 | p50(max_across_ranks)=0.464, p90(max_across_ranks)=0.494         31.2        3.9         15.3       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.036, t1=0.038, t2=0.036, t3=0.038, t4=0.037, t5=0.036, t6=0.036, t7=0.037 | p50(max_across_ranks)=0.038, p90(max_across_ranks)=0.043        377.0       47.1        736.7  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000000_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 2/20: case_000001_dcp4_hkv2: B=9, Sq=[16, 16, 16, 16, 16, 16, 16, 16, 16], Sk=[1290, 8657, 2495, 19092, 17560, 4239, 5936, 6373, 948], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=9, q_tokens=144, history_tokens=66590, q_seqlens=[16, 16, 16, 16, 16, 16, 16, 16, 16], history_seqlens=[1290, 8657, 2495, 19092, 17560, 4239, 5936, 6373, 948]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=9, q_tokens=144, history_tokens=66590, causal=True
+
+B=9, q_tokens=144, history_tokens=66590, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.250, t1=0.272, t2=0.254, t3=0.258, t4=0.261, t5=0.244, t6=0.255, t7=0.254 | p50(max_across_ranks)=0.279, p90(max_across_ranks)=0.294         62.6        7.8         30.8       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.330, t1=0.365, t2=0.331, t3=0.343, t4=0.356, t5=0.339, t6=0.338, t7=0.343 | p50(max_across_ranks)=0.374, p90(max_across_ranks)=0.399         46.7        5.8         23.0       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.296, t1=0.341, t2=0.306, t3=0.307, t4=0.321, t5=0.296, t6=0.307, t7=0.310 | p50(max_across_ranks)=0.344, p90(max_across_ranks)=0.373         50.8        6.3         25.0       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.285, t1=0.312, t2=0.289, t3=0.291, t4=0.302, t5=0.287, t6=0.297, t7=0.301 | p50(max_across_ranks)=0.322, p90(max_across_ranks)=0.342         54.3        6.8         26.7       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.399, t1=0.453, t2=0.404, t3=0.425, t4=0.423, t5=0.390, t6=0.411, t7=0.417 | p50(max_across_ranks)=0.453, p90(max_across_ranks)=0.478         38.6        4.8         19.0       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.036, t1=0.039, t2=0.037, t3=0.039, t4=0.037, t5=0.037, t6=0.037, t7=0.037 | p50(max_across_ranks)=0.039, p90(max_across_ranks)=0.041        444.0       55.5        868.1  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000001_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 3/20: case_000002_dcp4_hkv2: B=6, Sq=[16, 16, 16, 16, 16, 16], Sk=[6023, 1629, 16646, 1400, 3924, 30366], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=6, q_tokens=96, history_tokens=59988, q_seqlens=[16, 16, 16, 16, 16, 16], history_seqlens=[6023, 1629, 16646, 1400, 3924, 30366]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=6, q_tokens=96, history_tokens=59988, causal=True
+
+B=6, q_tokens=96, history_tokens=59988, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.243, t1=0.261, t2=0.248, t3=0.249, t4=0.260, t5=0.243, t6=0.249, t7=0.254 | p50(max_across_ranks)=0.270, p90(max_across_ranks)=0.280         58.4        7.3         28.7       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.322, t1=0.354, t2=0.337, t3=0.339, t4=0.348, t5=0.327, t6=0.336, t7=0.345 | p50(max_across_ranks)=0.359, p90(max_across_ranks)=1.068         43.9        5.5         21.5       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.293, t1=0.322, t2=0.292, t3=0.299, t4=0.310, t5=0.287, t6=0.300, t7=0.304 | p50(max_across_ranks)=0.330, p90(max_across_ranks)=0.346         47.8        6.0         23.5       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.284, t1=0.314, t2=0.289, t3=0.297, t4=0.307, t5=0.286, t6=0.297, t7=0.299 | p50(max_across_ranks)=0.325, p90(max_across_ranks)=0.354         48.4        6.1         23.8       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.396, t1=0.451, t2=0.396, t3=0.425, t4=0.424, t5=0.388, t6=0.404, t7=0.409 | p50(max_across_ranks)=0.454, p90(max_across_ranks)=0.468         34.7        4.3         17.0       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.038, t1=0.040, t2=0.038, t3=0.040, t4=0.038, t5=0.038, t6=0.039, t7=0.039 | p50(max_across_ranks)=0.041, p90(max_across_ranks)=0.042        386.1       48.3        754.6  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000002_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 4/20: case_000003_dcp4_hkv2: B=7, Sq=[16, 16, 16, 16, 16, 16, 16], Sk=[13399, 10148, 27317, 6022, 984, 11484, 1058], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=7, q_tokens=112, history_tokens=70412, q_seqlens=[16, 16, 16, 16, 16, 16, 16], history_seqlens=[13399, 10148, 27317, 6022, 984, 11484, 1058]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=7, q_tokens=112, history_tokens=70412, causal=True
+
+B=7, q_tokens=112, history_tokens=70412, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.240, t1=0.255, t2=0.244, t3=0.248, t4=0.255, t5=0.241, t6=0.250, t7=0.247 | p50(max_across_ranks)=0.261, p90(max_across_ranks)=0.280         70.8        8.9         34.8       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.335, t1=0.357, t2=0.340, t3=0.339, t4=0.354, t5=0.331, t6=0.339, t7=0.346 | p50(max_across_ranks)=0.369, p90(max_across_ranks)=1.090         50.0        6.3         24.6       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.289, t1=0.317, t2=0.297, t3=0.299, t4=0.309, t5=0.289, t6=0.304, t7=0.308 | p50(max_across_ranks)=0.327, p90(max_across_ranks)=0.336         56.4        7.1         27.7       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.281, t1=0.307, t2=0.285, t3=0.290, t4=0.297, t5=0.285, t6=0.294, t7=0.295 | p50(max_across_ranks)=0.313, p90(max_across_ranks)=0.330         59.1        7.4         29.0       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.398, t1=0.445, t2=0.397, t3=0.416, t4=0.420, t5=0.389, t6=0.414, t7=0.415 | p50(max_across_ranks)=0.445, p90(max_across_ranks)=0.461         41.5        5.2         20.4       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.039, t1=0.041, t2=0.038, t3=0.040, t4=0.039, t5=0.039, t6=0.039, t7=0.039 | p50(max_across_ranks)=0.041, p90(max_across_ranks)=0.043        450.7       56.3        880.9  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000003_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 5/20: case_000004_dcp4_hkv2: B=5, Sq=[16, 16, 16, 16, 16], Sk=[10280, 1380, 5320, 6138, 16054], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=5, q_tokens=80, history_tokens=39172, q_seqlens=[16, 16, 16, 16, 16], history_seqlens=[10280, 1380, 5320, 6138, 16054]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=5, q_tokens=80, history_tokens=39172, causal=True
+
+B=5, q_tokens=80, history_tokens=39172, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.245, t1=0.267, t2=0.254, t3=0.250, t4=0.260, t5=0.251, t6=0.259, t7=0.256 | p50(max_across_ranks)=0.280, p90(max_across_ranks)=2.037         36.7        4.6         18.0       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.326, t1=0.359, t2=0.328, t3=0.329, t4=0.344, t5=0.322, t6=0.329, t7=0.340 | p50(max_across_ranks)=0.361, p90(max_across_ranks)=0.372         28.5        3.6         14.0       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.283, t1=0.315, t2=0.289, t3=0.295, t4=0.308, t5=0.284, t6=0.299, t7=0.304 | p50(max_across_ranks)=0.320, p90(max_across_ranks)=0.341         32.1        4.0         15.8       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.286, t1=0.308, t2=0.285, t3=0.288, t4=0.300, t5=0.288, t6=0.295, t7=0.298 | p50(max_across_ranks)=0.317, p90(max_across_ranks)=0.335         32.4        4.1         15.9       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.389, t1=0.442, t2=0.393, t3=0.425, t4=0.415, t5=0.382, t6=0.401, t7=0.412 | p50(max_across_ranks)=0.445, p90(max_across_ranks)=0.462         23.1        2.9         11.4       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.034, t1=0.036, t2=0.035, t3=0.036, t4=0.035, t5=0.035, t6=0.035, t7=0.035 | p50(max_across_ranks)=0.037, p90(max_across_ranks)=0.050        278.4       34.8        544.2  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000004_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 6/20: case_000005_dcp4_hkv2: B=8, Sq=[16, 16, 16, 16, 16, 16, 16, 16], Sk=[1168, 10246, 15437, 1528, 26676, 24195, 6834, 91614], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=8, q_tokens=128, history_tokens=177698, q_seqlens=[16, 16, 16, 16, 16, 16, 16, 16], history_seqlens=[1168, 10246, 15437, 1528, 26676, 24195, 6834, 91614]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=8, q_tokens=128, history_tokens=177698, causal=True
+
+B=8, q_tokens=128, history_tokens=177698, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.239, t1=0.261, t2=0.245, t3=0.250, t4=0.257, t5=0.243, t6=0.251, t7=0.252 | p50(max_across_ranks)=0.267, p90(max_across_ranks)=0.286        174.8       21.9         85.6       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.328, t1=0.355, t2=0.331, t3=0.333, t4=0.348, t5=0.326, t6=0.334, t7=0.344 | p50(max_across_ranks)=0.365, p90(max_across_ranks)=0.387        127.8       16.0         62.6       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.309, t1=0.329, t2=0.304, t3=0.313, t4=0.318, t5=0.292, t6=0.308, t7=0.321 | p50(max_across_ranks)=0.337, p90(max_across_ranks)=1.524        138.5       17.3         67.8       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.283, t1=0.309, t2=0.286, t3=0.289, t4=0.301, t5=0.281, t6=0.293, t7=0.296 | p50(max_across_ranks)=0.317, p90(max_across_ranks)=0.328        146.8       18.3         71.9       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.392, t1=0.442, t2=0.398, t3=0.417, t4=0.416, t5=0.392, t6=0.407, t7=0.413 | p50(max_across_ranks)=0.444, p90(max_across_ranks)=0.457        104.9       13.1         51.3       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.064, t1=0.066, t2=0.065, t3=0.066, t4=0.065, t5=0.064, t6=0.064, t7=0.064 | p50(max_across_ranks)=0.067, p90(max_across_ranks)=0.068        698.8       87.3       1365.3  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000005_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 7/20: case_000006_dcp4_hkv2: B=16, Sq=[16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 4096], Sk=[40254, 12088, 3967, 24084, 2434, 11625, 22441, 5873, 7604, 5181, 7206, 6789, 11393, 15626, 19348, 512], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=16, q_tokens=4336, history_tokens=196425, q_seqlens=[16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 4096], history_seqlens=[40254, 12088, 3967, 24084, 2434, 11625, 22441, 5873, 7604, 5181, 7206, 6789, 11393, 15626, 19348, 512]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=16, q_tokens=4336, history_tokens=196425, causal=True
+
+B=16, q_tokens=4336, history_tokens=196425, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.452, t1=0.450, t2=0.451, t3=0.453, t4=0.451, t5=0.453, t6=0.455, t7=0.453 | p50(max_across_ranks)=0.458, p90(max_across_ranks)=0.464        487.2       60.9         59.7       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.478, t1=0.478, t2=0.480, t3=0.478, t4=0.478, t5=0.481, t6=0.479, t7=0.478 | p50(max_across_ranks)=0.484, p90(max_across_ranks)=1.185        460.9       57.6         56.5       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.484, t1=0.482, t2=0.482, t3=0.485, t4=0.480, t5=0.485, t6=0.484, t7=0.484 | p50(max_across_ranks)=0.489, p90(max_across_ranks)=0.494        456.6       57.1         56.0       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.443, t1=0.443, t2=0.443, t3=0.444, t4=0.443, t5=0.443, t6=0.444, t7=0.441 | p50(max_across_ranks)=0.450, p90(max_across_ranks)=0.456        495.8       62.0         60.8       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.730, t1=0.727, t2=0.734, t3=0.731, t4=0.724, t5=0.732, t6=0.732, t7=0.734 | p50(max_across_ranks)=0.740, p90(max_across_ranks)=2.121        301.8       37.7         37.0       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.423, t1=0.428, t2=0.424, t3=0.426, t4=0.425, t5=0.428, t6=0.429, t7=0.426 | p50(max_across_ranks)=0.429, p90(max_across_ranks)=0.431        520.5       65.1        239.7  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000006_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 8/20: case_000007_dcp4_hkv2: B=8, Sq=[16, 16, 16, 16, 16, 16, 16, 16], Sk=[11006, 1808, 19704, 2593, 2718, 7154, 4708, 1617], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=8, q_tokens=128, history_tokens=51308, q_seqlens=[16, 16, 16, 16, 16, 16, 16, 16], history_seqlens=[11006, 1808, 19704, 2593, 2718, 7154, 4708, 1617]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=8, q_tokens=128, history_tokens=51308, causal=True
+
+B=8, q_tokens=128, history_tokens=51308, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.241, t1=0.257, t2=0.244, t3=0.245, t4=0.251, t5=0.239, t6=0.244, t7=0.247 | p50(max_across_ranks)=0.265, p90(max_across_ranks)=0.281         50.9        6.4         25.0       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.317, t1=0.346, t2=0.329, t3=0.330, t4=0.340, t5=0.327, t6=0.333, t7=0.338 | p50(max_across_ranks)=0.356, p90(max_across_ranks)=0.374         37.8        4.7         18.6       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.291, t1=0.322, t2=0.297, t3=0.300, t4=0.311, t5=0.294, t6=0.305, t7=0.309 | p50(max_across_ranks)=0.328, p90(max_across_ranks)=0.438         41.0        5.1         20.2       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.288, t1=0.307, t2=0.287, t3=0.288, t4=0.306, t5=0.285, t6=0.297, t7=0.303 | p50(max_across_ranks)=0.315, p90(max_across_ranks)=0.345         42.8        5.3         21.1       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.392, t1=0.442, t2=0.395, t3=0.418, t4=0.418, t5=0.391, t6=0.409, t7=0.411 | p50(max_across_ranks)=0.443, p90(max_across_ranks)=0.462         30.4        3.8         15.0       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.035, t1=0.037, t2=0.035, t3=0.036, t4=0.036, t5=0.035, t6=0.036, t7=0.036 | p50(max_across_ranks)=0.037, p90(max_across_ranks)=0.039        362.2       45.3        708.2  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000007_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 9/20: case_000008_dcp4_hkv2: B=8, Sq=[16, 16, 16, 16, 16, 16, 16, 16], Sk=[93624, 5934, 1484, 28130, 10018, 2074, 5904, 15259], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=8, q_tokens=128, history_tokens=162427, q_seqlens=[16, 16, 16, 16, 16, 16, 16, 16], history_seqlens=[93624, 5934, 1484, 28130, 10018, 2074, 5904, 15259]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=8, q_tokens=128, history_tokens=162427, causal=True
+
+B=8, q_tokens=128, history_tokens=162427, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.238, t1=0.261, t2=0.243, t3=0.244, t4=0.250, t5=0.240, t6=0.246, t7=0.245 | p50(max_across_ranks)=0.261, p90(max_across_ranks)=0.278        163.0       20.4         79.8       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.339, t1=0.362, t2=0.348, t3=0.346, t4=0.357, t5=0.343, t6=0.346, t7=0.351 | p50(max_across_ranks)=0.390, p90(max_across_ranks)=2.072        109.2       13.6         53.5       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.289, t1=0.319, t2=0.295, t3=0.296, t4=0.312, t5=0.291, t6=0.306, t7=0.310 | p50(max_across_ranks)=0.328, p90(max_across_ranks)=0.337        129.8       16.2         63.5       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.284, t1=0.314, t2=0.287, t3=0.287, t4=0.298, t5=0.283, t6=0.297, t7=0.302 | p50(max_across_ranks)=0.319, p90(max_across_ranks)=0.337        133.5       16.7         65.3       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.390, t1=0.441, t2=0.390, t3=0.411, t4=0.411, t5=0.389, t6=0.404, t7=0.409 | p50(max_across_ranks)=0.441, p90(max_across_ranks)=0.463         96.5       12.1         47.2       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.062, t1=0.064, t2=0.063, t3=0.063, t4=0.063, t5=0.061, t6=0.062, t7=0.063 | p50(max_across_ranks)=0.065, p90(max_across_ranks)=0.067        660.0       82.5       1289.5  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000008_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 10/20: case_000009_dcp4_hkv2: B=16, Sq=[16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 3656], Sk=[1556, 1539, 1494, 15462, 3814, 13179, 5139, 2741, 20931, 53351, 3283, 1005, 5600, 7666, 2573, 4608], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=16, q_tokens=3896, history_tokens=143941, q_seqlens=[16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 3656], history_seqlens=[1556, 1539, 1494, 15462, 3814, 13179, 5139, 2741, 20931, 53351, 3283, 1005, 5600, 7666, 2573, 4608]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=16, q_tokens=3896, history_tokens=143941, causal=True
+
+B=16, q_tokens=3896, history_tokens=143941, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.469, t1=0.466, t2=0.466, t3=0.466, t4=0.469, t5=0.470, t6=0.469, t7=0.469 | p50(max_across_ranks)=0.474, p90(max_across_ranks)=0.483        890.3      111.3         43.1       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.495, t1=0.494, t2=0.494, t3=0.494, t4=0.496, t5=0.500, t6=0.499, t7=0.498 | p50(max_across_ranks)=0.503, p90(max_across_ranks)=1.310        839.6      104.9         40.6       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.503, t1=0.500, t2=0.501, t3=0.503, t4=0.503, t5=0.518, t6=0.516, t7=0.516 | p50(max_across_ranks)=0.522, p90(max_across_ranks)=1.018        808.3      101.0         39.1       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.460, t1=0.458, t2=0.461, t3=0.458, t4=0.456, t5=0.464, t6=0.461, t7=0.461 | p50(max_across_ranks)=0.467, p90(max_across_ranks)=0.484        904.0      113.0         43.7       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.718, t1=0.719, t2=0.723, t3=0.722, t4=0.719, t5=0.735, t6=0.733, t7=0.731 | p50(max_across_ranks)=0.738, p90(max_across_ranks)=0.760        572.1       71.5         27.7       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.561, t1=0.574, t2=0.563, t3=0.567, t4=0.568, t5=0.572, t6=0.562, t7=0.569 | p50(max_across_ranks)=0.574, p90(max_across_ranks)=0.578        735.2       91.9        131.8  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000009_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 11/20: case_000010_dcp4_hkv2: B=8, Sq=[16, 16, 16, 16, 16, 16, 16, 656], Sk=[12972, 9727, 2291, 1248, 18750, 1599, 3314, 4608], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=8, q_tokens=768, history_tokens=54509, q_seqlens=[16, 16, 16, 16, 16, 16, 16, 656], history_seqlens=[12972, 9727, 2291, 1248, 18750, 1599, 3314, 4608]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=8, q_tokens=768, history_tokens=54509, causal=True
+
+B=8, q_tokens=768, history_tokens=54509, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.257, t1=0.267, t2=0.262, t3=0.261, t4=0.263, t5=0.256, t6=0.261, t7=0.263 | p50(max_across_ranks)=0.277, p90(max_across_ranks)=0.470        238.7       29.8         26.6       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.337, t1=0.361, t2=0.340, t3=0.349, t4=0.349, t5=0.335, t6=0.344, t7=0.354 | p50(max_across_ranks)=0.369, p90(max_across_ranks)=0.548        179.2       22.4         20.0       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.302, t1=0.327, t2=0.304, t3=0.307, t4=0.319, t5=0.298, t6=0.318, t7=0.318 | p50(max_across_ranks)=0.335, p90(max_across_ranks)=0.403        197.4       24.7         22.0       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.299, t1=0.317, t2=0.298, t3=0.302, t4=0.323, t5=0.296, t6=0.311, t7=0.314 | p50(max_across_ranks)=0.333, p90(max_across_ranks)=0.468        198.4       24.8         22.1       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.410, t1=0.456, t2=0.418, t3=0.421, t4=0.431, t5=0.406, t6=0.419, t7=0.429 | p50(max_across_ranks)=0.462, p90(max_across_ranks)=1.997        143.2       17.9         16.0       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.065, t1=0.068, t2=0.066, t3=0.067, t4=0.066, t5=0.066, t6=0.066, t7=0.065 | p50(max_across_ranks)=0.068, p90(max_across_ranks)=0.070        967.4      120.9        413.9  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000010_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 12/20: case_000011_dcp4_hkv2: B=7, Sq=[16, 16, 16, 16, 16, 16, 16], Sk=[19047, 48015, 19990, 8108, 6092, 7325, 9923], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=7, q_tokens=112, history_tokens=118500, q_seqlens=[16, 16, 16, 16, 16, 16, 16], history_seqlens=[19047, 48015, 19990, 8108, 6092, 7325, 9923]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=7, q_tokens=112, history_tokens=118500, causal=True
+
+B=7, q_tokens=112, history_tokens=118500, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.239, t1=0.255, t2=0.244, t3=0.240, t4=0.250, t5=0.238, t6=0.243, t7=0.251 | p50(max_across_ranks)=0.262, p90(max_across_ranks)=0.285        118.8       14.9         58.2       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.322, t1=0.350, t2=0.330, t3=0.332, t4=0.339, t5=0.328, t6=0.332, t7=0.341 | p50(max_across_ranks)=0.359, p90(max_across_ranks)=0.380         86.6       10.8         42.4       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.301, t1=0.318, t2=0.303, t3=0.298, t4=0.316, t5=0.303, t6=0.308, t7=0.320 | p50(max_across_ranks)=0.331, p90(max_across_ranks)=0.802         94.0       11.8         46.1       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.292, t1=0.308, t2=0.290, t3=0.289, t4=0.298, t5=0.282, t6=0.297, t7=0.309 | p50(max_across_ranks)=0.322, p90(max_across_ranks)=2.014         96.4       12.1         47.2       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.403, t1=0.443, t2=0.404, t3=0.410, t4=0.415, t5=0.393, t6=0.417, t7=0.416 | p50(max_across_ranks)=0.449, p90(max_across_ranks)=0.464         69.2        8.6         33.9       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.052, t1=0.054, t2=0.053, t3=0.053, t4=0.053, t5=0.053, t6=0.053, t7=0.053 | p50(max_across_ranks)=0.055, p90(max_across_ranks)=0.058        569.3       71.2       1112.4  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000011_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 13/20: case_000012_dcp4_hkv2: B=5, Sq=[16, 16, 16, 16, 16], Sk=[5205, 4119, 1205, 18454, 2473], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=5, q_tokens=80, history_tokens=31456, q_seqlens=[16, 16, 16, 16, 16], history_seqlens=[5205, 4119, 1205, 18454, 2473]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=5, q_tokens=80, history_tokens=31456, causal=True
+
+B=5, q_tokens=80, history_tokens=31456, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.240, t1=0.254, t2=0.246, t3=0.241, t4=0.250, t5=0.245, t6=0.248, t7=0.250 | p50(max_across_ranks)=0.264, p90(max_across_ranks)=0.286         31.3        3.9         15.4       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.332, t1=0.354, t2=0.339, t3=0.339, t4=0.352, t5=0.339, t6=0.340, t7=0.353 | p50(max_across_ranks)=0.373, p90(max_across_ranks)=0.584         22.1        2.8         10.9       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.292, t1=0.321, t2=0.303, t3=0.297, t4=0.323, t5=0.292, t6=0.303, t7=0.319 | p50(max_across_ranks)=0.336, p90(max_across_ranks)=1.940         24.6        3.1         12.1       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.284, t1=0.310, t2=0.291, t3=0.292, t4=0.301, t5=0.287, t6=0.300, t7=0.303 | p50(max_across_ranks)=0.324, p90(max_across_ranks)=0.346         25.5        3.2         12.6       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.389, t1=0.443, t2=0.402, t3=0.409, t4=0.416, t5=0.387, t6=0.410, t7=0.412 | p50(max_across_ranks)=0.453, p90(max_across_ranks)=0.466         18.2        2.3          9.0       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.033, t1=0.035, t2=0.034, t3=0.035, t4=0.034, t5=0.033, t6=0.034, t7=0.034 | p50(max_across_ranks)=0.036, p90(max_across_ranks)=0.038        232.4       29.0        454.4  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000012_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 14/20: case_000013_dcp4_hkv2: B=3, Sq=[16, 16, 16], Sk=[1139, 44536, 3167], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=3, q_tokens=48, history_tokens=48842, q_seqlens=[16, 16, 16], history_seqlens=[1139, 44536, 3167]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=3, q_tokens=48, history_tokens=48842, causal=True
+
+B=3, q_tokens=48, history_tokens=48842, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.240, t1=0.255, t2=0.244, t3=0.243, t4=0.252, t5=0.241, t6=0.250, t7=0.249 | p50(max_across_ranks)=0.259, p90(max_across_ranks)=0.310         49.5        6.2         24.3       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.325, t1=0.342, t2=0.326, t3=0.333, t4=0.343, t5=0.334, t6=0.332, t7=0.339 | p50(max_across_ranks)=0.360, p90(max_across_ranks)=0.435         35.6        4.4         17.4       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.295, t1=0.322, t2=0.299, t3=0.298, t4=0.317, t5=0.291, t6=0.304, t7=0.314 | p50(max_across_ranks)=0.334, p90(max_across_ranks)=1.667         38.3        4.8         18.8       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.283, t1=0.303, t2=0.287, t3=0.284, t4=0.299, t5=0.282, t6=0.293, t7=0.295 | p50(max_across_ranks)=0.312, p90(max_across_ranks)=0.351         41.1        5.1         20.1       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.390, t1=0.435, t2=0.393, t3=0.405, t4=0.419, t5=0.388, t6=0.407, t7=0.409 | p50(max_across_ranks)=0.436, p90(max_across_ranks)=0.502         29.4        3.7         14.4       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.038, t1=0.040, t2=0.038, t3=0.040, t4=0.038, t5=0.038, t6=0.038, t7=0.038 | p50(max_across_ranks)=0.040, p90(max_across_ranks)=0.045        318.3       39.8        622.1  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000013_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 15/20: case_000014_dcp4_hkv2: B=7, Sq=[16, 16, 16, 16, 16, 16, 16], Sk=[1338, 1139, 95121, 23940, 11233, 14633, 9710], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=7, q_tokens=112, history_tokens=157114, q_seqlens=[16, 16, 16, 16, 16, 16, 16], history_seqlens=[1338, 1139, 95121, 23940, 11233, 14633, 9710]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=7, q_tokens=112, history_tokens=157114, causal=True
+
+B=7, q_tokens=112, history_tokens=157114, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.248, t1=0.265, t2=0.258, t3=0.250, t4=0.253, t5=0.248, t6=0.251, t7=0.251 | p50(max_across_ranks)=0.278, p90(max_across_ranks)=0.869        148.4       18.5         72.6       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.336, t1=0.351, t2=0.338, t3=0.334, t4=0.347, t5=0.327, t6=0.343, t7=0.347 | p50(max_across_ranks)=0.362, p90(max_across_ranks)=1.513        113.9       14.2         55.7       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.287, t1=0.314, t2=0.296, t3=0.296, t4=0.308, t5=0.288, t6=0.300, t7=0.309 | p50(max_across_ranks)=0.319, p90(max_across_ranks)=0.346        129.2       16.1         63.2       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.291, t1=0.300, t2=0.287, t3=0.289, t4=0.302, t5=0.285, t6=0.297, t7=0.298 | p50(max_across_ranks)=0.315, p90(max_across_ranks)=0.372        130.7       16.3         64.0       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.392, t1=0.448, t2=0.403, t3=0.414, t4=0.420, t5=0.396, t6=0.420, t7=0.414 | p50(max_across_ranks)=0.452, p90(max_across_ranks)=1.065         91.1       11.4         44.6       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.061, t1=0.063, t2=0.061, t3=0.062, t4=0.061, t5=0.061, t6=0.062, t7=0.061 | p50(max_across_ranks)=0.063, p90(max_across_ranks)=0.065        655.4       81.9       1280.5  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000014_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 16/20: case_000015_dcp4_hkv2: B=3, Sq=[16, 16, 16], Sk=[8239, 1938, 1591], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=3, q_tokens=48, history_tokens=11768, q_seqlens=[16, 16, 16], history_seqlens=[8239, 1938, 1591]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=3, q_tokens=48, history_tokens=11768, causal=True
+
+B=3, q_tokens=48, history_tokens=11768, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.249, t1=0.257, t2=0.246, t3=0.239, t4=0.250, t5=0.240, t6=0.246, t7=0.254 | p50(max_across_ranks)=0.265, p90(max_across_ranks)=0.548         11.7        1.5          5.8       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.324, t1=0.347, t2=0.332, t3=0.330, t4=0.342, t5=0.325, t6=0.333, t7=0.342 | p50(max_across_ranks)=0.357, p90(max_across_ranks)=0.396          8.7        1.1          4.3       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.288, t1=0.314, t2=0.291, t3=0.297, t4=0.304, t5=0.293, t6=0.299, t7=0.305 | p50(max_across_ranks)=0.322, p90(max_across_ranks)=0.353          9.6        1.2          4.8       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.279, t1=0.304, t2=0.284, t3=0.287, t4=0.300, t5=0.288, t6=0.304, t7=0.300 | p50(max_across_ranks)=0.317, p90(max_across_ranks)=0.355          9.7        1.2          4.8       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.394, t1=0.441, t2=0.401, t3=0.418, t4=0.414, t5=0.398, t6=0.407, t7=0.419 | p50(max_across_ranks)=0.443, p90(max_across_ranks)=0.612          7.0        0.9          3.5       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.030, t1=0.032, t2=0.038, t3=0.032, t4=0.031, t5=0.030, t6=0.030, t7=0.030 | p50(max_across_ranks)=0.038, p90(max_across_ranks)=0.041         81.8       10.2        160.1  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000015_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 17/20: case_000016_dcp4_hkv2: B=14, Sq=[16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 3608], Sk=[5108, 33698, 3871, 1247, 23587, 15157, 17287, 1812, 5562, 4021, 14640, 2555, 30199, 4608], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=14, q_tokens=3816, history_tokens=163352, q_seqlens=[16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 3608], history_seqlens=[5108, 33698, 3871, 1247, 23587, 15157, 17287, 1812, 5562, 4021, 14640, 2555, 30199, 4608]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=14, q_tokens=3816, history_tokens=163352, causal=True
+
+B=14, q_tokens=3816, history_tokens=163352, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.409, t1=0.411, t2=0.410, t3=0.412, t4=0.410, t5=0.414, t6=0.413, t7=0.408 | p50(max_across_ranks)=0.417, p90(max_across_ranks)=0.443       1008.1      126.0         54.8       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.436, t1=0.434, t2=0.435, t3=0.435, t4=0.435, t5=0.439, t6=0.437, t7=0.436 | p50(max_across_ranks)=0.442, p90(max_across_ranks)=0.446        952.6      119.1         51.8       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.438, t1=0.437, t2=0.438, t3=0.438, t4=0.435, t5=0.441, t6=0.439, t7=0.436 | p50(max_across_ranks)=0.446, p90(max_across_ranks)=0.642        944.3      118.0         51.3       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.399, t1=0.399, t2=0.399, t3=0.398, t4=0.398, t5=0.401, t6=0.399, t7=0.399 | p50(max_across_ranks)=0.406, p90(max_across_ranks)=0.412       1035.8      129.5         56.3       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.658, t1=0.654, t2=0.662, t3=0.662, t4=0.653, t5=0.661, t6=0.660, t7=0.661 | p50(max_across_ranks)=0.667, p90(max_across_ranks)=1.091        630.4       78.8         34.3       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.368, t1=0.373, t2=0.363, t3=0.374, t4=0.365, t5=0.368, t6=0.369, t7=0.369 | p50(max_across_ranks)=0.374, p90(max_across_ranks)=0.377       1124.1      140.5        228.7  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000016_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 18/20: case_000017_dcp4_hkv2: B=11, Sq=[16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 1008], Sk=[34056, 23922, 8523, 49994, 28896, 11238, 4124, 14970, 11770, 15134, 1024], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=11, q_tokens=1168, history_tokens=203651, q_seqlens=[16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 1008], history_seqlens=[34056, 23922, 8523, 49994, 28896, 11238, 4124, 14970, 11770, 15134, 1024]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=11, q_tokens=1168, history_tokens=203651, causal=True
+
+B=11, q_tokens=1168, history_tokens=203651, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.333, t1=0.329, t2=0.332, t3=0.335, t4=0.330, t5=0.333, t6=0.332, t7=0.330 | p50(max_across_ranks)=0.337, p90(max_across_ranks)=0.345        232.3       29.0         79.0       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.383, t1=0.380, t2=0.383, t3=0.383, t4=0.384, t5=0.389, t6=0.387, t7=0.385 | p50(max_across_ranks)=0.395, p90(max_across_ranks)=0.758        198.3       24.8         67.5       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.337, t1=0.335, t2=0.338, t3=0.338, t4=0.337, t5=0.343, t6=0.339, t7=0.337 | p50(max_across_ranks)=0.345, p90(max_across_ranks)=0.350        227.5       28.4         77.4       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.314, t1=0.315, t2=0.313, t3=0.314, t4=0.315, t5=0.317, t6=0.315, t7=0.315 | p50(max_across_ranks)=0.322, p90(max_across_ranks)=0.342        243.6       30.5         82.9       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.472, t1=0.470, t2=0.474, t3=0.475, t4=0.466, t5=0.472, t6=0.474, t7=0.471 | p50(max_across_ranks)=0.481, p90(max_across_ranks)=0.563        163.1       20.4         55.5       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.171, t1=0.172, t2=0.170, t3=0.173, t4=0.171, t5=0.171, t6=0.171, t7=0.171 | p50(max_across_ranks)=0.173, p90(max_across_ranks)=0.176        451.8       56.5        604.5  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000017_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 19/20: case_000018_dcp4_hkv2: B=8, Sq=[16, 16, 16, 16, 16, 16, 16, 16], Sk=[9661, 4003, 3899, 9085, 21681, 29144, 1146, 911], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=8, q_tokens=128, history_tokens=79530, q_seqlens=[16, 16, 16, 16, 16, 16, 16, 16], history_seqlens=[9661, 4003, 3899, 9085, 21681, 29144, 1146, 911]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=8, q_tokens=128, history_tokens=79530, causal=True
+
+B=8, q_tokens=128, history_tokens=79530, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.243, t1=0.267, t2=0.247, t3=0.244, t4=0.255, t5=0.244, t6=0.252, t7=0.252 | p50(max_across_ranks)=0.267, p90(max_across_ranks)=0.302         78.1        9.8         38.3       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.322, t1=0.346, t2=0.327, t3=0.337, t4=0.349, t5=0.329, t6=0.331, t7=0.344 | p50(max_across_ranks)=0.359, p90(max_across_ranks)=0.430         58.1        7.3         28.5       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.288, t1=0.317, t2=0.297, t3=0.291, t4=0.313, t5=0.296, t6=0.322, t7=0.306 | p50(max_across_ranks)=0.334, p90(max_across_ranks)=0.394         62.6        7.8         30.7       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.288, t1=0.306, t2=0.295, t3=0.293, t4=0.304, t5=0.288, t6=0.300, t7=0.304 | p50(max_across_ranks)=0.322, p90(max_across_ranks)=0.369         64.9        8.1         31.8       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.400, t1=0.448, t2=0.402, t3=0.413, t4=0.418, t5=0.391, t6=0.407, t7=0.410 | p50(max_across_ranks)=0.450, p90(max_across_ranks)=0.598         46.4        5.8         22.8       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.043, t1=0.046, t2=0.043, t3=0.045, t4=0.043, t5=0.043, t6=0.043, t7=0.043 | p50(max_across_ranks)=0.046, p90(max_across_ranks)=0.048        456.3       57.0        891.9  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000018_dcp4_hkv2_eager.json
+
+================================================================================
+Batch case 20/20: case_000019_dcp4_hkv2: B=8, Sq=[16, 16, 16, 16, 16, 16, 16, 16], Sk=[75250, 3956, 17773, 7729, 10272, 17368, 13957, 26659], DCP=4, Hkv=2
+================================================================================
+Config: world_size=8, methods=['ours_no_overlap_varlen', 'ours_overlap_varlen', 'vllm_ag_rs_min_fa3_varlen', 'vllm_a2a_min_fa3_varlen', 'sglang_mha_ag_ar_min_fa3_varlen', 'full_kv_min_fa3_varlen'], QH=32, KVH=2, D=128, TP=8, DCP=4, workload=chunk, execution=eager, baseline_phase_timing=False, warmup=10, iters=30, check=False
+Workload: B=8, q_tokens=128, history_tokens=172964, q_seqlens=[16, 16, 16, 16, 16, 16, 16, 16], history_seqlens=[75250, 3956, 17773, 7729, 10272, 17368, 13957, 26659]
+Agg TFLOPS uses useful attention work across all TP ranks and p50(max_across_ranks); Avg/GPU divides it by world_size.
+KV GB/s/GPU is average logical BF16 K+V bytes read per TP rank divided by p50(max_across_ranks); it is not hardware-counter HBM traffic.
+
+Running B=8, q_tokens=128, history_tokens=172964, causal=True
+
+B=8, q_tokens=128, history_tokens=172964, QH=32, KVH=2, D=128, TP=8, DCP=4, mode=causal
+Method                          Time ms                                                                                                                                     Agg TFLOPS    Avg/GPU  KV GB/s/GPU      Check  Note
+ours_no_overlap_varlen          t0=0.239, t1=0.261, t2=0.242, t3=0.241, t4=0.251, t5=0.239, t6=0.247, t7=0.250 | p50(max_across_ranks)=0.265, p90(max_across_ranks)=0.276        171.4       21.4         83.9       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+ours_overlap_varlen             t0=0.322, t1=0.348, t2=0.331, t3=0.327, t4=0.340, t5=0.330, t6=0.333, t7=0.351 | p50(max_across_ranks)=0.363, p90(max_across_ranks)=0.631        125.0       15.6         61.2       skip  eager; output=bf16_reduce_scatter; persistent_grow_only
+vllm_ag_rs_min_fa3_varlen       t0=0.292, t1=0.316, t2=0.297, t3=0.300, t4=0.311, t5=0.290, t6=0.304, t7=0.307 | p50(max_across_ranks)=0.326, p90(max_across_ranks)=0.361        138.9       17.4         68.0       skip  eager; output=bf16_reduce_scatter; framework_style_per_call
+vllm_a2a_min_fa3_varlen         t0=0.289, t1=0.305, t2=0.292, t3=0.288, t4=0.302, t5=0.282, t6=0.295, t7=0.297 | p50(max_across_ranks)=0.316, p90(max_across_ranks)=0.350        143.6       17.9         70.3       skip  eager; output=bf16_packed_all_to_all; framework_style_per_call
+sglang_mha_ag_ar_min_fa3_varlen t0=0.397, t1=0.438, t2=0.401, t3=0.411, t4=0.417, t5=0.392, t6=0.409, t7=0.411 | p50(max_across_ranks)=0.438, p90(max_across_ranks)=0.458        103.4       12.9         50.6       skip  eager; output=fp32_all_reduce; framework_style_per_call
+full_kv_min_fa3_varlen          t0=0.063, t1=0.065, t2=0.063, t3=0.065, t4=0.063, t5=0.063, t6=0.063, t7=0.064 | p50(max_across_ranks)=0.065, p90(max_across_ranks)=0.066        695.2       86.9       1358.3  reference  eager; output=none; operator_managed
+Wrote benchmark JSON to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/case_000019_dcp4_hkv2_eager.json
+
+Mega DCP batch summary
+Case                   DCP Method                              p50 ms     p90 ms   Agg TFLOPS
+case_000000_dcp4_hkv2    4 ours_no_overlap_varlen               0.510      0.521         28.4
+case_000000_dcp4_hkv2    4 ours_overlap_varlen                  0.658      0.725         22.0
+case_000000_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.617      0.627         23.5
+case_000000_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.340      0.373         42.7
+case_000000_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.464      0.494         31.2
+case_000000_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.038      0.043        377.0
+case_000001_dcp4_hkv2    4 ours_no_overlap_varlen               0.279      0.294         62.6
+case_000001_dcp4_hkv2    4 ours_overlap_varlen                  0.374      0.399         46.7
+case_000001_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.344      0.373         50.8
+case_000001_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.322      0.342         54.3
+case_000001_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.453      0.478         38.6
+case_000001_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.039      0.041        444.0
+case_000002_dcp4_hkv2    4 ours_no_overlap_varlen               0.270      0.280         58.4
+case_000002_dcp4_hkv2    4 ours_overlap_varlen                  0.359      1.068         43.9
+case_000002_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.330      0.346         47.8
+case_000002_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.325      0.354         48.4
+case_000002_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.454      0.468         34.7
+case_000002_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.041      0.042        386.1
+case_000003_dcp4_hkv2    4 ours_no_overlap_varlen               0.261      0.280         70.8
+case_000003_dcp4_hkv2    4 ours_overlap_varlen                  0.369      1.090         50.0
+case_000003_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.327      0.336         56.4
+case_000003_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.313      0.330         59.1
+case_000003_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.445      0.461         41.5
+case_000003_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.041      0.043        450.7
+case_000004_dcp4_hkv2    4 ours_no_overlap_varlen               0.280      2.037         36.7
+case_000004_dcp4_hkv2    4 ours_overlap_varlen                  0.361      0.372         28.5
+case_000004_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.320      0.341         32.1
+case_000004_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.317      0.335         32.4
+case_000004_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.445      0.462         23.1
+case_000004_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.037      0.050        278.4
+case_000005_dcp4_hkv2    4 ours_no_overlap_varlen               0.267      0.286        174.8
+case_000005_dcp4_hkv2    4 ours_overlap_varlen                  0.365      0.387        127.8
+case_000005_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.337      1.524        138.5
+case_000005_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.317      0.328        146.8
+case_000005_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.444      0.457        104.9
+case_000005_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.067      0.068        698.8
+case_000006_dcp4_hkv2    4 ours_no_overlap_varlen               0.458      0.464        487.2
+case_000006_dcp4_hkv2    4 ours_overlap_varlen                  0.484      1.185        460.9
+case_000006_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.489      0.494        456.6
+case_000006_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.450      0.456        495.8
+case_000006_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.740      2.121        301.8
+case_000006_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.429      0.431        520.5
+case_000007_dcp4_hkv2    4 ours_no_overlap_varlen               0.265      0.281         50.9
+case_000007_dcp4_hkv2    4 ours_overlap_varlen                  0.356      0.374         37.8
+case_000007_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.328      0.438         41.0
+case_000007_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.315      0.345         42.8
+case_000007_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.443      0.462         30.4
+case_000007_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.037      0.039        362.2
+case_000008_dcp4_hkv2    4 ours_no_overlap_varlen               0.261      0.278        163.0
+case_000008_dcp4_hkv2    4 ours_overlap_varlen                  0.390      2.072        109.2
+case_000008_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.328      0.337        129.8
+case_000008_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.319      0.337        133.5
+case_000008_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.441      0.463         96.5
+case_000008_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.065      0.067        660.0
+case_000009_dcp4_hkv2    4 ours_no_overlap_varlen               0.474      0.483        890.3
+case_000009_dcp4_hkv2    4 ours_overlap_varlen                  0.503      1.310        839.6
+case_000009_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.522      1.018        808.3
+case_000009_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.467      0.484        904.0
+case_000009_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.738      0.760        572.1
+case_000009_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.574      0.578        735.2
+case_000010_dcp4_hkv2    4 ours_no_overlap_varlen               0.277      0.470        238.7
+case_000010_dcp4_hkv2    4 ours_overlap_varlen                  0.369      0.548        179.2
+case_000010_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.335      0.403        197.4
+case_000010_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.333      0.468        198.4
+case_000010_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.462      1.997        143.2
+case_000010_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.068      0.070        967.4
+case_000011_dcp4_hkv2    4 ours_no_overlap_varlen               0.262      0.285        118.8
+case_000011_dcp4_hkv2    4 ours_overlap_varlen                  0.359      0.380         86.6
+case_000011_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.331      0.802         94.0
+case_000011_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.322      2.014         96.4
+case_000011_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.449      0.464         69.2
+case_000011_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.055      0.058        569.3
+case_000012_dcp4_hkv2    4 ours_no_overlap_varlen               0.264      0.286         31.3
+case_000012_dcp4_hkv2    4 ours_overlap_varlen                  0.373      0.584         22.1
+case_000012_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.336      1.940         24.6
+case_000012_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.324      0.346         25.5
+case_000012_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.453      0.466         18.2
+case_000012_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.036      0.038        232.4
+case_000013_dcp4_hkv2    4 ours_no_overlap_varlen               0.259      0.310         49.5
+case_000013_dcp4_hkv2    4 ours_overlap_varlen                  0.360      0.435         35.6
+case_000013_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.334      1.667         38.3
+case_000013_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.312      0.351         41.1
+case_000013_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.436      0.502         29.4
+case_000013_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.040      0.045        318.3
+case_000014_dcp4_hkv2    4 ours_no_overlap_varlen               0.278      0.869        148.4
+case_000014_dcp4_hkv2    4 ours_overlap_varlen                  0.362      1.513        113.9
+case_000014_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.319      0.346        129.2
+case_000014_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.315      0.372        130.7
+case_000014_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.452      1.065         91.1
+case_000014_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.063      0.065        655.4
+case_000015_dcp4_hkv2    4 ours_no_overlap_varlen               0.265      0.548         11.7
+case_000015_dcp4_hkv2    4 ours_overlap_varlen                  0.357      0.396          8.7
+case_000015_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.322      0.353          9.6
+case_000015_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.317      0.355          9.7
+case_000015_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.443      0.612          7.0
+case_000015_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.038      0.041         81.8
+case_000016_dcp4_hkv2    4 ours_no_overlap_varlen               0.417      0.443       1008.1
+case_000016_dcp4_hkv2    4 ours_overlap_varlen                  0.442      0.446        952.6
+case_000016_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.446      0.642        944.3
+case_000016_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.406      0.412       1035.8
+case_000016_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.667      1.091        630.4
+case_000016_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.374      0.377       1124.1
+case_000017_dcp4_hkv2    4 ours_no_overlap_varlen               0.337      0.345        232.3
+case_000017_dcp4_hkv2    4 ours_overlap_varlen                  0.395      0.758        198.3
+case_000017_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.345      0.350        227.5
+case_000017_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.322      0.342        243.6
+case_000017_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.481      0.563        163.1
+case_000017_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.173      0.176        451.8
+case_000018_dcp4_hkv2    4 ours_no_overlap_varlen               0.267      0.302         78.1
+case_000018_dcp4_hkv2    4 ours_overlap_varlen                  0.359      0.430         58.1
+case_000018_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.334      0.394         62.6
+case_000018_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.322      0.369         64.9
+case_000018_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.450      0.598         46.4
+case_000018_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.046      0.048        456.3
+case_000019_dcp4_hkv2    4 ours_no_overlap_varlen               0.265      0.276        171.4
+case_000019_dcp4_hkv2    4 ours_overlap_varlen                  0.363      0.631        125.0
+case_000019_dcp4_hkv2    4 vllm_ag_rs_min_fa3_varlen            0.326      0.361        138.9
+case_000019_dcp4_hkv2    4 vllm_a2a_min_fa3_varlen              0.316      0.350        143.6
+case_000019_dcp4_hkv2    4 sglang_mha_ag_ar_min_fa3_varlen      0.438      0.458        103.4
+case_000019_dcp4_hkv2    4 full_kv_min_fa3_varlen               0.065      0.066        695.2
+
+Mega DCP workload-weighted summary
+Topology        DCP Method                            Cases    Mean ms  Mean TFLOPS     Weighted  Weighted/GPU
+dcp4_hkv2         4 ours_no_overlap_varlen               20      0.311        205.6        249.8          31.2
+dcp4_hkv2         4 ours_overlap_varlen                  20      0.398        177.3        195.1          24.4
+dcp4_hkv2         4 vllm_ag_rs_min_fa3_varlen            20      0.368        182.6        210.7          26.3
+dcp4_hkv2         4 vllm_a2a_min_fa3_varlen              20      0.339        197.5        229.1          28.6
+dcp4_hkv2         4 sglang_mha_ag_ar_min_fa3_varlen      20      0.490        128.8        158.4          19.8
+dcp4_hkv2         4 full_kv_min_fa3_varlen               20      0.116        523.2        667.4          83.4
+Wrote batch manifest to benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_4/baseline_eager/manifest.json

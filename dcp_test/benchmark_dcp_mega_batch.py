@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass, replace
@@ -21,6 +22,7 @@ from dcp_test.trace.models import (
     load_config as load_trace_config,
 )
 from dcp_test.utils import (
+    DCPGroup,
     initialize_distributed_sm90,
     make_dcp_groups,
     require_world_size,
@@ -30,6 +32,7 @@ from min_fa3_dcp import make_topology
 
 CONFIG_SCHEMA_VERSION = 1
 MANIFEST_SCHEMA_VERSION = 1
+SWEEP_MANIFEST_SCHEMA_VERSION = 1
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "dcp_mega_six_loads.json"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -435,6 +438,29 @@ def _arg_num_splits(value: str) -> int:
     return parsed
 
 
+def _arg_positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("value must be a number") from error
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive finite number")
+    return parsed
+
+
+def _arg_positive_int_list(value: str) -> tuple[int, ...]:
+    tokens = tuple(token.strip() for token in value.split(",") if token.strip())
+    if not tokens:
+        raise argparse.ArgumentTypeError("value must not be empty")
+    try:
+        parsed = tuple(_arg_positive_int(token) for token in tokens)
+    except (ValueError, argparse.ArgumentTypeError) as error:
+        raise argparse.ArgumentTypeError(
+            "value must contain comma-separated positive integers"
+        ) from error
+    return tuple(dict.fromkeys(parsed))
+
+
 def default_output_dir() -> Path:
     timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
     return Path("benchmarks/results") / f"dcp_mega_batch_{timestamp}"
@@ -463,6 +489,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="trace num_cases override used when generating the input JSONL",
     )
+    parser.add_argument(
+        "--trace-arrival-time-scale",
+        type=_arg_positive_float,
+        default=None,
+        help="arrival_time_scale override used to generate --trace-cases",
+    )
+    parser.add_argument(
+        "--trace-dcp-size",
+        type=int,
+        choices=(2, 4, 8),
+        default=None,
+        help="dcp_size override used to generate --trace-cases",
+    )
     parser.add_argument("--workloads", default="all")
     parser.add_argument("--dcp-sizes", default="all")
     parser.add_argument(
@@ -470,6 +509,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--num-splits", type=_arg_num_splits, default=0)
     parser.add_argument("--mega-num-comm-sm", type=_arg_positive_int, default=8)
+    parser.add_argument(
+        "--mega-num-comm-sms",
+        type=_arg_positive_int_list,
+        default=None,
+        help="Mega-only eager comm-SM sweep executed in one torchrun",
+    )
     parser.add_argument("--mega-block-n", type=int, choices=(128, 176), default=128)
     parser.add_argument(
         "--mega-phase-timestamps",
@@ -509,10 +554,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--trace-cases and --trace-config must be provided together")
     if args.trace_cases is None and args.num_cases is not None:
         parser.error("--num-cases is valid only with --trace-cases")
+    if args.trace_cases is None and (
+        args.trace_arrival_time_scale is not None or args.trace_dcp_size is not None
+    ):
+        parser.error("trace overrides are valid only with --trace-cases")
     if args.trace_cases is not None and args.workloads != "all":
         parser.error("--workloads is not supported with --trace-cases")
     if args.mega_num_comm_sm >= 132:
         parser.error("--mega-num-comm-sm must leave at least one of 132 SMs for compute")
+    if args.mega_num_comm_sms is not None and any(
+        value >= 132 for value in args.mega_num_comm_sms
+    ):
+        parser.error(
+            "--mega-num-comm-sms values must leave at least one of 132 SMs "
+            "for compute"
+        )
     if args.output_dir is None:
         args.output_dir = default_output_dir()
     if args.manifest is None:
@@ -524,8 +580,20 @@ def _length_spec(values: Sequence[int]) -> str:
     return ",".join(str(value) for value in values)
 
 
-def _result_path(args: argparse.Namespace, case: BatchCase) -> Path:
+def _result_path(
+    args: argparse.Namespace,
+    case: BatchCase,
+    mega_num_comm_sm: int | None = None,
+) -> Path:
     mode = "graph" if args.cuda_graph else "eager"
+    if args.mega_num_comm_sms is not None:
+        if mega_num_comm_sm is None:
+            raise ValueError("comm-SM sweep result paths require a comm-SM value")
+        return (
+            args.output_dir
+            / f"comm_sm_{mega_num_comm_sm}"
+            / f"{case.case_id}_{mode}.json"
+        )
     return args.output_dir / f"{case.case_id}_{mode}.json"
 
 
@@ -534,7 +602,11 @@ def _case_argv(
     config: BatchConfig,
     case: BatchCase,
     output_path: Path,
+    mega_num_comm_sm: int | None = None,
 ) -> list[str]:
+    comm_sm = (
+        args.mega_num_comm_sm if mega_num_comm_sm is None else mega_num_comm_sm
+    )
     return [
         "--b",
         str(case.workload.batch_size),
@@ -559,7 +631,7 @@ def _case_argv(
         "--num-splits",
         str(args.num_splits),
         "--mega-num-comm-sm",
-        str(args.mega_num_comm_sm),
+        str(comm_sm),
         "--mega-block-n",
         str(args.mega_block_n),
         "--warmup",
@@ -610,6 +682,12 @@ def _method_summary(result: Mapping[str, Any]) -> dict[str, dict[str, float]]:
             "p50_ms": float(report["stages_ms"]["attention_end_to_end_ms"]["p50"]),
             "p90_ms": float(report["stages_ms"]["attention_end_to_end_ms"]["p90"]),
             "effective_tflops": float(report["effective_tflops"]),
+            "average_logical_kv_bytes_per_gpu": float(
+                report["logical_kv_read"]["average_bytes_per_gpu"]
+            ),
+            "effective_kv_bandwidth_gbps_per_gpu": float(
+                report["logical_kv_read"]["effective_bandwidth_gbps_per_gpu"]
+            ),
         }
         for method, report in methods.items()
     }
@@ -673,13 +751,24 @@ def _weighted_summary(
         p50_values = [float(record["p50_ms"]) for record in records]
         p90_values = [float(record["p90_ms"]) for record in records]
         tflops_values = [float(record["effective_tflops"]) for record in records]
+        bandwidth_values = [
+            float(record["effective_kv_bandwidth_gbps_per_gpu"])
+            for record in records
+        ]
         total_flops = sum(int(record["global_effective_flops"]) for record in records)
+        total_logical_kv_bytes_per_gpu = sum(
+            float(record["average_logical_kv_bytes_per_gpu"])
+            for record in records
+        )
         total_p50_ms = sum(p50_values)
         if total_p50_ms <= 0:
             raise ValueError(
                 f"cannot aggregate non-positive p50 latency for {topology}/{method}"
             )
         weighted_tflops = total_flops / (total_p50_ms * 1.0e9)
+        weighted_bandwidth = total_logical_kv_bytes_per_gpu / (
+            total_p50_ms * 1.0e6
+        )
         topology_summary = topologies.setdefault(
             topology,
             {
@@ -696,7 +785,13 @@ def _weighted_summary(
             "workload_weighted_effective_tflops": weighted_tflops,
             "workload_weighted_effective_tflops_per_gpu": weighted_tflops
             / tp_size,
+            "mean_effective_kv_bandwidth_gbps_per_gpu": sum(bandwidth_values)
+            / len(bandwidth_values),
+            "workload_weighted_effective_kv_bandwidth_gbps_per_gpu": (
+                weighted_bandwidth
+            ),
             "total_effective_flops": total_flops,
+            "total_logical_kv_bytes_per_gpu": total_logical_kv_bytes_per_gpu,
             "total_p50_latency_ms": total_p50_ms,
         }
 
@@ -705,6 +800,11 @@ def _weighted_summary(
         "weighting": (
             "sum(global_effective_flops) / sum(p50_latency_seconds), equivalent "
             "to a p50-latency-weighted mean of per-case effective TFLOPS"
+        ),
+        "bandwidth_weighting": (
+            "sum(average logical BF16 K+V bytes per GPU) / "
+            "sum(p50_latency_seconds); this is effective payload bandwidth, "
+            "not hardware-counter HBM traffic"
         ),
         "topologies": topologies,
     }
@@ -770,6 +870,159 @@ def _print_weighted_summary(summary: Mapping[str, Any]) -> None:
         )
 
 
+def _trace_manifest(
+    args: argparse.Namespace,
+    trace_config: ReplayConfig | None,
+) -> dict[str, Any] | None:
+    if trace_config is None:
+        return None
+    return {
+        "cases_jsonl": str(args.trace_cases),
+        "replay_config": str(args.trace_config),
+        "trace_sha256": trace_config.trace_sha256,
+        "config_sha256": trace_config.config_sha256,
+        "num_cases": trace_config.num_cases,
+        "arrival_time_scale": str(trace_config.arrival_time_scale),
+        "dcp_size": trace_config.dcp_size,
+        "fixed_step_us": trace_config.fixed_step_us,
+        "sampling_start_ms": trace_config.sampling_start_ms,
+        "sampling_end_ms": trace_config.sampling_end_ms,
+        "seed": trace_config.seed,
+    }
+
+
+def _manifest_parameters(
+    args: argparse.Namespace,
+    config: BatchConfig,
+    implementations: tuple[str, ...],
+) -> dict[str, Any]:
+    return {
+        "tp_size": config.tp_size,
+        "q_heads": config.q_heads,
+        "head_dim": config.head_dim,
+        "implementations": list(implementations),
+        "method_labels": list(
+            benchmark_dcp_varlen.expanded_method_labels(implementations)
+        ),
+        "num_splits": args.num_splits,
+        "mega_block_n": args.mega_block_n,
+        "mega_phase_timestamps": args.mega_phase_timestamps,
+        "baseline_phase_timing": args.baseline_phase_timing,
+        "warmup": args.warmup,
+        "iters": args.iters,
+        "check": args.check,
+    }
+
+
+def _manifest_common(
+    args: argparse.Namespace,
+    config: BatchConfig,
+    selected_dcp_sizes: str,
+    implementations: tuple[str, ...],
+    trace_config: ReplayConfig | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": "running",
+        "name": config.name,
+        "source_config": str(args.config),
+        "started_at": datetime.now().astimezone().isoformat(),
+        "completed_at": None,
+        "execution_mode": "cuda_graph" if args.cuda_graph else "eager",
+        "selection": {
+            "workloads": args.workloads,
+            "dcp_sizes": selected_dcp_sizes,
+            "requested_dcp_sizes": args.dcp_sizes,
+        },
+        "parameters": _manifest_parameters(args, config, implementations),
+    }
+    trace = _trace_manifest(args, trace_config)
+    if trace is not None:
+        payload["trace"] = trace
+    return payload
+
+
+def _run_case(
+    args: argparse.Namespace,
+    config: BatchConfig,
+    case: BatchCase,
+    output_path: Path,
+    device: torch.device,
+    dcp_group: DCPGroup,
+    *,
+    mega_num_comm_sm: int | None = None,
+) -> dict[str, object]:
+    return benchmark_dcp_varlen.main(
+        _case_argv(
+            args,
+            config,
+            case,
+            output_path,
+            mega_num_comm_sm=mega_num_comm_sm,
+        ),
+        device=device,
+        dcp_group=dcp_group,
+        manage_process_group=False,
+    )
+
+
+def _build_manifest(
+    args: argparse.Namespace,
+    config: BatchConfig,
+    selected_dcp_sizes: str,
+    implementations: tuple[str, ...],
+    trace_config: ReplayConfig | None,
+    cases: Sequence[BatchCase],
+    comm_sm_sweep: tuple[int, ...] | None,
+) -> dict[str, Any]:
+    common = _manifest_common(
+        args,
+        config,
+        selected_dcp_sizes,
+        implementations,
+        trace_config,
+    )
+    if comm_sm_sweep is None:
+        return {
+            "schema_version": MANIFEST_SCHEMA_VERSION,
+            **common,
+            "parameters": {
+                **common["parameters"],
+                "mega_num_comm_sm": args.mega_num_comm_sm,
+            },
+            "case_total": len(cases),
+            "completed_case_count": 0,
+            "cases": [],
+            "weighted_summary": None,
+        }
+    return {
+        "schema_version": SWEEP_MANIFEST_SCHEMA_VERSION,
+        "manifest_kind": "mega_comm_sm_sweep",
+        **common,
+        "parameters": {
+            **common["parameters"],
+            "mega_num_comm_sms": list(comm_sm_sweep),
+        },
+        "case_total": len(cases) * len(comm_sm_sweep),
+        "completed_case_count": 0,
+        "variant_total": len(comm_sm_sweep),
+        "completed_variant_count": 0,
+        "variants": [
+            {
+                "variant_id": f"comm_sm_{comm_sm}",
+                "mega_num_comm_sm": comm_sm,
+                "status": "pending",
+                "started_at": None,
+                "completed_at": None,
+                "case_total": len(cases),
+                "completed_case_count": 0,
+                "cases": [],
+                "weighted_summary": None,
+            }
+            for comm_sm in comm_sm_sweep
+        ],
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     trace_config: ReplayConfig | None = None
@@ -781,6 +1034,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             trace_config = load_trace_config(
                 args.trace_config,
                 num_cases=args.num_cases,
+                arrival_time_scale=args.trace_arrival_time_scale,
+                dcp_size=args.trace_dcp_size,
             )
             config = replace(
                 config,
@@ -807,18 +1062,45 @@ def main(argv: Sequence[str] | None = None) -> None:
     except ValueError as error:
         raise SystemExit(str(error)) from error
 
+    comm_sm_sweep = args.mega_num_comm_sms
+    if comm_sm_sweep is not None:
+        if implementations != ("mega",):
+            raise SystemExit(
+                "--mega-num-comm-sms requires --implementations mega"
+            )
+        if args.cuda_graph:
+            raise SystemExit("--mega-num-comm-sms supports eager execution only")
+
     mode = "graph" if args.cuda_graph else "eager"
     if args.print_cases:
+        if comm_sm_sweep is None:
+            print(
+                f"Batch config: name={config.name}, mode={mode}, "
+                f"cases={len(cases)}, implementations={list(implementations)}, "
+                f"baseline_phase_timing={args.baseline_phase_timing}"
+            )
+            for index, case in enumerate(cases, start=1):
+                print(
+                    f"[{index}/{len(cases)}] {_case_description(case)}; "
+                    f"output={_result_path(args, case)}"
+                )
+            return
+        total = len(cases) * len(comm_sm_sweep)
         print(
             f"Batch config: name={config.name}, mode={mode}, "
-            f"cases={len(cases)}, implementations={list(implementations)}, "
+            f"cases={len(cases)}, executions={total}, "
+            f"implementations={list(implementations)}, "
             f"baseline_phase_timing={args.baseline_phase_timing}"
         )
-        for index, case in enumerate(cases, start=1):
-            print(
-                f"[{index}/{len(cases)}] {_case_description(case)}; "
-                f"output={_result_path(args, case)}"
-            )
+        execution_index = 0
+        for comm_sm in comm_sm_sweep:
+            for case in cases:
+                execution_index += 1
+                print(
+                    f"[{execution_index}/{total}] {_case_description(case)}; "
+                    f"comm_sm={comm_sm}; "
+                    f"output={_result_path(args, case, comm_sm)}"
+                )
         return
 
     device = initialize_distributed_sm90("Mega DCP batch benchmark")
@@ -827,101 +1109,123 @@ def main(argv: Sequence[str] | None = None) -> None:
     local_groups = make_dcp_groups(
         (case.topology.dcp_size for case in cases), device
     )
-    started_at = datetime.now().astimezone().isoformat()
-    manifest: dict[str, Any] = {
-        "schema_version": MANIFEST_SCHEMA_VERSION,
-        "status": "running",
-        "name": config.name,
-        "source_config": str(args.config),
-        "started_at": started_at,
-        "completed_at": None,
-        "execution_mode": "cuda_graph" if args.cuda_graph else "eager",
-        "selection": {
-            "workloads": args.workloads,
-            "dcp_sizes": selected_dcp_sizes,
-            "requested_dcp_sizes": args.dcp_sizes,
-        },
-        "parameters": {
-            "tp_size": config.tp_size,
-            "q_heads": config.q_heads,
-            "head_dim": config.head_dim,
-            "implementations": list(implementations),
-            "method_labels": list(
-                benchmark_dcp_varlen.expanded_method_labels(implementations)
-            ),
-            "num_splits": args.num_splits,
-            "mega_num_comm_sm": args.mega_num_comm_sm,
-            "mega_block_n": args.mega_block_n,
-            "mega_phase_timestamps": args.mega_phase_timestamps,
-            "baseline_phase_timing": args.baseline_phase_timing,
-            "warmup": args.warmup,
-            "iters": args.iters,
-            "check": args.check,
-        },
-        "case_total": len(cases),
-        "completed_case_count": 0,
-        "cases": [],
-        "weighted_summary": None,
-    }
-    if trace_config is not None:
-        manifest["trace"] = {
-            "cases_jsonl": str(args.trace_cases),
-            "replay_config": str(args.trace_config),
-            "trace_sha256": trace_config.trace_sha256,
-            "config_sha256": trace_config.config_sha256,
-            "num_cases": trace_config.num_cases,
-            "dcp_size": trace_config.dcp_size,
-            "fixed_step_us": trace_config.fixed_step_us,
-            "sampling_start_ms": trace_config.sampling_start_ms,
-            "sampling_end_ms": trace_config.sampling_end_ms,
-            "seed": trace_config.seed,
-        }
+    manifest = _build_manifest(
+        args,
+        config,
+        selected_dcp_sizes,
+        implementations,
+        trace_config,
+        cases,
+        comm_sm_sweep,
+    )
     if rank == 0:
         _write_json(args.manifest, manifest)
         print(
             f"Mega DCP batch: name={config.name}, mode={mode}, cases={len(cases)}, "
             f"methods={list(benchmark_dcp_varlen.expanded_method_labels(implementations))}, "
+            f"comm_sm_sweep={list(comm_sm_sweep) if comm_sm_sweep else None}, "
             f"baseline_phase_timing={args.baseline_phase_timing}"
         )
 
     active_case: BatchCase | None = None
+    active_variant: dict[str, Any] | None = None
     try:
-        for case_index, case in enumerate(cases, start=1):
-            active_case = case
-            output_path = _result_path(args, case)
-            if rank == 0:
-                print("\n" + "=" * 80)
-                print(
-                    f"Batch case {case_index}/{len(cases)}: {_case_description(case)}",
-                    flush=True,
+        if comm_sm_sweep is None:
+            for case_index, case in enumerate(cases, start=1):
+                active_case = case
+                output_path = _result_path(args, case)
+                if rank == 0:
+                    print("\n" + "=" * 80)
+                    print(
+                        f"Batch case {case_index}/{len(cases)}: "
+                        f"{_case_description(case)}",
+                        flush=True,
+                    )
+                    print("=" * 80)
+                result = _run_case(
+                    args,
+                    config,
+                    case,
+                    output_path,
+                    device,
+                    local_groups[case.topology.dcp_size],
                 )
-                print("=" * 80)
-            result = benchmark_dcp_varlen.main(
-                _case_argv(args, config, case, output_path),
-                device=device,
-                dcp_group=local_groups[case.topology.dcp_size],
-                manage_process_group=False,
-            )
+                if rank == 0:
+                    manifest["cases"].append(
+                        _manifest_case(case, output_path, result)
+                    )
+                    manifest["completed_case_count"] = len(manifest["cases"])
+                    _write_json(args.manifest, manifest)
             if rank == 0:
-                manifest["cases"].append(
-                    _manifest_case(case, output_path, result)
+                manifest["weighted_summary"] = _weighted_summary(
+                    manifest["cases"], config.tp_size
                 )
-                manifest["completed_case_count"] = len(manifest["cases"])
+                manifest["status"] = "complete"
+                manifest["completed_at"] = datetime.now().astimezone().isoformat()
+                _write_json(args.manifest, manifest)
+                _print_summary(manifest["cases"])
+                _print_weighted_summary(manifest["weighted_summary"])
+        else:
+            for variant in manifest["variants"]:
+                active_variant = variant
+                comm_sm = int(variant["mega_num_comm_sm"])
+                if rank == 0:
+                    variant["status"] = "running"
+                    variant["started_at"] = datetime.now().astimezone().isoformat()
+                    _write_json(args.manifest, manifest)
+                for case_index, case in enumerate(cases, start=1):
+                    active_case = case
+                    output_path = _result_path(args, case, comm_sm)
+                    if rank == 0:
+                        print("\n" + "=" * 80)
+                        print(
+                            f"Mega comm_sm={comm_sm}, case "
+                            f"{case_index}/{len(cases)}: {_case_description(case)}",
+                            flush=True,
+                        )
+                        print("=" * 80)
+                    result = _run_case(
+                        args,
+                        config,
+                        case,
+                        output_path,
+                        device,
+                        local_groups[case.topology.dcp_size],
+                        mega_num_comm_sm=comm_sm,
+                    )
+                    if rank == 0:
+                        variant["cases"].append(
+                            _manifest_case(case, output_path, result)
+                        )
+                        variant["completed_case_count"] = len(variant["cases"])
+                        manifest["completed_case_count"] += 1
+                        _write_json(args.manifest, manifest)
+                if rank == 0:
+                    variant["weighted_summary"] = _weighted_summary(
+                        variant["cases"], config.tp_size
+                    )
+                    variant["status"] = "complete"
+                    variant["completed_at"] = datetime.now().astimezone().isoformat()
+                    manifest["completed_variant_count"] += 1
+                    _write_json(args.manifest, manifest)
+                    print(f"\nMega comm_sm={comm_sm} summary")
+                    _print_summary(variant["cases"])
+                    _print_weighted_summary(variant["weighted_summary"])
+            if rank == 0:
+                manifest["status"] = "complete"
+                manifest["completed_at"] = datetime.now().astimezone().isoformat()
                 _write_json(args.manifest, manifest)
         if rank == 0:
-            manifest["weighted_summary"] = _weighted_summary(
-                manifest["cases"], config.tp_size
-            )
-            manifest["status"] = "complete"
-            manifest["completed_at"] = datetime.now().astimezone().isoformat()
-            _write_json(args.manifest, manifest)
-            _print_summary(manifest["cases"])
-            _print_weighted_summary(manifest["weighted_summary"])
             print(f"Wrote batch manifest to {args.manifest}", flush=True)
     except BaseException as error:
         if rank == 0:
             manifest["status"] = "failed"
             manifest["completed_at"] = datetime.now().astimezone().isoformat()
+            if active_variant is not None:
+                active_variant["status"] = "failed"
+                active_variant["completed_at"] = manifest["completed_at"]
+                active_variant["error"] = f"{type(error).__name__}: {error}"
+                manifest["failed_variant"] = active_variant["variant_id"]
             manifest["failed_case"] = (
                 active_case.case_id if active_case is not None else None
             )

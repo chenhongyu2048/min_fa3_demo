@@ -8,8 +8,10 @@ from unittest import mock
 from dcp_test import benchmark_dcp_varlen
 from dcp_test.benchmark_dcp_mega_batch import (
     DEFAULT_CONFIG,
+    _build_manifest,
     _case_argv,
     _manifest_case,
+    _result_path,
     _weighted_summary,
     expand_cases,
     load_batch_config,
@@ -131,6 +133,10 @@ class DCPMegaBatchTest(unittest.TestCase):
                         "attention_end_to_end_ms": {"p50": 0.125, "p90": 0.150}
                     },
                     "effective_tflops": 42.0,
+                    "logical_kv_read": {
+                        "average_bytes_per_gpu": 12_000_000.0,
+                        "effective_bandwidth_gbps_per_gpu": 96.0,
+                    },
                 }
             }
         }
@@ -140,7 +146,13 @@ class DCPMegaBatchTest(unittest.TestCase):
         self.assertEqual(entry["global_effective_flops"], 5_250_000_000)
         self.assertEqual(
             entry["methods"]["dcp_mega_varlen"],
-            {"p50_ms": 0.125, "p90_ms": 0.150, "effective_tflops": 42.0},
+            {
+                "p50_ms": 0.125,
+                "p90_ms": 0.150,
+                "effective_tflops": 42.0,
+                "average_logical_kv_bytes_per_gpu": 12_000_000.0,
+                "effective_kv_bandwidth_gbps_per_gpu": 96.0,
+            },
         )
 
     def test_trace_cases_are_validated_and_keep_provenance(self) -> None:
@@ -251,6 +263,8 @@ class DCPMegaBatchTest(unittest.TestCase):
                         "p50_ms": 1.0,
                         "p90_ms": 1.5,
                         "effective_tflops": 1000.0,
+                        "average_logical_kv_bytes_per_gpu": 2_000_000_000.0,
+                        "effective_kv_bandwidth_gbps_per_gpu": 2000.0,
                     }
                 },
             },
@@ -264,6 +278,8 @@ class DCPMegaBatchTest(unittest.TestCase):
                         "p50_ms": 6.0,
                         "p90_ms": 9.0,
                         "effective_tflops": 500.0,
+                        "average_logical_kv_bytes_per_gpu": 6_000_000_000.0,
+                        "effective_kv_bandwidth_gbps_per_gpu": 1000.0,
                     }
                 },
             },
@@ -284,6 +300,16 @@ class DCPMegaBatchTest(unittest.TestCase):
             method["workload_weighted_effective_tflops_per_gpu"],
             500.0 / 7.0,
         )
+        self.assertEqual(
+            method["mean_effective_kv_bandwidth_gbps_per_gpu"], 1500.0
+        )
+        self.assertAlmostEqual(
+            method["workload_weighted_effective_kv_bandwidth_gbps_per_gpu"],
+            8000.0 / 7.0,
+        )
+        self.assertEqual(
+            method["total_logical_kv_bytes_per_gpu"], 8_000_000_000.0
+        )
 
     def test_baseline_phase_timing_flag_is_forwarded_to_every_case(self) -> None:
         args = parse_args(
@@ -303,6 +329,68 @@ class DCPMegaBatchTest(unittest.TestCase):
         self.assertIn("--no-baseline-phase-timing", case_argv)
         direct_args = benchmark_dcp_varlen.parse_args(case_argv)
         self.assertFalse(direct_args.baseline_phase_timing)
+
+    def test_comm_sm_sweep_parser_paths_and_case_forwarding(self) -> None:
+        args = parse_args(
+            [
+                "--implementations",
+                "mega",
+                "--no-cuda-graph",
+                "--mega-num-comm-sms",
+                "4,8,4,20",
+                "--output-dir",
+                "results",
+                "--manifest",
+                "results/manifest.json",
+            ]
+        )
+        self.assertEqual(args.mega_num_comm_sms, (4, 8, 20))
+
+        config = load_batch_config(DEFAULT_CONFIG)
+        case = expand_cases(config, workloads="small1", dcp_sizes="2")[0]
+        output_path = _result_path(args, case, 20)
+        self.assertEqual(
+            output_path,
+            Path("results/comm_sm_20/small1_dcp2_hkv4_eager.json"),
+        )
+        direct_args = benchmark_dcp_varlen.parse_args(
+            _case_argv(args, config, case, output_path, mega_num_comm_sm=20)
+        )
+        self.assertEqual(direct_args.mega_num_comm_sm, 20)
+
+        manifest = _build_manifest(
+            args,
+            config,
+            "2",
+            ("mega",),
+            None,
+            (case,),
+            args.mega_num_comm_sms,
+        )
+        self.assertEqual(manifest["manifest_kind"], "mega_comm_sm_sweep")
+        self.assertEqual(manifest["case_total"], 3)
+        self.assertEqual(manifest["variant_total"], 3)
+        self.assertEqual(
+            [variant["variant_id"] for variant in manifest["variants"]],
+            ["comm_sm_4", "comm_sm_8", "comm_sm_20"],
+        )
+        self.assertTrue(
+            all(variant["status"] == "pending" for variant in manifest["variants"])
+        )
+
+        with self.assertRaises(SystemExit):
+            with mock.patch("sys.stderr"):
+                parse_args(["--mega-num-comm-sms", "4,132"])
+
+    def test_trace_matrix_overrides_require_trace_inputs(self) -> None:
+        for option, value in (
+            ("--trace-arrival-time-scale", "2"),
+            ("--trace-dcp-size", "4"),
+        ):
+            with self.subTest(option=option), self.assertRaises(SystemExit), mock.patch(
+                "sys.stderr"
+            ):
+                parse_args([option, value])
 
     @mock.patch("dcp_test.utils.torch.cuda.Event")
     def test_disabled_phase_timing_only_constructs_end_to_end_events(

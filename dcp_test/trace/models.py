@@ -143,8 +143,10 @@ def load_config(
     path: str | Path,
     *,
     num_cases: int | None = None,
+    arrival_time_scale: int | float | str | None = None,
+    dcp_size: int | None = None,
 ) -> ReplayConfig:
-    """Load a strict JSON config, applying an optional case-count override."""
+    """Load a strict JSON config, applying optional benchmark overrides."""
     config_path = Path(path).resolve()
     try:
         with config_path.open("r", encoding="utf-8") as handle:
@@ -165,6 +167,13 @@ def load_config(
         if num_cases < 1:
             raise ConfigError("num_cases override must be >= 1")
         raw["num_cases"] = num_cases
+    if arrival_time_scale is not None:
+        raw["arrival_time_scale"] = arrival_time_scale
+        _decimal(raw, "arrival_time_scale")
+    if dcp_size is not None:
+        if isinstance(dcp_size, bool) or not isinstance(dcp_size, int):
+            raise ConfigError("dcp_size override must be an integer")
+        raw["dcp_size"] = dcp_size
 
     trace_path_value = raw["trace_path"]
     if not isinstance(trace_path_value, str) or not trace_path_value:

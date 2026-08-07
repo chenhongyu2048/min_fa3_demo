@@ -5,6 +5,7 @@ import io
 import json
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 from dcp_test.trace.generate import run
@@ -120,6 +121,19 @@ class TraceWorkloadTest(unittest.TestCase):
         self.assertNotEqual(overridden.config_sha256, config.config_sha256)
         with self.assertRaisesRegex(ConfigError, "num_cases override must be >= 1"):
             load_config(config_path, num_cases=0)
+
+        matrix_override = load_config(
+            config_path,
+            arrival_time_scale=4.0,
+            dcp_size=8,
+        )
+        self.assertEqual(matrix_override.arrival_time_scale, Decimal("4.0"))
+        self.assertEqual(matrix_override.dcp_size, 8)
+        self.assertNotEqual(matrix_override.config_sha256, config.config_sha256)
+        with self.assertRaisesRegex(ConfigError, "positive finite"):
+            load_config(config_path, arrival_time_scale=0)
+        with self.assertRaisesRegex(ConfigError, "must be one of"):
+            load_config(config_path, dcp_size=3)
 
         drafts_only = load_config(
             self._config_path(
@@ -410,6 +424,20 @@ class TraceWorkloadTest(unittest.TestCase):
                 for case in override_cases
             )
         )
+
+        matrix_output = self.root / "matrix_override_cases.jsonl"
+        matrix_summary = run(
+            config_path,
+            matrix_output,
+            force=False,
+            num_cases=1,
+            arrival_time_scale=2.0,
+            dcp_size=4,
+        )
+        self.assertEqual(matrix_summary["arrival_time_scale"], "2.0")
+        self.assertEqual(matrix_summary["dcp_size"], 4)
+        matrix_case = json.loads(matrix_output.read_text(encoding="utf-8"))
+        self.assertEqual(matrix_case["config_sha256"], matrix_summary["config_sha256"])
 
     def test_show_examples_is_focused_deterministic_and_capped(self) -> None:
         config_path = self._config_path(

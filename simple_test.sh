@@ -33,7 +33,9 @@ printf '[1/6] CPU unit tests\n'
     scripts.test_min_fa3.test_dcp_topology \
     scripts.test_min_fa3.test_dcp_mega_metadata \
     scripts.test_min_fa3.test_dcp_mega_batch \
-    dcp_test.trace.tests.test_trace_workload
+    dcp_test.trace.tests.test_trace_workload \
+    dcp_test.trace.tests.test_summarize_dcp_mega_matrix \
+    dcp_test.trace.tests.test_plot_dcp_mega_latency
 
 printf '[2/6] Python compile checks\n'
 "$python_bin" -m py_compile \
@@ -44,6 +46,8 @@ printf '[2/6] Python compile checks\n'
     dcp_test/benchmark_dcp.py \
     dcp_test/benchmark_dcp_varlen.py \
     dcp_test/benchmark_dcp_mega_batch.py \
+    dcp_test/summarize_dcp_mega_matrix.py \
+    dcp_test/plot_dcp_mega_latency.py \
     dcp_test/trace/models.py \
     dcp_test/trace/generate.py \
     scripts/test_min_fa3/test_dcp_topology.py \
@@ -58,6 +62,8 @@ printf '[3/6] CLI import checks\n'
 "$python_bin" -m dcp_test.benchmark_dcp_mega_batch \
     --workloads small1 --dcp-sizes 2,8 --print-cases >/dev/null
 "$python_bin" -m dcp_test.trace.generate --help >/dev/null
+"$python_bin" -m dcp_test.summarize_dcp_mega_matrix --help >/dev/null
+"$python_bin" -m dcp_test.plot_dcp_mega_latency --help >/dev/null
 "$python_bin" scripts/test_min_fa3/test_min_fa3_dcp.py --help >/dev/null
 "$python_bin" scripts/test_min_fa3/test_min_fa3_dcp_varlen.py --help >/dev/null
 "$python_bin" -m scripts.test_min_fa3.test_dcp_mega_varlen_multi_rank \
@@ -65,6 +71,7 @@ printf '[3/6] CLI import checks\n'
 
 printf '[4/6] Shell syntax and benchmark dry-run checks\n'
 bash -n benchmark_dcp_mega_six_loads.sh benchmark_dcp_mega_trace.sh \
+    benchmark_dcp_mega_arrival_matrix.sh \
     simple_bench.sh simple_test.sh
 DRY_RUN=1 bash simple_bench.sh >/dev/null
 batch_dry_run=$(DRY_RUN=1 LOADS=small1 DCP_SIZES=2,8 WARMUP=0 ITERS=1 \
@@ -94,6 +101,14 @@ trace_graph_dry_run=$(DRY_RUN=1 NUM_CASES=2 MODES=graph WARMUP=0 ITERS=1 \
     bash benchmark_dcp_mega_trace.sh)
 rg -Fq -- '--implementations ours\,vllm\,sglang' <<< "$trace_graph_dry_run"
 ! rg -Fq -- '--implementations mega\,ours\,vllm\,sglang' <<< "$trace_graph_dry_run"
+matrix_dry_run=$(DRY_RUN=1 ARRIVAL_TIME_SCALES=4 DCP_SIZES=2 \
+    MEGA_NUM_COMM_SMS=4,8 NUM_CASES=2 WARMUP=0 ITERS=1 \
+    bash benchmark_dcp_mega_arrival_matrix.sh)
+[[ $(rg -c -- '--module dcp_test.benchmark_dcp_mega_batch' <<< "$matrix_dry_run") == 3 ]]
+[[ $(rg -c -- '--mega-num-comm-sms 4\\,8' <<< "$matrix_dry_run") == 2 ]]
+[[ $(rg -c -- '--implementations ours\\,vllm\\,sglang\\,full' <<< "$matrix_dry_run") == 2 ]]
+[[ $(rg -c -- '--arrival-time-scale 4 --dcp-size 2' <<< "$matrix_dry_run") == 1 ]]
+[[ $(rg -c -- 'dcp_test.summarize_dcp_mega_matrix' <<< "$matrix_dry_run") == 1 ]]
 
 printf '[5/6] Patch whitespace check\n'
 git diff --check

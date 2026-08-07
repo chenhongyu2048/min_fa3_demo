@@ -253,8 +253,50 @@ The underlying trace generator can also be used directly with an override:
 ```bash
 python -m dcp_test.trace.generate \
   --config dcp_test/trace/example_config.json \
-  --output /tmp/mega_dcp_trace_cases.jsonl --num-cases 20
+  --output /tmp/mega_dcp_trace_cases.jsonl --num-cases 20 \
+  --arrival-time-scale 2 --dcp-size 4
 ```
+
+`benchmark_dcp_mega_arrival_matrix.sh` is the full arrival/DCP study wrapper.
+It defaults to the Cartesian product of arrival scales `1,2,4` and DCP sizes
+`2,4,8`. Every combination generates an independent 100-case JSONL and then
+uses three `torchrun` launches: an eager Mega-only launch that sweeps comm-SM
+budgets `4,8,12,16,20`, a six-method eager baseline launch, and the same
+baselines under CUDA Graph. The baseline selection is
+`ours,vllm,sglang,full`, which expands to six result labels.
+
+The Mega sweep is selected with `--mega-num-comm-sms`. It is intentionally
+valid only with `--implementations mega --no-cuda-graph`; the older singular
+`--mega-num-comm-sm` path and its standard manifest remain unchanged. Sweep
+results use `comm_sm_N/` case directories and a top-level incremental sweep
+manifest whose variants each retain their own workload-weighted summary.
+
+After the 27 launches, `dcp_test.summarize_dcp_mega_matrix` verifies execution
+modes, method sets, case counts, trace config SHA reuse within each combination,
+and comm-SM coverage. It writes a matrix status JSON and a 153-row CSV. The
+wrapper also invokes it with partial-result support on failure, so completed
+runs remain discoverable. The default run directory is
+`benchmark_logs/bench_dcp/<timestamp>/`. On eight H100 GPUs, reserve roughly
+5-8 hours for the default 100-case matrix; smaller environment-variable
+subsets scale primarily with the number of Mega case/comm-SM executions.
+
+After the matrix completes, plot its latency comparison with:
+
+```bash
+python -m dcp_test.plot_dcp_mega_latency \
+  benchmark_logs/bench_dcp/<timestamp>
+```
+
+The command writes three 1-by-3 figures, each with one panel per DCP size:
+latency in microseconds, workload-weighted effective TFLOPS/GPU, and
+workload-weighted effective KV GB/s/GPU. Each arrival-scale group contains
+eager and CUDA Graph bars for vLLM AG+RS, vLLM A2A, and SGLang, plus eager Mega
+DCP. By default the Mega bar selects and labels the lowest-latency measured
+comm-SM value for that workload; `--mega-num-comm-sm N` fixes it instead. All
+three figures reuse that selection. Mega labels compare against the best of the
+six baseline bars, using `baseline / Mega` for latency and `Mega / baseline`
+for the two higher-is-better metrics. KV GB/s/GPU is an effective logical BF16
+K+V payload rate, not hardware-counter HBM transaction bandwidth.
 
 Packed-varlen decode requires every `--sq` value to be `1`. Both benchmarks
 also accept `--output-json PATH`. See the repository `README.md` for topology,

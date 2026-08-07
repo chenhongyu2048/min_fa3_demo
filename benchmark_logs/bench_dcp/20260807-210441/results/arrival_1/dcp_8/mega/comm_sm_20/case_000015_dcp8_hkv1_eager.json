@@ -1,0 +1,331 @@
+{
+  "collective_payload": {
+    "a2a_buffer_bytes_per_rank": 399360,
+    "a2a_remote_bytes_per_rank": 349440,
+    "bf16_output_bytes_per_rank": 49152,
+    "lse_allgather_input_bytes_per_rank": 6144,
+    "q_allgather_input_bytes_per_rank": 49152
+  },
+  "comparison_scope": "Same min_fa3_op.forward_kvcache_varlen kernel; orchestration baseline only, not native vLLM/SGLang backend performance.",
+  "effective_causal_or_decode_pairs": 188696,
+  "environment": {
+    "cuda_runtime": "12.8",
+    "gpu_name": "NVIDIA H100 80GB HBM3",
+    "hostname": "zkrh-58",
+    "platform": "Linux-5.15.0-185-generic-x86_64-with-glibc2.35",
+    "python": "3.12.13",
+    "repository_commit": "d061f5dbe611daffb53439add4f8aad4ad2bf980",
+    "sglang_source_commit": "8d6549bc4039d33635844495d86684677a4f0df8",
+    "torch": "2.10.0+cu128",
+    "vllm_source_commit": "a89015c6df8eeb37a843b717c97a5be1355de83d",
+    "world_size": 8
+  },
+  "execution": {
+    "capture_eager_warmup": 0,
+    "execution_mode": "eager",
+    "warmup_semantics": "eager_call"
+  },
+  "global_effective_flops": 3091595264,
+  "kv_memory": {
+    "full_kv_bytes_per_rank": 6049792,
+    "local_dcp_bytes_by_tp_rank": [
+      778240,
+      778240,
+      777728,
+      777728,
+      777728,
+      777728,
+      777728,
+      776704
+    ],
+    "reduction_ratio_by_tp_rank": [
+      7.773684210526316,
+      7.773684210526316,
+      7.778801843317972,
+      7.778801843317972,
+      7.778801843317972,
+      7.778801843317972,
+      7.778801843317972,
+      7.78905735003296
+    ]
+  },
+  "lengths": {
+    "history_or_cache_global": [
+      8239,
+      1938,
+      1591
+    ],
+    "history_or_cache_local_by_tp_rank": [
+      [
+        1030,
+        243,
+        199
+      ],
+      [
+        1030,
+        243,
+        199
+      ],
+      [
+        1030,
+        242,
+        199
+      ],
+      [
+        1030,
+        242,
+        199
+      ],
+      [
+        1030,
+        242,
+        199
+      ],
+      [
+        1030,
+        242,
+        199
+      ],
+      [
+        1030,
+        242,
+        199
+      ],
+      [
+        1029,
+        242,
+        198
+      ]
+    ],
+    "q_global": [
+      16,
+      16,
+      16
+    ],
+    "reference_k_global": [
+      8255,
+      1954,
+      1607
+    ]
+  },
+  "methods": {
+    "dcp_mega_varlen": {
+      "communication": {
+        "collective_payload_bytes_per_rank_total": 693588.0,
+        "lse_allgather_receive_bytes_per_rank": 5376.0,
+        "output_collective": "bf16_ipc_a2a",
+        "output_collective_buffer_bytes_per_rank": 49152.0,
+        "output_collective_payload_bytes_per_rank": 344064.0,
+        "output_collective_remote_bytes_per_rank": 344064.0,
+        "q_allgather_receive_bytes_per_rank": 344064.0,
+        "tile_ready_remote_bytes_per_rank": 84.0
+      },
+      "effective_tflops": 41.05050023267139,
+      "execution": {
+        "capture_eager_warmup": 0,
+        "dispatch": {
+          "block_n": 128,
+          "chunk_num_splits": 1,
+          "effective_num_splits": 8,
+          "history_copy_vectors_per_task": 32,
+          "history_num_splits": 8,
+          "pack_gqa": true,
+          "split": true
+        },
+        "execution_mode": "eager",
+        "graph_phase_policy": null,
+        "graph_replay_correctness_checked": false,
+        "graph_static_signature": null,
+        "metadata_policy": "generated_and_uploaded_once_before_timing",
+        "num_comm_sm": 20,
+        "overlap_q_allgather": true,
+        "phase_profile": null,
+        "post_barrier_timed": false,
+        "post_capture_warmup": 10,
+        "pre_barrier": "torch_distributed_outside_timing",
+        "pre_barrier_timed": false,
+        "prepared_replay_correctness_checked": false,
+        "queue_counts": {
+          "actual": {
+            "final_tasks": 3,
+            "history_combine_tasks": 1536,
+            "publish_tasks": 24,
+            "q_transfer_tasks": 24,
+            "receive_tasks": 21,
+            "system_ready_signals": 21
+          },
+          "history_combine_task_waves": 1.1428571428571428,
+          "history_combine_worker_warps": 1344,
+          "q_ready_counters": 3,
+          "token_blocks": 3
+        },
+        "rank_latency_ms": {
+          "p50": [
+            0.07204799726605415,
+            0.07200000062584877,
+            0.07203199714422226,
+            0.07176000252366066,
+            0.0721759982407093,
+            0.07238399982452393,
+            0.0743199996650219,
+            0.07160000130534172
+          ],
+          "p90": [
+            0.07513279840350151,
+            0.07528639957308769,
+            0.07523519694805146,
+            0.0739840015769005,
+            0.0767712026834488,
+            0.0766336016356945,
+            0.07956480011343957,
+            0.07584000006318094
+          ]
+        },
+        "stream_policy": "single_stream_persistent_mega",
+        "timing_boundary": "mega_kernel_only",
+        "timing_source": "internal_cpp_cuda_events",
+        "workspace_reset_timed": false
+      },
+      "logical_kv_read": {
+        "average_bytes_per_gpu": 777728.0,
+        "bytes_by_tp_rank": [
+          778240.0,
+          778240.0,
+          777728.0,
+          777728.0,
+          777728.0,
+          777728.0,
+          777728.0,
+          776704.0
+        ],
+        "effective_bandwidth_gbps_per_gpu": 10.326747429302264,
+        "latency_basis": "p50_max_across_ranks",
+        "traffic_model": "logical BF16 K+V input bytes counted once"
+      },
+      "output_collective_kind": "bf16_ipc_a2a",
+      "speedup_vs_full_kv": null,
+      "stages_ms": {
+        "a2a_all_to_all_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "a2a_pack_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "a2a_unpack_combine_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "attention_end_to_end_ms": {
+          "p50": 0.07531199976801872,
+          "p90": 0.07956480011343957
+        },
+        "local_chunk_attention_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "local_history_attention_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "lse_allgather_correct_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "output_collective_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "output_reduce_scatter_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "overlap_hidden_time_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "overlapped_ag_chunk_window_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "q_allgather_and_reorder_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "state_merge_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        }
+      },
+      "workspace_policy": "runner_preallocated"
+    }
+  },
+  "packed_tokens": {
+    "total_local_history_by_tp_rank": [
+      1472,
+      1472,
+      1471,
+      1471,
+      1471,
+      1471,
+      1471,
+      1469
+    ],
+    "total_q": 48,
+    "total_reference_k": 11816
+  },
+  "parameters": {
+    "b": 3,
+    "baseline_phase_timing": false,
+    "check": false,
+    "cuda_graph": false,
+    "dcp_size": 8,
+    "headdim": 128,
+    "implementations": [
+      "mega"
+    ],
+    "iters": 30,
+    "kvhead": 1,
+    "mega_block_n": 128,
+    "mega_num_comm_sm": 20,
+    "mega_phase_timestamps": false,
+    "method_labels": [
+      "dcp_mega_varlen"
+    ],
+    "num_splits": 0,
+    "output_json": "benchmark_logs/bench_dcp/20260807-210441/results/arrival_1/dcp_8/mega/comm_sm_20/case_000015_dcp8_hkv1_eager.json",
+    "qhead": 32,
+    "seqlen": "8239,1938,1591",
+    "sq": "16,16,16",
+    "tp_size": 8,
+    "warmup": 10,
+    "workload": "chunk"
+  },
+  "pinned_sources": {
+    "sglang": "8d6549bc4039d33635844495d86684677a4f0df8",
+    "vllm": "a89015c6df8eeb37a843b717c97a5be1355de83d"
+  },
+  "schema_version": 3,
+  "topology": {
+    "dcp_groups": [
+      [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    ],
+    "dcp_size": 8,
+    "kv_heads": 1,
+    "kv_replicas": 8,
+    "q_heads": 32,
+    "q_heads_local": 4,
+    "q_heads_per_kv": 32,
+    "tp_size": 8
+  }
+}
