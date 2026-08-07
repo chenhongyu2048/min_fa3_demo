@@ -552,3 +552,26 @@ matrix 覆盖：
 1. chunk Q 保持当前 cp.async 路径，除非另有独立设计和验证；
 2. history speculative tail rows 不参与有效输出或跨-row reduction；
 3. remote TMA store 完成、ready release、receiver acquire、local receive store 和 `receive_ready` 之间的内存可见性顺序不能削弱。
+
+## 15. Case007 history combine 优化实现补记（2026-08-06）
+
+本轮按 `DCP_MEGA_PERFORMANCE_OPTIMIZATION.md` 的计划完成了第一版实现，范围严格限制在 DCP Mega history combine 及其 metadata/dispatch/test 配套：
+
+- metadata 升级到 v3，但 header 保持 40 个 int；新增逐 `(dst_rank, vector)` 的 8-int history combine descriptor；
+- publish dependency 从 tile union 改为每个 vector 的精确 split completion IDs；
+- 12 个 compute warps 独立领取 vector task，任务循环只使用 warp sync；
+- split>1 使用 FA3 风格 normalized LSE weights、128-bit partial-O `cp.async` 和 4-stage pipeline；
+- split==1 直接复制现有 BF16 O/LSE；
+- 结果直接写 IPC send O/LSE，移除旧 history combine 的 shared BF16 tile 和 producer TMA store；
+- `publish_ready` 改为 tile completion counter，最后一个 warp 以 device acq_rel RMW、system fence、remote system release 发布 ready；
+- communication CTA 改为 receive-only；combine queue 和 final combine 之间仅保留一次 CTA convergence barrier；
+- split kernel 增加 32/64/128 编译期 combine bucket，nonsplit 使用 bucket 1；
+- runner API 和 CUDA binding tensor 参数保持不变。
+
+静态结果：metadata unit test 14/14、py_compile、`git diff --check`、`make -j2` 和扩展 import 均通过。`cuobjdump` 显示 split kernel 为 168 registers/thread、`LOCAL:0`，三个 bucket 的 register count 相同；SASS 确认 128-bit `LDGSTS`、strong GPU atomic 和 warp sync。
+
+case007 的纯 CPU metadata 检查同样通过：auto 实际 splits 为 `[1,22,2]`，split16 为 `[1,16,2]`，两者都覆盖 1536 个 `(dst_rank, vector)` combine tasks。
+
+GPU 结果尚未产生。正确性 matrix 已加入 case007 auto/split16，但两次启动都没有进入 kernel：第一次暴露并修复了脚本 repo-root import 问题；第二次被 22:11 后启动的 root-owned `pretrain_gpt.py` 抢占 8 张 Exclusive Process H100，失败于 `torch.cuda.set_device()`。为遵守“静态优先、尽量减少 GPU 测试次数”，没有在占卡状态继续重试，也没有运行性能 sweep、`simple_bench.sh` 或 Nsight。
+
+后续验收顺序固定为：一次六-case matrix，通过后一次 case007 split/comm sweep，再运行一次完整 `simple_bench.sh`。在此之前，本文只记录实现和静态证据，不把性能目标写成已达成结果。

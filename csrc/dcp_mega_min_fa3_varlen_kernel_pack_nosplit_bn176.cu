@@ -6,9 +6,9 @@ void run_pack_nosplit_bn176(DCPMega_fwd_params& p, cudaStream_t s) {
     #define DCP_MEGA_CASE(DCP) \
         case DCP: \
             if (p.hq_local == 4) { \
-                detail::launch_dcp_mega_instance<false, 176, DCP, 4>(p, s); \
+                detail::launch_dcp_mega_instance<false, 176, DCP, 4, 1>(p, s); \
             } else { \
-                detail::launch_dcp_mega_instance<false, 176, DCP, 8>(p, s); \
+                detail::launch_dcp_mega_instance<false, 176, DCP, 8, 1>(p, s); \
             } \
             break
     switch (p.dcp_size) {

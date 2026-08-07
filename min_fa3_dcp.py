@@ -2480,6 +2480,7 @@ class DCPMegaAttentionRunner:
         max_q_tasks = self.world_size * self._max_token_blocks
         max_q_ready = self._max_token_blocks
         max_publish = self.world_size * self._max_token_blocks
+        max_history_combine = self.world_size * max_total_q * Hq_local
         max_final = self._max_token_blocks
         vectors_per_work = 16 * Hq_local
         max_q_dependencies = max_history_base_tiles * min(128, max_q_ready)
@@ -2493,6 +2494,7 @@ class DCPMegaAttentionRunner:
             + max_q_tasks * 4
             + max_q_dependencies
             + max_publish * 8
+            + max_history_combine * 8
             + max_publish_dependencies
             + max_final * 8
             + max_final_dependencies
@@ -2775,6 +2777,7 @@ class DCPMegaAttentionRunner:
             actual_counts = {
                 "q_transfer_tasks": len(metadata.q_tasks),
                 "publish_tasks": len(metadata.publish),
+                "history_combine_tasks": len(metadata.history_combine),
                 "receive_tasks": metadata.receive_count,
                 "final_tasks": len(metadata.final),
                 "system_ready_signals": metadata.tile_ready_count,

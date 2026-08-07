@@ -8,6 +8,7 @@ import unittest
 from dcp_mega_metadata import (
     CHUNK,
     HISTORY,
+    HISTORY_COMBINE_DESC_FIELDS,
     METADATA_HEADER_INTS,
     METADATA_VERSION,
     build_dcp_mega_metadata,
@@ -15,6 +16,61 @@ from dcp_mega_metadata import (
     choose_split_upper_bound,
     pack_dcp_mega_metadata,
 )
+
+
+_RECEIVE_CHUNKS = 6
+_RECEIVE_SCAN_WINDOW = 8
+
+
+def _receive_slot_tasks(total_tasks, num_comm_sm):
+    """Return the current static strided receive ownership by pipeline slot."""
+    stride = _RECEIVE_CHUNKS * num_comm_sm
+    return [
+        list(range(slot, total_tasks, stride))
+        for slot in range(stride)
+    ]
+
+
+def _simulate_bounded_receive_slot(task_ids, ready_order):
+    """Model one static slot when remote tasks become ready one at a time."""
+    if sorted(task_ids) != sorted(ready_order):
+        raise ValueError("ready_order must contain every slot task exactly once")
+    if not task_ids:
+        return [], []
+
+    cursor = 0
+    completed = set()
+    ready = set()
+    completion_order = []
+    probes_per_window = []
+    for newly_ready in ready_order:
+        ready.add(newly_ready)
+        miss_windows = 0
+        while True:
+            selected = None
+            ordinal = cursor
+            probes = 0
+            for _ in range(min(_RECEIVE_SCAN_WINDOW, len(task_ids))):
+                task_id = task_ids[ordinal]
+                ordinal = (ordinal + 1) % len(task_ids)
+                probes += 1
+                if task_id not in completed and task_id in ready:
+                    selected = task_id
+                    cursor = ordinal
+                    break
+            probes_per_window.append(probes)
+            if selected is not None:
+                completed.add(selected)
+                ready.remove(selected)
+                completion_order.append(selected)
+                break
+            cursor = ordinal
+            miss_windows += 1
+            if miss_windows > (
+                len(task_ids) + _RECEIVE_SCAN_WINDOW - 1
+            ) // _RECEIVE_SCAN_WINDOW:
+                raise AssertionError("bounded scan failed to cover its task ring")
+    return completion_order, probes_per_window
 
 
 def _simulate_unified_attention_queue(kinds, num_compute_ctas):
@@ -49,6 +105,31 @@ def _simulate_unified_attention_queue(kinds, num_compute_ctas):
 
 
 class DCPMegaMetadataTest(unittest.TestCase):
+    def _assert_receive_slots(self, total_tasks, num_comm_sm):
+        slots = _receive_slot_tasks(total_tasks, num_comm_sm)
+        claimed = [task_id for tasks in slots for task_id in tasks]
+        self.assertEqual(sorted(claimed), list(range(total_tasks)))
+        self.assertEqual(len(claimed), len(set(claimed)))
+        for task_ids in slots:
+            orders = (
+                task_ids,
+                list(reversed(task_ids)),
+                task_ids[::2] + task_ids[1::2],
+            )
+            for ready_order in orders:
+                completed, probe_counts = _simulate_bounded_receive_slot(
+                    task_ids, ready_order
+                )
+                self.assertEqual(completed, ready_order)
+                self.assertEqual(len(completed), len(set(completed)))
+                self.assertTrue(
+                    all(
+                        probes <= min(_RECEIVE_SCAN_WINDOW, len(task_ids))
+                        for probes in probe_counts
+                    )
+                )
+        return slots
+
     def _assert_unified_queue(self, kinds, num_compute_ctas):
         assignments, q_waits = _simulate_unified_attention_queue(
             kinds, num_compute_ctas
@@ -89,13 +170,75 @@ class DCPMegaMetadataTest(unittest.TestCase):
             self.assertEqual(len(coordinates), len(set(coordinates)))
             self.assertEqual(set(coordinates), expected)
 
-    def _assert_publish_receive_mapping(self, metadata, dcp_size):
+    def _assert_publish_receive_mapping(
+        self, metadata, cu_q, hq_local, dcp_size
+    ):
         final_count = len(metadata.final)
         self.assertEqual(len(metadata.publish), dcp_size * final_count)
+        vectors_per_task = 1 if metadata.dispatch.split else hq_local
         for publish_id, publish in enumerate(metadata.publish):
             dst_rank, final_id = divmod(publish_id, final_count)
             self.assertEqual(publish[0], dst_rank)
             self.assertEqual(publish[1:3], metadata.final[final_id][0:2])
+            self.assertEqual(publish[6], publish[2] // vectors_per_task)
+        self.assertEqual(
+            len(metadata.history_combine),
+            dcp_size
+            * (
+                metadata.total_vectors
+                if metadata.dispatch.split
+                else metadata.total_q
+            ),
+        )
+        self.assertTrue(
+            all(
+                len(row) == HISTORY_COMBINE_DESC_FIELDS
+                for row in metadata.history_combine
+            )
+        )
+        coordinates = []
+        for row in metadata.history_combine:
+            publish = metadata.publish[row[0]]
+            coordinates.extend(
+                (publish[0], vector)
+                for vector in range(row[1], row[1] + row[2])
+            )
+            self.assertLessEqual(publish[1], row[1])
+            self.assertLessEqual(row[1] + row[2], publish[1] + publish[2])
+            self.assertEqual(row[2], vectors_per_task)
+            self.assertGreater(row[4], 0)
+            self.assertEqual(
+                row[6], metadata.history_sequence_splits[row[5]]
+            )
+            self.assertEqual(row[7], 0)
+            expected_dependencies = set()
+            for vector in range(row[1], row[1] + row[2]):
+                token, local_head = divmod(vector, hq_local)
+                token_in_batch = token - cu_q[row[5]]
+                history_head = publish[0] * hq_local + local_head
+                m_block = (
+                    token_in_batch * (dcp_size * hq_local) + history_head
+                ) // 128
+                expected_dependencies.update(
+                    attention[7]
+                    for attention in metadata.attention
+                    if attention[0] == HISTORY
+                    and attention[1] == row[5]
+                    and attention[2] == m_block
+                )
+            self.assertEqual(
+                metadata.publish_dependencies[row[3] : row[3] + row[4]],
+                tuple(sorted(expected_dependencies)),
+            )
+        self.assertEqual(
+            coordinates,
+            [
+                (dst_rank, vector)
+                for final in metadata.final
+                for dst_rank in range(dcp_size)
+                for vector in range(final[0], final[0] + final[1])
+            ],
+        )
         sources = dcp_size - 1
         receive_ids = [
             final_id * sources + source
@@ -125,7 +268,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertTrue(metadata.dispatch.split)
         self.assertTrue(any(split > 1 for split in metadata.history_sequence_splits))
         self._assert_attention_tiles_once(metadata, cu_q, 4, 8)
-        self._assert_publish_receive_mapping(metadata, 8)
+        self._assert_publish_receive_mapping(metadata, cu_q, 4, 8)
         history = [row for row in metadata.attention if row[0] == HISTORY]
         self.assertTrue(all(row[6] > 0 for row in history))
         self.assertTrue(all(row[6] == 0 for row in metadata.attention if row[0] == CHUNK))
@@ -149,7 +292,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertTrue(metadata.dispatch.pack_gqa)
         self.assertFalse(metadata.dispatch.split)
         self._assert_attention_tiles_once(metadata, cu_q, 4, 4)
-        self._assert_publish_receive_mapping(metadata, 4)
+        self._assert_publish_receive_mapping(metadata, cu_q, 4, 4)
         for row in metadata.publish:
             self.assertIn(row[0], range(4))
             deps = metadata.publish_dependencies[row[3] : row[3] + row[4]]
@@ -278,6 +421,26 @@ class DCPMegaMetadataTest(unittest.TestCase):
             any(len(tasks) >= 3 for tasks in results["multiple_dynamic_rounds"])
         )
 
+    def test_receive_static_slots_and_bounded_scan(self):
+        case007_slots = self._assert_receive_slots(21, 8)
+        self.assertEqual([len(tasks) for tasks in case007_slots].count(1), 21)
+        self.assertEqual([len(tasks) for tasks in case007_slots].count(0), 27)
+
+        case004_slots = self._assert_receive_slots(1708, 8)
+        self.assertEqual(set(map(len, case004_slots)), {35, 36})
+
+        for dcp_size in (2, 4, 8):
+            for final_count in (0, 1, 3, 17):
+                for num_comm_sm in (1, 4, 8):
+                    with self.subTest(
+                        dcp_size=dcp_size,
+                        final_count=final_count,
+                        num_comm_sm=num_comm_sm,
+                    ):
+                        self._assert_receive_slots(
+                            final_count * (dcp_size - 1), num_comm_sm
+                        )
+
     def test_attention_order_and_completion_ids_are_dense(self):
         metadata = build_dcp_mega_metadata(
             (0, 5, 42),
@@ -348,7 +511,9 @@ class DCPMegaMetadataTest(unittest.TestCase):
                         self._assert_attention_tiles_once(
                             metadata, cu_q, hq_local, dcp_size
                         )
-                        self._assert_publish_receive_mapping(metadata, dcp_size)
+                        self._assert_publish_receive_mapping(
+                            metadata, cu_q, hq_local, dcp_size
+                        )
                         final_vectors = [
                             vector
                             for row in metadata.final
@@ -357,6 +522,75 @@ class DCPMegaMetadataTest(unittest.TestCase):
                         self.assertEqual(
                             final_vectors, list(range(cu_q[-1] * hq_local))
                         )
+
+    def test_non_split_history_combine_groups_one_token_per_task(self):
+        cu_q = (0, 7, 23)
+        cu_history = (0, 257, 1281)
+        for dcp_size in (2, 4, 8):
+            for hq_local in (4, 8):
+                for block_n in (128, 176):
+                    with self.subTest(
+                        dcp_size=dcp_size,
+                        hq_local=hq_local,
+                        block_n=block_n,
+                    ):
+                        metadata = build_dcp_mega_metadata(
+                            cu_q,
+                            cu_history,
+                            hq_local=hq_local,
+                            dcp_size=dcp_size,
+                            num_sms=132,
+                            requested_num_splits=1,
+                            block_n_override=block_n,
+                        )
+                        self.assertFalse(metadata.dispatch.split)
+                        self.assertEqual(
+                            len(metadata.history_combine),
+                            dcp_size * metadata.total_q,
+                        )
+                        self.assertTrue(
+                            all(
+                                row[1] % hq_local == 0
+                                and row[2] == hq_local
+                                for row in metadata.history_combine
+                            )
+                        )
+                        full_publish = next(
+                            row
+                            for row in metadata.publish
+                            if row[2] == 16 * hq_local
+                        )
+                        self.assertEqual(full_publish[6], 16)
+                        self._assert_publish_receive_mapping(
+                            metadata, cu_q, hq_local, dcp_size
+                        )
+
+    def test_split_history_combine_keeps_one_vector_per_task(self):
+        cu_q = (0, 7, 23)
+        cu_history = (0, 4097, 12290)
+        for hq_local in (4, 8):
+            for block_n in (128, 176):
+                with self.subTest(hq_local=hq_local, block_n=block_n):
+                    metadata = build_dcp_mega_metadata(
+                        cu_q,
+                        cu_history,
+                        hq_local=hq_local,
+                        dcp_size=8,
+                        num_sms=132,
+                        requested_num_splits=2,
+                        block_n_override=block_n,
+                    )
+                    self.assertTrue(metadata.dispatch.split)
+                    self.assertEqual(
+                        len(metadata.history_combine),
+                        8 * metadata.total_vectors,
+                    )
+                    self.assertTrue(
+                        all(row[2] == 1 for row in metadata.history_combine)
+                    )
+                    self._assert_publish_receive_mapping(
+                        metadata, cu_q, hq_local, 8
+                    )
 
     def test_q_dependencies_only_gate_history_token_blocks(self):
         metadata = build_dcp_mega_metadata(
@@ -412,7 +646,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
                 )
             )
 
-    def test_metadata_v2_header_offsets_counts_and_capacity(self):
+    def test_metadata_v4_header_offsets_counts_and_capacity(self):
         metadata = build_dcp_mega_metadata(
             (0, 3, 20, 53),
             (0, 129, 516, 1541),
@@ -423,7 +657,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         )
         image = pack_dcp_mega_metadata(metadata, pre_phase=11, post_phase=12)
         self.assertEqual(image[0], METADATA_VERSION)
-        self.assertEqual(METADATA_VERSION, 2)
+        self.assertEqual(METADATA_VERSION, 4)
         self.assertEqual(image[30], len(image))
         self.assertEqual(image[32], 1)
         self.assertEqual(image[33], metadata.token_block_count)
@@ -431,6 +665,8 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(image[35], metadata.receive_count)
         self.assertEqual(image[36], metadata.tile_ready_count)
         self.assertEqual(image[37], 8)
+        self.assertEqual(image[38], len(metadata.history_combine))
+        self.assertEqual(image[39], image[24] + len(metadata.publish) * 8)
         offsets = list(image[21:30])
         self.assertEqual(offsets[0], METADATA_HEADER_INTS)
         self.assertEqual(offsets, sorted(offsets))
@@ -440,6 +676,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         expected_offsets.append(expected_offsets[-1] + len(metadata.q_tasks) * 4)
         expected_offsets.append(expected_offsets[-1] + len(metadata.q_dependencies))
         expected_offsets.append(expected_offsets[-1] + len(metadata.publish) * 8)
+        expected_offsets[-1] += len(metadata.history_combine) * 8
         expected_offsets.append(
             expected_offsets[-1] + len(metadata.publish_dependencies)
         )

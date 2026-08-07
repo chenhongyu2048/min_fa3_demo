@@ -21,9 +21,10 @@ HISTORY = 1
 ATTENTION_DESC_FIELDS = 8
 Q_TASK_FIELDS = 4
 PUBLISH_DESC_FIELDS = 8
+HISTORY_COMBINE_DESC_FIELDS = 8
 FINAL_DESC_FIELDS = 8
 METADATA_HEADER_INTS = 40
-METADATA_VERSION = 2
+METADATA_VERSION = 4
 
 @dataclass(frozen=True)
 class DCPMegaDispatch:
@@ -48,6 +49,7 @@ class DCPMegaMetadata:
     q_tasks: tuple[tuple[int, ...], ...]
     q_dependencies: tuple[int, ...]
     publish: tuple[tuple[int, ...], ...]
+    history_combine: tuple[tuple[int, ...], ...]
     publish_dependencies: tuple[int, ...]
     final: tuple[tuple[int, ...], ...]
     final_dependencies: tuple[int, ...]
@@ -62,12 +64,13 @@ class DCPMegaMetadata:
     dcp_size: int
 
     @property
-    def counts(self) -> tuple[int, int, int, int, int, int, int]:
+    def counts(self) -> tuple[int, int, int, int, int, int, int, int]:
         return (
             len(self.attention),
             len(self.q_tasks),
             len(self.q_dependencies),
             len(self.publish),
+            len(self.history_combine),
             len(self.publish_dependencies),
             len(self.final),
             len(self.final_dependencies),
@@ -387,42 +390,85 @@ def build_dcp_mega_metadata(
     )
 
     publish: list[tuple[int, ...]] = []
+    history_combine_by_publish: list[list[tuple[int, ...]]] = []
     publish_dependencies: list[int] = []
     publish_tile_size = 16 * hq_local
+    batch_for_token = [0] * total_q
+    for batch_idx, (begin, end) in enumerate(zip(cu_q, cu_q[1:])):
+        batch_for_token[begin:end] = [batch_idx] * (end - begin)
     for dst_rank in range(dcp_size):
         for vector_begin in range(0, total_q * hq_local, publish_tile_size):
             valid_vectors = min(
                 publish_tile_size, total_q * hq_local - vector_begin
             )
-            dependency_set: set[int] = set()
-            for vector in range(vector_begin, vector_begin + valid_vectors):
-                token, local_head = divmod(vector, hq_local)
-                batch_idx = next(
-                    idx
-                    for idx, (begin, end) in enumerate(zip(cu_q, cu_q[1:]))
-                    if begin <= token < end
+            publish_id = len(publish)
+            publish_dependency_begin = len(publish_dependencies)
+            combine_tasks: list[tuple[int, ...]] = []
+            vectors_per_task = 1 if dispatch.split else hq_local
+            for task_vector_begin in range(
+                vector_begin,
+                vector_begin + valid_vectors,
+                vectors_per_task,
+            ):
+                task_valid_vectors = min(
+                    vectors_per_task,
+                    vector_begin + valid_vectors - task_vector_begin,
                 )
-                physical_head = dst_rank * hq_local + local_head
-                dependency_set.update(
-                    completion_for_vector[
-                        (HISTORY, batch_idx, token, physical_head)
-                    ]
+                token = task_vector_begin // hq_local
+                batch_idx = batch_for_token[token]
+                dependency_set: set[int] = set()
+                for vector in range(
+                    task_vector_begin,
+                    task_vector_begin + task_valid_vectors,
+                ):
+                    vector_token, local_head = divmod(vector, hq_local)
+                    if batch_for_token[vector_token] != batch_idx:
+                        raise AssertionError(
+                            "history combine task crosses a batch boundary"
+                        )
+                    history_head = dst_rank * hq_local + local_head
+                    dependency_set.update(
+                        completion_for_vector[
+                            (HISTORY, batch_idx, vector_token, history_head)
+                        ]
+                    )
+                dependencies = tuple(sorted(dependency_set))
+                dependency_begin = len(publish_dependencies)
+                publish_dependencies.extend(dependencies)
+                combine_tasks.append(
+                    (
+                        publish_id,
+                        task_vector_begin,
+                        task_valid_vectors,
+                        dependency_begin,
+                        len(dependencies),
+                        batch_idx,
+                        history_sequence_splits[batch_idx],
+                        0,
+                    )
                 )
-            dependencies = tuple(sorted(dependency_set))
-            dep_begin = len(publish_dependencies)
-            publish_dependencies.extend(dependencies)
             publish.append(
                 (
                     dst_rank,
                     vector_begin,
                     valid_vectors,
-                    dep_begin,
-                    len(dependencies),
+                    publish_dependency_begin,
+                    len(publish_dependencies) - publish_dependency_begin,
                     int(dispatch.pack_gqa),
-                    0,
+                    len(combine_tasks),
                     0,
                 )
             )
+            history_combine_by_publish.append(combine_tasks)
+
+    history_combine = tuple(
+        task
+        for final_id in range(num_token_subtiles)
+        for dst_rank in range(dcp_size)
+        for task in history_combine_by_publish[
+            dst_rank * num_token_subtiles + final_id
+        ]
+    )
 
     final: list[tuple[int, ...]] = []
     final_dependencies: list[int] = []
@@ -433,11 +479,7 @@ def build_dcp_mega_metadata(
         dependency_set: set[int] = set()
         for vector in range(vector_begin, vector_begin + valid_vectors):
             token, local_head = divmod(vector, hq_local)
-            batch_idx = next(
-                idx
-                for idx, (begin, end) in enumerate(zip(cu_q, cu_q[1:]))
-                if begin <= token < end
-            )
+            batch_idx = batch_for_token[token]
             dependency_set.update(
                 completion_for_vector[(CHUNK, batch_idx, token, local_head)]
             )
@@ -463,6 +505,7 @@ def build_dcp_mega_metadata(
         q_tasks=tuple(q_tasks),
         q_dependencies=tuple(q_dependencies),
         publish=tuple(publish),
+        history_combine=history_combine,
         publish_dependencies=tuple(publish_dependencies),
         final=tuple(final),
         final_dependencies=tuple(final_dependencies),
@@ -495,6 +538,11 @@ def validate_dcp_mega_metadata(
         raise AssertionError("invalid Q task width")
     if any(len(row) != PUBLISH_DESC_FIELDS for row in metadata.publish):
         raise AssertionError("invalid publish descriptor width")
+    if any(
+        len(row) != HISTORY_COMBINE_DESC_FIELDS
+        for row in metadata.history_combine
+    ):
+        raise AssertionError("invalid history combine descriptor width")
     if any(len(row) != FINAL_DESC_FIELDS for row in metadata.final):
         raise AssertionError("invalid final descriptor width")
 
@@ -516,18 +564,19 @@ def validate_dcp_mega_metadata(
         for ready_id in metadata.q_dependencies[dep_begin : dep_begin + dep_count]:
             if ready_id < 0 or ready_id >= metadata.q_ready_count:
                 raise AssertionError("Q dependency references an invalid ready counter")
-    for descriptors, dependencies in (
-        (metadata.publish, metadata.publish_dependencies),
-        (metadata.final, metadata.final_dependencies),
+    for descriptors, dependencies, dep_fields in (
+        (metadata.publish, metadata.publish_dependencies, (3, 4)),
+        (metadata.history_combine, metadata.publish_dependencies, (3, 4)),
+        (metadata.final, metadata.final_dependencies, (2, 3)),
     ):
         for row in descriptors:
-            dep_begin, dep_count = row[3], row[4] if descriptors is metadata.publish else row[3]
-            # final stores (begin,count) in fields 2/3; publish in fields 3/4.
-            if descriptors is metadata.final:
-                dep_begin, dep_count = row[2], row[3]
+            dep_begin, dep_count = row[dep_fields[0]], row[dep_fields[1]]
             if dep_begin < 0 or dep_begin + dep_count > len(dependencies):
                 raise AssertionError("partial dependency range is out of bounds")
-            if any(dep < 0 or dep >= len(metadata.attention) for dep in dependencies[dep_begin : dep_begin + dep_count]):
+            if any(
+                dep < 0 or dep >= len(metadata.attention)
+                for dep in dependencies[dep_begin : dep_begin + dep_count]
+            ):
                 raise AssertionError("partial dependency references an invalid completion")
 
     expected_q_tasks = dcp_size * _ceil_div(metadata.total_q, 16)
@@ -536,6 +585,13 @@ def validate_dcp_mega_metadata(
     expected_publish = dcp_size * metadata.token_block_count
     if len(metadata.publish) != expected_publish:
         raise AssertionError("publish queue does not cover every destination vector")
+    expected_history_combine = dcp_size * (
+        metadata.total_vectors if metadata.dispatch.split else metadata.total_q
+    )
+    if len(metadata.history_combine) != expected_history_combine:
+        raise AssertionError(
+            "history combine queue does not cover every destination vector"
+        )
     expected_final = metadata.token_block_count
     if len(metadata.final) != expected_final:
         raise AssertionError("final queue does not cover every local output vector")
@@ -573,6 +629,98 @@ def validate_dcp_mega_metadata(
             raise AssertionError(
                 "publish tasks must be destination-major copies of final tiles"
             )
+        if row[5] != int(metadata.dispatch.pack_gqa):
+            raise AssertionError("publish PackGQA marker mismatch")
+        expected_task_count = row[2] if metadata.dispatch.split else _ceil_div(
+            row[2], hq_local
+        )
+        if row[6] != expected_task_count or row[7] != 0:
+            raise AssertionError("publish combine completion target is invalid")
+
+    combine_by_publish: list[list[tuple[int, ...]]] = [
+        [] for _ in metadata.publish
+    ]
+    history_completion_ids: dict[tuple[int, int], tuple[int, ...]] = {}
+    for row in metadata.attention:
+        if row[0] != HISTORY:
+            continue
+        key = (row[1], row[2])
+        history_completion_ids.setdefault(key, tuple())
+        history_completion_ids[key] += (row[7],)
+    for row in metadata.history_combine:
+        publish_id, vector_begin, valid_vectors = row[0], row[1], row[2]
+        dep_begin, dep_count, batch_idx, actual_splits = row[3:7]
+        if publish_id < 0 or publish_id >= len(metadata.publish):
+            raise AssertionError("history combine references an invalid publish task")
+        publish_row = metadata.publish[publish_id]
+        if (
+            valid_vectors <= 0
+            or vector_begin < publish_row[1]
+            or vector_begin + valid_vectors
+                > publish_row[1] + publish_row[2]
+        ):
+            raise AssertionError("history combine vectors are outside its publish tile")
+        expected_vectors_per_task = 1 if metadata.dispatch.split else hq_local
+        if valid_vectors != expected_vectors_per_task:
+            raise AssertionError("history combine task vector count is invalid")
+        if not metadata.dispatch.split and vector_begin % hq_local != 0:
+            raise AssertionError("non-split history combine task is not token-aligned")
+        token = vector_begin // hq_local
+        expected_batch = next(
+            idx
+            for idx, (begin, end) in enumerate(zip(cu_q, cu_q[1:]))
+            if begin <= token < end
+        )
+        expected_dst = publish_row[0]
+        if batch_idx != expected_batch:
+            raise AssertionError("history combine batch mapping is invalid")
+        if actual_splits != metadata.history_sequence_splits[batch_idx]:
+            raise AssertionError("history combine split count is invalid")
+        if row[7] != 0:
+            raise AssertionError("history combine reserved field is invalid")
+        expected_id_set: set[int] = set()
+        for vector in range(vector_begin, vector_begin + valid_vectors):
+            vector_token, local_head = divmod(vector, hq_local)
+            if not cu_q[batch_idx] <= vector_token < cu_q[batch_idx + 1]:
+                raise AssertionError("history combine task crosses a batch boundary")
+            history_head = expected_dst * hq_local + local_head
+            q_relative = vector_token - cu_q[batch_idx]
+            packed = q_relative * (dcp_size * hq_local) + history_head
+            expected_id_set.update(
+                history_completion_ids[(batch_idx, packed // 128)]
+            )
+        expected_ids = tuple(sorted(expected_id_set))
+        dependencies = metadata.publish_dependencies[
+            dep_begin : dep_begin + dep_count
+        ]
+        if dependencies != expected_ids:
+            raise AssertionError("history combine dependencies are not exact")
+        combine_by_publish[publish_id].append(row)
+    combine_coordinates = [
+        (metadata.publish[row[0]][0], vector)
+        for row in metadata.history_combine
+        for vector in range(row[1], row[1] + row[2])
+    ]
+    expected_coordinates = [
+        (dst_rank, vector)
+        for final_row in metadata.final
+        for dst_rank in range(dcp_size)
+        for vector in range(final_row[0], final_row[0] + final_row[1])
+    ]
+    if combine_coordinates != expected_coordinates:
+        raise AssertionError("history combine descriptors are missing or duplicated")
+    for publish_id, combine_rows in enumerate(combine_by_publish):
+        publish_row = metadata.publish[publish_id]
+        if len(combine_rows) != publish_row[6]:
+            raise AssertionError("publish combine task count mismatch")
+        if combine_rows:
+            dependency_begin = combine_rows[0][3]
+            dependency_end = combine_rows[-1][3] + combine_rows[-1][4]
+            if (
+                publish_row[3] != dependency_begin
+                or publish_row[4] != dependency_end - dependency_begin
+            ):
+                raise AssertionError("publish dependency span is invalid")
 
     receive_sources = dcp_size - 1
     receive_ids = [
@@ -607,7 +755,7 @@ def pack_dcp_mega_metadata(
     post_phase: int,
     capacity: int | None = None,
 ) -> array:
-    """Serialize a validated metadata v2 image into native int32 values."""
+    """Serialize a validated metadata v4 image into native int32 values."""
     if pre_phase <= 0 or post_phase <= pre_phase:
         raise ValueError("metadata phases must be positive and strictly increasing")
     payload = array("i", [0] * METADATA_HEADER_INTS)
@@ -623,6 +771,7 @@ def pack_dcp_mega_metadata(
     q_dependencies_offset = len(payload)
     payload.extend(metadata.q_dependencies)
     publish_offset = append_rows(metadata.publish)
+    history_combine_offset = append_rows(metadata.history_combine)
     publish_dependencies_offset = len(payload)
     payload.extend(metadata.publish_dependencies)
     final_offset = append_rows(metadata.final)
@@ -678,11 +827,11 @@ def pack_dcp_mega_metadata(
         metadata.receive_count,
         metadata.tile_ready_count,
         metadata.dcp_size,
-        0,
-        0,
+        len(metadata.history_combine),
+        history_combine_offset,
     )
     if len(header) != METADATA_HEADER_INTS:
-        raise AssertionError("metadata v2 header width mismatch")
+        raise AssertionError("metadata v4 header width mismatch")
     payload[:METADATA_HEADER_INTS] = array("i", header)
     return payload
 
@@ -694,6 +843,7 @@ __all__ = [
     "DCPMegaMetadata",
     "FINAL_DESC_FIELDS",
     "HISTORY",
+    "HISTORY_COMBINE_DESC_FIELDS",
     "METADATA_HEADER_INTS",
     "METADATA_VERSION",
     "PUBLISH_DESC_FIELDS",

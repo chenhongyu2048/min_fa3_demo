@@ -10,7 +10,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from dataclasses import dataclass
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 import torch.distributed as dist
@@ -132,7 +137,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--matrix",
         action="store_true",
-        help="Run the fixed four-case DCP mega correctness matrix",
+        help="Run the fixed six-case DCP mega correctness matrix",
     )
     return parser.parse_args()
 
@@ -354,6 +359,16 @@ def main() -> None:
                     "dcp2_h8_bn128_split2_tail", 2,
                     (5, 16, 23), (129, 258, 515),
                     8, 2, 128, 2, 8,
+                ),
+                CorrectnessCase(
+                    "case007_dcp8_h4_bn128_auto", 8,
+                    (16, 16, 16), (1139, 44536, 3167),
+                    4, 0, 128, 1, 8,
+                ),
+                CorrectnessCase(
+                    "case007_dcp8_h4_bn128_split16", 8,
+                    (16, 16, 16), (1139, 44536, 3167),
+                    4, 16, 128, 1, 8,
                 ),
             )
         else:

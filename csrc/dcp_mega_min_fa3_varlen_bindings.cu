@@ -95,8 +95,8 @@ void validate_metadata_header(
     int64_t total_vectors,
     int64_t batch_size,
     int dcp_size) {
-    TORCH_CHECK(header.version == 2,
-                "unsupported DCP mega metadata version; expected version 2");
+    TORCH_CHECK(header.version == 4,
+                "unsupported DCP mega metadata version; expected version 4");
     TORCH_CHECK(header.used_ints == metadata_used,
                 "metadata_used does not match the pinned header");
     TORCH_CHECK(metadata_used >= 40 && metadata_used <= metadata_capacity,
@@ -121,6 +121,11 @@ void validate_metadata_header(
     TORCH_CHECK(header.effective_num_splits >= 1
                     && header.effective_num_splits <= 128,
                 "invalid effective split count");
+    TORCH_CHECK(header.chunk_num_splits >= 1
+                    && header.chunk_num_splits <= header.effective_num_splits
+                    && header.history_num_splits >= 1
+                    && header.history_num_splits <= header.effective_num_splits,
+                "invalid chunk/history split upper bounds");
     TORCH_CHECK(header.pack_gqa == 1,
                 "DCP mega metadata must use PackGQA");
     TORCH_CHECK(header.split == 0 || header.split == 1,
@@ -142,6 +147,11 @@ void validate_metadata_header(
     TORCH_CHECK(header.publish_count == header.token_block_count * dcp_size
                     && header.final_count == header.token_block_count,
                 "invalid fixed-layout publish/final queue counts");
+    int64_t const expected_history_combine = header.split
+        ? total_vectors * dcp_size
+        : total_q * dcp_size;
+    TORCH_CHECK(header.history_combine_count == expected_history_combine,
+                "invalid history combine descriptor count");
     TORCH_CHECK(header.receive_count
                         == header.token_block_count * (dcp_size - 1)
                     && header.tile_ready_count == header.receive_count,
@@ -160,6 +170,9 @@ void validate_metadata_header(
                 "Q dependencies");
     check_range(header.publish_offset, int64_t(header.publish_count) * 8,
                 "publish descriptors");
+    check_range(header.history_combine_offset,
+                int64_t(header.history_combine_count) * 8,
+                "history combine descriptors");
     check_range(header.publish_dependencies_offset,
                 header.publish_dependency_count, "publish dependencies");
     check_range(header.final_offset, int64_t(header.final_count) * 8,
@@ -176,8 +189,11 @@ void validate_metadata_header(
                 == header.q_tasks_offset + header.q_task_count * 4
             && header.publish_offset
                 == header.q_dependencies_offset + header.q_dependency_count
-            && header.publish_dependencies_offset
+            && header.history_combine_offset
                 == header.publish_offset + header.publish_count * 8
+            && header.publish_dependencies_offset
+                == header.history_combine_offset
+                    + header.history_combine_count * 8
             && header.final_offset
                 == header.publish_dependencies_offset
                     + header.publish_dependency_count
@@ -188,7 +204,7 @@ void validate_metadata_header(
             && header.history_splits_offset
                 == header.chunk_splits_offset + batch_size
             && header.used_ints == header.history_splits_offset + batch_size,
-        "DCP mega metadata v2 ranges must be contiguous and non-overlapping");
+        "DCP mega metadata v4 ranges must be contiguous and non-overlapping");
 }
 
 Flash_fwd_params make_attention_params(

@@ -109,7 +109,7 @@ void run_dcp_mega_varlen_fwd(
     DCPMega_fwd_params& params,
     cudaStream_t stream) {
     MetadataHeader const& header = params.metadata_header;
-    TORCH_CHECK(header.version == 2, "unsupported DCP mega metadata version");
+    TORCH_CHECK(header.version == 4, "unsupported DCP mega metadata version");
     TORCH_CHECK(header.effective_num_splits >= 1 && header.effective_num_splits <= 128,
                 "invalid effective_num_splits in DCP mega metadata");
     TORCH_CHECK(header.block_n == 128 || header.block_n == 176,

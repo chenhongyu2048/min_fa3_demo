@@ -57,8 +57,19 @@ struct PublishWorkDesc {
     int32_t dependency_begin;
     int32_t dependency_count;
     int32_t pack_gqa;
-    int32_t reserved0;
+    int32_t combine_task_count;
     int32_t reserved1;
+};
+
+struct HistoryCombineWorkDesc {
+    int32_t publish_id;
+    int32_t vector_begin;
+    int32_t valid_vectors;
+    int32_t dependency_begin;
+    int32_t dependency_count;
+    int32_t batch_idx;
+    int32_t actual_splits;
+    int32_t reserved;
 };
 
 struct FinalWorkDesc {
@@ -113,13 +124,14 @@ struct MetadataHeader {
     int32_t receive_count;
     int32_t tile_ready_count;
     int32_t dcp_size;
-    int32_t reserved_v2_0;
-    int32_t reserved_v2_1;
+    int32_t history_combine_count;
+    int32_t history_combine_offset;
 };
 
 static_assert(sizeof(AttentionWorkDesc) == 8 * sizeof(int32_t));
 static_assert(sizeof(QTaskDesc) == 4 * sizeof(int32_t));
 static_assert(sizeof(PublishWorkDesc) == 8 * sizeof(int32_t));
+static_assert(sizeof(HistoryCombineWorkDesc) == 8 * sizeof(int32_t));
 static_assert(sizeof(FinalWorkDesc) == 8 * sizeof(int32_t));
 static_assert(sizeof(MetadataHeader) == 40 * sizeof(int32_t));
 static_assert(sizeof(uint64_t) == 8 && alignof(uint64_t) >= 8);
