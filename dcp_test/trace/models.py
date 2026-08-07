@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "mega_dcp_workload/v1"
+SCHEMA_VERSION = "mega_dcp_workload/v2"
 SOURCE_NAME = "mooncake_kimi_conversation_fast25"
 
 
@@ -34,6 +34,7 @@ class ReplayConfig:
     max_num_seqs: int
     max_num_batched_tokens: int
     prefill_chunk_size: int
+    q_len_alignment: int
     max_model_len: int
     dcp_size: int
     prefix_cache_capacity_blocks: int
@@ -84,6 +85,7 @@ _CONFIG_FIELDS = {
     "max_num_seqs",
     "max_num_batched_tokens",
     "prefill_chunk_size",
+    "q_len_alignment",
     "max_model_len",
     "dcp_size",
     "prefix_cache_capacity_blocks",
@@ -229,6 +231,7 @@ def load_config(
             raw, "max_num_batched_tokens", minimum=1
         ),
         prefill_chunk_size=_integer(raw, "prefill_chunk_size", minimum=1),
+        q_len_alignment=_integer(raw, "q_len_alignment", minimum=1),
         max_model_len=_integer(raw, "max_model_len", minimum=1),
         dcp_size=_integer(raw, "dcp_size", minimum=1),
         prefix_cache_capacity_blocks=_integer(
@@ -241,9 +244,20 @@ def load_config(
     )
     if config.dcp_size not in {2, 4, 8}:
         raise ConfigError("dcp_size must be one of 2, 4, or 8")
-    if config.mtp_query_len > config.max_num_batched_tokens:
+    if config.q_len_alignment not in {1, 8}:
+        raise ConfigError("q_len_alignment must be 1 or 8")
+    if config.max_num_batched_tokens < config.q_len_alignment:
         raise ConfigError(
-            "the configured MTP query cannot fit max_num_batched_tokens"
+            "max_num_batched_tokens must fit one aligned query"
+        )
+    aligned_mtp_query_len = (
+        (config.mtp_query_len + config.q_len_alignment - 1)
+        // config.q_len_alignment
+        * config.q_len_alignment
+    )
+    if aligned_mtp_query_len > config.max_num_batched_tokens:
+        raise ConfigError(
+            "the aligned MTP query cannot fit max_num_batched_tokens"
         )
     return config
 

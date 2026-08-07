@@ -175,21 +175,14 @@ class DCPMegaMetadataTest(unittest.TestCase):
     ):
         final_count = len(metadata.final)
         self.assertEqual(len(metadata.publish), dcp_size * final_count)
-        vectors_per_task = 1 if metadata.dispatch.split else hq_local
+        combine_counts = [0] * len(metadata.publish)
+        for row in metadata.history_combine:
+            combine_counts[row[0]] += 1
         for publish_id, publish in enumerate(metadata.publish):
             dst_rank, final_id = divmod(publish_id, final_count)
             self.assertEqual(publish[0], dst_rank)
             self.assertEqual(publish[1:3], metadata.final[final_id][0:2])
-            self.assertEqual(publish[6], publish[2] // vectors_per_task)
-        self.assertEqual(
-            len(metadata.history_combine),
-            dcp_size
-            * (
-                metadata.total_vectors
-                if metadata.dispatch.split
-                else metadata.total_q
-            ),
-        )
+            self.assertEqual(publish[6], combine_counts[publish_id])
         self.assertTrue(
             all(
                 len(row) == HISTORY_COMBINE_DESC_FIELDS
@@ -205,7 +198,12 @@ class DCPMegaMetadataTest(unittest.TestCase):
             )
             self.assertLessEqual(publish[1], row[1])
             self.assertLessEqual(row[1] + row[2], publish[1] + publish[2])
-            self.assertEqual(row[2], vectors_per_task)
+            if row[6] > 1:
+                self.assertEqual(row[2], 1)
+            else:
+                self.assertLessEqual(
+                    row[2], metadata.dispatch.history_copy_vectors_per_task
+                )
             self.assertGreater(row[4], 0)
             self.assertEqual(
                 row[6], metadata.history_sequence_splits[row[5]]
@@ -262,6 +260,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
             hq_local=4,
             dcp_size=8,
             num_sms=132,
+            num_comm_sm=8,
             requested_num_splits=8,
         )
         self.assertTrue(metadata.dispatch.pack_gqa)
@@ -287,6 +286,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
             hq_local=4,
             dcp_size=4,
             num_sms=132,
+            num_comm_sm=8,
             requested_num_splits=1,
         )
         self.assertTrue(metadata.dispatch.pack_gqa)
@@ -312,6 +312,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
                     hq_local=4,
                     dcp_size=dcp_size,
                     num_sms=132,
+                    num_comm_sm=8,
                     block_n_override=block_n,
                 )
                 self.assertEqual(metadata.dispatch.block_n, block_n)
@@ -338,6 +339,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
             hq_local=4,
             dcp_size=8,
             num_sms=132,
+            num_comm_sm=8,
             requested_num_splits=0,
             block_n_override=128,
         )
@@ -448,6 +450,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
             hq_local=4,
             dcp_size=4,
             num_sms=132,
+            num_comm_sm=8,
             requested_num_splits=2,
         )
         kinds = [row[0] for row in metadata.attention]
@@ -467,6 +470,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
                 hq_local=4,
                 dcp_size=2,
                 num_sms=132,
+                num_comm_sm=8,
             )
 
     def test_fixed_layout_queue_coverage_matrix(self):
@@ -490,6 +494,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
                             hq_local=hq_local,
                             dcp_size=dcp_size,
                             num_sms=132,
+                            num_comm_sm=8,
                             requested_num_splits=2,
                         )
                         token_blocks = (cu_q[-1] + 15) // 16
@@ -523,7 +528,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
                             final_vectors, list(range(cu_q[-1] * hq_local))
                         )
 
-    def test_non_split_history_combine_groups_one_token_per_task(self):
+    def test_small_non_split_history_combine_preserves_vector_parallelism(self):
         cu_q = (0, 7, 23)
         cu_history = (0, 257, 1281)
         for dcp_size in (2, 4, 8):
@@ -540,18 +545,21 @@ class DCPMegaMetadataTest(unittest.TestCase):
                             hq_local=hq_local,
                             dcp_size=dcp_size,
                             num_sms=132,
+                            num_comm_sm=8,
                             requested_num_splits=1,
                             block_n_override=block_n,
                         )
                         self.assertFalse(metadata.dispatch.split)
                         self.assertEqual(
+                            metadata.dispatch.history_copy_vectors_per_task, 1
+                        )
+                        self.assertEqual(
                             len(metadata.history_combine),
-                            dcp_size * metadata.total_q,
+                            dcp_size * metadata.total_vectors,
                         )
                         self.assertTrue(
                             all(
-                                row[1] % hq_local == 0
-                                and row[2] == hq_local
+                                row[2] == 1
                                 for row in metadata.history_combine
                             )
                         )
@@ -560,10 +568,78 @@ class DCPMegaMetadataTest(unittest.TestCase):
                             for row in metadata.publish
                             if row[2] == 16 * hq_local
                         )
-                        self.assertEqual(full_publish[6], 16)
+                        self.assertEqual(full_publish[6], 16 * hq_local)
                         self._assert_publish_receive_mapping(
                             metadata, cu_q, hq_local, dcp_size
                         )
+
+    def test_adaptive_copy_granularity_covers_each_task_wave(self):
+        expected_granularity = {
+            40: 1,
+            200: 4,
+            400: 8,
+            800: 16,
+            1200: 32,
+        }
+        for q_len, expected in expected_granularity.items():
+            with self.subTest(q_len=q_len):
+                metadata = build_dcp_mega_metadata(
+                    (0, q_len),
+                    (0, 257),
+                    hq_local=4,
+                    dcp_size=8,
+                    num_sms=132,
+                    num_comm_sm=8,
+                    requested_num_splits=1,
+                )
+                self.assertEqual(
+                    metadata.dispatch.history_copy_vectors_per_task,
+                    expected,
+                )
+                self._assert_publish_receive_mapping(
+                    metadata, (0, q_len), 4, 8
+                )
+
+    def test_chunk_split_does_not_force_fine_history_copy(self):
+        metadata = build_dcp_mega_metadata(
+            (0, 1200),
+            (0, 64),
+            hq_local=4,
+            dcp_size=8,
+            num_sms=132,
+            num_comm_sm=8,
+            requested_num_splits=2,
+        )
+        self.assertTrue(metadata.dispatch.split)
+        self.assertGreater(metadata.chunk_sequence_splits[0], 1)
+        self.assertEqual(metadata.history_sequence_splits, (1,))
+        self.assertEqual(
+            metadata.dispatch.history_copy_vectors_per_task, 32
+        )
+        self.assertTrue(
+            all(row[2] == 32 for row in metadata.history_combine)
+        )
+        self.assertEqual(len(metadata.history_combine), 1200)
+
+    def test_history_copy_tasks_stop_at_unaligned_batch_boundaries(self):
+        cu_q = (0, 17, 40)
+        metadata = build_dcp_mega_metadata(
+            cu_q,
+            (0, 257, 514),
+            hq_local=4,
+            dcp_size=8,
+            num_sms=132,
+            num_comm_sm=8,
+            requested_num_splits=1,
+        )
+        self._assert_publish_receive_mapping(metadata, cu_q, 4, 8)
+        for row in metadata.history_combine:
+            begin_token = row[1] // 4
+            end_token = (row[1] + row[2] - 1) // 4
+            self.assertTrue(
+                any(begin <= begin_token <= end_token < end
+                    for begin, end in zip(cu_q, cu_q[1:]))
+            )
 
     def test_split_history_combine_keeps_one_vector_per_task(self):
         cu_q = (0, 7, 23)
@@ -577,6 +653,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
                         hq_local=hq_local,
                         dcp_size=8,
                         num_sms=132,
+                        num_comm_sm=8,
                         requested_num_splits=2,
                         block_n_override=block_n,
                     )
@@ -599,6 +676,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
             hq_local=8,
             dcp_size=4,
             num_sms=132,
+            num_comm_sm=8,
             requested_num_splits=2,
         )
         referenced = set()
@@ -626,6 +704,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
                 hq_local=4,
                 dcp_size=2,
                 num_sms=132,
+                num_comm_sm=8,
                 requested_num_splits=1,
             )
             history_rows = [
@@ -646,18 +725,19 @@ class DCPMegaMetadataTest(unittest.TestCase):
                 )
             )
 
-    def test_metadata_v4_header_offsets_counts_and_capacity(self):
+    def test_metadata_v5_header_offsets_counts_and_capacity(self):
         metadata = build_dcp_mega_metadata(
             (0, 3, 20, 53),
             (0, 129, 516, 1541),
             hq_local=4,
             dcp_size=8,
             num_sms=132,
+            num_comm_sm=8,
             requested_num_splits=2,
         )
         image = pack_dcp_mega_metadata(metadata, pre_phase=11, post_phase=12)
         self.assertEqual(image[0], METADATA_VERSION)
-        self.assertEqual(METADATA_VERSION, 4)
+        self.assertEqual(METADATA_VERSION, 5)
         self.assertEqual(image[30], len(image))
         self.assertEqual(image[32], 1)
         self.assertEqual(image[33], metadata.token_block_count)
@@ -710,6 +790,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
                         hq_local=hq_local,
                         dcp_size=2,
                         num_sms=132,
+                        num_comm_sm=8,
                     )
 
 

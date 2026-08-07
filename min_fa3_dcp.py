@@ -32,6 +32,7 @@ import triton.language as tl
 
 import min_fa3_op
 from dcp_mega_metadata import (
+    MEGA_COMPUTE_WARPS,
     METADATA_HEADER_INTS,
     build_dcp_mega_metadata,
     pack_dcp_mega_metadata,
@@ -2764,6 +2765,7 @@ class DCPMegaAttentionRunner:
                 hq_local=self.Hq_local,
                 dcp_size=self.world_size,
                 num_sms=self.num_sms,
+                num_comm_sm=self.num_comm_sm,
                 requested_num_splits=num_splits,
                 block_n_override=self.block_n_override,
             )
@@ -2785,6 +2787,13 @@ class DCPMegaAttentionRunner:
             self._last_queue_counts = {
                 "token_blocks": token_blocks,
                 "q_ready_counters": metadata.q_ready_count,
+                "history_combine_worker_warps": (
+                    (self.num_sms - self.num_comm_sm) * MEGA_COMPUTE_WARPS
+                ),
+                "history_combine_task_waves": (
+                    len(metadata.history_combine)
+                    / ((self.num_sms - self.num_comm_sm) * MEGA_COMPUTE_WARPS)
+                ),
                 "actual": actual_counts,
             }
             pre_phase, post_phase = self._next_phases()

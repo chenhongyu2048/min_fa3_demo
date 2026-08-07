@@ -234,6 +234,11 @@ interface as the six-load wrapper. Trace defaults are 20 cases, 10 warmups, 40
 measured iterations, correctness disabled, and baseline phase timing disabled.
 The default `GENERATE_TRACE=1` retains this one-command behavior.
 
+The example trace config uses `q_len_alignment=8`. Generated `q_lens` are the
+physical benchmark lengths and are at least 8 and divisible by 8;
+`logical_q_lens` preserve the scheduler lengths used for request-state, cache,
+and decode progress. Physical padding counts against `max_num_batched_tokens`.
+
 `NUM_CASES` is forwarded both to `dcp_test.trace.generate` and the distributed
 batch frontend. The override becomes part of the effective trace config hash,
 so stale JSONL files with a different count or provenance are rejected. The

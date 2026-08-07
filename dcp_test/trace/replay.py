@@ -45,6 +45,7 @@ class _ScheduledQuery:
     state: _RequestState
     phase: str
     q_len: int
+    physical_q_len: int
     history_len: int
     generated_tokens_before: int
     accepted_drafts: int | None
@@ -92,6 +93,10 @@ def _sample_accepted(probabilities: tuple[float, ...], rng: random.Random) -> in
     return len(probabilities) - 1
 
 
+def _align_q_len(q_len: int, alignment: int) -> int:
+    return (q_len + alignment - 1) // alignment * alignment
+
+
 def _admit(
     waiting: deque[TraceRequest],
     active: list[_RequestState],
@@ -127,7 +132,8 @@ def _schedule(
         if state.is_prefill or state.complete:
             continue
         q_len = config.mtp_query_len
-        if q_len > remaining_budget:
+        physical_q_len = _align_q_len(q_len, config.q_len_alignment)
+        if physical_q_len > remaining_budget:
             break
         sampled_accepted = _sample_accepted(
             config.accepted_draft_pmf, acceptance_rng
@@ -143,32 +149,41 @@ def _schedule(
                 state=state,
                 phase="decode",
                 q_len=q_len,
+                physical_q_len=physical_q_len,
                 history_len=state.history_len,
                 generated_tokens_before=state.generated_tokens,
                 accepted_drafts=accepted_drafts,
             )
         )
-        remaining_budget -= q_len
+        remaining_budget -= physical_q_len
 
     for state in active:
         if not state.is_prefill or remaining_budget == 0:
             continue
+        aligned_budget = (
+            remaining_budget // config.q_len_alignment
+            * config.q_len_alignment
+        )
+        if aligned_budget == 0:
+            break
         q_len = min(
             state.request.input_length - state.computed_prompt_tokens,
             config.prefill_chunk_size,
-            remaining_budget,
+            aligned_budget,
         )
+        physical_q_len = _align_q_len(q_len, config.q_len_alignment)
         scheduled.append(
             _ScheduledQuery(
                 state=state,
                 phase="chunk_prefill",
                 q_len=q_len,
+                physical_q_len=physical_q_len,
                 history_len=state.history_len,
                 generated_tokens_before=state.generated_tokens,
                 accepted_drafts=None,
             )
         )
-        remaining_budget -= q_len
+        remaining_budget -= physical_q_len
     return scheduled
 
 
@@ -207,7 +222,8 @@ def _snapshot_case(
     trace: TraceLoadResult,
 ) -> dict[str, object]:
     queries = snapshot.queries
-    q_lens = [query.q_len for query in queries]
+    logical_q_lens = [query.q_len for query in queries]
+    q_lens = [query.physical_q_len for query in queries]
     history_lens = [query.history_len for query in queries]
     return {
         "schema_version": SCHEMA_VERSION,
@@ -219,6 +235,7 @@ def _snapshot_case(
         "scheduler_step": snapshot.scheduler_step,
         "batch_size": len(queries),
         "q_lens": q_lens,
+        "logical_q_lens": logical_q_lens,
         "history_lens": history_lens,
         "total_kv_lens": [
             history + query for history, query in zip(history_lens, q_lens)
@@ -236,6 +253,7 @@ def _snapshot_case(
             query.generated_tokens_before for query in queries
         ],
         "num_speculative_tokens": config.num_speculative_tokens,
+        "q_len_alignment": config.q_len_alignment,
         "accepted_drafts": [query.accepted_drafts for query in queries],
         "fixed_step_us": config.fixed_step_us,
         "timestamp_policy": config.timestamp_policy,

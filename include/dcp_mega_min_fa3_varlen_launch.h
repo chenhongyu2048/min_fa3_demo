@@ -140,11 +140,10 @@ struct DCPMegaKernelConfig {
     static constexpr int kCommHeads = CommHeads;
     static constexpr int kCombineMaxSplits = CombineMaxSplits;
     static constexpr int kCombineStages = 4;
-    static constexpr int kHistoryVectorsPerTask = Split ? 1 : CommHeads;
+    static constexpr int kHistoryMaxCopyVectorsPerTask = 32;
     static constexpr int kReceiveScanWindow = 8;
-    static_assert(kHistoryVectorsPerTask >= 1);
-    static_assert(kHistoryVectorsPerTask <= CommHeads);
-    static_assert(CommHeads % kHistoryVectorsPerTask == 0);
+    static_assert(kHistoryMaxCopyVectorsPerTask >= CommHeads);
+    static_assert(kHistoryMaxCopyVectorsPerTask % CommHeads == 0);
     static_assert(kReceiveScanWindow > 0);
 
     using ArchTag = cutlass::arch::Sm90;
@@ -214,6 +213,7 @@ struct DCPMegaKernelConfig {
         = AttentionKernel::MaxThreadsPerBlock;
     static constexpr int kNumWarps = MaxThreadsPerBlock / cutlass::NumThreadsPerWarp;
     static constexpr int kNumCommChunks = kNumWarps / 2;
+    static_assert(kNumWarps == 12);
     using CommTile = kittens::st_bf<16, CommHeads * 128>;
     using QGlobal = kittens::gl<
         kittens::bf16, 1, -1, -1, CommHeads * 128,
@@ -669,28 +669,36 @@ CUTLASS_DEVICE void run_history_combine(
         }
         __syncwarp();
         PublishWorkDesc const publish = params.publish[work.publish_id];
-        #pragma unroll
-        for (int vector_in_task = 0;
-             vector_in_task < Config::kHistoryVectorsPerTask;
-             ++vector_in_task) {
-            if (vector_in_task < work.valid_vectors) {
+        if constexpr (Config::HistoryKernel::Split) {
+            if (work.actual_splits > 1) {
+                int const vector = work.vector_begin;
+                int const local_head = vector % params.hq_local;
+                int const history_head
+                    = publish.dst_rank * params.hq_local + local_head;
+                combine_history_splits<Config>(
+                    params, shared, work, publish, vector, history_head);
+            } else {
+                for (int vector_in_task = 0;
+                     vector_in_task < work.valid_vectors;
+                     ++vector_in_task) {
+                    int const vector = work.vector_begin + vector_in_task;
+                    int const local_head = vector % params.hq_local;
+                    int const history_head
+                        = publish.dst_rank * params.hq_local + local_head;
+                    copy_single_history_split<Config>(
+                        params, publish, vector, history_head);
+                }
+            }
+        } else {
+            for (int vector_in_task = 0;
+                 vector_in_task < work.valid_vectors;
+                 ++vector_in_task) {
                 int const vector = work.vector_begin + vector_in_task;
                 int const local_head = vector % params.hq_local;
                 int const history_head
                     = publish.dst_rank * params.hq_local + local_head;
-                if constexpr (Config::HistoryKernel::Split) {
-                    if (work.actual_splits > 1) {
-                        combine_history_splits<Config>(
-                            params, shared, work, publish,
-                            vector, history_head);
-                    } else {
-                        copy_single_history_split<Config>(
-                            params, publish, vector, history_head);
-                    }
-                } else {
-                    copy_single_history_split<Config>(
-                        params, publish, vector, history_head);
-                }
+                copy_single_history_split<Config>(
+                    params, publish, vector, history_head);
             }
         }
         complete_history_combine_task<Config>(params, work);

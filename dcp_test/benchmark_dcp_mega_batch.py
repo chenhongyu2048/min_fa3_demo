@@ -256,6 +256,8 @@ def load_trace_workloads(
                 "config_sha256",
                 "batch_size",
                 "q_lens",
+                "logical_q_lens",
+                "q_len_alignment",
                 "history_lens",
                 "total_kv_lens",
             }
@@ -277,6 +279,11 @@ def load_trace_workloads(
 
             batch_size = _positive_int(case["batch_size"], f"{context}.batch_size")
             q_lengths = _lengths(case["q_lens"], batch_size, f"{context}.q_lens")
+            logical_q_lengths = _lengths(
+                case["logical_q_lens"],
+                batch_size,
+                f"{context}.logical_q_lens",
+            )
             history_lengths = _lengths(
                 case["history_lens"], batch_size, f"{context}.history_lens"
             )
@@ -290,6 +297,23 @@ def load_trace_workloads(
             if total_kv_lengths != expected_total_kv:
                 raise ValueError(
                     f"{context}.total_kv_lens must equal history_lens + q_lens"
+                )
+            alignment = _positive_int(
+                case["q_len_alignment"], f"{context}.q_len_alignment"
+            )
+            if alignment != trace_config.q_len_alignment:
+                raise ValueError(
+                    f"{context}.q_len_alignment does not match trace config"
+                )
+            if any(
+                physical % alignment != 0
+                or logical > physical
+                or physical - logical >= alignment
+                for physical, logical in zip(q_lengths, logical_q_lengths)
+            ):
+                raise ValueError(
+                    f"{context}.q_lens must be the aligned physical form of "
+                    "logical_q_lens"
                 )
             if any(length < trace_config.dcp_size for length in history_lengths):
                 raise ValueError(

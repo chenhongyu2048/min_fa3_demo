@@ -1607,3 +1607,103 @@ per-m-block split completion counter 值得作为下一项 history-combine 优�
 > 最后一个 split CTA 以 acq_rel counter 确认 group 完成并 release-publish READY；所有已经退出 attention pipeline 的 compute warp，包括最后完成者退出后的 warp，通过 group-local cursor 协作执行该 group 的 vector combine。
 
 该方案兼顾早期 overlap、warp-per-vector 并行度、copied-and-trimmed FA3 pipeline 生命周期和轻量同步要求。它仍不能单独消除 final combine 的全局阶段边界，也不能保证隐藏全部 `19.712 us` history tail；这两点应通过第一阶段实测后再决定是否继续扩展。
+
+## 20. Metadata v5：自适应 history copy 宏任务（2026-08-07）
+
+本节记录针对新 trace 大负载实施的 history copy 优化。它解决的是
+`actual_splits == 1` 的 O/LSE transpose-pack，不替代上一节面向真实 split
+reduction 的 ready-group 候选设计。
+
+### 20.1 新 trace 上的瓶颈
+
+`simple_bench.sh` 的 10-case eager timestamp 显示，大 non-split case 的
+`attention_done -> history_combine_done` 达到 `331-497 us`。该 tail 与
+`total_q` 的 Pearson 相关系数为 `0.998`，与估算 O/LSE 读写量的相关系数为
+`0.999`；大 case 的有效读写带宽只有约 `424-434 GB/s`。
+
+history combine 除数值 reduction 外还负责 token-major history O/LSE 到
+destination-major IPC send layout 的搬运。v4 的一个 token 一个任务在原负载上
+有效，但新 trace 的 8K-13K query token 仍产生 69K-103K 个任务。每个任务都
+需要 queue ticket atomic、descriptor/dependency 读取和 publish completion atomic。
+
+另一个问题是粒度由全局 `dispatch.split` 控制。case000001 的 chunk domain
+需要 split，而 history sequence 的 `actual_splits` 全为 1；旧实现仍为 history
+copy 生成 46,976 个逐-vector任务。
+
+### 20.2 自适应选择
+
+v5 只对 `actual_splits == 1` 合并连续 copy，真实 reduction 始终保持一个
+vector 一个任务。copy 候选为：
+
+```text
+Hq_local=4: 1, 4, 8, 16, 32 vectors/task
+Hq_local=8: 1, 8, 16, 32 vectors/task
+```
+
+最大任务覆盖 32 vectors，即 Hq_local4 的 8 tokens 或 Hq_local8 的 4 tokens。
+Host metadata 用以下模型从大到小选择候选：
+
+```text
+worker_warps = (num_sms - num_comm_sm) * 12
+target_claims = ceil(0.8 * worker_warps)
+
+total_claims(g) = real_split_vector_tasks
+                + copy_tasks_after_tile_and_sequence_clipping(g)
+```
+
+选择满足 `total_claims(g) >= target_claims` 的最大 `g`；如果逐-vector任务也
+不足目标波次，则使用 `g=1` 提供最大可用并行度。H100、`num_comm_sm=8` 时
+worker 数为 1,488 warps，目标为 1,191 tasks。
+
+粒度绑定每个 descriptor 的 `actual_splits`，不再绑定全局 kernel split
+specialization。因此同一个 split kernel 内可以同时执行 32-vector普通 copy 和
+one-vector真实 split reduction。
+
+### 20.3 对齐与边界
+
+trace schema v2 将物理 `q_lens` 对齐到至少 8 且为 8 的倍数，同时保留
+`logical_q_lens` 推进 replay 状态。16-token publish tile 内恰有两个 8-token
+region，宏任务不会跨 sequence 或 publish 边界。
+
+CUDA API 不把对齐作为正确性前提。metadata builder 仍先按 publish tile 和
+sequence region 截断，再按选定粒度分组；非对齐输入会产生较小尾任务。每个
+descriptor 只属于一个 `batch_idx`、`actual_splits` 和 `publish_id`。
+
+宏任务 dependency 是所覆盖 vector completion IDs 的精确去重并集。
+`publish.combine_task_count` 记录实际宏描述符数，因此每个宏任务仍只执行一次
+completion atomic。最后任务的 device acq_rel RMW、system fence 和 remote
+release store 完全保留；hot loop 没有新增 CTA barrier。
+
+Metadata image 升级到 v5，但 40-int header 和 `HistoryCombineWorkDesc` 的
+8-int 布局不变。dispatch/benchmark JSON 新增
+`history_copy_vectors_per_task`，queue profile 新增 worker warp 和 task wave 数。
+
+### 20.4 验证结果
+
+CPU suite 覆盖 DCP 2/4/8、Hq_local 4/8、五档 copy 粒度、non-split、真实
+split、chunk split/history copy、mixed split 和非对齐 batch fallback，共 31 项
+相关测试通过。SM90 扩展成功编译；non-split 32-vector copy 与同批 mixed
+copy/reduction 均在 8x H100 上通过 full-KV correctness。
+
+对齐后的确定性 10-case trace 使用 eager Mega、`warmup=10,iters=20`、auto
+split、`num_comm_sm=8` 和 phase timestamps。与 2026-08-07 修改前诊断 run
+对比如下：
+
+| Case | Tasks old -> v5 | Copy vectors/task | History tail old -> v5 | 变化 |
+| --- | ---: | ---: | ---: | ---: |
+| 000000 | 101,248 -> 12,656 | 32 | 489.232 -> 306.400 us | -37.4% |
+| 000001 | 46,976 -> 1,472 | 32 | 111.392 -> 28.656 us | -74.3% |
+| 000002 | 14,336 -> 4,416 | 32 | 33.120 -> 28.928 us | -12.7% |
+| 000003 | 21,504 -> 5,136 | 32 | 54.768 -> 37.152 us | -32.2% |
+| 000004 | 16,992 -> 4,752 | 32 | 42.176 -> 30.048 us | -28.8% |
+| 000005 | 102,912 -> 12,864 | 32 | 496.800 -> 313.360 us | -36.9% |
+| 000006 | 70,912 -> 8,864 | 32 | 348.032 -> 219.184 us | -37.0% |
+| 000007 | 17,920 -> 6,016 | 32 | 43.504 -> 34.256 us | -21.3% |
+| 000008 | 43,440 -> 5,432 | 32 | 210.560 -> 134.688 us | -36.0% |
+| 000009 | 69,248 -> 8,656 | 32 | 331.616 -> 210.128 us | -36.6% |
+
+所有 case 的 history tail 均下降。case000000/000005/000006/000009 达到大负载
+至少 30% 的方向性门槛；case000001 证明按 `actual_splits` 解耦修复了全局 split
+导致的伪细粒度 copy。剩余大 case tail 仍包含不可消除的约 210 MB O/LSE 搬运，
+下一步应先用 hardware counter 区分 HBM 带宽与 receive backpressure，不应重新
+把真实 split reduction 合并进一个 warp task。

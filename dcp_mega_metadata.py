@@ -24,7 +24,11 @@ PUBLISH_DESC_FIELDS = 8
 HISTORY_COMBINE_DESC_FIELDS = 8
 FINAL_DESC_FIELDS = 8
 METADATA_HEADER_INTS = 40
-METADATA_VERSION = 4
+METADATA_VERSION = 5
+MEGA_COMPUTE_WARPS = 12
+HISTORY_MAX_COPY_VECTORS = 32
+HISTORY_TASK_WAVE_TARGET = 0.8
+
 
 @dataclass(frozen=True)
 class DCPMegaDispatch:
@@ -34,6 +38,7 @@ class DCPMegaDispatch:
     pack_gqa: bool
     split: bool
     block_n: int
+    history_copy_vectors_per_task: int
 
 
 @dataclass(frozen=True)
@@ -205,6 +210,7 @@ def choose_dispatch(
         pack_gqa=True,
         split=effective > 1,
         block_n=block_n,
+        history_copy_vectors_per_task=1,
     )
 
 
@@ -295,6 +301,65 @@ def _append_attention_domain(
                 )
 
 
+def _history_combine_task_count(
+    cu_q: tuple[int, ...],
+    history_sequence_splits: tuple[int, ...],
+    *,
+    hq_local: int,
+    dcp_size: int,
+    copy_vectors_per_task: int,
+) -> int:
+    tasks_per_destination = 0
+    for tile_begin in range(0, cu_q[-1], 16):
+        tile_end = min(tile_begin + 16, cu_q[-1])
+        for batch_idx, (q_begin, q_end) in enumerate(zip(cu_q, cu_q[1:])):
+            region_begin = max(tile_begin, q_begin)
+            region_end = min(tile_end, q_end)
+            if region_begin >= region_end:
+                continue
+            region_vectors = (region_end - region_begin) * hq_local
+            if history_sequence_splits[batch_idx] > 1:
+                tasks_per_destination += region_vectors
+            else:
+                tasks_per_destination += _ceil_div(
+                    region_vectors, copy_vectors_per_task
+                )
+    return dcp_size * tasks_per_destination
+
+
+def _choose_history_copy_vectors_per_task(
+    cu_q: tuple[int, ...],
+    history_sequence_splits: tuple[int, ...],
+    *,
+    hq_local: int,
+    dcp_size: int,
+    num_sms: int,
+    num_comm_sm: int,
+) -> int:
+    candidates = sorted(
+        {
+            1,
+            hq_local,
+            2 * hq_local,
+            4 * hq_local,
+            min(8 * hq_local, HISTORY_MAX_COPY_VECTORS),
+        }
+    )
+    worker_warps = (num_sms - num_comm_sm) * MEGA_COMPUTE_WARPS
+    target_claims = math.ceil(HISTORY_TASK_WAVE_TARGET * worker_warps)
+    for candidate in reversed(candidates):
+        task_count = _history_combine_task_count(
+            cu_q,
+            history_sequence_splits,
+            hq_local=hq_local,
+            dcp_size=dcp_size,
+            copy_vectors_per_task=candidate,
+        )
+        if task_count >= target_claims:
+            return candidate
+    return 1
+
+
 def build_dcp_mega_metadata(
     cu_seqlens_q: Sequence[int],
     cu_seqlens_history: Sequence[int],
@@ -302,6 +367,7 @@ def build_dcp_mega_metadata(
     hq_local: int,
     dcp_size: int,
     num_sms: int,
+    num_comm_sm: int,
     requested_num_splits: int = 0,
     block_n_override: int | None = None,
 ) -> DCPMegaMetadata:
@@ -314,6 +380,8 @@ def build_dcp_mega_metadata(
         raise ValueError("Q and history cu_seqlens must have the same batch size")
     if hq_local <= 0:
         raise ValueError("hq_local must be positive")
+    if num_comm_sm <= 0 or num_comm_sm >= num_sms:
+        raise ValueError("num_comm_sm must be positive and smaller than num_sms")
     q_lengths = tuple(end - begin for begin, end in zip(cu_q, cu_q[1:]))
     history_lengths = tuple(
         end - begin for begin, end in zip(cu_history, cu_history[1:])
@@ -356,7 +424,26 @@ def build_dcp_mega_metadata(
             pack_gqa=dispatch.pack_gqa,
             split=False,
             block_n=dispatch.block_n,
+            history_copy_vectors_per_task=1,
         )
+
+    copy_vectors_per_task = _choose_history_copy_vectors_per_task(
+        cu_q,
+        history_sequence_splits,
+        hq_local=hq_local,
+        dcp_size=dcp_size,
+        num_sms=num_sms,
+        num_comm_sm=num_comm_sm,
+    )
+    dispatch = DCPMegaDispatch(
+        effective_num_splits=dispatch.effective_num_splits,
+        chunk_num_splits=dispatch.chunk_num_splits,
+        history_num_splits=dispatch.history_num_splits,
+        pack_gqa=dispatch.pack_gqa,
+        split=dispatch.split,
+        block_n=dispatch.block_n,
+        history_copy_vectors_per_task=copy_vectors_per_task,
+    )
 
     total_q = cu_q[-1]
     num_token_subtiles = _ceil_div(total_q, 16)
@@ -404,49 +491,52 @@ def build_dcp_mega_metadata(
             publish_id = len(publish)
             publish_dependency_begin = len(publish_dependencies)
             combine_tasks: list[tuple[int, ...]] = []
-            vectors_per_task = 1 if dispatch.split else hq_local
-            for task_vector_begin in range(
-                vector_begin,
-                vector_begin + valid_vectors,
-                vectors_per_task,
-            ):
-                task_valid_vectors = min(
-                    vectors_per_task,
-                    vector_begin + valid_vectors - task_vector_begin,
-                )
-                token = task_vector_begin // hq_local
+            tile_end = vector_begin + valid_vectors
+            region_begin = vector_begin
+            while region_begin < tile_end:
+                token = region_begin // hq_local
                 batch_idx = batch_for_token[token]
-                dependency_set: set[int] = set()
-                for vector in range(
-                    task_vector_begin,
-                    task_vector_begin + task_valid_vectors,
-                ):
-                    vector_token, local_head = divmod(vector, hq_local)
-                    if batch_for_token[vector_token] != batch_idx:
-                        raise AssertionError(
-                            "history combine task crosses a batch boundary"
-                        )
-                    history_head = dst_rank * hq_local + local_head
-                    dependency_set.update(
-                        completion_for_vector[
-                            (HISTORY, batch_idx, vector_token, history_head)
-                        ]
-                    )
-                dependencies = tuple(sorted(dependency_set))
-                dependency_begin = len(publish_dependencies)
-                publish_dependencies.extend(dependencies)
-                combine_tasks.append(
-                    (
-                        publish_id,
-                        task_vector_begin,
-                        task_valid_vectors,
-                        dependency_begin,
-                        len(dependencies),
-                        batch_idx,
-                        history_sequence_splits[batch_idx],
-                        0,
-                    )
+                region_end = min(tile_end, cu_q[batch_idx + 1] * hq_local)
+                actual_splits = history_sequence_splits[batch_idx]
+                vectors_per_task = (
+                    1 if actual_splits > 1 else copy_vectors_per_task
                 )
+                for task_vector_begin in range(
+                    region_begin,
+                    region_end,
+                    vectors_per_task,
+                ):
+                    task_valid_vectors = min(
+                        vectors_per_task, region_end - task_vector_begin
+                    )
+                    dependency_set: set[int] = set()
+                    for vector in range(
+                        task_vector_begin,
+                        task_vector_begin + task_valid_vectors,
+                    ):
+                        vector_token, local_head = divmod(vector, hq_local)
+                        history_head = dst_rank * hq_local + local_head
+                        dependency_set.update(
+                            completion_for_vector[
+                                (HISTORY, batch_idx, vector_token, history_head)
+                            ]
+                        )
+                    dependencies = tuple(sorted(dependency_set))
+                    dependency_begin = len(publish_dependencies)
+                    publish_dependencies.extend(dependencies)
+                    combine_tasks.append(
+                        (
+                            publish_id,
+                            task_vector_begin,
+                            task_valid_vectors,
+                            dependency_begin,
+                            len(dependencies),
+                            batch_idx,
+                            actual_splits,
+                            0,
+                        )
+                    )
+                region_begin = region_end
             publish.append(
                 (
                     dst_rank,
@@ -585,8 +675,14 @@ def validate_dcp_mega_metadata(
     expected_publish = dcp_size * metadata.token_block_count
     if len(metadata.publish) != expected_publish:
         raise AssertionError("publish queue does not cover every destination vector")
-    expected_history_combine = dcp_size * (
-        metadata.total_vectors if metadata.dispatch.split else metadata.total_q
+    expected_history_combine = _history_combine_task_count(
+        cu_q,
+        metadata.history_sequence_splits,
+        hq_local=hq_local,
+        dcp_size=dcp_size,
+        copy_vectors_per_task=(
+            metadata.dispatch.history_copy_vectors_per_task
+        ),
     )
     if len(metadata.history_combine) != expected_history_combine:
         raise AssertionError(
@@ -609,6 +705,18 @@ def validate_dcp_mega_metadata(
         raise AssertionError("invalid token-block count")
     if metadata.dcp_size != dcp_size:
         raise AssertionError("metadata DCP size mismatch")
+    valid_copy_vectors = {
+        1,
+        hq_local,
+        2 * hq_local,
+        4 * hq_local,
+        min(8 * hq_local, HISTORY_MAX_COPY_VECTORS),
+    }
+    if (
+        metadata.dispatch.history_copy_vectors_per_task
+        not in valid_copy_vectors
+    ):
+        raise AssertionError("invalid history copy task granularity")
 
     q_coordinates = [(row[2] // 16, row[0]) for row in metadata.q_tasks]
     expected_q_coordinates = [
@@ -631,10 +739,7 @@ def validate_dcp_mega_metadata(
             )
         if row[5] != int(metadata.dispatch.pack_gqa):
             raise AssertionError("publish PackGQA marker mismatch")
-        expected_task_count = row[2] if metadata.dispatch.split else _ceil_div(
-            row[2], hq_local
-        )
-        if row[6] != expected_task_count or row[7] != 0:
+        if row[6] <= 0 or row[7] != 0:
             raise AssertionError("publish combine completion target is invalid")
 
     combine_by_publish: list[list[tuple[int, ...]]] = [
@@ -660,11 +765,6 @@ def validate_dcp_mega_metadata(
                 > publish_row[1] + publish_row[2]
         ):
             raise AssertionError("history combine vectors are outside its publish tile")
-        expected_vectors_per_task = 1 if metadata.dispatch.split else hq_local
-        if valid_vectors != expected_vectors_per_task:
-            raise AssertionError("history combine task vector count is invalid")
-        if not metadata.dispatch.split and vector_begin % hq_local != 0:
-            raise AssertionError("non-split history combine task is not token-aligned")
         token = vector_begin // hq_local
         expected_batch = next(
             idx
@@ -676,6 +776,18 @@ def validate_dcp_mega_metadata(
             raise AssertionError("history combine batch mapping is invalid")
         if actual_splits != metadata.history_sequence_splits[batch_idx]:
             raise AssertionError("history combine split count is invalid")
+        if actual_splits > 1:
+            if valid_vectors != 1:
+                raise AssertionError("split history combine task must contain one vector")
+        else:
+            copy_vectors = metadata.dispatch.history_copy_vectors_per_task
+            region_end = min(
+                publish_row[1] + publish_row[2],
+                cu_q[batch_idx + 1] * hq_local,
+            )
+            expected_valid = min(copy_vectors, region_end - vector_begin)
+            if valid_vectors != expected_valid:
+                raise AssertionError("history copy task vector count is invalid")
         if row[7] != 0:
             raise AssertionError("history combine reserved field is invalid")
         expected_id_set: set[int] = set()
@@ -755,7 +867,7 @@ def pack_dcp_mega_metadata(
     post_phase: int,
     capacity: int | None = None,
 ) -> array:
-    """Serialize a validated metadata v4 image into native int32 values."""
+    """Serialize a validated metadata v5 image into native int32 values."""
     if pre_phase <= 0 or post_phase <= pre_phase:
         raise ValueError("metadata phases must be positive and strictly increasing")
     payload = array("i", [0] * METADATA_HEADER_INTS)
@@ -831,7 +943,7 @@ def pack_dcp_mega_metadata(
         history_combine_offset,
     )
     if len(header) != METADATA_HEADER_INTS:
-        raise AssertionError("metadata v4 header width mismatch")
+        raise AssertionError("metadata v5 header width mismatch")
     payload[:METADATA_HEADER_INTS] = array("i", header)
     return payload
 
@@ -844,6 +956,9 @@ __all__ = [
     "FINAL_DESC_FIELDS",
     "HISTORY",
     "HISTORY_COMBINE_DESC_FIELDS",
+    "HISTORY_MAX_COPY_VECTORS",
+    "HISTORY_TASK_WAVE_TARGET",
+    "MEGA_COMPUTE_WARPS",
     "METADATA_HEADER_INTS",
     "METADATA_VERSION",
     "PUBLISH_DESC_FIELDS",

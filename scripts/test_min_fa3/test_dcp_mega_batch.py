@@ -147,20 +147,23 @@ class DCPMegaBatchTest(unittest.TestCase):
         trace_config = mock.Mock(
             num_cases=2,
             dcp_size=4,
+            q_len_alignment=8,
             trace_sha256="trace-sha",
             config_sha256="config-sha",
         )
         cases = [
             {
-                "schema_version": "mega_dcp_workload/v1",
+                "schema_version": "mega_dcp_workload/v2",
                 "case_id": f"case_{index:06d}",
                 "source": "trace-test",
                 "trace_sha256": "trace-sha",
                 "config_sha256": "config-sha",
                 "batch_size": 2,
-                "q_lens": [1, 8],
+                "q_lens": [8, 16],
+                "logical_q_lens": [1, 9],
+                "q_len_alignment": 8,
                 "history_lens": [4, 17],
-                "total_kv_lens": [5, 25],
+                "total_kv_lens": [12, 33],
                 "sampled_time_us": index * 20_000,
             }
             for index in range(2)
@@ -177,9 +180,64 @@ class DCPMegaBatchTest(unittest.TestCase):
             "case_000000",
             "case_000001",
         ])
-        self.assertEqual(workloads[0].q_lengths, (1, 8))
+        self.assertEqual(workloads[0].q_lengths, (8, 16))
         self.assertEqual(workloads[0].history_lengths, (4, 17))
+        self.assertEqual(
+            workloads[0].trace_metadata["logical_q_lens"], [1, 9]
+        )
         self.assertEqual(workloads[1].trace_metadata["sampled_time_us"], 20_000)
+
+    def test_trace_cases_reject_nonminimal_physical_alignment(self) -> None:
+        trace_config = mock.Mock(
+            num_cases=1,
+            dcp_size=4,
+            q_len_alignment=8,
+            trace_sha256="trace-sha",
+            config_sha256="config-sha",
+        )
+        case = {
+            "schema_version": "mega_dcp_workload/v2",
+            "case_id": "case_000000",
+            "trace_sha256": "trace-sha",
+            "config_sha256": "config-sha",
+            "batch_size": 1,
+            "q_lens": [16],
+            "logical_q_lens": [8],
+            "q_len_alignment": 8,
+            "history_lens": [4],
+            "total_kv_lens": [20],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace_cases.jsonl"
+            path.write_text(json.dumps(case) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "aligned physical form"):
+                load_trace_workloads(path, trace_config)
+
+    def test_trace_cases_reject_alignment_mismatch(self) -> None:
+        trace_config = mock.Mock(
+            num_cases=1,
+            dcp_size=4,
+            q_len_alignment=8,
+            trace_sha256="trace-sha",
+            config_sha256="config-sha",
+        )
+        case = {
+            "schema_version": "mega_dcp_workload/v2",
+            "case_id": "case_000000",
+            "trace_sha256": "trace-sha",
+            "config_sha256": "config-sha",
+            "batch_size": 1,
+            "q_lens": [8],
+            "logical_q_lens": [8],
+            "q_len_alignment": 1,
+            "history_lens": [4],
+            "total_kv_lens": [12],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace_cases.jsonl"
+            path.write_text(json.dumps(case) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "does not match trace config"):
+                load_trace_workloads(path, trace_config)
 
     def test_weighted_summary_uses_total_work_over_total_time(self) -> None:
         entries = [

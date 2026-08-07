@@ -107,7 +107,7 @@ Mooncake SHA 校验、JSONL 解析、arrival 归一化
 history_len >= dcp_size 过滤 + reservoir sampling
         |
         v
-mega_dcp_workload/v1 JSONL
+mega_dcp_workload/v2 JSONL
         |
         v
 batch frontend 在 CUDA 初始化前校验 provenance 和 shape
@@ -205,20 +205,27 @@ request 数达到 `max_num_seqs`。当 active 和 waiting 都为空时，实现�
 
 ### 4.5 Decode-first 调度和 token budget
 
-每个 step 共享 `max_num_batched_tokens` token budget，并最多为每个 request
-调度一次 query。调度分两遍完成：
+每个 step 共享 `max_num_batched_tokens` 物理 query token budget，并最多为每个
+request 调度一次 query。调度分两遍完成：
 
 1. 按 active FCFS 顺序调度所有可 decode/MTP 的 request；
 2. 使用剩余 budget 按 active FCFS 顺序调度 chunk prefill。
 
-Prefill query 长度为以下三者的最小值：
+Replay 区分逻辑 query 长度和用于性能 workload 的物理长度：
 
 ```text
-q_len = min(prompt_remaining, prefill_chunk_size, remaining_budget)
+logical_q_len = min(prompt_remaining,
+                    prefill_chunk_size,
+                    aligned_remaining_budget)
+physical_q_len = align_up(logical_q_len, q_len_alignment)
 ```
 
-Decode/MTP query 是 atomic 的。如果完整 query 放不进剩余 budget，就停止
-decode pass，不把它缩短。两种 `scheduled_q_rule` 为：
+budget 扣减 `physical_q_len`，因此对齐 padding 不会让物理 batch 超过配置上限；
+prompt progress、prefix cache、history state 和 decode commit 只使用
+`logical_q_len`。`q_len_alignment=1` 保持原始 replay 行为，示例性能配置使用 8。
+
+Decode/MTP query 是 atomic 的。如果对齐后的完整物理 query 放不进剩余 budget，
+就停止 decode pass，不把它缩短。两种 `scheduled_q_rule` 定义逻辑长度：
 
 - `target_plus_drafts`：`q_len = 1 + num_speculative_tokens`；
 - `drafts_only`：`q_len = num_speculative_tokens`，这里配置值表示验证 query
@@ -291,6 +298,7 @@ case，也不静默减少输出数量。
 | `max_num_seqs` | active request 上限 |
 | `max_num_batched_tokens` | 每个 scheduler step 的共享 query token budget |
 | `prefill_chunk_size` | 单个 request 每步最大 prefill chunk |
+| `q_len_alignment` | 物理 benchmark query 对齐，严格限制为 1 或 8 |
 | `max_model_len` | 允许的 `input_length + output_length` 上限 |
 | `dcp_size` | Mega eligibility 和 benchmark topology，限制为 2、4 或 8 |
 | `prefix_cache_capacity_blocks` | 全局 512-token prefix LRU 容量，0 表示关闭 |
@@ -304,12 +312,12 @@ MTP acceptance 都是研究用输入。公开 Mooncake trace 没有提供这些 
 
 ## 6. JSONL 输出契约
 
-Schema version 为 `mega_dcp_workload/v1`。一行是一个 scheduler snapshot，
+Schema version 为 `mega_dcp_workload/v2`。一行是一个 scheduler snapshot，
 字段如下：
 
 | 字段 | 内容 |
 | --- | --- |
-| `schema_version` | 固定为 `mega_dcp_workload/v1` |
+| `schema_version` | 固定为 `mega_dcp_workload/v2` |
 | `case_id` | 按采样时间排序后分配的安全、唯一 ID |
 | `source` | 固定为 `mooncake_kimi_conversation_fast25` |
 | `trace_sha256` | 已验证输入 trace 的 SHA-256 |
@@ -317,7 +325,8 @@ Schema version 为 `mega_dcp_workload/v1`。一行是一个 scheduler snapshot�
 | `sampled_time_us` | snapshot 的 replay wall-clock time |
 | `scheduler_step` | `sampled_time_us / fixed_step_us` 对应的 step |
 | `batch_size` | 此 case 保留的 Mega-eligible query 数 |
-| `q_lens` | 对齐的 query/chunk 长度数组 |
+| `q_lens` | 对齐后的物理 query/chunk 长度数组 |
+| `logical_q_lens` | 推进 replay 状态的逻辑 query/chunk 长度数组 |
 | `history_lens` | 状态转换前的 KV history 长度数组 |
 | `total_kv_lens` | `history_lens + q_lens` |
 | `request_ids` | 源 JSONL line index |
@@ -327,6 +336,7 @@ Schema version 为 `mega_dcp_workload/v1`。一行是一个 scheduler snapshot�
 | `cached_prefix_lengths` | admission 时命中的 prefix token 数 |
 | `generated_tokens_before` | 本 step 之前已提交的 output token 数 |
 | `num_speculative_tokens` | replay 配置中的 MTP 参数 |
+| `q_len_alignment` | 该 case 使用的物理 query 对齐 |
 | `accepted_drafts` | decode 为整数，chunk prefill 为 `null` |
 | `fixed_step_us` | replay fixed step |
 | `timestamp_policy` | arrival normalization policy |
@@ -336,12 +346,16 @@ Schema version 为 `mega_dcp_workload/v1`。一行是一个 scheduler snapshot�
 
 ```text
 batch_size == len(q_lens)
+           == len(logical_q_lens)
            == len(history_lens)
            == len(total_kv_lens)
            == len(request_ids)
            == len(phases)
 
 total_kv_lens[i] == history_lens[i] + q_lens[i]
+q_lens[i] % q_len_alignment == 0
+logical_q_lens[i] <= q_lens[i]
+q_lens[i] - logical_q_lens[i] < q_len_alignment
 history_lens[i] >= dcp_size
 ```
 
@@ -378,8 +392,9 @@ replay seed，也不修改输入文件。`--full` 关闭 focused field projectio
 - case ID 可安全用于文件名、没有重复；
 - JSONL case 数精确等于有效配置中的 `num_cases`；
 - `trace_sha256` 和 `config_sha256` 与有效配置一致；
-- `batch_size` 与三个 length array 对齐；
+- `batch_size` 与四个 length array 对齐；
 - `total_kv_lens == history_lens + q_lens`；
+- `q_lens` 是 `logical_q_lens` 按配置生成的最小对齐物理长度；
 - 每个 `history_len >= dcp_size`；
 - 最终选择的 benchmark topology 恰好等于 replay 的 DCP size。
 
@@ -588,7 +603,8 @@ DRY_RUN=1 NUM_CASES=20 MODES=eager ./benchmark_dcp_mega_trace.sh
 - consolidated trace CPU suite 覆盖 strict config、trace schema/SHA、两种
   timestamp policy、model-length filtering、prefix LRU、chunk-to-decode 状态、
   MTP atomicity、mixed phase、deterministic reservoir、sampling shortfall、
-  atomic output、overwrite protection 和 example viewer；
+  1/8-token query alignment、逻辑/物理状态分离、atomic output、overwrite
+  protection 和 example viewer；
 - 纠正毫秒单位后的原始 64-case full-Mooncake smoke 在约 4.53 秒内完成，
   12,031/12,031 个请求均 admission 并完成；该次独立 smoke 配置产生
   1,240,338 个 sampling-window eligible step；
@@ -631,6 +647,8 @@ python -m unittest scripts.test_min_fa3.test_dcp_mega_batch -v
 - prefix cache 是可复用 prompt block 的全局 LRU，不是完整的 KV allocator；
 - decode-first、token budget、MTP PMF 和 cache capacity 来自明确配置，不来自
   公开 trace；
+- `q_len_alignment=8` 产生的是 synthetic performance padding；padding 参与物理
+  attention shape 和 token budget，但不表示模型提交了额外 token；
 - 样本条件是当前 step 至少有一个 Mega-eligible query，因此不能将 case 分布
   解读为包含 idle time 的无条件 wall-clock 分布；
 - workload-weighted summary 汇总 attention case，不包含真实 serving 的 queueing

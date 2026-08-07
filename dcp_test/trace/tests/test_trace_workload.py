@@ -72,6 +72,7 @@ class TraceWorkloadTest(unittest.TestCase):
             "max_num_seqs": 4,
             "max_num_batched_tokens": 2048,
             "prefill_chunk_size": 512,
+            "q_len_alignment": 1,
             "max_model_len": 10000,
             "dcp_size": 2,
             "prefix_cache_capacity_blocks": 16,
@@ -261,6 +262,54 @@ class TraceWorkloadTest(unittest.TestCase):
         self.assertEqual(case["history_lens"], [2, 2])
         self.assertEqual(case["accepted_drafts"], [0, None])
         self.assertEqual(sum(case["q_lens"]), 4)
+
+    def test_aligned_physical_queries_preserve_logical_progress(self) -> None:
+        config_path = self._config_path(
+            [_row(0, 18, 3)],
+            q_len_alignment=8,
+            max_num_batched_tokens=16,
+            prefill_chunk_size=10,
+            num_cases=2,
+            sampling_start_ms=1,
+            sampling_end_ms=3,
+        )
+        config, _, result = self._load_and_replay(config_path)
+        self.assertEqual(config.q_len_alignment, 8)
+        self.assertEqual(
+            [case["phases"][0] for case in result.cases],
+            ["chunk_prefill", "decode"],
+        )
+        self.assertEqual(
+            [case["logical_q_lens"][0] for case in result.cases],
+            [8, 1],
+        )
+        self.assertEqual(
+            [case["q_lens"][0] for case in result.cases],
+            [8, 8],
+        )
+        self.assertEqual(
+            [case["history_lens"][0] for case in result.cases],
+            [10, 18],
+        )
+        for case in result.cases:
+            self.assertEqual(case["q_len_alignment"], 8)
+            self.assertEqual(case["q_lens"][0] % 8, 0)
+            self.assertLess(
+                case["q_lens"][0] - case["logical_q_lens"][0], 8
+            )
+
+    def test_query_alignment_config_validation(self) -> None:
+        rows = [_row(0, 8, 1)]
+        with self.assertRaisesRegex(ConfigError, "must be 1 or 8"):
+            load_config(self._config_path(rows, q_len_alignment=4))
+        with self.assertRaisesRegex(ConfigError, "fit one aligned query"):
+            load_config(
+                self._config_path(
+                    rows,
+                    q_len_alignment=8,
+                    max_num_batched_tokens=4,
+                )
+            )
 
     def test_prefix_reuse_enters_later_chunk_prefill_case(self) -> None:
         shared = [101, 102, 103]

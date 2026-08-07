@@ -95,8 +95,8 @@ void validate_metadata_header(
     int64_t total_vectors,
     int64_t batch_size,
     int dcp_size) {
-    TORCH_CHECK(header.version == 4,
-                "unsupported DCP mega metadata version; expected version 4");
+    TORCH_CHECK(header.version == 5,
+                "unsupported DCP mega metadata version; expected version 5");
     TORCH_CHECK(header.used_ints == metadata_used,
                 "metadata_used does not match the pinned header");
     TORCH_CHECK(metadata_used >= 40 && metadata_used <= metadata_capacity,
@@ -147,10 +147,9 @@ void validate_metadata_header(
     TORCH_CHECK(header.publish_count == header.token_block_count * dcp_size
                     && header.final_count == header.token_block_count,
                 "invalid fixed-layout publish/final queue counts");
-    int64_t const expected_history_combine = header.split
-        ? total_vectors * dcp_size
-        : total_q * dcp_size;
-    TORCH_CHECK(header.history_combine_count == expected_history_combine,
+    TORCH_CHECK(header.history_combine_count >= header.publish_count
+                    && header.history_combine_count
+                        <= total_vectors * dcp_size,
                 "invalid history combine descriptor count");
     TORCH_CHECK(header.receive_count
                         == header.token_block_count * (dcp_size - 1)
@@ -204,7 +203,7 @@ void validate_metadata_header(
             && header.history_splits_offset
                 == header.chunk_splits_offset + batch_size
             && header.used_ints == header.history_splits_offset + batch_size,
-        "DCP mega metadata v4 ranges must be contiguous and non-overlapping");
+        "DCP mega metadata v5 ranges must be contiguous and non-overlapping");
 }
 
 Flash_fwd_params make_attention_params(
