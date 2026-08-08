@@ -138,6 +138,7 @@ ext_modules = [
                 "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
                 "-DCUTLASS_ENABLE_GDC_FOR_SM90",
                 "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
+                "-DCMAKE_CUDA_SEPARABLE_COMPILATION=OFF",
                 "-DNDEBUG",
                 "-gencode",
                 "arch=compute_90a,code=sm_90a",
