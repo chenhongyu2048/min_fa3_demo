@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Plot latency, per-GPU FLOPS, and KV bandwidth from a Mega DCP matrix."""
 
 from __future__ import annotations
@@ -20,9 +21,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
 
-DEFAULT_BENCHMARK_ROOT = (
-    Path(__file__).resolve().parent.parent / "benchmark_logs" / "bench_dcp"
-)
+DEFAULT_BENCHMARK_ROOT = Path(__file__).resolve().parent
 
 METHOD_VLLM_AG_RS = "vllm_ag_rs_min_fa3_varlen"
 METHOD_VLLM_A2A = "vllm_a2a_min_fa3_varlen"
@@ -43,8 +42,6 @@ LATENCY_LABELS = {
 }
 TFLOPS_COLUMN = "workload_weighted_effective_tflops_per_gpu"
 BANDWIDTH_COLUMN = "workload_weighted_effective_kv_bandwidth_gbps_per_gpu"
-
-
 @dataclass(frozen=True)
 class Series:
     key: str
@@ -251,8 +248,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "fixed comm-SM value (default: best)"
         ),
     )
-    parser.add_argument("--arrival-time-scales", default="1,2,4")
-    parser.add_argument("--dcp-sizes", default="2,4,8")
+    parser.add_argument(
+        "--arrival-time-scales",
+        default=None,
+        help="comma-separated scales; defaults to all scales found in the CSV",
+    )
+    parser.add_argument(
+        "--dcp-sizes",
+        default=None,
+        help="comma-separated sizes; defaults to all sizes found in the CSV",
+    )
     parser.add_argument(
         "--allow-incomplete",
         action="store_true",
@@ -269,11 +274,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dpi", type=_positive_integer, default=220)
     args = parser.parse_args(argv)
     try:
-        args.arrival_time_scales = _parse_arrivals(args.arrival_time_scales)
-        args.dcp_sizes = _parse_dcp_sizes(args.dcp_sizes)
+        if args.arrival_time_scales is not None:
+            args.arrival_time_scales = _parse_arrivals(args.arrival_time_scales)
+        if args.dcp_sizes is not None:
+            args.dcp_sizes = _parse_dcp_sizes(args.dcp_sizes)
     except ValueError as error:
         parser.error(str(error))
-    if len(args.dcp_sizes) != 3:
+    if args.dcp_sizes is not None and len(args.dcp_sizes) != 3:
         parser.error("--dcp-sizes must contain exactly three values for a 1x3 figure")
     return args
 
@@ -282,13 +289,15 @@ def _latest_run(root: Path) -> Path:
     if not root.is_dir():
         raise FileNotFoundError(f"benchmark root does not exist: {root}")
     candidates = [
-        path.parent
-        for path in root.glob("*/matrix_summary.csv")
-        if path.is_file()
+        path for path in root.glob("*/matrix_summary.csv") if path.is_file()
     ]
     if not candidates:
         raise FileNotFoundError(f"no matrix_summary.csv was found below {root}")
-    return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name))
+    latest_csv = max(
+        candidates,
+        key=lambda path: (path.stat().st_mtime_ns, path.parent.name),
+    )
+    return latest_csv.parent
 
 
 def resolve_input(path: Path | None) -> tuple[Path, Path | None, Path]:
@@ -724,6 +733,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         csv_path, manifest_path, run_dir = resolve_input(args.input)
         validate_manifest(manifest_path, allow_incomplete=args.allow_incomplete)
         records = load_records(csv_path, args.latency_stat)
+        if args.arrival_time_scales is None:
+            args.arrival_time_scales = tuple(
+                sorted({record.arrival_time_scale for record in records})
+            )
+        if args.dcp_sizes is None:
+            args.dcp_sizes = tuple(sorted({record.dcp_size for record in records}))
+        if len(args.dcp_sizes) != 3:
+            raise ValueError(
+                "the selected matrix must contain exactly three DCP sizes for a "
+                "1x3 figure; use --dcp-sizes to select them"
+            )
         points = select_plot_points(
             records,
             arrivals=args.arrival_time_scales,
@@ -794,41 +814,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     for dcp_size in args.dcp_sizes:
         for arrival in args.arrival_time_scales:
             point = points.get((dcp_size, arrival, "mega_eager"))
-            if point is not None:
-                comparisons = []
-                for metric_name, metric, _title, _output in metrics:
-                    comparison = best_baseline_comparison(
-                        points,
-                        dcp_size=dcp_size,
-                        arrival=arrival,
-                        mega=point,
-                        metric=metric,
-                    )
-                    if comparison is None:
-                        comparisons.append(
-                            f"{metric_name}_best_baseline=unavailable "
-                            f"{metric_name}_speedup=unavailable"
-                        )
-                    else:
-                        comparisons.append(
-                            f"{metric_name}_best_baseline={comparison.series.key} "
-                            f"{metric_name}_best_value="
-                            f"{comparison.value * metric.scale:.6f} "
-                            f"{metric_name}_speedup={comparison.speedup:.6f}x"
-                        )
-                print(
-                    f"mega_selection dcp={dcp_size} "
-                    f"arrival={_decimal_label(arrival)} "
-                    f"comm_sm={point.mega_num_comm_sm} "
-                    f"latency_us={point.latency_ms * 1000.0:.6f} "
-                    f"tflops_per_gpu={point.tflops_per_gpu:.6f} "
-                    f"kv_bandwidth_gbps_per_gpu="
-                    f"{point.kv_bandwidth_gbps_per_gpu:.6f} "
-                    + " ".join(comparisons)
+            if point is None:
+                continue
+            comparisons = []
+            for metric_name, metric, _title, _output in metrics:
+                comparison = best_baseline_comparison(
+                    points,
+                    dcp_size=dcp_size,
+                    arrival=arrival,
+                    mega=point,
+                    metric=metric,
                 )
+                if comparison is None:
+                    comparisons.append(
+                        f"{metric_name}_best_baseline=unavailable "
+                        f"{metric_name}_speedup=unavailable"
+                    )
+                else:
+                    comparisons.append(
+                        f"{metric_name}_best_baseline={comparison.series.key} "
+                        f"{metric_name}_best_value="
+                        f"{comparison.value * metric.scale:.6f} "
+                        f"{metric_name}_speedup={comparison.speedup:.6f}x"
+                    )
+            print(
+                f"mega_selection dcp={dcp_size} "
+                f"arrival={_decimal_label(arrival)} "
+                f"comm_sm={point.mega_num_comm_sm} "
+                f"latency_us={point.latency_ms * 1000.0:.6f} "
+                f"tflops_per_gpu={point.tflops_per_gpu:.6f} "
+                f"kv_bandwidth_gbps_per_gpu="
+                f"{point.kv_bandwidth_gbps_per_gpu:.6f} "
+                + " ".join(comparisons)
+            )
     for metric_name, _metric, _title, output in metrics:
         print(f"{metric_name}_output={output.resolve()}")
     return 0
+
 
 
 if __name__ == "__main__":

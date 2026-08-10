@@ -18,8 +18,8 @@
 这不是完整的在线 serving simulator。它是一个 CPU-only 的固定步长重放器，
 用于生成 attention benchmark 输入。生成 workload 时不会初始化 CUDA，也不会
 调用或修改 CUDA kernel。真正的 GPU 测试由
-`dcp_test.benchmark_dcp_mega_batch` 和仓库根目录的
-`benchmark_dcp_mega_trace.sh` 完成。
+`dcp_test.benchmark_dcp_mega_batch` 和
+`scripts/test_dcp/benchmark_dcp_mega_trace.sh` 完成。
 
 实现保持以下边界：
 
@@ -374,7 +374,7 @@ Generator 先在目标目录写临时文件、flush 并 `fsync`，再用 `os.rep
 | `example_config.json` | 可运行但非 production 声明的示例 replay 参数 |
 | `tests/test_trace_workload.py` | config、parser、cache、scheduler、MTP、sampling、I/O 和 viewer 的 CPU 测试 |
 | `../benchmark_dcp_mega_batch.py` | 多 case benchmark frontend、trace 校验、进程组复用、manifest 和加权汇总 |
-| `../../benchmark_dcp_mega_trace.sh` | 生成或复用 trace，并按 execution mode 各启动一次 `torchrun` |
+| `../../scripts/test_dcp/benchmark_dcp_mega_trace.sh` | 生成或复用 trace，并按 execution mode 各启动一次 `torchrun` |
 
 `show_example.py` 的 display seed 只决定展示已有 JSONL 中的哪些 case，不影响
 replay seed，也不修改输入文件。`--full` 关闭 focused field projection，打印
@@ -531,7 +531,7 @@ WARMUP=10 \
 ITERS=40 \
 CHECK=0 \
 BASELINE_PHASE_TIMING=0 \
-./benchmark_dcp_mega_trace.sh
+./scripts/test_dcp/benchmark_dcp_mega_trace.sh
 ```
 
 `GENERATE_TRACE=0` 要求 `TRACE_CASES` 已存在。Shell wrapper 会在 `torchrun`
@@ -549,7 +549,7 @@ GENERATE_TRACE=1 \
 TRACE_CASES="$PWD/mega_dcp_trace_cases.jsonl" \
 NUM_CASES=20 \
 MODES=eager,graph \
-./benchmark_dcp_mega_trace.sh
+./scripts/test_dcp/benchmark_dcp_mega_trace.sh
 ```
 
 此模式准确执行：
@@ -582,7 +582,7 @@ python -m dcp_test.trace.generate \
 | `BASELINE_PHASE_TIMING` | `0` | non-Mega CUDA Event 分解计时 |
 | `MEGA_PHASE_TIMESTAMPS` | `0` | eager Mega 内核 milestone |
 | `NUM_SPLITS` | `0` | baseline split 参数 |
-| `MEGA_BLOCK_N` | `128` | Mega block N，支持 128 或 176 |
+| `MEGA_BLOCK_N` | `auto` | 默认 NoSplit 用 176、critical-wave split=2/4 用 128；也可固定 128 或 176 |
 | `MEGA_NUM_COMM_SM` | `8` | Mega communication CTA/SM budget |
 | `LOG_DIR` | 带时间戳的 `benchmark_logs/dcp_mega_trace_*` | 日志根目录 |
 | `RESULT_DIR` | `$LOG_DIR/results` | case JSON、trace JSONL 和 manifest 目录 |
@@ -592,7 +592,7 @@ python -m dcp_test.trace.generate \
 启动 replay 或 GPU benchmark：
 
 ```bash
-DRY_RUN=1 NUM_CASES=20 MODES=eager ./benchmark_dcp_mega_trace.sh
+DRY_RUN=1 NUM_CASES=20 MODES=eager ./scripts/test_dcp/benchmark_dcp_mega_trace.sh
 ```
 
 ## 10. 验证结果和回归范围
@@ -618,15 +618,14 @@ DRY_RUN=1 NUM_CASES=20 MODES=eager ./benchmark_dcp_mega_trace.sh
   的 completion、trace provenance、case count、per-case metadata 和 weighted
   throughput 均做过机器复算；smoke 只有 2 次 iteration 且关闭 correctness，
   不能作为正式性能数据；
-- `./simple_test.sh --static-only` 的最近一次集成检查通过 56 个 CPU tests，
-  并覆盖 Python compile、CLI import/help、shell syntax、wrapper dry-run、
-  whitespace 和 public API checks。
+- `scripts/test_dcp/simple_test.sh --static-only` 覆盖 Python compile、CLI
+  import/help、shell syntax、wrapper dry-run、whitespace 和 public API checks。
 
 修改 replay 时，最低限度应重新运行：
 
 ```bash
 python -m unittest dcp_test.trace.tests.test_trace_workload -v
-./simple_test.sh --static-only
+./scripts/test_dcp/simple_test.sh --static-only
 ```
 
 涉及 batch validation 或 weighted summary 时，还应运行：

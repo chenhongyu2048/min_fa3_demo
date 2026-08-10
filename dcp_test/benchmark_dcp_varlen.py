@@ -110,6 +110,25 @@ def parse_implementations(spec: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
+def parse_mega_block_n(value: str) -> int | None:
+    normalized = value.strip().lower()
+    if normalized == "auto":
+        return None
+    try:
+        parsed = int(normalized)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "value must be auto, 128, or 176"
+        ) from error
+    if parsed not in (128, 176):
+        raise argparse.ArgumentTypeError("value must be auto, 128, or 176")
+    return parsed
+
+
+def mega_block_n_spec(value: int | None) -> str:
+    return "auto" if value is None else str(value)
+
+
 def expanded_method_labels(implementations: tuple[str, ...]) -> tuple[str, ...]:
     methods: list[str] = []
     if "ours" in implementations:
@@ -851,8 +870,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--implementations", type=str, default="ours,vllm,sglang,full"
     )
     parser.add_argument("--num-splits", type=int, default=0)
+    parser.add_argument(
+        "--mega-scheduler-heuristic",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use critical-wave split selection instead of FA3 native split "
+            "selection (default for Mega with --num-splits 0 or 1)"
+        ),
+    )
+    parser.add_argument(
+        "--mega-history-order",
+        choices=("auto", "fifo", "release-lpt"),
+        default="auto",
+        help=(
+            "Mega history order: auto uses release-LPT only for critical-wave "
+            "decode-only split plans; fifo and release-lpt force that order"
+        ),
+    )
     parser.add_argument("--mega-num-comm-sm", type=int, default=8)
-    parser.add_argument("--mega-block-n", type=int, choices=(128, 176), default=128)
+    parser.add_argument(
+        "--mega-block-n",
+        type=parse_mega_block_n,
+        default=None,
+        metavar="{auto,128,176}",
+        help=(
+            "Mega BlockN policy: auto uses 176 for critical-wave NoSplit and "
+            "128 for selected split=2/4; 128 or 176 fixes the kernel variant"
+        ),
+    )
     parser.add_argument(
         "--mega-phase-timestamps",
         action=argparse.BooleanOptionalAction,
@@ -883,7 +929,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Compare each method against full-KV before measurement",
     )
     parser.add_argument("--output-json", type=Path, default=None)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    implementation_tokens = {
+        token.strip() for token in args.implementations.split(",")
+    }
+    if args.mega_scheduler_heuristic is None:
+        args.mega_scheduler_heuristic = (
+            "mega" in implementation_tokens
+            and args.num_splits in (0, 1)
+        )
+    return args
 
 
 def main(
@@ -910,6 +965,10 @@ def main(
             raise SystemExit("--dcp-size must be positive and divide world size")
         if not 0 <= args.num_splits <= 128:
             raise SystemExit("--num-splits must be in [0, 128]")
+        if args.mega_scheduler_heuristic and args.num_splits not in (0, 1):
+            raise SystemExit(
+                "--mega-scheduler-heuristic requires --num-splits 0 or 1"
+            )
         if args.warmup < 0 or args.iters <= 0:
             raise SystemExit("--warmup must be nonnegative and --iters must be positive")
         if args.workload == "decode" and any(
@@ -918,6 +977,15 @@ def main(
             raise SystemExit("decode requires every --sq value to be 1")
 
         implementations = parse_implementations(args.implementations)
+        if args.mega_scheduler_heuristic and "mega" not in implementations:
+            raise SystemExit(
+                "--mega-scheduler-heuristic requires --implementations mega"
+            )
+        if args.mega_history_order != "auto" and "mega" not in implementations:
+            raise SystemExit(
+                "--mega-history-order fifo/release-lpt requires "
+                "--implementations mega"
+            )
         if "mega" in implementations:
             if args.workload != "chunk":
                 raise SystemExit("the DCP mega experimental path supports chunk only")
@@ -1048,6 +1116,12 @@ def main(
                     cu_seqlens_q_host=inputs.cu_q_host,
                     cu_seqlens_history_local_host=inputs.cu_history_local_host,
                     num_splits=args.num_splits,
+                    scheduler_heuristic=args.mega_scheduler_heuristic,
+                    reorder_history_override=(
+                        None
+                        if args.mega_history_order == "auto"
+                        else args.mega_history_order == "release-lpt"
+                    ),
                     return_lse=False,
                 )
 
@@ -1174,6 +1248,7 @@ def main(
             },
             "parameters": {
                 **vars(args),
+                "mega_block_n": mega_block_n_spec(args.mega_block_n),
                 "output_json": str(args.output_json) if args.output_json else None,
                 "implementations": list(implementations),
                 "method_labels": list(expanded_method_labels(implementations)),

@@ -508,6 +508,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--implementations", default="mega,ours,vllm,sglang"
     )
     parser.add_argument("--num-splits", type=_arg_num_splits, default=0)
+    parser.add_argument(
+        "--mega-scheduler-heuristic",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use critical-wave split selection instead of FA3 native split "
+            "selection (default for Mega with --num-splits 0 or 1)"
+        ),
+    )
+    parser.add_argument(
+        "--mega-history-order",
+        choices=("auto", "fifo", "release-lpt"),
+        default="auto",
+        help=(
+            "Mega history order: auto uses release-LPT only for critical-wave "
+            "decode-only split plans; fifo and release-lpt force that order"
+        ),
+    )
     parser.add_argument("--mega-num-comm-sm", type=_arg_positive_int, default=8)
     parser.add_argument(
         "--mega-num-comm-sms",
@@ -515,7 +533,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Mega-only eager comm-SM sweep executed in one torchrun",
     )
-    parser.add_argument("--mega-block-n", type=int, choices=(128, 176), default=128)
+    parser.add_argument(
+        "--mega-block-n",
+        type=benchmark_dcp_varlen.parse_mega_block_n,
+        default=None,
+        metavar="{auto,128,176}",
+        help=(
+            "Mega BlockN policy: auto uses 176 for critical-wave NoSplit and "
+            "128 for selected split=2/4; 128 or 176 fixes the kernel variant"
+        ),
+    )
     parser.add_argument(
         "--mega-phase-timestamps",
         action=argparse.BooleanOptionalAction,
@@ -550,6 +577,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Validate and print the expanded case matrix without initializing CUDA",
     )
     args = parser.parse_args(argv)
+    implementation_tokens = {
+        token.strip() for token in args.implementations.split(",")
+    }
+    if args.mega_scheduler_heuristic is None:
+        args.mega_scheduler_heuristic = (
+            "mega" in implementation_tokens
+            and args.num_splits in (0, 1)
+        )
     if (args.trace_cases is None) != (args.trace_config is None):
         parser.error("--trace-cases and --trace-config must be provided together")
     if args.trace_cases is None and args.num_cases is not None:
@@ -562,6 +597,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--workloads is not supported with --trace-cases")
     if args.mega_num_comm_sm >= 132:
         parser.error("--mega-num-comm-sm must leave at least one of 132 SMs for compute")
+    if args.mega_scheduler_heuristic and args.num_splits not in (0, 1):
+        parser.error("--mega-scheduler-heuristic requires --num-splits 0 or 1")
+    if args.mega_scheduler_heuristic and "mega" not in implementation_tokens:
+        parser.error("--mega-scheduler-heuristic requires --implementations mega")
+    if args.mega_history_order != "auto" and "mega" not in implementation_tokens:
+        parser.error(
+            "--mega-history-order fifo/release-lpt requires "
+            "--implementations mega"
+        )
     if args.mega_num_comm_sms is not None and any(
         value >= 132 for value in args.mega_num_comm_sms
     ):
@@ -607,7 +651,7 @@ def _case_argv(
     comm_sm = (
         args.mega_num_comm_sm if mega_num_comm_sm is None else mega_num_comm_sm
     )
-    return [
+    case_argv = [
         "--b",
         str(case.workload.batch_size),
         "--sq",
@@ -630,10 +674,17 @@ def _case_argv(
         args.implementations,
         "--num-splits",
         str(args.num_splits),
+        (
+            "--mega-scheduler-heuristic"
+            if args.mega_scheduler_heuristic
+            else "--no-mega-scheduler-heuristic"
+        ),
         "--mega-num-comm-sm",
         str(comm_sm),
         "--mega-block-n",
-        str(args.mega_block_n),
+        benchmark_dcp_varlen.mega_block_n_spec(args.mega_block_n),
+        "--mega-history-order",
+        args.mega_history_order,
         "--warmup",
         str(args.warmup),
         "--iters",
@@ -653,6 +704,7 @@ def _case_argv(
             else "--no-baseline-phase-timing"
         ),
     ]
+    return case_argv
 
 
 def _case_description(case: BatchCase) -> str:
@@ -905,7 +957,11 @@ def _manifest_parameters(
             benchmark_dcp_varlen.expanded_method_labels(implementations)
         ),
         "num_splits": args.num_splits,
-        "mega_block_n": args.mega_block_n,
+        "mega_scheduler_heuristic": args.mega_scheduler_heuristic,
+        "mega_history_order": args.mega_history_order,
+        "mega_block_n": benchmark_dcp_varlen.mega_block_n_spec(
+            args.mega_block_n
+        ),
         "mega_phase_timestamps": args.mega_phase_timestamps,
         "baseline_phase_timing": args.baseline_phase_timing,
         "warmup": args.warmup,

@@ -62,8 +62,14 @@ contract from PR #47801.
 Packed-varlen also accepts the explicit experimental category
 `--implementations mega`, reported as `dcp_mega_varlen`. It is chunk-only and
 supports both the default CUDA Graph mode and `--no-cuda-graph` eager mode.
-`--mega-block-n 128|176` and `--mega-num-comm-sm N` select the isolated
-instance and communication-CTA budget. The communication path is fixed to
+`--mega-block-n auto|128|176` selects the BlockN policy and
+`--mega-num-comm-sm N` selects the communication-CTA budget. The default auto
+policy uses BlockN=128 as the canonical critical-wave decision model, then
+dispatches NoSplit with BlockN=176 or a selected split plan with BlockN=128.
+Explicit 128 or 176 fixes both the model and dispatch. The split and queue-order
+axes are independently selectable with
+`--mega-scheduler-heuristic|--no-mega-scheduler-heuristic` and
+`--mega-history-order auto|fifo|release-lpt`. The communication path is fixed to
 PackGQA with `Hq_local` 4 or 8 and
 `[16,Hq_local,128]` Q/O tiles; there is no runtime communication-layout
 selection. History combine performs the remote TMA store and publishes a
@@ -128,38 +134,6 @@ torchrun --standalone --nproc_per_node=8 --module dcp_test.benchmark_dcp_varlen 
   --num-splits 0 --warmup 2 --iters 5
 ```
 
-The repository-root `benchmark_dcp_mega_six_loads.sh` script reads
-`dcp_test/configs/dcp_mega_six_loads.json` and expands six standard
-small/medium/large chunk workloads across `DCP/Hkv=2/4,4/2,8/1`. The default
-18-case matrix is run with exactly two `torchrun` launches: the first process
-group runs eager Mega plus `ours`, vLLM, and SGLang, while the second runs only
-those three baselines under CUDA Graph. Each launch creates the needed
-DCP=2/4/8 subgroups once and reuses them while cases run sequentially. Defaults
-remain 500 warmups and 100 samples.
-
-Each mode writes one console log, one schema-version-1 manifest, and one
-unchanged schema-version-3 JSON result per case below a timestamped
-`benchmark_logs/dcp_mega_six_loads_*` directory. The manifest is updated after
-each successful case and includes result paths plus method p50/p90/TFLOPS
-summaries. A completed manifest also contains `weighted_summary`, grouped by
-topology and method. Its workload-weighted TFLOPS is
-`sum(global_effective_flops) / sum(case_p50_seconds)`, matching the ring
-benchmark's total-work-over-total-time definition. Use `DRY_RUN=1` to validate
-and print the expanded matrix without
-initializing CUDA. `LOADS=large2`, `MODES=eager`, or `DCP_SIZES=8` restricts
-the matrix; selecting one mode produces only one `torchrun` launch. Set
-`BASELINE_PHASE_TIMING=0` to pass `--no-baseline-phase-timing` to both launches:
-
-```bash
-BASELINE_PHASE_TIMING=0 ./benchmark_dcp_mega_six_loads.sh
-```
-
-This switch affects the CUDA-event phase breakdown for `ours`, vLLM, and
-SGLang only. Their end-to-end CUDA-event latency remains measured. It does not
-change Mega eager timing or `MEGA_PHASE_TIMESTAMPS`, which independently
-controls optional in-kernel Mega `%globaltimer` milestones. The selected value
-is recorded in every case JSON and the mode manifest.
-
 The batch frontend also accepts another schema-version-1 JSON config. `sq` and
 `seqlen` may be broadcast positive integers or explicit length-`B` arrays;
 workloads are expanded against topologies in file order:
@@ -189,10 +163,10 @@ torchrun --standalone --nproc_per_node=8 --module \
 The trace research, replay model, JSONL contract, benchmark integration, and
 complete usage reference are documented in `trace/DESIGN.md`.
 
-For trace-driven workloads, use the repository-root wrapper:
+For trace-driven workloads, use the wrapper under `scripts/test_dcp/`:
 
 ```bash
-NUM_CASES=20 ./benchmark_dcp_mega_trace.sh
+NUM_CASES=20 ./scripts/test_dcp/benchmark_dcp_mega_trace.sh
 ```
 
 A complete two-step example that first writes the sampled trace workload into
@@ -214,7 +188,7 @@ TRACE_CONFIG=dcp_test/trace/example_config.json \
 TRACE_CASES="$TRACE_CASES" \
 NUM_CASES="$NUM_CASES" \
 MODES=eager,graph \
-./benchmark_dcp_mega_trace.sh
+./scripts/test_dcp/benchmark_dcp_mega_trace.sh
 ```
 
 `GENERATE_TRACE=0` tells the wrapper to reuse the file produced by the first
@@ -259,7 +233,7 @@ python -m dcp_test.trace.generate \
 
 `benchmark_dcp_mega_arrival_matrix.sh` is the full arrival/DCP study wrapper.
 It defaults to the Cartesian product of arrival scales `1,2,4` and DCP sizes
-`2,4,8`. Every combination generates an independent 100-case JSONL and then
+`2,4,8`. Every combination generates an independent 20-case JSONL and then
 uses three `torchrun` launches: an eager Mega-only launch that sweeps comm-SM
 budgets `4,8,12,16,20`, a six-method eager baseline launch, and the same
 baselines under CUDA Graph. The baseline selection is
@@ -276,14 +250,13 @@ modes, method sets, case counts, trace config SHA reuse within each combination,
 and comm-SM coverage. It writes a matrix status JSON and a 153-row CSV. The
 wrapper also invokes it with partial-result support on failure, so completed
 runs remain discoverable. The default run directory is
-`benchmark_logs/bench_dcp/<timestamp>/`. On eight H100 GPUs, reserve roughly
-5-8 hours for the default 100-case matrix; smaller environment-variable
-subsets scale primarily with the number of Mega case/comm-SM executions.
+`benchmark_logs/bench_dcp/<timestamp>/`. Runtime scales with `NUM_CASES`, the
+comm-SM sweep size, and the sampled workload distribution.
 
 After the matrix completes, plot its latency comparison with:
 
 ```bash
-python -m dcp_test.plot_dcp_mega_latency \
+./benchmark_logs/bench_dcp/plot_dcp_mega_latency.py \
   benchmark_logs/bench_dcp/<timestamp>
 ```
 
@@ -329,9 +302,30 @@ torchrun --standalone --nproc_per_node=8 --module dcp_test.benchmark_dcp_varlen 
   --b 3 --sq 1,8,32 --seqlen 129,1024,3131 \
   --qhead 32 --kvhead 1 --headdim 128 --tp-size 8 --dcp-size 8 \
   --workload chunk --implementations mega,vllm,full --cuda-graph \
-  --mega-block-n 128 --mega-num-comm-sm 8 \
+  --mega-block-n auto --mega-num-comm-sm 8 \
   --num-splits 0 --warmup 5 --iters 20
 ```
+
+For Mega, critical-wave split selection is enabled by default when
+`--num-splits` is `0` or `1`. Pass `--no-mega-scheduler-heuristic` to use FA3's
+native dynamic split vector instead. This split decision is independent from
+`--mega-history-order`: `fifo` forces FIFO candidate scoring and metadata,
+while `release-lpt` forces Q unlock ordering plus release-aware LPT even when
+the final vector is NoSplit. The default `auto` order is batch-aware:
+
+```text
+critical-wave NoSplit       -> FIFO        + BlockN176
+critical-wave decode split  -> release-LPT + BlockN128
+critical-wave mixed split   -> FIFO        + BlockN128
+```
+
+The critical-wave cost model scores every candidate with the same order that
+will be emitted into metadata, so forcing FIFO versus release-LPT may also
+change the selected split vector. `--mega-block-n 128|176` overrides both the
+model and dispatch choices above. FA3 native and fixed split counts from 2
+through 128 keep the BlockN=128 fallback when BlockN is `auto`. See
+[`DCP_MEGA_CRITICAL_WAVE_SCHEDULER.md`](../DCP_MEGA_CRITICAL_WAVE_SCHEDULER.md)
+for the model, thresholds, and measured A/B results.
 
 The fixed eight-GPU correctness matrix runs DCP 2/4/8, Hq-local 4/8,
 BlockN 128/176, split/nosplit, and auto-split cases in a single process group.

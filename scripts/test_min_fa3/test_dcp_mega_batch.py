@@ -330,6 +330,156 @@ class DCPMegaBatchTest(unittest.TestCase):
         direct_args = benchmark_dcp_varlen.parse_args(case_argv)
         self.assertFalse(direct_args.baseline_phase_timing)
 
+    def test_scheduler_heuristic_is_forwarded_recorded_and_validated(self) -> None:
+        args = parse_args(
+            [
+                "--implementations",
+                "mega",
+                "--num-splits",
+                "1",
+                "--mega-scheduler-heuristic",
+                "--output-dir",
+                "results",
+                "--manifest",
+                "results/manifest.json",
+            ]
+        )
+        config = load_batch_config(DEFAULT_CONFIG)
+        case = expand_cases(config, workloads="small1", dcp_sizes="2")[0]
+        direct_args = benchmark_dcp_varlen.parse_args(
+            _case_argv(args, config, case, Path("results/case.json"))
+        )
+        manifest = _build_manifest(
+            args,
+            config,
+            "2",
+            ("mega",),
+            None,
+            (case,),
+            None,
+        )
+
+        self.assertTrue(args.mega_scheduler_heuristic)
+        self.assertTrue(direct_args.mega_scheduler_heuristic)
+        self.assertTrue(manifest["parameters"]["mega_scheduler_heuristic"])
+        self.assertEqual(args.mega_history_order, "auto")
+        self.assertEqual(direct_args.mega_history_order, "auto")
+        self.assertEqual(manifest["parameters"]["mega_history_order"], "auto")
+
+        invalid_argv = (
+            ["--num-splits", "2", "--mega-scheduler-heuristic"],
+            [
+                "--implementations", "vllm", "--num-splits", "1",
+                "--mega-scheduler-heuristic",
+            ],
+        )
+        for argv in invalid_argv:
+            with self.subTest(argv=argv), self.assertRaises(SystemExit), mock.patch(
+                "sys.stderr"
+            ):
+                parse_args(argv)
+
+    def test_scheduler_heuristic_default_and_explicit_opt_out(self) -> None:
+        default_args = parse_args([])
+        self.assertTrue(default_args.mega_scheduler_heuristic)
+        self.assertIsNone(default_args.mega_block_n)
+
+        direct_default_args = benchmark_dcp_varlen.parse_args(
+            ["--implementations", "mega"]
+        )
+        self.assertTrue(direct_default_args.mega_scheduler_heuristic)
+        self.assertFalse(
+            benchmark_dcp_varlen.parse_args([]).mega_scheduler_heuristic
+        )
+
+        fixed_split_args = parse_args(["--num-splits", "2"])
+        self.assertFalse(fixed_split_args.mega_scheduler_heuristic)
+
+        fifo_args = parse_args(["--no-mega-scheduler-heuristic"])
+        self.assertFalse(fifo_args.mega_scheduler_heuristic)
+
+    def test_split_and_history_order_switches_are_forwarded_independently(self) -> None:
+        config = load_batch_config(DEFAULT_CONFIG)
+        case = expand_cases(config, workloads="small1", dcp_sizes="2")[0]
+        for scheduler_heuristic in (False, True):
+            for history_order in ("fifo", "release-lpt"):
+                with self.subTest(
+                    scheduler_heuristic=scheduler_heuristic,
+                    history_order=history_order,
+                ):
+                    args = parse_args(
+                        [
+                            "--implementations",
+                            "mega",
+                            (
+                                "--mega-scheduler-heuristic"
+                                if scheduler_heuristic
+                                else "--no-mega-scheduler-heuristic"
+                            ),
+                            "--mega-history-order",
+                            history_order,
+                        ]
+                    )
+                    case_argv = _case_argv(
+                        args, config, case, Path("results/case.json")
+                    )
+                    direct_args = benchmark_dcp_varlen.parse_args(case_argv)
+                    manifest = _build_manifest(
+                        args,
+                        config,
+                        "2",
+                        ("mega",),
+                        None,
+                        (case,),
+                        None,
+                    )
+
+                    self.assertEqual(
+                        direct_args.mega_scheduler_heuristic,
+                        scheduler_heuristic,
+                    )
+                    self.assertEqual(
+                        direct_args.mega_history_order, history_order
+                    )
+                    self.assertEqual(
+                        manifest["parameters"]["mega_history_order"],
+                        history_order,
+                    )
+
+    def test_mega_block_n_auto_and_fixed_values_round_trip(self) -> None:
+        config = load_batch_config(DEFAULT_CONFIG)
+        case = expand_cases(config, workloads="small1", dcp_sizes="2")[0]
+
+        for spec, expected in (("auto", None), ("128", 128), ("176", 176)):
+            with self.subTest(spec=spec):
+                args = parse_args(["--mega-block-n", spec])
+                case_argv = _case_argv(
+                    args, config, case, Path("results/case.json")
+                )
+                direct_args = benchmark_dcp_varlen.parse_args(case_argv)
+                manifest = _build_manifest(
+                    args,
+                    config,
+                    "2",
+                    ("mega",),
+                    None,
+                    (case,),
+                    None,
+                )
+
+                self.assertEqual(args.mega_block_n, expected)
+                self.assertEqual(direct_args.mega_block_n, expected)
+                self.assertEqual(
+                    case_argv[case_argv.index("--mega-block-n") + 1], spec
+                )
+                self.assertEqual(manifest["parameters"]["mega_block_n"], spec)
+
+        for value in ("129", "dynamic"):
+            with self.subTest(value=value), self.assertRaises(SystemExit), mock.patch(
+                "sys.stderr"
+            ):
+                parse_args(["--mega-block-n", value])
+
     def test_comm_sm_sweep_parser_paths_and_case_forwarding(self) -> None:
         args = parse_args(
             [

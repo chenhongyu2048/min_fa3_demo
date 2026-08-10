@@ -9,8 +9,21 @@ from dcp_mega_metadata import (
     CHUNK,
     HISTORY,
     HISTORY_COMBINE_DESC_FIELDS,
+    HISTORY_ORDER_POLICY_FIFO,
+    HISTORY_ORDER_POLICY_RELEASE_LPT,
     METADATA_HEADER_INTS,
     METADATA_VERSION,
+    SCHEDULER_POLICY_CRITICAL_WAVE_FIFO,
+    SCHEDULER_POLICY_HEURISTIC,
+    SCHEDULER_POLICY_NATIVE_RELEASE_LPT,
+    SPLIT_POLICY_CRITICAL_WAVE,
+    SPLIT_POLICY_FA3_NATIVE,
+    _AttentionScheduleProfile,
+    _HistoryCombineScheduleTask,
+    _choose_critical_wave_split,
+    _fifo_attention_profile,
+    _history_combine_profile,
+    _overlapped_attention_combine_makespan,
     build_dcp_mega_metadata,
     choose_dispatch,
     choose_split_upper_bound,
@@ -20,6 +33,13 @@ from dcp_mega_metadata import (
 
 _RECEIVE_CHUNKS = 6
 _RECEIVE_SCAN_WINDOW = 8
+
+
+def _cumulative(lengths):
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    return tuple(offsets)
 
 
 def _receive_slot_tasks(total_tasks, num_comm_sm):
@@ -278,6 +298,629 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(metadata.receive_count, 7 * metadata.token_block_count)
         self.assertEqual(metadata.tile_ready_count, metadata.receive_count)
 
+    def test_default_critical_wave_preserves_fifo_when_no_split_is_selected(self):
+        kwargs = {
+            "hq_local": 4,
+            "dcp_size": 2,
+            "num_sms": 132,
+            "num_comm_sm": 4,
+            "requested_num_splits": 1,
+        }
+        default = build_dcp_mega_metadata(
+            (0, 8, 24),
+            (0, 257, 1281),
+            **kwargs,
+        )
+        explicit_enabled_heuristic = build_dcp_mega_metadata(
+            (0, 8, 24),
+            (0, 257, 1281),
+            scheduler_heuristic=True,
+            **kwargs,
+        )
+        explicit_fifo = build_dcp_mega_metadata(
+            (0, 8, 24),
+            (0, 257, 1281),
+            scheduler_heuristic=False,
+            **kwargs,
+        )
+        fixed_128 = build_dcp_mega_metadata(
+            (0, 8, 24),
+            (0, 257, 1281),
+            block_n_override=128,
+            **kwargs,
+        )
+        fixed_176 = build_dcp_mega_metadata(
+            (0, 8, 24),
+            (0, 257, 1281),
+            block_n_override=176,
+            **kwargs,
+        )
+
+        self.assertEqual(default, explicit_enabled_heuristic)
+        self.assertFalse(default.dispatch.split)
+        self.assertEqual(default.dispatch.block_n, 176)
+        self.assertEqual(default.split_policy, SPLIT_POLICY_CRITICAL_WAVE)
+        self.assertEqual(default.history_order_policy, HISTORY_ORDER_POLICY_FIFO)
+        self.assertEqual(
+            default.scheduler_policy, SCHEDULER_POLICY_CRITICAL_WAVE_FIFO
+        )
+        self.assertEqual(default.heuristic_model_block_n, 128)
+        self.assertEqual(default.heuristic_plan_source, "nosplit")
+        self.assertIsNone(default.heuristic_history_sequence_splits)
+        self.assertIsNone(default.heuristic_split_sequence_idx)
+        self.assertIsNone(default.heuristic_split_sequence_splits)
+        self.assertEqual(
+            default.heuristic_q_block_order,
+            tuple(range(default.token_block_count)),
+        )
+        self.assertEqual(
+            [row[7] for row in default.attention],
+            list(range(len(default.attention))),
+        )
+        for field in (
+            "attention",
+            "q_tasks",
+            "q_dependencies",
+            "publish",
+            "history_combine",
+            "publish_dependencies",
+            "final",
+            "final_dependencies",
+            "chunk_sequence_splits",
+            "history_sequence_splits",
+        ):
+            self.assertEqual(getattr(default, field), getattr(explicit_fifo, field))
+        self.assertEqual(explicit_fifo.dispatch.block_n, 128)
+        self.assertIsNone(explicit_fifo.heuristic_model_block_n)
+        self.assertEqual(fixed_128.dispatch.block_n, 128)
+        self.assertEqual(fixed_128.heuristic_model_block_n, 128)
+        self.assertEqual(fixed_176.dispatch.block_n, 176)
+        self.assertEqual(fixed_176.heuristic_model_block_n, 176)
+
+    def test_scheduler_heuristic_selects_case40_critical_wave(self):
+        q_lengths = [16] * 30 + [4096]
+        global_history_lengths = [
+            18234, 12375, 85844, 13016, 12015, 3183, 9091, 7179,
+            1183, 13975, 13359, 19947, 18835, 7404, 25785, 5381,
+            11799, 4710, 13899, 25580, 2076, 25461, 23476, 22178,
+            8113, 1296, 14450, 943, 901, 7156, 66048,
+        ]
+        local_history_lengths = [
+            (length + 1) // 2 for length in global_history_lengths
+        ]
+        metadata = build_dcp_mega_metadata(
+            _cumulative(q_lengths),
+            _cumulative(local_history_lengths),
+            hq_local=4,
+            dcp_size=2,
+            num_sms=132,
+            num_comm_sm=4,
+            requested_num_splits=0,
+        )
+
+        self.assertEqual(metadata.split_policy, SPLIT_POLICY_CRITICAL_WAVE)
+        self.assertEqual(metadata.history_order_policy, HISTORY_ORDER_POLICY_FIFO)
+        self.assertEqual(
+            metadata.scheduler_policy, SCHEDULER_POLICY_CRITICAL_WAVE_FIFO
+        )
+        self.assertEqual(metadata.dispatch.block_n, 128)
+        self.assertEqual(metadata.heuristic_model_block_n, 128)
+        self.assertEqual(metadata.heuristic_plan_source, "iterative")
+        self.assertEqual(
+            metadata.heuristic_history_sequence_splits,
+            metadata.history_sequence_splits,
+        )
+        self.assertEqual(metadata.heuristic_split_sequence_idx, 2)
+        self.assertEqual(metadata.heuristic_split_sequence_splits, 4)
+        self.assertEqual(metadata.heuristic_baseline_makespan, 798)
+        self.assertEqual(metadata.heuristic_selected_makespan, 639)
+        self.assertEqual(metadata.heuristic_baseline_combine_penalty, 20)
+        self.assertEqual(metadata.heuristic_selected_combine_penalty, 36)
+        self.assertAlmostEqual(metadata.heuristic_gain, 143 / 818)
+        self.assertEqual(metadata.history_sequence_splits[2], 4)
+        self.assertEqual(metadata.history_sequence_splits.count(4), 1)
+        self.assertEqual(
+            sorted(row[7] for row in metadata.attention),
+            list(range(len(metadata.attention))),
+        )
+        self.assertEqual(
+            [row[7] for row in metadata.attention],
+            list(range(len(metadata.attention))),
+        )
+        q_coordinates = [(row[2] // 16, row[0]) for row in metadata.q_tasks]
+        self.assertEqual(len(q_coordinates), len(set(q_coordinates)))
+        self.assertEqual(
+            sorted(q_coordinates),
+            [
+                (token_block, source)
+                for token_block in range(metadata.token_block_count)
+                for source in range(2)
+            ],
+        )
+        self._assert_attention_tiles_once(
+            metadata, _cumulative(q_lengths), 4, 2
+        )
+        self._assert_publish_receive_mapping(
+            metadata, _cumulative(q_lengths), 4, 2
+        )
+
+        fixed_176 = build_dcp_mega_metadata(
+            _cumulative(q_lengths),
+            _cumulative(local_history_lengths),
+            hq_local=4,
+            dcp_size=2,
+            num_sms=132,
+            num_comm_sm=4,
+            requested_num_splits=0,
+            block_n_override=176,
+        )
+        self.assertEqual(fixed_176.dispatch.block_n, 176)
+        self.assertEqual(fixed_176.heuristic_model_block_n, 176)
+        self.assertEqual(fixed_176.heuristic_split_sequence_splits, 4)
+        self.assertEqual(fixed_176.heuristic_baseline_makespan, 586)
+        self.assertEqual(fixed_176.heuristic_selected_makespan, 470)
+        self.assertAlmostEqual(fixed_176.heuristic_gain, 100 / 606)
+
+    def test_multi_sequence_critical_wave_crosses_joint_sequence_plateau(self):
+        q_lengths = (16,) * 8
+        history_lengths = (584, 5123, 7719, 764, 13338, 12098, 3417, 45807)
+        metadata = build_dcp_mega_metadata(
+            _cumulative(q_lengths),
+            _cumulative(history_lengths),
+            hq_local=4,
+            dcp_size=2,
+            num_sms=132,
+            num_comm_sm=20,
+            requested_num_splits=0,
+        )
+
+        expected_splits = (1, 1, 2, 1, 3, 3, 1, 12)
+        self.assertEqual(metadata.heuristic_plan_source, "iterative")
+        self.assertEqual(metadata.history_sequence_splits, expected_splits)
+        self.assertEqual(
+            metadata.heuristic_history_sequence_splits, expected_splits
+        )
+        self.assertEqual(metadata.dispatch.block_n, 128)
+        self.assertEqual(metadata.split_policy, SPLIT_POLICY_CRITICAL_WAVE)
+        self.assertEqual(
+            metadata.history_order_policy, HISTORY_ORDER_POLICY_RELEASE_LPT
+        )
+        self.assertEqual(metadata.scheduler_policy, SCHEDULER_POLICY_HEURISTIC)
+        self.assertEqual(metadata.dispatch.effective_num_splits, 12)
+        self.assertEqual(metadata.heuristic_baseline_makespan, 362)
+        self.assertEqual(metadata.heuristic_selected_makespan, 45)
+        self.assertEqual(metadata.heuristic_baseline_attention_tasks, 16)
+        self.assertEqual(metadata.heuristic_selected_attention_tasks, 32)
+        self.assertEqual(metadata.heuristic_baseline_combine_tasks, 1024)
+        self.assertEqual(metadata.heuristic_selected_combine_tasks, 1024)
+        self.assertEqual(
+            metadata.heuristic_baseline_combine_partial_vectors, 1024
+        )
+        self.assertEqual(
+            metadata.heuristic_selected_combine_partial_vectors, 3072
+        )
+        self.assertEqual(metadata.heuristic_baseline_combine_work, 5120)
+        self.assertEqual(metadata.heuristic_selected_combine_work, 7168)
+        self.assertEqual(metadata.heuristic_baseline_combine_penalty, 5)
+        self.assertEqual(metadata.heuristic_selected_combine_penalty, 5)
+        self.assertAlmostEqual(metadata.heuristic_gain, 317 / 367)
+        self.assertNotEqual(
+            [row[7] for row in metadata.attention],
+            list(range(len(metadata.attention))),
+        )
+
+    def test_multi_sequence_critical_wave_can_choose_smaller_iterative_plan(self):
+        q_lengths = (16, 16, 16, 16, 16, 16, 16, 656)
+        history_lengths = (6486, 4864, 1146, 624, 9375, 800, 1657, 2304)
+        metadata = build_dcp_mega_metadata(
+            _cumulative(q_lengths),
+            _cumulative(history_lengths),
+            hq_local=4,
+            dcp_size=2,
+            num_sms=132,
+            num_comm_sm=20,
+            requested_num_splits=0,
+        )
+
+        expected_splits = (2, 2, 1, 1, 3, 1, 1, 1)
+        self.assertEqual(metadata.heuristic_plan_source, "iterative")
+        self.assertEqual(metadata.history_sequence_splits, expected_splits)
+        self.assertEqual(metadata.dispatch.block_n, 128)
+        self.assertEqual(metadata.dispatch.effective_num_splits, 3)
+        self.assertEqual(metadata.heuristic_baseline_makespan, 78)
+        self.assertEqual(metadata.heuristic_selected_makespan, 30)
+        self.assertEqual(metadata.heuristic_baseline_attention_tasks, 76)
+        self.assertEqual(metadata.heuristic_selected_attention_tasks, 80)
+        self.assertEqual(metadata.heuristic_baseline_combine_tasks, 1536)
+        self.assertEqual(metadata.heuristic_selected_combine_tasks, 1104)
+        self.assertEqual(
+            metadata.heuristic_baseline_combine_partial_vectors, 6144
+        )
+        self.assertEqual(
+            metadata.heuristic_selected_combine_partial_vectors, 6656
+        )
+        self.assertEqual(metadata.heuristic_baseline_combine_work, 12288)
+        self.assertEqual(metadata.heuristic_selected_combine_work, 11072)
+        self.assertEqual(metadata.heuristic_baseline_combine_penalty, 8)
+        self.assertEqual(metadata.heuristic_selected_combine_penalty, 6)
+        self.assertAlmostEqual(metadata.heuristic_gain, 50 / 86)
+
+    def test_history_combine_profile_counts_partial_vector_work(self):
+        split2 = _history_combine_profile(
+            (0, 16, 32),
+            (1, 2),
+            hq_local=4,
+            dcp_size=2,
+            copy_vectors_per_task=4,
+        )
+        split3 = _history_combine_profile(
+            (0, 16, 32),
+            (1, 3),
+            hq_local=4,
+            dcp_size=2,
+            copy_vectors_per_task=4,
+        )
+
+        self.assertEqual(split2.task_count, 160)
+        self.assertEqual(split3.task_count, split2.task_count)
+        self.assertEqual(split2.partial_vector_count, 384)
+        self.assertEqual(split3.partial_vector_count, 512)
+        self.assertEqual(split2.work, 1024)
+        self.assertEqual(split3.work, 1152)
+
+    def test_history_combine_overlaps_late_attention_on_another_cta(self):
+        attention = _AttentionScheduleProfile(
+            makespan=20,
+            task_count=2,
+            critical_history_sequences=(),
+            cta_finish_times=(5, 20),
+            completion_finish_times=(5, 20),
+        )
+        combine = (_HistoryCombineScheduleTask(dependencies=(0,), work=7),)
+
+        self.assertEqual(
+            _overlapped_attention_combine_makespan(attention, combine),
+            20,
+        )
+
+    def test_history_combine_waits_for_its_attention_dependencies(self):
+        attention = _AttentionScheduleProfile(
+            makespan=20,
+            task_count=2,
+            critical_history_sequences=(),
+            cta_finish_times=(5, 20),
+            completion_finish_times=(5, 20),
+        )
+        combine = (_HistoryCombineScheduleTask(dependencies=(1,), work=7),)
+
+        self.assertEqual(
+            _overlapped_attention_combine_makespan(attention, combine),
+            27,
+        )
+
+    def test_blocked_combine_warps_hold_their_fifo_tasks(self):
+        attention = _AttentionScheduleProfile(
+            makespan=100,
+            task_count=2,
+            critical_history_sequences=(),
+            cta_finish_times=(0, 100),
+            completion_finish_times=(100, 0),
+        )
+        blocked = _HistoryCombineScheduleTask(dependencies=(0,), work=1)
+        ready_long = _HistoryCombineScheduleTask(dependencies=(1,), work=100)
+
+        blocked_first = (blocked,) * 12 + (ready_long,)
+        ready_first = (ready_long,) + (blocked,) * 12
+        self.assertEqual(
+            _overlapped_attention_combine_makespan(attention, blocked_first),
+            200,
+        )
+        self.assertEqual(
+            _overlapped_attention_combine_makespan(attention, ready_first),
+            101,
+        )
+
+    def test_overlapped_combine_avoids_dcp4_case8_oversplit(self):
+        q_lengths = (16,) * 12
+        local_history_lengths = (
+            4204,
+            4380,
+            2806,
+            390,
+            552,
+            1239,
+            2370,
+            542,
+            735,
+            391,
+            1082,
+            547,
+        )
+        metadata = build_dcp_mega_metadata(
+            _cumulative(q_lengths),
+            _cumulative(local_history_lengths),
+            hq_local=4,
+            dcp_size=4,
+            num_sms=132,
+            num_comm_sm=8,
+            requested_num_splits=0,
+        )
+
+        self.assertEqual(metadata.heuristic_plan_source, "iterative")
+        self.assertEqual(
+            metadata.history_sequence_splits,
+            (3, 3, 2, 1, 1, 1, 2, 1, 1, 1, 1, 1),
+        )
+        self.assertNotEqual(
+            metadata.history_sequence_splits,
+            (4, 4, 3, 1, 1, 2, 3, 1, 1, 1, 1, 1),
+        )
+        self.assertEqual(metadata.heuristic_selected_attention_tasks, 48)
+        self.assertEqual(metadata.heuristic_baseline_makespan, 39)
+        self.assertEqual(metadata.heuristic_selected_makespan, 16)
+        self.assertEqual(metadata.heuristic_baseline_combine_penalty, 5)
+        self.assertEqual(metadata.heuristic_selected_combine_penalty, 10)
+        self.assertAlmostEqual(metadata.heuristic_gain, 18 / 44)
+
+    def test_combine_work_can_prefer_iterative_over_legacy_dynamic(self):
+        q_lengths = (16,) * 8
+        history_lengths = (5503, 904, 9852, 1297, 1359, 3577, 2354, 809)
+        metadata = build_dcp_mega_metadata(
+            _cumulative(q_lengths),
+            _cumulative(history_lengths),
+            hq_local=4,
+            dcp_size=2,
+            num_sms=132,
+            num_comm_sm=20,
+            requested_num_splits=0,
+        )
+
+        self.assertEqual(metadata.heuristic_plan_source, "iterative")
+        self.assertEqual(
+            metadata.history_sequence_splits,
+            (2, 1, 3, 1, 1, 1, 1, 1),
+        )
+        self.assertEqual(metadata.heuristic_baseline_combine_work, 5120)
+        self.assertEqual(metadata.heuristic_selected_combine_work, 5504)
+        self.assertEqual(metadata.heuristic_baseline_combine_penalty, 5)
+        self.assertEqual(metadata.heuristic_selected_combine_penalty, 5)
+        self.assertAlmostEqual(metadata.heuristic_gain, 49 / 86)
+
+    def test_attention_profile_finds_all_tied_critical_sequences(self):
+        profile = _fifo_attention_profile(
+            (16,) * 8,
+            (5, 41, 61, 6, 105, 95, 27, 358),
+            hq_local=4,
+            dcp_size=2,
+            block_n=128,
+            num_compute_ctas=112,
+            history_sequence_splits=(1, 2, 3, 1, 4, 4, 1, 14),
+        )
+
+        self.assertEqual(profile.makespan, 31)
+        self.assertEqual(profile.task_count, 38)
+        self.assertEqual(profile.critical_history_sequences, (4, 6))
+
+    def test_noncritical_wave_auto_block_n_keeps_legacy_128_fallback(self):
+        common = {
+            "hq_local": 4,
+            "dcp_size": 2,
+            "num_sms": 132,
+            "num_comm_sm": 4,
+        }
+        fifo = build_dcp_mega_metadata(
+            (0, 8, 24),
+            (0, 257, 1281),
+            requested_num_splits=1,
+            scheduler_heuristic=False,
+            **common,
+        )
+        fixed_split = build_dcp_mega_metadata(
+            (0, 8, 24),
+            (0, 257, 1281),
+            requested_num_splits=2,
+            **common,
+        )
+        for metadata in (fifo, fixed_split):
+            self.assertEqual(metadata.dispatch.block_n, 128)
+            self.assertIsNone(metadata.heuristic_model_block_n)
+
+    def test_split_and_history_order_axes_form_true_two_by_two(self):
+        common = {
+            "cu_seqlens_q": _cumulative((16,) * 8),
+            "cu_seqlens_history": _cumulative(
+                (584, 5123, 7719, 764, 13338, 12098, 3417, 45807)
+            ),
+            "hq_local": 4,
+            "dcp_size": 2,
+            "num_sms": 132,
+            "num_comm_sm": 20,
+            "requested_num_splits": 0,
+        }
+        combinations = (
+            (
+                True,
+                False,
+                SPLIT_POLICY_CRITICAL_WAVE,
+                HISTORY_ORDER_POLICY_FIFO,
+                SCHEDULER_POLICY_CRITICAL_WAVE_FIFO,
+            ),
+            (
+                True,
+                True,
+                SPLIT_POLICY_CRITICAL_WAVE,
+                HISTORY_ORDER_POLICY_RELEASE_LPT,
+                SCHEDULER_POLICY_HEURISTIC,
+            ),
+            (
+                False,
+                False,
+                SPLIT_POLICY_FA3_NATIVE,
+                HISTORY_ORDER_POLICY_FIFO,
+                "fifo",
+            ),
+            (
+                False,
+                True,
+                SPLIT_POLICY_FA3_NATIVE,
+                HISTORY_ORDER_POLICY_RELEASE_LPT,
+                SCHEDULER_POLICY_NATIVE_RELEASE_LPT,
+            ),
+        )
+        for scheduler_heuristic, reorder, split_policy, order_policy, combined in combinations:
+            with self.subTest(split=split_policy, order=order_policy):
+                metadata = build_dcp_mega_metadata(
+                    **common,
+                    scheduler_heuristic=scheduler_heuristic,
+                    reorder_history_override=reorder,
+                )
+                self.assertTrue(metadata.dispatch.split)
+                self.assertEqual(metadata.dispatch.block_n, 128)
+                self.assertEqual(metadata.split_policy, split_policy)
+                self.assertEqual(metadata.history_order_policy, order_policy)
+                self.assertEqual(metadata.scheduler_policy, combined)
+                completion_ids = [row[7] for row in metadata.attention]
+                if reorder:
+                    self.assertNotEqual(
+                        completion_ids, list(range(len(metadata.attention)))
+                    )
+                else:
+                    self.assertEqual(
+                        completion_ids, list(range(len(metadata.attention)))
+                    )
+
+    def test_explicit_release_lpt_remains_active_for_nosplit(self):
+        common = {
+            "cu_seqlens_q": (0, 8, 24),
+            "cu_seqlens_history": (0, 257, 1281),
+            "hq_local": 4,
+            "dcp_size": 2,
+            "num_sms": 132,
+            "num_comm_sm": 4,
+            "requested_num_splits": 1,
+            "scheduler_heuristic": True,
+        }
+        fifo = build_dcp_mega_metadata(
+            **common, reorder_history_override=False
+        )
+        release_lpt = build_dcp_mega_metadata(
+            **common, reorder_history_override=True
+        )
+
+        self.assertFalse(fifo.dispatch.split)
+        self.assertFalse(release_lpt.dispatch.split)
+        self.assertEqual(fifo.history_sequence_splits, (1, 1))
+        self.assertEqual(release_lpt.history_sequence_splits, (1, 1))
+        self.assertEqual(fifo.history_order_policy, HISTORY_ORDER_POLICY_FIFO)
+        self.assertEqual(
+            release_lpt.history_order_policy,
+            HISTORY_ORDER_POLICY_RELEASE_LPT,
+        )
+        self.assertEqual(
+            [row[7] for row in fifo.attention],
+            list(range(len(fifo.attention))),
+        )
+        self.assertNotEqual(fifo.attention, release_lpt.attention)
+
+    def test_critical_wave_cost_model_uses_the_requested_history_order(self):
+        q_lengths = [16] * 30 + [4096]
+        global_history_lengths = [
+            18234, 12375, 85844, 13016, 12015, 3183, 9091, 7179,
+            1183, 13975, 13359, 19947, 18835, 7404, 25785, 5381,
+            11799, 4710, 13899, 25580, 2076, 25461, 23476, 22178,
+            8113, 1296, 14450, 943, 901, 7156, 66048,
+        ]
+        common = {
+            "cu_seqlens_q": _cumulative(q_lengths),
+            "cu_seqlens_history": _cumulative(
+                [(length + 1) // 2 for length in global_history_lengths]
+            ),
+            "hq_local": 4,
+            "dcp_size": 2,
+            "num_sms": 132,
+            "num_comm_sm": 4,
+            "requested_num_splits": 0,
+            "scheduler_heuristic": True,
+        }
+        fifo = build_dcp_mega_metadata(
+            **common, reorder_history_override=False
+        )
+        release_lpt = build_dcp_mega_metadata(
+            **common, reorder_history_override=True
+        )
+
+        self.assertEqual(fifo.heuristic_baseline_makespan, 798)
+        self.assertEqual(fifo.heuristic_selected_makespan, 639)
+        self.assertEqual(release_lpt.heuristic_baseline_makespan, 791)
+        self.assertEqual(release_lpt.heuristic_selected_makespan, 634)
+        self.assertEqual(
+            fifo.heuristic_history_sequence_splits,
+            fifo.history_sequence_splits,
+        )
+        self.assertEqual(
+            release_lpt.heuristic_history_sequence_splits,
+            release_lpt.history_sequence_splits,
+        )
+
+    def test_history_order_override_rejects_non_bool(self):
+        common = {
+            "cu_seqlens_q": (0, 16, 32),
+            "cu_seqlens_history": (0, 257, 8449),
+            "hq_local": 4,
+            "dcp_size": 2,
+            "num_sms": 132,
+            "num_comm_sm": 8,
+        }
+        with self.assertRaisesRegex(ValueError, "bool or None"):
+            build_dcp_mega_metadata(
+                **common,
+                scheduler_heuristic=False,
+                reorder_history_override="release-lpt",
+            )
+
+    def test_scheduler_heuristic_rejects_nonbeneficial_ablation_profiles(self):
+        profiles = (
+            (19, 11, 26, 80, 8, 121, 20, 4, 43, 18, 20, 46, 29, 5, 33, 4, 37, 81, 5, 28, 6, 11, 14, 6, 4, 13, 48, 23, 14, 73, 37, 110, 3, 120, 5, 14, 14, 211),
+            (50, 44, 30, 42, 143, 169, 5, 21, 9, 28, 6, 16, 41, 14, 7, 6, 7, 13, 36, 9, 13, 14, 12, 9, 40, 31, 37, 51, 4, 16, 39, 19, 21, 3, 19, 12, 21, 16, 13, 304),
+            (170, 134, 11, 29, 15, 19, 6, 36, 28, 4, 13, 41, 13, 10, 22, 12, 28, 46, 8, 17, 41, 37, 26, 5, 33, 4, 13, 24, 55, 48, 16, 39, 9, 200),
+            (177, 65, 26, 38, 10, 25, 5, 4, 29, 14, 29, 10, 5, 5, 23, 24, 5, 12, 16, 22, 21, 5, 87, 5, 4, 5, 13, 15, 4, 3, 130, 11, 11, 26, 20, 223),
+            (12, 8, 60, 10, 5, 5, 4, 35, 89, 4, 4, 5, 25, 64, 14, 4, 13, 15, 33, 50, 18, 15, 6, 16, 110, 17, 20, 14, 3, 21, 43, 246),
+        )
+        for n_blocks in profiles:
+            with self.subTest(candidate=max(n_blocks[:-1])):
+                q_lengths = [16] * (len(n_blocks) - 1) + [4096]
+                history_lengths = [
+                    (count - 1) * 176 + 1 for count in n_blocks
+                ]
+                selected = _choose_critical_wave_split(
+                    q_lengths,
+                    history_lengths,
+                    hq_local=4,
+                    dcp_size=2,
+                    block_n=176,
+                    num_compute_ctas=128,
+                )
+                self.assertEqual(selected[0:2], (None, None))
+                self.assertEqual(selected[2], selected[3])
+                self.assertEqual(selected[4], 0.0)
+
+    def test_scheduler_heuristic_rejects_conflicting_metadata_options(self):
+        common = {
+            "hq_local": 4,
+            "dcp_size": 2,
+            "num_sms": 132,
+            "num_comm_sm": 4,
+            "scheduler_heuristic": True,
+        }
+        with self.assertRaisesRegex(
+            ValueError, "requires requested_num_splits in"
+        ):
+            build_dcp_mega_metadata(
+                (0, 16),
+                (0, 4096),
+                requested_num_splits=2,
+                **common,
+            )
     def test_publish_dependencies_follow_history_and_final_follow_chunk(self):
         cu_q = (0, 17, 148)
         metadata = build_dcp_mega_metadata(

@@ -2,9 +2,11 @@
 
 set -euo pipefail
 
-cd /home/hychen/min_fa3_demo
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+cd "$REPO_ROOT"
 NUM_CASES=20
-TRACE_CASES="/home/hychen/min_fa3_demo/dcp_test/mega_dcp_trace_cases.jsonl"
+TRACE_CASES="$REPO_ROOT/dcp_test/mega_dcp_trace_cases.jsonl"
 
 python -m dcp_test.trace.generate \
     --config dcp_test/trace/example_config.json \
@@ -22,7 +24,7 @@ GENERATE_TRACE=0 \
   MEGA_PHASE_TIMESTAMPS=1 \
   BASELINE_PHASE_TIMING=1 \
   MEGA_NUM_COMM_SM=16 \
-  ./benchmark_dcp_mega_trace.sh
+  ./scripts/test_dcp/benchmark_dcp_mega_trace.sh
 
 ########################################
 # GENERATE_TRACE=1
@@ -32,11 +34,12 @@ GENERATE_TRACE=0 \
 # LOG_DIR=benchmark_logs/dcp_mega_trace_<timestamp>
 # RESULT_DIR="$LOG_DIR/results"
 # TRACE_CASES="$RESULT_DIR/trace_cases.jsonl"
-# NUM_CASES=20 GENERATE_TRACE=1 ./benchmark_dcp_mega_trace.sh
+# NUM_CASES=20 GENERATE_TRACE=1 ./scripts/test_dcp/benchmark_dcp_mega_trace.sh
 
 ########################################
-# repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# cd "$repo_dir"
+# script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# repo_root=$(cd -- "$script_dir/../.." && pwd)
+# cd "$repo_root"
 
 # run_command() {
 #     if [[ ${DRY_RUN:-0} == 1 ]]; then

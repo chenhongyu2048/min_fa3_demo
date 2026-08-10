@@ -9,6 +9,7 @@ preallocated pinned host buffer before each launch.
 
 from __future__ import annotations
 
+import heapq
 import math
 from array import array
 from dataclasses import dataclass
@@ -28,6 +29,19 @@ METADATA_VERSION = 5
 MEGA_COMPUTE_WARPS = 12
 HISTORY_MAX_COPY_VECTORS = 32
 HISTORY_TASK_WAVE_TARGET = 0.8
+SCHEDULER_POLICY_FIFO = "fifo"
+SCHEDULER_POLICY_HEURISTIC = "release_lpt_critical_wave"
+SCHEDULER_POLICY_CRITICAL_WAVE_FIFO = "fifo_critical_wave"
+SCHEDULER_POLICY_NATIVE_RELEASE_LPT = "release_lpt_fa3_native"
+SPLIT_POLICY_CRITICAL_WAVE = "critical_wave"
+SPLIT_POLICY_FA3_NATIVE = "fa3_native"
+HISTORY_ORDER_POLICY_FIFO = "fifo"
+HISTORY_ORDER_POLICY_RELEASE_LPT = "release_lpt"
+HEURISTIC_TASK_OVERHEAD = 4
+HEURISTIC_COMBINE_TASK_OVERHEAD = HEURISTIC_TASK_OVERHEAD
+HEURISTIC_COMBINE_PARTIAL_VECTOR_COST = 1
+HEURISTIC_MIN_MAKESPAN_GAIN = 0.10
+HEURISTIC_SPLIT4_EXTRA_GAIN = 0.05
 
 
 @dataclass(frozen=True)
@@ -39,6 +53,42 @@ class DCPMegaDispatch:
     split: bool
     block_n: int
     history_copy_vectors_per_task: int
+
+
+@dataclass(frozen=True)
+class _CriticalWavePlan:
+    sequence_splits: tuple[int, ...]
+    source: str
+    attention_makespan: int
+    attention_tasks: int
+    combine_tasks: int
+    combine_partial_vectors: int
+    combine_work: int
+    combine_penalty: float
+    critical_history_sequences: tuple[int, ...]
+    score: float
+
+
+@dataclass(frozen=True)
+class _HistoryCombineProfile:
+    task_count: int
+    partial_vector_count: int
+    work: int
+
+
+@dataclass(frozen=True)
+class _AttentionScheduleProfile:
+    makespan: int
+    task_count: int
+    critical_history_sequences: tuple[int, ...]
+    cta_finish_times: tuple[int, ...] = ()
+    completion_finish_times: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class _HistoryCombineScheduleTask:
+    dependencies: tuple[int, ...]
+    work: int
 
 
 @dataclass(frozen=True)
@@ -67,6 +117,28 @@ class DCPMegaMetadata:
     receive_count: int
     tile_ready_count: int
     dcp_size: int
+    split_policy: str
+    history_order_policy: str
+    scheduler_policy: str
+    heuristic_model_block_n: int | None
+    heuristic_plan_source: str | None
+    heuristic_history_sequence_splits: tuple[int, ...] | None
+    heuristic_baseline_attention_tasks: int | None
+    heuristic_selected_attention_tasks: int | None
+    heuristic_baseline_combine_tasks: int | None
+    heuristic_selected_combine_tasks: int | None
+    heuristic_baseline_combine_partial_vectors: int | None
+    heuristic_selected_combine_partial_vectors: int | None
+    heuristic_baseline_combine_work: int | None
+    heuristic_selected_combine_work: int | None
+    heuristic_baseline_combine_penalty: float | None
+    heuristic_selected_combine_penalty: float | None
+    heuristic_split_sequence_idx: int | None
+    heuristic_split_sequence_splits: int | None
+    heuristic_baseline_makespan: int | None
+    heuristic_selected_makespan: int | None
+    heuristic_gain: float | None
+    heuristic_q_block_order: tuple[int, ...]
 
     @property
     def counts(self) -> tuple[int, int, int, int, int, int, int, int]:
@@ -84,6 +156,25 @@ class DCPMegaMetadata:
 
 def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+def _combined_scheduler_policy(
+    split_policy: str, history_order_policy: str
+) -> str:
+    release_lpt = history_order_policy == HISTORY_ORDER_POLICY_RELEASE_LPT
+    if split_policy == SPLIT_POLICY_CRITICAL_WAVE:
+        return (
+            SCHEDULER_POLICY_HEURISTIC
+            if release_lpt
+            else SCHEDULER_POLICY_CRITICAL_WAVE_FIFO
+        )
+    if split_policy == SPLIT_POLICY_FA3_NATIVE:
+        return (
+            SCHEDULER_POLICY_NATIVE_RELEASE_LPT
+            if release_lpt
+            else SCHEDULER_POLICY_FIFO
+        )
+    raise ValueError(f"unknown split policy: {split_policy}")
 
 
 def _validate_cu_seqlens(values: Sequence[int], name: str) -> tuple[int, ...]:
@@ -241,6 +332,378 @@ def _dynamic_sequence_splits(
     )
 
 
+def _split_n_block_count(
+    num_n_blocks: int,
+    split_idx: int,
+    num_splits: int,
+) -> int:
+    blocks_per_split = _ceil_div(num_n_blocks, num_splits)
+    split_begin = split_idx * blocks_per_split
+    return max(min(blocks_per_split, num_n_blocks - split_begin), 0)
+
+
+def _fifo_attention_profile(
+    q_lengths: Sequence[int],
+    history_n_blocks: Sequence[int],
+    *,
+    hq_local: int,
+    dcp_size: int,
+    block_n: int,
+    num_compute_ctas: int,
+    split_sequence_idx: int | None = None,
+    split_sequence_splits: int = 1,
+    history_sequence_splits: Sequence[int] | None = None,
+) -> _AttentionScheduleProfile:
+    """Estimate wave quantization with the kernel's FIFO descriptor order."""
+    if history_sequence_splits is not None:
+        if split_sequence_idx is not None or split_sequence_splits != 1:
+            raise ValueError(
+                "history_sequence_splits cannot be combined with a single "
+                "split override"
+            )
+        if len(history_sequence_splits) != len(q_lengths):
+            raise ValueError("history_sequence_splits must match batch size")
+        sequence_splits = tuple(int(value) for value in history_sequence_splits)
+        if any(value < 1 or value > 128 for value in sequence_splits):
+            raise ValueError("history sequence splits must be in [1, 128]")
+    else:
+        sequence_splits = tuple(
+            split_sequence_splits if index == split_sequence_idx else 1
+            for index in range(len(q_lengths))
+        )
+    task_costs: list[tuple[int, int | None]] = []
+    for q_len in q_lengths:
+        for m_block in range(_ceil_div(q_len * hq_local, 128)):
+            causal_tokens = min(q_len, _ceil_div((m_block + 1) * 128, hq_local))
+            task_costs.append(
+                (
+                    _ceil_div(causal_tokens, block_n) + HEURISTIC_TASK_OVERHEAD,
+                    None,
+                )
+            )
+    for sequence_idx, (q_len, num_n_blocks, splits) in enumerate(
+        zip(q_lengths, history_n_blocks, sequence_splits)
+    ):
+        for _ in range(_ceil_div(q_len * dcp_size * hq_local, 128)):
+            for split_idx in range(splits):
+                task_costs.append(
+                    (
+                        _split_n_block_count(num_n_blocks, split_idx, splits)
+                        + HEURISTIC_TASK_OVERHEAD,
+                        sequence_idx,
+                    )
+                )
+
+    return _schedule_attention_tasks(task_costs, num_compute_ctas)
+
+
+def _schedule_attention_tasks(
+    task_costs: Sequence[tuple[int, int | None] | tuple[int, int | None, int]],
+    num_compute_ctas: int,
+) -> _AttentionScheduleProfile:
+    """List-schedule attention descriptors and retain completion times."""
+    if num_compute_ctas <= 0:
+        raise ValueError("num_compute_ctas must be positive")
+    worker_loads = [(0, worker) for worker in range(num_compute_ctas)]
+    heapq.heapify(worker_loads)
+    final_sequence_by_worker: list[int | None] = [None] * num_compute_ctas
+    completion_finish_times = [0] * len(task_costs)
+    for ordinal, task in enumerate(task_costs):
+        task_cost, sequence_idx = task[0], task[1]
+        completion_id = task[2] if len(task) == 3 else ordinal
+        load, worker = heapq.heappop(worker_loads)
+        load += task_cost
+        completion_finish_times[completion_id] = load
+        final_sequence_by_worker[worker] = sequence_idx
+        heapq.heappush(worker_loads, (load, worker))
+    makespan = max(load for load, _ in worker_loads)
+    cta_finish_times = [0] * num_compute_ctas
+    for load, worker in worker_loads:
+        cta_finish_times[worker] = load
+    critical_history_sequences = tuple(
+        sorted(
+            {
+                final_sequence_by_worker[worker]
+                for load, worker in worker_loads
+                if load == makespan
+                and final_sequence_by_worker[worker] is not None
+            }
+        )
+    )
+    return _AttentionScheduleProfile(
+        makespan=makespan,
+        task_count=len(task_costs),
+        critical_history_sequences=critical_history_sequences,
+        cta_finish_times=tuple(cta_finish_times),
+        completion_finish_times=tuple(completion_finish_times),
+    )
+
+
+def _fifo_attention_makespan(
+    q_lengths: Sequence[int],
+    history_n_blocks: Sequence[int],
+    *,
+    hq_local: int,
+    dcp_size: int,
+    block_n: int,
+    num_compute_ctas: int,
+    split_sequence_idx: int | None = None,
+    split_sequence_splits: int = 1,
+    history_sequence_splits: Sequence[int] | None = None,
+) -> tuple[int, int]:
+    profile = _fifo_attention_profile(
+        q_lengths,
+        history_n_blocks,
+        hq_local=hq_local,
+        dcp_size=dcp_size,
+        block_n=block_n,
+        num_compute_ctas=num_compute_ctas,
+        split_sequence_idx=split_sequence_idx,
+        split_sequence_splits=split_sequence_splits,
+        history_sequence_splits=history_sequence_splits,
+    )
+    return profile.makespan, profile.task_count
+
+
+def _choose_critical_wave_split(
+    q_lengths: Sequence[int],
+    history_lengths: Sequence[int],
+    *,
+    hq_local: int,
+    dcp_size: int,
+    block_n: int,
+    num_compute_ctas: int,
+) -> tuple[int | None, int | None, int, int, float]:
+    """Choose at most one decode-history split using a dimensionless proxy."""
+    history_n_blocks = tuple(
+        _ceil_div(length, block_n) for length in history_lengths
+    )
+    baseline, _ = _fifo_attention_makespan(
+        q_lengths,
+        history_n_blocks,
+        hq_local=hq_local,
+        dcp_size=dcp_size,
+        block_n=block_n,
+        num_compute_ctas=num_compute_ctas,
+    )
+    candidates: list[tuple[int, int, int, float]] = []
+    for batch_idx, (q_len, num_n_blocks) in enumerate(
+        zip(q_lengths, history_n_blocks)
+    ):
+        if q_len > 16 or num_n_blocks < num_compute_ctas:
+            continue
+        split2, _ = _fifo_attention_makespan(
+            q_lengths,
+            history_n_blocks,
+            hq_local=hq_local,
+            dcp_size=dcp_size,
+            block_n=block_n,
+            num_compute_ctas=num_compute_ctas,
+            split_sequence_idx=batch_idx,
+            split_sequence_splits=2,
+        )
+        split4, _ = _fifo_attention_makespan(
+            q_lengths,
+            history_n_blocks,
+            hq_local=hq_local,
+            dcp_size=dcp_size,
+            block_n=block_n,
+            num_compute_ctas=num_compute_ctas,
+            split_sequence_idx=batch_idx,
+            split_sequence_splits=4,
+        )
+        if (split2 - split4) / baseline >= HEURISTIC_SPLIT4_EXTRA_GAIN:
+            selected_splits, selected = 4, split4
+        else:
+            selected_splits, selected = 2, split2
+        gain = (baseline - selected) / baseline
+        if gain >= HEURISTIC_MIN_MAKESPAN_GAIN:
+            candidates.append((selected, selected_splits, batch_idx, gain))
+
+    if not candidates:
+        return None, None, baseline, baseline, 0.0
+    selected, selected_splits, batch_idx, gain = min(candidates)
+    return batch_idx, selected_splits, baseline, selected, gain
+
+
+def _critical_wave_plan(
+    q_lengths: Sequence[int],
+    history_lengths: Sequence[int],
+    *,
+    hq_local: int,
+    dcp_size: int,
+    block_n: int,
+    num_sms: int,
+    num_comm_sm: int,
+    chunk_sequence_splits: Sequence[int],
+    include_legacy_candidate: bool,
+    reorder_no_split: bool,
+    reorder_split: bool,
+) -> tuple[_CriticalWavePlan, _CriticalWavePlan]:
+    """Compare iterative and legacy multi-sequence split candidates."""
+    num_compute_ctas = num_sms - num_comm_sm
+    history_n_blocks = tuple(
+        _ceil_div(length, block_n) for length in history_lengths
+    )
+    cu_q_values = [0]
+    for q_len in q_lengths:
+        cu_q_values.append(cu_q_values[-1] + q_len)
+    cu_q = tuple(cu_q_values)
+
+    def profile(sequence_splits: Sequence[int], source: str) -> _CriticalWavePlan:
+        splits = tuple(int(value) for value in sequence_splits)
+        attention_profile, _, completion_for_vector = _attention_schedule_profile(
+            q_lengths,
+            history_n_blocks,
+            hq_local=hq_local,
+            dcp_size=dcp_size,
+            block_n=block_n,
+            num_compute_ctas=num_compute_ctas,
+            num_comm_sm=num_comm_sm,
+            chunk_sequence_splits=chunk_sequence_splits,
+            history_sequence_splits=splits,
+            reorder_history=(
+                reorder_split
+                if any(value > 1 for value in splits)
+                else reorder_no_split
+            ),
+        )
+        copy_vectors = _choose_history_copy_vectors_per_task(
+            cu_q,
+            splits,
+            hq_local=hq_local,
+            dcp_size=dcp_size,
+            num_sms=num_sms,
+            num_comm_sm=num_comm_sm,
+        )
+        combine_profile = _history_combine_profile(
+            cu_q,
+            splits,
+            hq_local=hq_local,
+            dcp_size=dcp_size,
+            copy_vectors_per_task=copy_vectors,
+        )
+        combine_tasks = _history_combine_schedule_tasks(
+            cu_q,
+            splits,
+            completion_for_vector,
+            hq_local=hq_local,
+            dcp_size=dcp_size,
+            copy_vectors_per_task=copy_vectors,
+        )
+        if (
+            len(combine_tasks) != combine_profile.task_count
+            or sum(task.work for task in combine_tasks) != combine_profile.work
+        ):
+            raise AssertionError("combine schedule/profile accounting mismatch")
+        score = _overlapped_attention_combine_makespan(
+            attention_profile, combine_tasks
+        )
+        combine_penalty = score - attention_profile.makespan
+        return _CriticalWavePlan(
+            sequence_splits=splits,
+            source=source,
+            attention_makespan=attention_profile.makespan,
+            attention_tasks=attention_profile.task_count,
+            combine_tasks=combine_profile.task_count,
+            combine_partial_vectors=combine_profile.partial_vector_count,
+            combine_work=combine_profile.work,
+            combine_penalty=combine_penalty,
+            critical_history_sequences=(
+                attention_profile.critical_history_sequences
+            ),
+            score=score,
+        )
+
+    no_split = profile((1,) * len(q_lengths), "nosplit")
+    if include_legacy_candidate:
+        legacy_upper_bound = choose_split_upper_bound(
+            max_seqlen_q=max(q_lengths),
+            max_seqlen_k=max(history_lengths),
+            q_heads=dcp_size * hq_local,
+            num_sms=num_sms,
+            block_n=block_n,
+            is_causal=False,
+            requested_num_splits=0,
+        )
+        legacy_splits = _dynamic_sequence_splits(
+            q_lengths,
+            history_lengths,
+            heads=dcp_size * hq_local,
+            pack_gqa=True,
+            split_upper_bound=legacy_upper_bound,
+            num_sms=num_sms,
+            block_n=block_n,
+        )
+    else:
+        legacy_splits = no_split.sequence_splits
+
+    split_caps = list(legacy_splits)
+    for index, (q_len, num_n_blocks) in enumerate(
+        zip(q_lengths, history_n_blocks)
+    ):
+        if q_len <= 16 and num_n_blocks >= num_compute_ctas:
+            split_caps[index] = max(split_caps[index], 4)
+
+    iterative = no_split
+    while True:
+        candidate_split_vectors: set[tuple[int, ...]] = set()
+        for index, cap in enumerate(split_caps):
+            if iterative.sequence_splits[index] >= cap:
+                continue
+            candidate_splits = list(iterative.sequence_splits)
+            candidate_splits[index] += 1
+            candidate_split_vectors.add(tuple(candidate_splits))
+        critical_sequences = iterative.critical_history_sequences
+        if len(critical_sequences) > 1 and all(
+            iterative.sequence_splits[index] < split_caps[index]
+            for index in critical_sequences
+        ):
+            candidate_splits = list(iterative.sequence_splits)
+            for index in critical_sequences:
+                candidate_splits[index] += 1
+            candidate_split_vectors.add(tuple(candidate_splits))
+        candidates = [
+            profile(sequence_splits, "iterative")
+            for sequence_splits in candidate_split_vectors
+        ]
+        if not candidates:
+            break
+        candidate = min(
+            candidates,
+            key=lambda plan: (
+                plan.score,
+                plan.attention_makespan,
+                plan.attention_tasks,
+                sum(plan.sequence_splits),
+                plan.sequence_splits,
+            ),
+        )
+        if candidate.score < iterative.score:
+            iterative = candidate
+        else:
+            break
+
+    plans = [no_split, iterative]
+    if legacy_splits != no_split.sequence_splits:
+        plans.append(profile(legacy_splits, "legacy_dynamic"))
+
+    selected = min(
+        plans,
+        key=lambda plan: (
+            plan.score,
+            plan.attention_makespan,
+            plan.attention_tasks,
+            sum(plan.sequence_splits),
+            plan.sequence_splits,
+        ),
+    )
+    gain = (no_split.score - selected.score) / no_split.score
+    if gain < HEURISTIC_MIN_MAKESPAN_GAIN or selected.score >= no_split.score:
+        selected = no_split
+    return no_split, selected
+
+
 def _append_attention_domain(
     rows: list[tuple[int, ...]],
     q_dependencies: list[int],
@@ -301,15 +764,254 @@ def _append_attention_domain(
                 )
 
 
-def _history_combine_task_count(
+def _release_lpt_attention_order(
+    attention: Sequence[tuple[int, ...]],
+    q_dependencies: Sequence[int],
+    *,
+    num_token_subtiles: int,
+    history_n_blocks: Sequence[int],
+    history_sequence_splits: Sequence[int],
+    num_comm_sm: int,
+    dcp_size: int,
+) -> tuple[tuple[int, ...], list[tuple[int, ...]]]:
+    """Return the Q release order and the matching attention descriptor order."""
+    unlock_values = [0.0] * num_token_subtiles
+    for row in attention:
+        if row[0] != HISTORY:
+            continue
+        dependencies = q_dependencies[row[5] : row[5] + row[6]]
+        tile_work = (
+            _split_n_block_count(
+                history_n_blocks[row[1]],
+                row[4],
+                history_sequence_splits[row[1]],
+            )
+            + HEURISTIC_TASK_OVERHEAD
+        )
+        for dependency in dependencies:
+            unlock_values[dependency] += tile_work / len(dependencies)
+    q_block_order = tuple(
+        sorted(
+            range(num_token_subtiles),
+            key=lambda block: (-unlock_values[block], block),
+        )
+    )
+    q_position = {
+        block: position for position, block in enumerate(q_block_order)
+    }
+    q_counters_per_epoch = max(1, num_comm_sm // dcp_size)
+
+    def history_order(row: tuple[int, ...]) -> tuple[int, ...]:
+        dependencies = q_dependencies[row[5] : row[5] + row[6]]
+        release_position = max(q_position[dependency] for dependency in dependencies)
+        tile_work = (
+            _split_n_block_count(
+                history_n_blocks[row[1]],
+                row[4],
+                history_sequence_splits[row[1]],
+            )
+            + HEURISTIC_TASK_OVERHEAD
+        )
+        return (
+            release_position // q_counters_per_epoch,
+            -tile_work,
+            row[1],
+            row[2],
+            row[4],
+            row[7],
+        )
+
+    chunk_attention = [row for row in attention if row[0] == CHUNK]
+    history_attention = [row for row in attention if row[0] == HISTORY]
+    return q_block_order, chunk_attention + sorted(
+        history_attention, key=history_order
+    )
+
+
+def _attention_schedule_profile(
+    q_lengths: Sequence[int],
+    history_n_blocks: Sequence[int],
+    *,
+    hq_local: int,
+    dcp_size: int,
+    block_n: int,
+    num_compute_ctas: int,
+    num_comm_sm: int,
+    chunk_sequence_splits: Sequence[int],
+    history_sequence_splits: Sequence[int],
+    reorder_history: bool,
+) -> tuple[
+    _AttentionScheduleProfile,
+    tuple[int, ...],
+    dict[tuple[int, int, int, int], tuple[int, ...]],
+]:
+    """Model the exact attention queue order used by a candidate plan."""
+    cu_q_values = [0]
+    for q_len in q_lengths:
+        cu_q_values.append(cu_q_values[-1] + q_len)
+    cu_q = tuple(cu_q_values)
+    attention: list[tuple[int, ...]] = []
+    q_dependencies: list[int] = []
+    completion_for_vector: dict[
+        tuple[int, int, int, int], tuple[int, ...]
+    ] = {}
+    _append_attention_domain(
+        attention,
+        q_dependencies,
+        completion_for_vector,
+        kind=CHUNK,
+        cu_q=cu_q,
+        heads=hq_local,
+        sequence_splits=tuple(chunk_sequence_splits),
+    )
+    _append_attention_domain(
+        attention,
+        q_dependencies,
+        completion_for_vector,
+        kind=HISTORY,
+        cu_q=cu_q,
+        heads=dcp_size * hq_local,
+        sequence_splits=tuple(history_sequence_splits),
+    )
+    if reorder_history:
+        _, attention = _release_lpt_attention_order(
+            attention,
+            q_dependencies,
+            num_token_subtiles=_ceil_div(cu_q[-1], 16),
+            history_n_blocks=history_n_blocks,
+            history_sequence_splits=history_sequence_splits,
+            num_comm_sm=num_comm_sm,
+            dcp_size=dcp_size,
+        )
+
+    task_costs: list[tuple[int, int | None, int]] = []
+    for row in attention:
+        kind, batch_idx, m_block, _, split_idx, _, _, completion_id = row
+        if kind == CHUNK:
+            causal_tokens = min(
+                q_lengths[batch_idx],
+                _ceil_div((m_block + 1) * 128, hq_local),
+            )
+            n_blocks = _ceil_div(causal_tokens, block_n)
+            splits = chunk_sequence_splits[batch_idx]
+            sequence_idx = None
+        else:
+            n_blocks = history_n_blocks[batch_idx]
+            splits = history_sequence_splits[batch_idx]
+            sequence_idx = batch_idx
+        task_costs.append(
+            (
+                _split_n_block_count(n_blocks, split_idx, splits)
+                + HEURISTIC_TASK_OVERHEAD,
+                sequence_idx,
+                completion_id,
+            )
+        )
+    return (
+        _schedule_attention_tasks(task_costs, num_compute_ctas),
+        cu_q,
+        completion_for_vector,
+    )
+
+
+def _history_combine_schedule_tasks(
+    cu_q: tuple[int, ...],
+    history_sequence_splits: Sequence[int],
+    completion_for_vector: dict[
+        tuple[int, int, int, int], tuple[int, ...]
+    ],
+    *,
+    hq_local: int,
+    dcp_size: int,
+    copy_vectors_per_task: int,
+) -> tuple[_HistoryCombineScheduleTask, ...]:
+    """Build combine work in the same final-tile/destination FIFO order."""
+    total_q = cu_q[-1]
+    batch_for_token = [0] * total_q
+    for batch_idx, (begin, end) in enumerate(zip(cu_q, cu_q[1:])):
+        batch_for_token[begin:end] = [batch_idx] * (end - begin)
+
+    tasks: list[_HistoryCombineScheduleTask] = []
+    tile_vectors = 16 * hq_local
+    total_vectors = total_q * hq_local
+    for vector_begin in range(0, total_vectors, tile_vectors):
+        tile_end = min(vector_begin + tile_vectors, total_vectors)
+        for dst_rank in range(dcp_size):
+            region_begin = vector_begin
+            while region_begin < tile_end:
+                token = region_begin // hq_local
+                batch_idx = batch_for_token[token]
+                region_end = min(tile_end, cu_q[batch_idx + 1] * hq_local)
+                actual_splits = history_sequence_splits[batch_idx]
+                vectors_per_task = (
+                    1 if actual_splits > 1 else copy_vectors_per_task
+                )
+                for task_vector_begin in range(
+                    region_begin, region_end, vectors_per_task
+                ):
+                    valid_vectors = min(
+                        vectors_per_task, region_end - task_vector_begin
+                    )
+                    dependency_set: set[int] = set()
+                    for vector in range(
+                        task_vector_begin,
+                        task_vector_begin + valid_vectors,
+                    ):
+                        vector_token, local_head = divmod(vector, hq_local)
+                        history_head = dst_rank * hq_local + local_head
+                        dependency_set.update(
+                            completion_for_vector[
+                                (HISTORY, batch_idx, vector_token, history_head)
+                            ]
+                        )
+                    tasks.append(
+                        _HistoryCombineScheduleTask(
+                            dependencies=tuple(sorted(dependency_set)),
+                            work=(
+                                HEURISTIC_COMBINE_TASK_OVERHEAD
+                                + valid_vectors * actual_splits
+                            ),
+                        )
+                    )
+                region_begin = region_end
+    return tuple(tasks)
+
+
+def _overlapped_attention_combine_makespan(
+    attention_profile: _AttentionScheduleProfile,
+    combine_tasks: Sequence[_HistoryCombineScheduleTask],
+) -> int:
+    """Schedule dependent combine warps as each CTA leaves attention."""
+    if not combine_tasks:
+        return attention_profile.makespan
+    worker_heap = [
+        (available, cta, warp)
+        for cta, available in enumerate(attention_profile.cta_finish_times)
+        for warp in range(MEGA_COMPUTE_WARPS)
+    ]
+    heapq.heapify(worker_heap)
+    for task in combine_tasks:
+        available, cta, warp = heapq.heappop(worker_heap)
+        dependency_ready = max(
+            attention_profile.completion_finish_times[completion_id]
+            for completion_id in task.dependencies
+        )
+        finish = max(available, dependency_ready) + task.work
+        heapq.heappush(worker_heap, (finish, cta, warp))
+    combine_finish = max(available for available, _, _ in worker_heap)
+    return max(attention_profile.makespan, combine_finish)
+
+
+def _history_combine_profile(
     cu_q: tuple[int, ...],
     history_sequence_splits: tuple[int, ...],
     *,
     hq_local: int,
     dcp_size: int,
     copy_vectors_per_task: int,
-) -> int:
+) -> _HistoryCombineProfile:
     tasks_per_destination = 0
+    partial_vectors_per_destination = 0
     for tile_begin in range(0, cu_q[-1], 16):
         tile_end = min(tile_begin + 16, cu_q[-1])
         for batch_idx, (q_begin, q_end) in enumerate(zip(cu_q, cu_q[1:])):
@@ -318,13 +1020,42 @@ def _history_combine_task_count(
             if region_begin >= region_end:
                 continue
             region_vectors = (region_end - region_begin) * hq_local
-            if history_sequence_splits[batch_idx] > 1:
+            actual_splits = history_sequence_splits[batch_idx]
+            partial_vectors_per_destination += region_vectors * actual_splits
+            if actual_splits > 1:
                 tasks_per_destination += region_vectors
             else:
                 tasks_per_destination += _ceil_div(
                     region_vectors, copy_vectors_per_task
                 )
-    return dcp_size * tasks_per_destination
+    task_count = dcp_size * tasks_per_destination
+    partial_vector_count = dcp_size * partial_vectors_per_destination
+    work = (
+        HEURISTIC_COMBINE_TASK_OVERHEAD * task_count
+        + HEURISTIC_COMBINE_PARTIAL_VECTOR_COST * partial_vector_count
+    )
+    return _HistoryCombineProfile(
+        task_count=task_count,
+        partial_vector_count=partial_vector_count,
+        work=work,
+    )
+
+
+def _history_combine_task_count(
+    cu_q: tuple[int, ...],
+    history_sequence_splits: tuple[int, ...],
+    *,
+    hq_local: int,
+    dcp_size: int,
+    copy_vectors_per_task: int,
+) -> int:
+    return _history_combine_profile(
+        cu_q,
+        history_sequence_splits,
+        hq_local=hq_local,
+        dcp_size=dcp_size,
+        copy_vectors_per_task=copy_vectors_per_task,
+    ).task_count
 
 
 def _choose_history_copy_vectors_per_task(
@@ -348,13 +1079,13 @@ def _choose_history_copy_vectors_per_task(
     worker_warps = (num_sms - num_comm_sm) * MEGA_COMPUTE_WARPS
     target_claims = math.ceil(HISTORY_TASK_WAVE_TARGET * worker_warps)
     for candidate in reversed(candidates):
-        task_count = _history_combine_task_count(
+        task_count = _history_combine_profile(
             cu_q,
             history_sequence_splits,
             hq_local=hq_local,
             dcp_size=dcp_size,
             copy_vectors_per_task=candidate,
-        )
+        ).task_count
         if task_count >= target_claims:
             return candidate
     return 1
@@ -370,6 +1101,8 @@ def build_dcp_mega_metadata(
     num_comm_sm: int,
     requested_num_splits: int = 0,
     block_n_override: int | None = None,
+    scheduler_heuristic: bool | None = None,
+    reorder_history_override: bool | None = None,
 ) -> DCPMegaMetadata:
     """Build all host queues for one packed-varlen chunk prefill call."""
     cu_q = _validate_cu_seqlens(cu_seqlens_q, "cu_seqlens_q")
@@ -386,15 +1119,44 @@ def build_dcp_mega_metadata(
     history_lengths = tuple(
         end - begin for begin, end in zip(cu_history, cu_history[1:])
     )
+    if reorder_history_override is not None and not isinstance(
+        reorder_history_override, bool
+    ):
+        raise ValueError("reorder_history_override must be a bool or None")
+    if scheduler_heuristic is not None and not isinstance(
+        scheduler_heuristic, bool
+    ):
+        raise ValueError("scheduler_heuristic must be a bool or None")
+    if scheduler_heuristic is None:
+        scheduler_heuristic = requested_num_splits in (0, 1)
+    if scheduler_heuristic and requested_num_splits not in (0, 1):
+        raise ValueError(
+            "scheduler_heuristic requires requested_num_splits in {0, 1}"
+        )
+    if scheduler_heuristic:
+        split_policy = SPLIT_POLICY_CRITICAL_WAVE
+    else:
+        split_policy = SPLIT_POLICY_FA3_NATIVE
+    decode_only = all(q_len <= 16 for q_len in q_lengths)
+    if reorder_history_override is None:
+        reorder_no_split = False
+        reorder_split = (
+            split_policy == SPLIT_POLICY_CRITICAL_WAVE and decode_only
+        )
+    else:
+        reorder_no_split = reorder_history_override
+        reorder_split = reorder_history_override
+    auto_block_n = block_n_override is None and scheduler_heuristic
     dispatch = choose_dispatch(
         max_seqlen_q=max(q_lengths),
         max_seqlen_history=max(history_lengths),
         hq_local=hq_local,
         dcp_size=dcp_size,
         num_sms=num_sms,
-        requested_num_splits=requested_num_splits,
+        requested_num_splits=1 if scheduler_heuristic else requested_num_splits,
         block_n_override=block_n_override,
     )
+    heuristic_model_block_n = dispatch.block_n if scheduler_heuristic else None
 
     chunk_sequence_splits = _dynamic_sequence_splits(
         q_lengths,
@@ -414,6 +1176,88 @@ def build_dcp_mega_metadata(
         num_sms=num_sms,
         block_n=dispatch.block_n,
     )
+    heuristic_split_sequence_idx = None
+    heuristic_split_sequence_splits = None
+    heuristic_plan_source = None
+    heuristic_history_sequence_splits = None
+    heuristic_baseline_attention_tasks = None
+    heuristic_selected_attention_tasks = None
+    heuristic_baseline_combine_tasks = None
+    heuristic_selected_combine_tasks = None
+    heuristic_baseline_combine_partial_vectors = None
+    heuristic_selected_combine_partial_vectors = None
+    heuristic_baseline_combine_work = None
+    heuristic_selected_combine_work = None
+    heuristic_baseline_combine_penalty = None
+    heuristic_selected_combine_penalty = None
+    heuristic_baseline_makespan = None
+    heuristic_selected_makespan = None
+    heuristic_gain = None
+    if scheduler_heuristic:
+        baseline_plan, selected_plan = _critical_wave_plan(
+            q_lengths,
+            history_lengths,
+            hq_local=hq_local,
+            dcp_size=dcp_size,
+            block_n=dispatch.block_n,
+            num_sms=num_sms,
+            num_comm_sm=num_comm_sm,
+            chunk_sequence_splits=chunk_sequence_splits,
+            include_legacy_candidate=requested_num_splits == 0,
+            reorder_no_split=reorder_no_split,
+            reorder_split=reorder_split,
+        )
+        heuristic_plan_source = selected_plan.source
+        heuristic_baseline_attention_tasks = baseline_plan.attention_tasks
+        heuristic_selected_attention_tasks = selected_plan.attention_tasks
+        heuristic_baseline_combine_tasks = baseline_plan.combine_tasks
+        heuristic_selected_combine_tasks = selected_plan.combine_tasks
+        heuristic_baseline_combine_partial_vectors = (
+            baseline_plan.combine_partial_vectors
+        )
+        heuristic_selected_combine_partial_vectors = (
+            selected_plan.combine_partial_vectors
+        )
+        heuristic_baseline_combine_work = baseline_plan.combine_work
+        heuristic_selected_combine_work = selected_plan.combine_work
+        heuristic_baseline_combine_penalty = baseline_plan.combine_penalty
+        heuristic_selected_combine_penalty = selected_plan.combine_penalty
+        heuristic_baseline_makespan = baseline_plan.attention_makespan
+        heuristic_selected_makespan = selected_plan.attention_makespan
+        heuristic_gain = (
+            baseline_plan.score - selected_plan.score
+        ) / baseline_plan.score
+        if selected_plan.sequence_splits != baseline_plan.sequence_splits:
+            heuristic_history_sequence_splits = selected_plan.sequence_splits
+            history_sequence_splits = selected_plan.sequence_splits
+            split_indices = tuple(
+                index
+                for index, splits in enumerate(history_sequence_splits)
+                if splits > 1
+            )
+            heuristic_split_sequence_idx = max(
+                split_indices,
+                key=lambda index: (
+                    history_sequence_splits[index],
+                    history_lengths[index],
+                    -index,
+                ),
+            )
+            heuristic_split_sequence_splits = history_sequence_splits[
+                heuristic_split_sequence_idx
+            ]
+    if heuristic_history_sequence_splits is not None:
+        chunk_num_splits = max(chunk_sequence_splits)
+        history_num_splits = max(history_sequence_splits)
+        dispatch = DCPMegaDispatch(
+            effective_num_splits=max(chunk_num_splits, history_num_splits),
+            chunk_num_splits=chunk_num_splits,
+            history_num_splits=history_num_splits,
+            pack_gqa=dispatch.pack_gqa,
+            split=True,
+            block_n=dispatch.block_n,
+            history_copy_vectors_per_task=1,
+        )
     if all(split == 1 for split in chunk_sequence_splits) and all(
         split == 1 for split in history_sequence_splits
     ):
@@ -424,6 +1268,16 @@ def build_dcp_mega_metadata(
             pack_gqa=dispatch.pack_gqa,
             split=False,
             block_n=dispatch.block_n,
+            history_copy_vectors_per_task=1,
+        )
+    if auto_block_n and not dispatch.split:
+        dispatch = DCPMegaDispatch(
+            effective_num_splits=dispatch.effective_num_splits,
+            chunk_num_splits=dispatch.chunk_num_splits,
+            history_num_splits=dispatch.history_num_splits,
+            pack_gqa=dispatch.pack_gqa,
+            split=dispatch.split,
+            block_n=176,
             history_copy_vectors_per_task=1,
         )
 
@@ -475,6 +1329,39 @@ def build_dcp_mega_metadata(
         heads=dcp_size * hq_local,
         sequence_splits=history_sequence_splits,
     )
+
+    heuristic_q_block_order = tuple(range(num_token_subtiles))
+    if reorder_history_override is None:
+        release_lpt_enabled = (
+            split_policy == SPLIT_POLICY_CRITICAL_WAVE
+            and heuristic_history_sequence_splits is not None
+            and decode_only
+        )
+    else:
+        release_lpt_enabled = reorder_history_override
+    history_order_policy = (
+        HISTORY_ORDER_POLICY_RELEASE_LPT
+        if release_lpt_enabled
+        else HISTORY_ORDER_POLICY_FIFO
+    )
+    if release_lpt_enabled:
+        history_n_blocks = tuple(
+            _ceil_div(length, dispatch.block_n) for length in history_lengths
+        )
+        heuristic_q_block_order, attention = _release_lpt_attention_order(
+            attention,
+            q_dependencies,
+            num_token_subtiles=num_token_subtiles,
+            history_n_blocks=history_n_blocks,
+            history_sequence_splits=history_sequence_splits,
+            num_comm_sm=num_comm_sm,
+            dcp_size=dcp_size,
+        )
+        q_tasks = [
+            (src_rank, 0, token_block * 16, min(16, total_q - token_block * 16))
+            for token_block in heuristic_q_block_order
+            for src_rank in range(dcp_size)
+        ]
 
     publish: list[tuple[int, ...]] = []
     history_combine_by_publish: list[list[tuple[int, ...]]] = []
@@ -608,6 +1495,34 @@ def build_dcp_mega_metadata(
         receive_count=len(final) * (dcp_size - 1),
         tile_ready_count=len(final) * (dcp_size - 1),
         dcp_size=dcp_size,
+        split_policy=split_policy,
+        history_order_policy=history_order_policy,
+        scheduler_policy=_combined_scheduler_policy(
+            split_policy, history_order_policy
+        ),
+        heuristic_model_block_n=heuristic_model_block_n,
+        heuristic_plan_source=heuristic_plan_source,
+        heuristic_history_sequence_splits=heuristic_history_sequence_splits,
+        heuristic_baseline_attention_tasks=heuristic_baseline_attention_tasks,
+        heuristic_selected_attention_tasks=heuristic_selected_attention_tasks,
+        heuristic_baseline_combine_tasks=heuristic_baseline_combine_tasks,
+        heuristic_selected_combine_tasks=heuristic_selected_combine_tasks,
+        heuristic_baseline_combine_partial_vectors=(
+            heuristic_baseline_combine_partial_vectors
+        ),
+        heuristic_selected_combine_partial_vectors=(
+            heuristic_selected_combine_partial_vectors
+        ),
+        heuristic_baseline_combine_work=heuristic_baseline_combine_work,
+        heuristic_selected_combine_work=heuristic_selected_combine_work,
+        heuristic_baseline_combine_penalty=heuristic_baseline_combine_penalty,
+        heuristic_selected_combine_penalty=heuristic_selected_combine_penalty,
+        heuristic_split_sequence_idx=heuristic_split_sequence_idx,
+        heuristic_split_sequence_splits=heuristic_split_sequence_splits,
+        heuristic_baseline_makespan=heuristic_baseline_makespan,
+        heuristic_selected_makespan=heuristic_selected_makespan,
+        heuristic_gain=heuristic_gain,
+        heuristic_q_block_order=heuristic_q_block_order,
     )
     validate_dcp_mega_metadata(result, cu_q, hq_local=hq_local, dcp_size=dcp_size)
     return result
@@ -622,6 +1537,95 @@ def validate_dcp_mega_metadata(
 ) -> None:
     """Validate queue ranges, dependencies, and publication ordering."""
     cu_q = tuple(int(value) for value in cu_seqlens_q)
+    if metadata.split_policy not in (
+        SPLIT_POLICY_CRITICAL_WAVE,
+        SPLIT_POLICY_FA3_NATIVE,
+    ):
+        raise AssertionError("unknown split policy")
+    if metadata.history_order_policy not in (
+        HISTORY_ORDER_POLICY_FIFO,
+        HISTORY_ORDER_POLICY_RELEASE_LPT,
+    ):
+        raise AssertionError("unknown history order policy")
+    if metadata.scheduler_policy != _combined_scheduler_policy(
+        metadata.split_policy, metadata.history_order_policy
+    ):
+        raise AssertionError("combined scheduler policy is inconsistent")
+    heuristic_enabled = metadata.split_policy == SPLIT_POLICY_CRITICAL_WAVE
+    heuristic_split_enabled = (
+        heuristic_enabled
+        and metadata.heuristic_history_sequence_splits is not None
+    )
+    release_lpt_enabled = (
+        metadata.history_order_policy == HISTORY_ORDER_POLICY_RELEASE_LPT
+    )
+    if heuristic_enabled:
+        if metadata.heuristic_model_block_n not in (128, 176):
+            raise AssertionError("heuristic model BlockN is invalid")
+        if any(
+            value is None
+            for value in (
+                metadata.heuristic_baseline_makespan,
+                metadata.heuristic_selected_makespan,
+                metadata.heuristic_gain,
+                metadata.heuristic_plan_source,
+                metadata.heuristic_baseline_attention_tasks,
+                metadata.heuristic_selected_attention_tasks,
+                metadata.heuristic_baseline_combine_tasks,
+                metadata.heuristic_selected_combine_tasks,
+                metadata.heuristic_baseline_combine_partial_vectors,
+                metadata.heuristic_selected_combine_partial_vectors,
+                metadata.heuristic_baseline_combine_work,
+                metadata.heuristic_selected_combine_work,
+                metadata.heuristic_baseline_combine_penalty,
+                metadata.heuristic_selected_combine_penalty,
+            )
+        ):
+            raise AssertionError("heuristic diagnostics are incomplete")
+        if (
+            metadata.heuristic_split_sequence_idx is None
+        ) != (metadata.heuristic_split_sequence_splits is None):
+            raise AssertionError("heuristic split selection is incomplete")
+        if heuristic_split_enabled:
+            if (
+                metadata.heuristic_history_sequence_splits
+                != metadata.history_sequence_splits
+            ):
+                raise AssertionError("heuristic split vector is inconsistent")
+            if metadata.heuristic_split_sequence_idx is None:
+                raise AssertionError("heuristic primary split is missing")
+        elif metadata.heuristic_split_sequence_idx is not None:
+            raise AssertionError("NoSplit heuristic has a primary split")
+        if metadata.dispatch.block_n != metadata.heuristic_model_block_n and not (
+            not metadata.dispatch.split
+            and metadata.heuristic_model_block_n == 128
+            and metadata.dispatch.block_n == 176
+        ):
+            raise AssertionError("heuristic model and dispatch BlockN are inconsistent")
+    elif any(
+        value is not None
+        for value in (
+            metadata.heuristic_split_sequence_idx,
+            metadata.heuristic_split_sequence_splits,
+            metadata.heuristic_baseline_makespan,
+            metadata.heuristic_selected_makespan,
+            metadata.heuristic_gain,
+            metadata.heuristic_model_block_n,
+            metadata.heuristic_plan_source,
+            metadata.heuristic_history_sequence_splits,
+            metadata.heuristic_baseline_attention_tasks,
+            metadata.heuristic_selected_attention_tasks,
+            metadata.heuristic_baseline_combine_tasks,
+            metadata.heuristic_selected_combine_tasks,
+            metadata.heuristic_baseline_combine_partial_vectors,
+            metadata.heuristic_selected_combine_partial_vectors,
+            metadata.heuristic_baseline_combine_work,
+            metadata.heuristic_selected_combine_work,
+            metadata.heuristic_baseline_combine_penalty,
+            metadata.heuristic_selected_combine_penalty,
+        )
+    ):
+        raise AssertionError("non-heuristic metadata contains heuristic diagnostics")
     if any(len(row) != ATTENTION_DESC_FIELDS for row in metadata.attention):
         raise AssertionError("invalid attention descriptor width")
     if any(len(row) != Q_TASK_FIELDS for row in metadata.q_tasks):
@@ -637,8 +1641,13 @@ def validate_dcp_mega_metadata(
         raise AssertionError("invalid final descriptor width")
 
     completion_ids = [row[7] for row in metadata.attention]
-    if completion_ids != list(range(len(metadata.attention))):
+    expected_completion_ids = list(range(len(metadata.attention)))
+    if sorted(completion_ids) != expected_completion_ids:
         raise AssertionError("attention completion ids must be dense and unique")
+    if not release_lpt_enabled and completion_ids != expected_completion_ids:
+        raise AssertionError(
+            "non-split FIFO attention completion ids must follow queue order"
+        )
     chunk_count = sum(row[0] == CHUNK for row in metadata.attention)
     if any(row[0] != CHUNK for row in metadata.attention[:chunk_count]):
         raise AssertionError("chunk descriptors must precede history descriptors")
@@ -721,11 +1730,19 @@ def validate_dcp_mega_metadata(
     q_coordinates = [(row[2] // 16, row[0]) for row in metadata.q_tasks]
     expected_q_coordinates = [
         (token_block, source)
-        for token_block in range(metadata.token_block_count)
+        for token_block in metadata.heuristic_q_block_order
         for source in range(dcp_size)
     ]
     if q_coordinates != expected_q_coordinates:
-        raise AssertionError("Q tasks must be token-block-major/rank-minor")
+        raise AssertionError("Q tasks do not follow their block order")
+    if sorted(metadata.heuristic_q_block_order) != list(
+        range(metadata.token_block_count)
+    ):
+        raise AssertionError("Q block order must be a permutation")
+    if not release_lpt_enabled and metadata.heuristic_q_block_order != tuple(
+        range(metadata.token_block_count)
+    ):
+        raise AssertionError("non-split FIFO Q blocks must remain token-major")
     if any(row[1] != 0 for row in metadata.q_tasks):
         raise AssertionError("Q tasks must not encode a local head")
 
@@ -956,7 +1973,15 @@ __all__ = [
     "FINAL_DESC_FIELDS",
     "HISTORY",
     "HISTORY_COMBINE_DESC_FIELDS",
+    "HISTORY_ORDER_POLICY_FIFO",
+    "HISTORY_ORDER_POLICY_RELEASE_LPT",
     "HISTORY_MAX_COPY_VECTORS",
+    "SCHEDULER_POLICY_CRITICAL_WAVE_FIFO",
+    "SCHEDULER_POLICY_FIFO",
+    "SCHEDULER_POLICY_HEURISTIC",
+    "SCHEDULER_POLICY_NATIVE_RELEASE_LPT",
+    "SPLIT_POLICY_CRITICAL_WAVE",
+    "SPLIT_POLICY_FA3_NATIVE",
     "HISTORY_TASK_WAVE_TARGET",
     "MEGA_COMPUTE_WARPS",
     "METADATA_HEADER_INTS",

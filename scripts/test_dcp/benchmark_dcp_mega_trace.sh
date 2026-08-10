@@ -5,7 +5,8 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-cd "$SCRIPT_DIR"
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+cd "$REPO_ROOT"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-8}
 export NCCL_CGA_CLUSTER_SIZE=${NCCL_CGA_CLUSTER_SIZE:-1}
@@ -25,7 +26,7 @@ WARMUP=${WARMUP:-10}
 ITERS=${ITERS:-40}
 CHECK=${CHECK:-0}
 NUM_SPLITS=${NUM_SPLITS:-0}
-MEGA_BLOCK_N=${MEGA_BLOCK_N:-128}
+MEGA_BLOCK_N=${MEGA_BLOCK_N:-auto}
 MEGA_NUM_COMM_SM=${MEGA_NUM_COMM_SM:-8}
 MEGA_PHASE_TIMESTAMPS=${MEGA_PHASE_TIMESTAMPS:-0}
 BASELINE_PHASE_TIMING=${BASELINE_PHASE_TIMING:-0}
@@ -98,8 +99,8 @@ require_positive_integer MEGA_NUM_COMM_SM "$MEGA_NUM_COMM_SM"
 ((MEGA_NUM_COMM_SM < 132)) || die \
     "MEGA_NUM_COMM_SM must leave at least one of 132 SMs for compute"
 case "$MEGA_BLOCK_N" in
-    128|176) ;;
-    *) die "MEGA_BLOCK_N must be 128 or 176, got '$MEGA_BLOCK_N'" ;;
+    auto|128|176) ;;
+    *) die "MEGA_BLOCK_N must be auto, 128, or 176, got '$MEGA_BLOCK_N'" ;;
 esac
 
 mode_spec=${MODES//,/ }

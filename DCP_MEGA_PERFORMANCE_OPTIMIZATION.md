@@ -772,7 +772,7 @@ case 007 的 comm 4 结果说明这是低风险、高收益的第一阶段改动
 
 ```bash
 cd /home/hychen/min_fa3_demo
-./simple_bench.sh
+./scripts/test_dcp/simple_bench.sh
 ```
 
 复现 Mega 最优 case 007 配置：

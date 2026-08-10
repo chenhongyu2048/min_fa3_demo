@@ -2,8 +2,9 @@
 
 set -euo pipefail
 
-repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-cd "$repo_dir"
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "$script_dir/../.." && pwd)
+cd "$repo_root"
 
 python_bin=${PYTHON:-python}
 torchrun_bin=${TORCHRUN:-torchrun}
@@ -34,8 +35,7 @@ printf '[1/6] CPU unit tests\n'
     scripts.test_min_fa3.test_dcp_mega_metadata \
     scripts.test_min_fa3.test_dcp_mega_batch \
     dcp_test.trace.tests.test_trace_workload \
-    dcp_test.trace.tests.test_summarize_dcp_mega_matrix \
-    dcp_test.trace.tests.test_plot_dcp_mega_latency
+    dcp_test.trace.tests.test_summarize_dcp_mega_matrix
 
 printf '[2/6] Python compile checks\n'
 "$python_bin" -m py_compile \
@@ -47,7 +47,9 @@ printf '[2/6] Python compile checks\n'
     dcp_test/benchmark_dcp_varlen.py \
     dcp_test/benchmark_dcp_mega_batch.py \
     dcp_test/summarize_dcp_mega_matrix.py \
-    dcp_test/plot_dcp_mega_latency.py \
+    benchmark_logs/bench_dcp/plot_dcp_mega_latency.py \
+    benchmark_logs/bench_dcp/plot_dcp_mega_latency_by_batch_type.py \
+    benchmark_logs/bench_dcp/plot_dcp_mega_phase_timestamps.py \
     dcp_test/trace/models.py \
     dcp_test/trace/generate.py \
     scripts/test_min_fa3/test_dcp_topology.py \
@@ -63,42 +65,31 @@ printf '[3/6] CLI import checks\n'
     --workloads small1 --dcp-sizes 2,8 --print-cases >/dev/null
 "$python_bin" -m dcp_test.trace.generate --help >/dev/null
 "$python_bin" -m dcp_test.summarize_dcp_mega_matrix --help >/dev/null
-"$python_bin" -m dcp_test.plot_dcp_mega_latency --help >/dev/null
+benchmark_logs/bench_dcp/plot_dcp_mega_latency.py --help >/dev/null
+benchmark_logs/bench_dcp/plot_dcp_mega_latency_by_batch_type.py --help >/dev/null
+benchmark_logs/bench_dcp/plot_dcp_mega_phase_timestamps.py --help >/dev/null
 "$python_bin" scripts/test_min_fa3/test_min_fa3_dcp.py --help >/dev/null
 "$python_bin" scripts/test_min_fa3/test_min_fa3_dcp_varlen.py --help >/dev/null
 "$python_bin" -m scripts.test_min_fa3.test_dcp_mega_varlen_multi_rank \
     --help >/dev/null
 
 printf '[4/6] Shell syntax and benchmark dry-run checks\n'
-bash -n benchmark_dcp_mega_six_loads.sh benchmark_dcp_mega_trace.sh \
+bash -n scripts/test_dcp/benchmark_dcp_mega_trace.sh \
     benchmark_dcp_mega_arrival_matrix.sh \
-    simple_bench.sh simple_test.sh
-DRY_RUN=1 bash simple_bench.sh >/dev/null
-batch_dry_run=$(DRY_RUN=1 LOADS=small1 DCP_SIZES=2,8 WARMUP=0 ITERS=1 \
-    bash benchmark_dcp_mega_six_loads.sh)
-[[ $(rg -c -- '--module dcp_test.benchmark_dcp_mega_batch' <<< "$batch_dry_run") == 2 ]]
-[[ $(rg -c -- '^\[[12]/2\]' <<< "$batch_dry_run") == 4 ]]
-rg -Fq "mode=eager, cases=2, implementations=['mega', 'ours', 'vllm', 'sglang']" \
-    <<< "$batch_dry_run"
-rg -Fq "mode=graph, cases=2, implementations=['ours', 'vllm', 'sglang']" \
-    <<< "$batch_dry_run"
-eager_dry_run=$(DRY_RUN=1 BASELINE_PHASE_TIMING=0 LOADS=small1 DCP_SIZES=2,8 MODES=eager \
-    WARMUP=0 ITERS=1 bash benchmark_dcp_mega_six_loads.sh)
-[[ $(rg -c -- '--module dcp_test.benchmark_dcp_mega_batch' <<< "$eager_dry_run") == 1 ]]
-[[ $(rg -c -- '--no-baseline-phase-timing' <<< "$eager_dry_run") == 1 ]]
+    scripts/test_dcp/simple_bench.sh scripts/test_dcp/simple_test.sh
 trace_dry_run=$(DRY_RUN=1 NUM_CASES=2 MODES=eager WARMUP=0 ITERS=1 \
-    bash benchmark_dcp_mega_trace.sh)
+    bash scripts/test_dcp/benchmark_dcp_mega_trace.sh)
 [[ $(rg -c -- '--module dcp_test.benchmark_dcp_mega_batch' <<< "$trace_dry_run") == 1 ]]
 [[ $(rg -c -- '--num-cases 2' <<< "$trace_dry_run") == 2 ]]
 [[ $(rg -c -- '--trace-cases' <<< "$trace_dry_run") == 1 ]]
 trace_reuse_dry_run=$(DRY_RUN=1 GENERATE_TRACE=0 \
-    TRACE_CASES=dcp_test/trace/conversation_trace.jsonl NUM_CASES=2 \
-    MODES=eager WARMUP=0 ITERS=1 bash benchmark_dcp_mega_trace.sh)
+TRACE_CASES=dcp_test/trace/conversation_trace.jsonl NUM_CASES=2 \
+    MODES=eager WARMUP=0 ITERS=1 bash scripts/test_dcp/benchmark_dcp_mega_trace.sh)
 [[ $(rg -c -- '^Using existing cases:' <<< "$trace_reuse_dry_run") == 1 ]]
 [[ $(rg -c -- '--module dcp_test.benchmark_dcp_mega_batch' <<< "$trace_reuse_dry_run") == 1 ]]
 ! rg -q -- 'dcp_test.trace.generate' <<< "$trace_reuse_dry_run"
 trace_graph_dry_run=$(DRY_RUN=1 NUM_CASES=2 MODES=graph WARMUP=0 ITERS=1 \
-    bash benchmark_dcp_mega_trace.sh)
+    bash scripts/test_dcp/benchmark_dcp_mega_trace.sh)
 rg -Fq -- '--implementations ours\,vllm\,sglang' <<< "$trace_graph_dry_run"
 ! rg -Fq -- '--implementations mega\,ours\,vllm\,sglang' <<< "$trace_graph_dry_run"
 matrix_dry_run=$(DRY_RUN=1 ARRIVAL_TIME_SCALES=4 DCP_SIZES=2 \

@@ -364,8 +364,7 @@ the import path.
 | Entry point | Purpose |
 | --- | --- |
 | `benchmark_dataset.sh` | Recommended dataset-shaped forward/backward benchmark wrapper for 2, 4, or 8 GPUs |
-| `benchmark_dcp_mega_six_loads.sh` | Two-launch eager-Mega/graph-baseline wrapper for the JSON-defined 18-case DCP matrix |
-| `benchmark_dcp_mega_trace.sh` | Generate `NUM_CASES` trace snapshots, then run eager Mega/baselines and graph baselines in separate 8-rank launches |
+| `scripts/test_dcp/benchmark_dcp_mega_trace.sh` | Generate `NUM_CASES` trace snapshots, then run eager Mega/baselines and graph baselines in separate 8-rank launches |
 | `benchmark_dcp_mega_arrival_matrix.sh` | Run the 3-arrival x 3-DCP trace matrix with one eager Mega comm-SM sweep plus eager/graph baselines per combination |
 | `dcp_test/benchmark_dcp_mega_batch.py` | Reuse one 8-rank process group across a filtered packed-varlen Mega DCP case matrix |
 | `dcp_test/summarize_dcp_mega_matrix.py` | Validate matrix manifests and flatten workload-weighted summaries to JSON and CSV |
@@ -993,24 +992,12 @@ torchrun --standalone --nproc_per_node=8 --module \
   --warmup 5 --iters 20 --output-dir benchmarks/results/dcp_batch_eager
 ```
 
-`benchmark_dcp_mega_six_loads.sh` is the recommended full wrapper. By default
-it launches `torchrun` exactly twice: the eager batch runs Mega plus `ours`,
-vLLM, and SGLang, while the CUDA Graph batch runs only those three baselines.
-`LOADS`, `DCP_SIZES`, and `MODES` select a submatrix;
-`DRY_RUN=1` prints both launcher commands and their expanded cases. Each mode
-writes unchanged packed-varlen schema-version-3 case JSON files and one
-schema-version-1 manifest containing the stable case order, result paths, and
-method summaries. `BASELINE_PHASE_TIMING=0` forwards
-`--no-baseline-phase-timing` to both launches while preserving end-to-end CUDA
-Event timing. It does not affect Mega timing; `MEGA_PHASE_TIMESTAMPS` remains
-the independent control for optional Mega `%globaltimer` milestones.
-
-`benchmark_dcp_mega_trace.sh` applies the same one-launch-per-mode and
+`scripts/test_dcp/benchmark_dcp_mega_trace.sh` applies the same one-launch-per-mode and
 eager-only Mega grouping to the Mooncake-derived scheduler replay under
 `dcp_test/trace`. For example:
 
 ```bash
-NUM_CASES=20 MODES=eager,graph ./benchmark_dcp_mega_trace.sh
+NUM_CASES=20 MODES=eager,graph ./scripts/test_dcp/benchmark_dcp_mega_trace.sh
 ```
 
 To materialize the sampled workload in the current directory first and then
@@ -1027,7 +1014,7 @@ python -m dcp_test.trace.generate \
   --output "$TRACE_CASES" --num-cases "$NUM_CASES"
 
 GENERATE_TRACE=0 TRACE_CASES="$TRACE_CASES" NUM_CASES="$NUM_CASES" \
-  MODES=eager,graph ./benchmark_dcp_mega_trace.sh
+  MODES=eager,graph ./scripts/test_dcp/benchmark_dcp_mega_trace.sh
 ```
 
 The second command requires the existing JSONL and validates its case count
@@ -1048,7 +1035,7 @@ The larger arrival/DCP matrix has a separate wrapper:
 ./benchmark_dcp_mega_arrival_matrix.sh
 ```
 
-Its defaults independently replay and reservoir-sample 100 cases for every
+Its defaults independently replay and reservoir-sample 20 cases for every
 `arrival_time_scale=1,2,4` and `DCP=2,4,8` combination. Each combination uses
 three 8-rank launches: one eager Mega launch sweeps
 `num_comm_sms=4,8,12,16,20` inside the same process group, one launch runs the
@@ -1064,12 +1051,8 @@ writes incremental per-case and per-launch manifests plus
 the completed manifests and marks missing, failed, or invalid launches in the
 top-level JSON.
 
-On eight H100 GPUs, the default 100-case matrix is expected to take roughly
-5 hours; reserve 5-8 hours for trace-shape variance, CUDA/NCCL initialization,
-and host scheduling noise. This estimate is based on the checked two-case
-H100 smoke: each Mega case/comm-SM pair took about 3.2-3.9 seconds after the
-first initialization, while each of the 27 launches also pays roughly
-40-50 seconds of process-group/JIT setup. A two-case, one-combination Hopper
+Runtime depends on the sampled trace shape, GPU availability, CUDA/NCCL
+initialization, and host scheduling state. A two-case, one-combination Hopper
 smoke can be launched with:
 
 ```bash
@@ -1085,7 +1068,7 @@ Plot the completed matrix as 1-by-3 grouped bar charts with one panel per DCP
 size:
 
 ```bash
-python -m dcp_test.plot_dcp_mega_latency \
+./benchmark_logs/bench_dcp/plot_dcp_mega_latency.py \
   benchmark_logs/bench_dcp/<timestamp>
 ```
 
@@ -1098,9 +1081,63 @@ that same selection. The Mega annotation reports its improvement over the best
 of the six baseline bars: `baseline / Mega` for latency and `Mega / baseline`
 for TFLOPS and bandwidth. Use `--mega-num-comm-sm 8` to select one fixed value,
 or `--latency-stat p50` to plot the median instead of the mean of the per-case
-p50 latency distribution. With no input argument, the plotter selects the
-newest run below `benchmark_logs/bench_dcp`. Incomplete matrices are rejected
-unless `--allow-incomplete` is passed; missing bars are then marked `N/A`.
+p50 latency distribution. The script is self-contained apart from its
+Matplotlib dependency and can be run from any working directory. With no input
+argument, it selects the newest run below its own `benchmark_logs/bench_dcp`
+directory and discovers the available arrival scales and DCP sizes from that
+run. Incomplete matrices are rejected unless `--allow-incomplete` is passed;
+missing bars are then marked `N/A`.
+
+To split the same three metrics into a 2-by-3 figure, with decode-only batches
+in the first row, mixed chunk-prefill batches in the second row, and DCP sizes
+2, 4, and 8 in the columns, run:
+
+```bash
+./benchmark_logs/bench_dcp/plot_dcp_mega_latency_by_batch_type.py \
+  benchmark_logs/bench_dcp/<timestamp>
+```
+
+Decode-only means every sequence in the case has `q_len <= 16`; cases with a
+larger Q length are classified as mixed chunk prefill. Because
+`matrix_summary.csv` only stores whole-run aggregates, this mode recomputes the
+latency distribution, workload-weighted TFLOPS/GPU, and workload-weighted KV
+GB/s/GPU from the per-case JSON files. It selects the lowest-latency Mega
+comm-SM setting independently for each batch type, arrival scale, and DCP size.
+
+For runs collected with `MEGA_PHASE_TIMESTAMPS=1` and
+`BASELINE_PHASE_TIMING=1`, plot the paired Mega kernel phase milestones and the
+vLLM A2A CUDA Graph phase breakdown for DCP sizes 2, 4, and 8 in one 4-by-3
+overview:
+
+```bash
+./benchmark_logs/bench_dcp/plot_dcp_mega_phase_timestamps.py \
+  benchmark_logs/bench_dcp/<timestamp>
+```
+
+The first two rows separate decode-only and mixed chunk-prefill batches and
+plot Mega against global effective FLOPs. Each Mega point independently uses
+the comm-SM configuration with the lowest E2E latency for that paired workload
+case; ties select the smaller comm-SM count. The selected configuration's full
+set of completion milestones contributes the per-case points and solid
+rolling-median curves. The same panels overlay dashed rolling-median curves for
+the vLLM A2A CUDA Graph baseline. For each case, its measured phase durations
+are accumulated in runner order to reconstruct completion timestamps: Q
+all-gather/reorder, local history attention, A2A pack, pure all-to-all,
+unpack/combine, local chunk attention, and state merge. The independently
+measured Graph E2E trend is a thicker black dashed line. Phase-summary
+quantiles, unmeasured gaps, or overlap mean that the final reconstructed
+timestamp need not equal E2E; runner Graph E2E also has a broader boundary than
+Mega's in-kernel timestamps. The third row compares all measured fixed Mega
+comm-SM settings with paired kernel-done ECDFs using the aggregate-best fixed
+setting as its reference. The fourth row shows medians of the explicitly
+recorded Mega phase-tail durations for every fixed setting. The script
+validates that Mega and baseline workloads are paired across every DCP and
+comm-SM setting, and writes both a high-resolution PNG and a vector PDF by
+default. Use `--stat p90`
+for iteration-tail milestones and phase durations, or `--no-pdf` to skip the
+PDF. To omit a known unrepresentative paired workload from every panel and
+aggregate, pass a repeatable option such as `--exclude-case-id case_000199`.
+The exclusion is recorded in the figure subtitle and console summary.
 
 The bandwidth metric is `sum(average logical BF16 K+V bytes per GPU) /
 sum(case p50 latency)`. It is an effective payload rate under the benchmark's
@@ -1111,12 +1148,27 @@ also recover them from retained per-case JSON files produced by older runs.
 The optional `--implementations mega` category adds the experimental
 `dcp_mega_varlen` path for chunk prefill only. It supports the default CUDA
 Graph mode and the explicit `--no-cuda-graph` eager fallback;
-`--mega-block-n 128|176` and `--mega-num-comm-sm N` select its isolated kernel
-instance and explicit communication-CTA budget. The default remains 8 and
-there is no `0/auto` mode. Mega uses fixed `[16,Hq_local,128]` Q/O
+`--mega-block-n auto|128|176` selects its BlockN policy and
+`--mega-num-comm-sm N` selects the explicit communication-CTA budget. BlockN
+defaults to `auto`: critical-wave always makes its split decision with the
+canonical BlockN=128 model, then dispatches NoSplit with BlockN=176 or a
+selected split plan with BlockN=128. Explicit 128 or 176 keeps that BlockN for
+both the model and dispatch. The communication-CTA budget defaults to 8 and
+has no `0/auto` mode. Mega uses fixed `[16,Hq_local,128]` Q/O
 communication tiles and requires PackGQA with `Hq_local` 4 or 8. History
 combine publishes each completed remote tile directly with a monotonic phase
 signal; there is no separate communication-granularity mode or publish pass.
+For Mega with `--num-splits 0|1`, critical-wave split selection is enabled by
+default. `--no-mega-scheduler-heuristic` independently selects the FA3 native
+split policy. `--mega-history-order auto|fifo|release-lpt` controls Q unlock
+ordering plus history descriptor order: FIFO and release-LPT are explicit
+overrides, including for NoSplit, while `auto` uses FIFO for critical-wave
+NoSplit, release-LPT for a decode-only split, and FIFO for a mixed-batch split.
+Critical-wave candidate scoring uses that resolved order. BlockN auto dispatches
+the three cases as 176, 128, and 128 respectively; FA3 native and fixed split
+paths retain the BlockN=128 fallback. Explicit fixed split values 2 through 128
+do not enable critical-wave implicitly. The design is documented in
+[`DCP_MEGA_CRITICAL_WAVE_SCHEDULER.md`](DCP_MEGA_CRITICAL_WAVE_SCHEDULER.md).
 Fixed-shape benchmark replay builds and
 uploads metadata once. Eager internal CUDA events measure only the persistent
 mega kernel. CUDA Graph replay captures workspace reset, a device-side
@@ -1133,7 +1185,7 @@ torchrun --standalone --nproc_per_node=8 --module \
   --b 3 --sq 1,8,32 --seqlen 129,1024,3131 \
   --qhead 32 --kvhead 1 --headdim 128 --tp-size 8 --dcp-size 8 \
   --workload chunk --implementations mega,vllm,full --cuda-graph \
-  --mega-block-n 128 --mega-num-comm-sm 8 \
+  --mega-block-n auto --mega-num-comm-sm 8 \
   --num-splits 0 --warmup 5 --iters 20
 ```
 

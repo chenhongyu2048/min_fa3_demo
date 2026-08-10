@@ -269,23 +269,19 @@ struct DCPMegaKernelConfig {
         QRemote q_remote;
         QGlobal q_group;
         HistoryRemote history_send_remote;
-        HistoryGlobal history_send_local;
         HistoryGlobal history_receive_local;
         Element* history_receive_o = nullptr;
         float* history_receive_lse = nullptr;
         Element* final_o = nullptr;
         float* final_lse = nullptr;
         int64_t final_lse_head_stride = 0;
-        AttentionWorkDesc const* attention = nullptr;
         QTaskDesc const* q_tasks = nullptr;
         PublishWorkDesc const* publish = nullptr;
         HistoryCombineWorkDesc const* history_combine = nullptr;
         FinalWorkDesc const* final = nullptr;
-        int32_t const* q_dependencies = nullptr;
         int32_t const* publish_dependencies = nullptr;
         int32_t const* final_dependencies = nullptr;
         int32_t const* chunk_sequence_splits = nullptr;
-        int32_t const* history_sequence_splits = nullptr;
         int32_t* q_ready = nullptr;
         int32_t* attention_done = nullptr;
         int32_t* publish_ready = nullptr;
@@ -295,7 +291,6 @@ struct DCPMegaKernelConfig {
         int32_t const* graph_post_phase = nullptr;
         int const* cu_seqlens_q = nullptr;
         int total_q = 0;
-        int total_vectors = 0;
         int batch_size = 0;
         int hq_local = 0;
         int q_row_stride = 0;
@@ -304,12 +299,8 @@ struct DCPMegaKernelConfig {
         int history_send_rank_stride = 0;
         int signal_rank_stride = 0;
         int num_q_tasks = 0;
-        int chunk_attention_count = 0;
-        int history_attention_count = 0;
-        int publish_count = 0;
         int history_combine_count = 0;
         int final_count = 0;
-        int effective_num_splits = 0;
         int dcp_rank = 0;
         int tile_ready_phase = 0;
         int num_sms = 0;
@@ -328,12 +319,10 @@ struct DCPMegaKernelConfig {
             QRemote const& q_remote_,
             QGlobal const& q_group_,
             HistoryRemote const& history_send_remote_,
-            HistoryGlobal const& history_send_local_,
             HistoryGlobal const& history_receive_local_)
             : chunk(chunk_), history(history_),
               q_remote(q_remote_), q_group(q_group_),
               history_send_remote(history_send_remote_),
-              history_send_local(history_send_local_),
               history_receive_local(history_receive_local_) {}
     };
 
@@ -345,7 +334,6 @@ struct DCPMegaKernelConfig {
     static_assert(offsetof(KernelParams, q_remote) % 64 == 0);
     static_assert(offsetof(KernelParams, q_group) % 64 == 0);
     static_assert(offsetof(KernelParams, history_send_remote) % 64 == 0);
-    static_assert(offsetof(KernelParams, history_send_local) % 64 == 0);
     static_assert(offsetof(KernelParams, history_receive_local) % 64 == 0);
 };
 
@@ -1316,9 +1304,6 @@ void launch_dcp_mega_instance(
     int const history_rows = params.ipc_q_token_capacity;
     auto history_remote = kittens::make_pgl<typename Config::HistoryRemote>(
         history_remote_ptrs, 1, DCPSize, history_rows, comm_width);
-    auto history_send_local = kittens::make_gl<typename Config::HistoryGlobal>(
-        reinterpret_cast<uint64_t>(params.ipc_history_send_o_ptrs[params.dcp_rank]),
-        1, DCPSize, history_rows, comm_width);
     auto history_receive_local = kittens::make_gl<typename Config::HistoryGlobal>(
         reinterpret_cast<uint64_t>(params.history_receive_o_ptr),
         1, DCPSize, history_rows, comm_width);
@@ -1328,7 +1313,6 @@ void launch_dcp_mega_instance(
         q_remote,
         q_group,
         history_remote,
-        history_send_local,
         history_receive_local);
     #pragma unroll
     for (int rank = 0; rank < DCPSize; ++rank) {
@@ -1342,17 +1326,14 @@ void launch_dcp_mega_instance(
     kernel_params.final_o = static_cast<Element*>(params.final_o_ptr);
     kernel_params.final_lse = params.final_lse_ptr;
     kernel_params.final_lse_head_stride = params.final_lse_head_stride;
-    kernel_params.attention = reinterpret_cast<AttentionWorkDesc const*>(metadata + header.attention_offset);
     kernel_params.q_tasks = reinterpret_cast<QTaskDesc const*>(metadata + header.q_tasks_offset);
     kernel_params.publish = reinterpret_cast<PublishWorkDesc const*>(metadata + header.publish_offset);
     kernel_params.history_combine = reinterpret_cast<HistoryCombineWorkDesc const*>(
         metadata + header.history_combine_offset);
     kernel_params.final = reinterpret_cast<FinalWorkDesc const*>(metadata + header.final_offset);
-    kernel_params.q_dependencies = metadata + header.q_dependencies_offset;
     kernel_params.publish_dependencies = metadata + header.publish_dependencies_offset;
     kernel_params.final_dependencies = metadata + header.final_dependencies_offset;
     kernel_params.chunk_sequence_splits = metadata + header.chunk_splits_offset;
-    kernel_params.history_sequence_splits = metadata + header.history_splits_offset;
     kernel_params.q_ready = params.q_ready;
     kernel_params.attention_done = params.attention_done;
     kernel_params.publish_ready = params.publish_ready;
@@ -1362,7 +1343,6 @@ void launch_dcp_mega_instance(
     kernel_params.graph_post_phase = params.graph_post_phase;
     kernel_params.cu_seqlens_q = params.chunk.cu_seqlens_q;
     kernel_params.total_q = header.total_q;
-    kernel_params.total_vectors = header.total_vectors;
     kernel_params.batch_size = header.batch_size;
     kernel_params.hq_local = params.hq_local;
     kernel_params.q_row_stride = params.chunk.q_row_stride;
@@ -1371,12 +1351,8 @@ void launch_dcp_mega_instance(
     kernel_params.history_send_rank_stride = params.ipc_vector_capacity * 128;
     kernel_params.signal_rank_stride = params.ipc_vector_capacity;
     kernel_params.num_q_tasks = header.q_task_count;
-    kernel_params.chunk_attention_count = header.chunk_attention_count;
-    kernel_params.history_attention_count = header.history_attention_count;
-    kernel_params.publish_count = header.publish_count;
     kernel_params.history_combine_count = header.history_combine_count;
     kernel_params.final_count = header.final_count;
-    kernel_params.effective_num_splits = header.effective_num_splits;
     kernel_params.dcp_rank = params.dcp_rank;
     kernel_params.tile_ready_phase = params.tile_ready_phase;
     kernel_params.num_sms = params.num_sms;

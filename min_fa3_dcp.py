@@ -23,7 +23,7 @@ from __future__ import annotations
 import threading
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
-from typing import Callable, Iterable, Optional, Protocol, Tuple, Union
+from typing import Callable, Iterable, Optional, Protocol, Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -2656,6 +2656,8 @@ class DCPMegaAttentionRunner:
         cu_seqlens_q_host: torch.Tensor,
         cu_seqlens_history_local_host: torch.Tensor,
         num_splits: int = 0,
+        scheduler_heuristic: bool | None = None,
+        reorder_history_override: bool | None = None,
         return_lse: bool = False,
     ) -> _DCPResult:
         if self._closed:
@@ -2768,6 +2770,8 @@ class DCPMegaAttentionRunner:
                 num_comm_sm=self.num_comm_sm,
                 requested_num_splits=num_splits,
                 block_n_override=self.block_n_override,
+                scheduler_heuristic=scheduler_heuristic,
+                reorder_history_override=reorder_history_override,
             )
             if metadata.dispatch.effective_num_splits > self.max_num_splits:
                 raise ValueError(
@@ -2777,6 +2781,7 @@ class DCPMegaAttentionRunner:
             self._last_dispatch = metadata.dispatch
             token_blocks = metadata.token_block_count
             actual_counts = {
+                "attention_tasks": len(metadata.attention),
                 "q_transfer_tasks": len(metadata.q_tasks),
                 "publish_tasks": len(metadata.publish),
                 "history_combine_tasks": len(metadata.history_combine),
@@ -2787,12 +2792,94 @@ class DCPMegaAttentionRunner:
             self._last_queue_counts = {
                 "token_blocks": token_blocks,
                 "q_ready_counters": metadata.q_ready_count,
+                "block_n_policy": (
+                    "fixed"
+                    if self.block_n_override is not None
+                    else (
+                        "auto_critical_wave"
+                        if metadata.heuristic_model_block_n is not None
+                        else "default_128"
+                    )
+                ),
+                "requested_block_n": (
+                    self.block_n_override
+                    if self.block_n_override is not None
+                    else "auto"
+                ),
+                "effective_block_n": metadata.dispatch.block_n,
+                "heuristic_model_block_n": metadata.heuristic_model_block_n,
                 "history_combine_worker_warps": (
                     (self.num_sms - self.num_comm_sm) * MEGA_COMPUTE_WARPS
                 ),
                 "history_combine_task_waves": (
                     len(metadata.history_combine)
                     / ((self.num_sms - self.num_comm_sm) * MEGA_COMPUTE_WARPS)
+                ),
+                "sequence_splits": {
+                    "chunk": list(metadata.chunk_sequence_splits),
+                    "history": list(metadata.history_sequence_splits),
+                },
+                "split_policy": metadata.split_policy,
+                "history_order_policy": metadata.history_order_policy,
+                "scheduler_policy": metadata.scheduler_policy,
+                "history_reorder_enabled": (
+                    metadata.history_order_policy == "release_lpt"
+                ),
+                "heuristic_plan_source": metadata.heuristic_plan_source,
+                "heuristic_history_sequence_splits": (
+                    list(metadata.heuristic_history_sequence_splits)
+                    if metadata.heuristic_history_sequence_splits is not None
+                    else None
+                ),
+                "heuristic_baseline_attention_tasks": (
+                    metadata.heuristic_baseline_attention_tasks
+                ),
+                "heuristic_selected_attention_tasks": (
+                    metadata.heuristic_selected_attention_tasks
+                ),
+                "heuristic_baseline_combine_tasks": (
+                    metadata.heuristic_baseline_combine_tasks
+                ),
+                "heuristic_selected_combine_tasks": (
+                    metadata.heuristic_selected_combine_tasks
+                ),
+                "heuristic_baseline_combine_partial_vectors": (
+                    metadata.heuristic_baseline_combine_partial_vectors
+                ),
+                "heuristic_selected_combine_partial_vectors": (
+                    metadata.heuristic_selected_combine_partial_vectors
+                ),
+                "heuristic_baseline_combine_work": (
+                    metadata.heuristic_baseline_combine_work
+                ),
+                "heuristic_selected_combine_work": (
+                    metadata.heuristic_selected_combine_work
+                ),
+                "heuristic_baseline_combine_penalty": (
+                    metadata.heuristic_baseline_combine_penalty
+                ),
+                "heuristic_selected_combine_penalty": (
+                    metadata.heuristic_selected_combine_penalty
+                ),
+                "heuristic_split_sequence_idx": (
+                    metadata.heuristic_split_sequence_idx
+                ),
+                "heuristic_split_sequence_splits": (
+                    metadata.heuristic_split_sequence_splits
+                ),
+                "heuristic_baseline_makespan": (
+                    metadata.heuristic_baseline_makespan
+                ),
+                "heuristic_selected_makespan": (
+                    metadata.heuristic_selected_makespan
+                ),
+                "heuristic_gain": metadata.heuristic_gain,
+                "heuristic_reorder_enabled": (
+                    metadata.split_policy == "critical_wave"
+                    and metadata.history_order_policy == "release_lpt"
+                ),
+                "heuristic_q_block_order": list(
+                    metadata.heuristic_q_block_order
                 ),
                 "actual": actual_counts,
             }

@@ -6,13 +6,14 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-cd "$SCRIPT_DIR"
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+cd "$REPO_ROOT"
 
 GPU_IDS=${GPU_IDS:-"0,1,2,3,4,5,6,7"}
 CHECK_INTERVAL_SECONDS=${CHECK_INTERVAL_SECONDS:-3}
 IDLE_MEMORY_LIMIT_MIB=${IDLE_MEMORY_LIMIT_MIB:-64}
 TORCHRUN=${TORCHRUN:-torchrun}
-LOG_ROOT=${LOG_ROOT:-"$SCRIPT_DIR/benchmark_logs/dcp_mega_matrix_when_idle"}
+LOG_ROOT=${LOG_ROOT:-"$REPO_ROOT/benchmark_logs/dcp_mega_matrix_when_idle"}
 RUN_ID=${RUN_ID:-$(date +%Y%m%d-%H%M%S)}
 RUN_DIR="$LOG_ROOT/$RUN_ID"
 MASTER_LOG="$RUN_DIR/matrix_queue.log"
@@ -63,7 +64,7 @@ for gpu in "${GPU_ID_LIST[@]}"; do
     nvidia-smi --id="$gpu" --query-gpu=index --format=csv,noheader,nounits \
         >/dev/null 2>&1 || die "GPU '$gpu' is not visible to nvidia-smi"
 done
-[[ -f "$SCRIPT_DIR/scripts/test_min_fa3/test_dcp_mega_varlen_multi_rank.py" ]] || \
+[[ -f "$REPO_ROOT/scripts/test_min_fa3/test_dcp_mega_varlen_multi_rank.py" ]] || \
     die "DCP Mega matrix test entry point was not found"
 
 mkdir -p "$LOG_ROOT"
