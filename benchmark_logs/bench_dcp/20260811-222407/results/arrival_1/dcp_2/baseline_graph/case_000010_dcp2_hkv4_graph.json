@@ -1,0 +1,1815 @@
+{
+  "collective_payload": {
+    "a2a_buffer_bytes_per_rank": 199680,
+    "a2a_remote_bytes_per_rank": 99840,
+    "bf16_output_bytes_per_rank": 98304,
+    "lse_allgather_input_bytes_per_rank": 3072,
+    "q_allgather_input_bytes_per_rank": 98304
+  },
+  "comparison_scope": "Same min_fa3_op.forward_kvcache_varlen kernel; orchestration baseline only, not native vLLM/SGLang backend performance.",
+  "effective_causal_or_decode_pairs": 731344,
+  "environment": {
+    "cuda_runtime": "12.8",
+    "gpu_name": "NVIDIA H100 80GB HBM3",
+    "hostname": "zkrh-58",
+    "platform": "Linux-5.15.0-185-generic-x86_64-with-glibc2.35",
+    "python": "3.12.13",
+    "repository_commit": "caa5b0c580b2472decc1e0137711908d677aad54",
+    "sglang_source_commit": "8d6549bc4039d33635844495d86684677a4f0df8",
+    "torch": "2.10.0+cu128",
+    "vllm_source_commit": "a89015c6df8eeb37a843b717c97a5be1355de83d",
+    "world_size": 8
+  },
+  "execution": {
+    "capture_eager_warmup": 3,
+    "execution_mode": "cuda_graph",
+    "input_materialization": "full_then_shard",
+    "warmup_semantics": "post_capture_replay"
+  },
+  "global_effective_flops": 11982340096,
+  "kv_memory": {
+    "full_kv_bytes_per_rank": 23426048,
+    "local_dcp_bytes_by_tp_rank": [
+      11738112,
+      11737088,
+      11738112,
+      11737088,
+      11738112,
+      11737088,
+      11738112,
+      11737088
+    ],
+    "reduction_ratio_by_tp_rank": [
+      1.9957253773008812,
+      1.9958994939801082,
+      1.9957253773008812,
+      1.9958994939801082,
+      1.9957253773008812,
+      1.9958994939801082,
+      1.9957253773008812,
+      1.9958994939801082
+    ]
+  },
+  "lengths": {
+    "history_or_cache_global": [
+      1145,
+      5197,
+      5174,
+      27678,
+      920,
+      5544
+    ],
+    "history_or_cache_local_by_tp_rank": [
+      [
+        573,
+        2599,
+        2587,
+        13839,
+        460,
+        2772
+      ],
+      [
+        572,
+        2598,
+        2587,
+        13839,
+        460,
+        2772
+      ],
+      [
+        573,
+        2599,
+        2587,
+        13839,
+        460,
+        2772
+      ],
+      [
+        572,
+        2598,
+        2587,
+        13839,
+        460,
+        2772
+      ],
+      [
+        573,
+        2599,
+        2587,
+        13839,
+        460,
+        2772
+      ],
+      [
+        572,
+        2598,
+        2587,
+        13839,
+        460,
+        2772
+      ],
+      [
+        573,
+        2599,
+        2587,
+        13839,
+        460,
+        2772
+      ],
+      [
+        572,
+        2598,
+        2587,
+        13839,
+        460,
+        2772
+      ]
+    ],
+    "q_global": [
+      16,
+      16,
+      16,
+      16,
+      16,
+      16
+    ],
+    "reference_k_global": [
+      1161,
+      5213,
+      5190,
+      27694,
+      936,
+      5560
+    ]
+  },
+  "methods": {
+    "full_kv_min_fa3_varlen": {
+      "communication": {
+        "collective_payload_bytes_per_rank_total": 0,
+        "lse_allgather_receive_bytes_per_rank": 0,
+        "output_collective": "none",
+        "output_collective_buffer_bytes_per_rank": 0,
+        "output_collective_payload_bytes_per_rank": 0,
+        "output_collective_remote_bytes_per_rank": 0,
+        "q_allgather_receive_bytes_per_rank": 0,
+        "tile_ready_remote_bytes_per_rank": 0
+      },
+      "effective_tflops": 267.2720480419577,
+      "execution": {
+        "capture_eager_warmup": 3,
+        "execution_mode": "cuda_graph",
+        "graph_static_signature": {
+          "bindings": {
+            "cu_q": {
+              "address": 43073404928,
+              "device": "cuda:0",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_q_host": {
+              "address": 1105434176,
+              "contents": [
+                0,
+                16,
+                32,
+                48,
+                64,
+                80,
+                96
+              ],
+              "device": "cpu",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_reference": {
+              "address": 43073405952,
+              "device": "cuda:0",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_reference_host": {
+              "address": 1162357312,
+              "contents": [
+                0,
+                1161,
+                6374,
+                11564,
+                39258,
+                40194,
+                45754
+              ],
+              "device": "cpu",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "k_reference": {
+              "address": 139935341948416,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                45754,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "q_local": {
+              "address": 43073427968,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                4,
+                128
+              ],
+              "stride": [
+                512,
+                128,
+                1
+              ]
+            },
+            "v_reference": {
+              "address": 139935353661440,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                45754,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            }
+          },
+          "operation": "full_kv_varlen",
+          "scalars": {
+            "is_causal": true,
+            "max_seqlen_k": 27694,
+            "max_seqlen_q": 16,
+            "num_splits": 0,
+            "return_lse": false
+          }
+        },
+        "overlap_q_allgather": false,
+        "post_capture_warmup": 40,
+        "rank_latency_ms": {
+          "p50": [
+            0.04291199892759323,
+            0.04342399910092354,
+            0.04475199989974499,
+            0.043088000267744064,
+            0.043168000876903534,
+            0.042608000338077545,
+            0.041680000722408295,
+            0.041728001087903976
+          ],
+          "p90": [
+            0.043676800653338434,
+            0.044867198914289474,
+            0.04593279957771301,
+            0.04459520019590855,
+            0.044233601167798044,
+            0.044044800102710724,
+            0.0428415983915329,
+            0.042880001664161685
+          ]
+        },
+        "stream_policy": "single_stream"
+      },
+      "logical_kv_read": {
+        "average_bytes_per_gpu": 23426048.0,
+        "bytes_by_tp_rank": [
+          23426048.0,
+          23426048.0,
+          23426048.0,
+          23426048.0,
+          23426048.0,
+          23426048.0,
+          23426048.0,
+          23426048.0
+        ],
+        "effective_bandwidth_gbps_per_gpu": 522.5296374770172,
+        "latency_basis": "p50_max_across_ranks",
+        "traffic_model": "logical BF16 K+V input bytes counted once"
+      },
+      "ours_no_overlap_speedup_vs_method": 0.6927070133481317,
+      "output_collective_kind": "none",
+      "speedup_vs_full_kv": 1.0,
+      "stages_ms": {
+        "a2a_all_to_all_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "a2a_pack_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "a2a_unpack_combine_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "attention_end_to_end_ms": {
+          "p50": 0.04483199864625931,
+          "p90": 0.0463871993124485
+        },
+        "local_chunk_attention_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "local_history_attention_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "lse_allgather_correct_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "output_collective_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "output_reduce_scatter_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "overlap_hidden_time_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "overlapped_ag_chunk_window_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "q_allgather_and_reorder_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "state_merge_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        }
+      },
+      "workspace_policy": "operator_managed"
+    },
+    "ours_no_overlap_varlen": {
+      "communication": {
+        "collective_payload_bytes_per_rank_total": 199680.0,
+        "lse_allgather_receive_bytes_per_rank": 3072.0,
+        "output_collective": "bf16_reduce_scatter",
+        "output_collective_buffer_bytes_per_rank": 196608.0,
+        "output_collective_payload_bytes_per_rank": 98304.0,
+        "output_collective_remote_bytes_per_rank": 98304.0,
+        "q_allgather_receive_bytes_per_rank": 98304.0,
+        "tile_ready_remote_bytes_per_rank": 0.0
+      },
+      "effective_tflops": 185.14122215058288,
+      "execution": {
+        "capture_eager_warmup": 3,
+        "cuda_event_phase_timing_enabled": false,
+        "execution_mode": "cuda_graph",
+        "graph_static_signature": {
+          "bindings": {
+            "cu_seqlens_history_local": {
+              "address": 43073405440,
+              "device": "cuda:0",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_seqlens_history_local_host": {
+              "address": 1162328128,
+              "contents": [
+                0,
+                573,
+                3172,
+                5759,
+                19598,
+                20058,
+                22830
+              ],
+              "device": "cpu",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_seqlens_q": {
+              "address": 43073404928,
+              "device": "cuda:0",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_seqlens_q_host": {
+              "address": 1105434176,
+              "contents": [
+                0,
+                16,
+                32,
+                48,
+                64,
+                80,
+                96
+              ],
+              "device": "cpu",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "k_chunk": {
+              "address": 43073526272,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "k_history_local": {
+              "address": 139935556613120,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                22830,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "max_seqlen_history_local": 13839,
+            "max_seqlen_q": 16,
+            "num_splits": 0,
+            "overlap_q_allgather": false,
+            "q_local": {
+              "address": 43073427968,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                4,
+                128
+              ],
+              "stride": [
+                512,
+                128,
+                1
+              ]
+            },
+            "return_lse": false,
+            "v_chunk": {
+              "address": 43073550848,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "v_history_local": {
+              "address": 139935336103936,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                22830,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            }
+          },
+          "operation": "chunk_prefill_varlen",
+          "rank": 0,
+          "runner": "TimedDCPAttentionRunner",
+          "world_size": 2
+        },
+        "overlap_q_allgather": false,
+        "post_capture_warmup": 40,
+        "rank_latency_ms": {
+          "p50": [
+            0.060896001756191254,
+            0.06032000109553337,
+            0.059039998799562454,
+            0.06014399975538254,
+            0.058111999183893204,
+            0.05897600017488003,
+            0.05875200033187866,
+            0.05878400057554245
+          ],
+          "p90": [
+            0.06603840291500092,
+            0.06128640100359917,
+            0.06095999851822853,
+            0.06737919896841049,
+            0.06429439783096313,
+            0.0618048008531332,
+            0.065219197422266,
+            0.06036160103976727
+          ]
+        },
+        "stream_policy": "single_stream",
+        "timing_source": "runner_cuda_event_end_to_end_only"
+      },
+      "logical_kv_read": {
+        "average_bytes_per_gpu": 11737600.0,
+        "bytes_by_tp_rank": [
+          11738112.0,
+          11737088.0,
+          11738112.0,
+          11737088.0,
+          11738112.0,
+          11737088.0,
+          11738112.0,
+          11737088.0
+        ],
+        "effective_bandwidth_gbps_per_gpu": 181.3597003343379,
+        "latency_basis": "p50_max_across_ranks",
+        "traffic_model": "logical BF16 K+V input bytes counted once"
+      },
+      "ours_no_overlap_speedup_vs_method": 1.0,
+      "output_collective_kind": "bf16_reduce_scatter",
+      "speedup_vs_full_kv": 0.6927070133481317,
+      "stages_ms": {
+        "a2a_all_to_all_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "a2a_pack_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "a2a_unpack_combine_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "attention_end_to_end_ms": {
+          "p50": 0.06472000107169151,
+          "p90": 0.06775040179491043
+        },
+        "local_chunk_attention_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "local_history_attention_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "lse_allgather_correct_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "output_collective_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "output_reduce_scatter_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "overlap_hidden_time_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "overlapped_ag_chunk_window_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "q_allgather_and_reorder_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "state_merge_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        }
+      },
+      "workspace_policy": "persistent_grow_only"
+    },
+    "ours_overlap_varlen": {
+      "communication": {
+        "collective_payload_bytes_per_rank_total": 199680.0,
+        "lse_allgather_receive_bytes_per_rank": 3072.0,
+        "output_collective": "bf16_reduce_scatter",
+        "output_collective_buffer_bytes_per_rank": 196608.0,
+        "output_collective_payload_bytes_per_rank": 98304.0,
+        "output_collective_remote_bytes_per_rank": 98304.0,
+        "q_allgather_receive_bytes_per_rank": 98304.0,
+        "tile_ready_remote_bytes_per_rank": 0.0
+      },
+      "effective_tflops": 182.25754194290928,
+      "execution": {
+        "capture_eager_warmup": 3,
+        "cuda_event_phase_timing_enabled": false,
+        "execution_mode": "cuda_graph",
+        "graph_static_signature": {
+          "bindings": {
+            "cu_seqlens_history_local": {
+              "address": 43073405440,
+              "device": "cuda:0",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_seqlens_history_local_host": {
+              "address": 1162328128,
+              "contents": [
+                0,
+                573,
+                3172,
+                5759,
+                19598,
+                20058,
+                22830
+              ],
+              "device": "cpu",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_seqlens_q": {
+              "address": 43073404928,
+              "device": "cuda:0",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_seqlens_q_host": {
+              "address": 1105434176,
+              "contents": [
+                0,
+                16,
+                32,
+                48,
+                64,
+                80,
+                96
+              ],
+              "device": "cpu",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "k_chunk": {
+              "address": 43073526272,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "k_history_local": {
+              "address": 139935556613120,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                22830,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "max_seqlen_history_local": 13839,
+            "max_seqlen_q": 16,
+            "num_splits": 0,
+            "overlap_q_allgather": true,
+            "q_local": {
+              "address": 43073427968,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                4,
+                128
+              ],
+              "stride": [
+                512,
+                128,
+                1
+              ]
+            },
+            "return_lse": false,
+            "v_chunk": {
+              "address": 43073550848,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "v_history_local": {
+              "address": 139935336103936,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                22830,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            }
+          },
+          "operation": "chunk_prefill_varlen",
+          "rank": 0,
+          "runner": "TimedDCPAttentionRunner",
+          "world_size": 2
+        },
+        "overlap_q_allgather": true,
+        "post_capture_warmup": 40,
+        "rank_latency_ms": {
+          "p50": [
+            0.060015998780727386,
+            0.06080000102519989,
+            0.06128000095486641,
+            0.06491199880838394,
+            0.057840000838041306,
+            0.05966399982571602,
+            0.05819199979305267,
+            0.05742400139570236
+          ],
+          "p90": [
+            0.06562240049242973,
+            0.06233600117266178,
+            0.06324799731373787,
+            0.07058240100741386,
+            0.0619264017790556,
+            0.061324800550937655,
+            0.0633791983127594,
+            0.05910399928689003
+          ]
+        },
+        "stream_policy": "compute_plus_communication",
+        "timing_source": "runner_cuda_event_end_to_end_only"
+      },
+      "logical_kv_read": {
+        "average_bytes_per_gpu": 11737600.0,
+        "bytes_by_tp_rank": [
+          11738112.0,
+          11737088.0,
+          11738112.0,
+          11737088.0,
+          11738112.0,
+          11737088.0,
+          11738112.0,
+          11737088.0
+        ],
+        "effective_bandwidth_gbps_per_gpu": 178.53491948732383,
+        "latency_basis": "p50_max_across_ranks",
+        "traffic_model": "logical BF16 K+V input bytes counted once"
+      },
+      "ours_no_overlap_speedup_vs_method": 1.0158220075665065,
+      "output_collective_kind": "bf16_reduce_scatter",
+      "overlap": {
+        "ag_chunk_window_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "hidden_time_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        }
+      },
+      "speedup_vs_full_kv": 0.6819177062402634,
+      "stages_ms": {
+        "a2a_all_to_all_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "a2a_pack_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "a2a_unpack_combine_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "attention_end_to_end_ms": {
+          "p50": 0.06574400141835213,
+          "p90": 0.07081280201673508
+        },
+        "local_chunk_attention_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "local_history_attention_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "lse_allgather_correct_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "output_collective_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "output_reduce_scatter_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "overlap_hidden_time_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "overlapped_ag_chunk_window_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "q_allgather_and_reorder_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "state_merge_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        }
+      },
+      "workspace_policy": "persistent_grow_only"
+    },
+    "sglang_mha_ag_ar_min_fa3_varlen": {
+      "communication": {
+        "collective_payload_bytes_per_rank_total": 494592.0,
+        "lse_allgather_receive_bytes_per_rank": 3072.0,
+        "output_collective": "fp32_all_reduce",
+        "output_collective_buffer_bytes_per_rank": 393216.0,
+        "output_collective_payload_bytes_per_rank": 393216.0,
+        "output_collective_remote_bytes_per_rank": 393216.0,
+        "q_allgather_receive_bytes_per_rank": 98304.0,
+        "tile_ready_remote_bytes_per_rank": 0.0
+      },
+      "effective_tflops": 98.61683537895145,
+      "execution": {
+        "capture_eager_warmup": 3,
+        "cuda_event_phase_timing_enabled": false,
+        "execution_mode": "cuda_graph",
+        "graph_static_signature": {
+          "bindings": {
+            "cu_seqlens_history_local": {
+              "address": 43073405440,
+              "device": "cuda:0",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_seqlens_history_local_host": {
+              "address": 1162328128,
+              "contents": [
+                0,
+                573,
+                3172,
+                5759,
+                19598,
+                20058,
+                22830
+              ],
+              "device": "cpu",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_seqlens_q": {
+              "address": 43073404928,
+              "device": "cuda:0",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_seqlens_q_host": {
+              "address": 1105434176,
+              "contents": [
+                0,
+                16,
+                32,
+                48,
+                64,
+                80,
+                96
+              ],
+              "device": "cpu",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "k_chunk": {
+              "address": 43073526272,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "k_history_local": {
+              "address": 139935556613120,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                22830,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "max_seqlen_history_local": 13839,
+            "max_seqlen_q": 16,
+            "num_splits": 0,
+            "overlap_q_allgather": false,
+            "q_local": {
+              "address": 43073427968,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                4,
+                128
+              ],
+              "stride": [
+                512,
+                128,
+                1
+              ]
+            },
+            "return_lse": false,
+            "v_chunk": {
+              "address": 43073550848,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "v_history_local": {
+              "address": 139935336103936,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                22830,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            }
+          },
+          "operation": "chunk_prefill_varlen",
+          "rank": 0,
+          "runner": "TimedSGLangDCPAttentionRunner",
+          "world_size": 2
+        },
+        "overlap_q_allgather": false,
+        "post_capture_warmup": 40,
+        "rank_latency_ms": {
+          "p50": [
+            0.1156960017979145,
+            0.11513599753379822,
+            0.11652800068259239,
+            0.12088000029325485,
+            0.11409599706530571,
+            0.11550400033593178,
+            0.1151839978992939,
+            0.11499199643731117
+          ],
+          "p90": [
+            0.11980160251259804,
+            0.11680960208177567,
+            0.1180511973798275,
+            0.12391679733991623,
+            0.11901119723916054,
+            0.11835839971899986,
+            0.12147520035505295,
+            0.11644480004906654
+          ]
+        },
+        "stream_policy": "single_stream",
+        "timing_source": "runner_cuda_event_end_to_end_only"
+      },
+      "logical_kv_read": {
+        "average_bytes_per_gpu": 11737600.0,
+        "bytes_by_tp_rank": [
+          11738112.0,
+          11737088.0,
+          11738112.0,
+          11737088.0,
+          11738112.0,
+          11737088.0,
+          11738112.0,
+          11737088.0
+        ],
+        "effective_bandwidth_gbps_per_gpu": 96.60257993598353,
+        "latency_basis": "p50_max_across_ranks",
+        "traffic_model": "logical BF16 K+V input bytes counted once"
+      },
+      "ours_no_overlap_speedup_vs_method": 1.8773794701396287,
+      "output_collective_kind": "fp32_all_reduce",
+      "speedup_vs_full_kv": 0.368975491830968,
+      "stages_ms": {
+        "a2a_all_to_all_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "a2a_pack_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "a2a_unpack_combine_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "attention_end_to_end_ms": {
+          "p50": 0.12150400131940842,
+          "p90": 0.12531200051307678
+        },
+        "local_chunk_attention_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "local_history_attention_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "lse_allgather_correct_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "output_collective_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "output_reduce_scatter_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "overlap_hidden_time_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "overlapped_ag_chunk_window_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "q_allgather_and_reorder_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "state_merge_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        }
+      },
+      "workspace_policy": "framework_style_per_call"
+    },
+    "vllm_a2a_min_fa3_varlen": {
+      "communication": {
+        "collective_payload_bytes_per_rank_total": 198144.0,
+        "lse_allgather_receive_bytes_per_rank": 0.0,
+        "output_collective": "bf16_packed_all_to_all",
+        "output_collective_buffer_bytes_per_rank": 199680.0,
+        "output_collective_payload_bytes_per_rank": 99840.0,
+        "output_collective_remote_bytes_per_rank": 99840.0,
+        "q_allgather_receive_bytes_per_rank": 98304.0,
+        "tile_ready_remote_bytes_per_rank": 0.0
+      },
+      "effective_tflops": 181.4186666450556,
+      "execution": {
+        "capture_eager_warmup": 3,
+        "cuda_event_phase_timing_enabled": false,
+        "execution_mode": "cuda_graph",
+        "graph_static_signature": {
+          "bindings": {
+            "cu_seqlens_history_local": {
+              "address": 43073405440,
+              "device": "cuda:0",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_seqlens_history_local_host": {
+              "address": 1162328128,
+              "contents": [
+                0,
+                573,
+                3172,
+                5759,
+                19598,
+                20058,
+                22830
+              ],
+              "device": "cpu",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_seqlens_q": {
+              "address": 43073404928,
+              "device": "cuda:0",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_seqlens_q_host": {
+              "address": 1105434176,
+              "contents": [
+                0,
+                16,
+                32,
+                48,
+                64,
+                80,
+                96
+              ],
+              "device": "cpu",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "k_chunk": {
+              "address": 43073526272,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "k_history_local": {
+              "address": 139935556613120,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                22830,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "max_seqlen_history_local": 13839,
+            "max_seqlen_q": 16,
+            "num_splits": 0,
+            "overlap_q_allgather": false,
+            "q_local": {
+              "address": 43073427968,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                4,
+                128
+              ],
+              "stride": [
+                512,
+                128,
+                1
+              ]
+            },
+            "return_lse": false,
+            "v_chunk": {
+              "address": 43073550848,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "v_history_local": {
+              "address": 139935336103936,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                22830,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            }
+          },
+          "operation": "chunk_prefill_varlen",
+          "rank": 0,
+          "runner": "TimedVLLMA2ADCPAttentionRunner",
+          "world_size": 2
+        },
+        "overlap_q_allgather": false,
+        "post_capture_warmup": 40,
+        "rank_latency_ms": {
+          "p50": [
+            0.06334400177001953,
+            0.06102399900555611,
+            0.061103999614715576,
+            0.06251199916005135,
+            0.05951999872922897,
+            0.061824001371860504,
+            0.05991999991238117,
+            0.059776000678539276
+          ],
+          "p90": [
+            0.06697920337319374,
+            0.06202879920601845,
+            0.06172800064086914,
+            0.06973440125584603,
+            0.06425919756293297,
+            0.0646464005112648,
+            0.06154559925198555,
+            0.060336000844836236
+          ]
+        },
+        "stream_policy": "single_stream",
+        "timing_source": "runner_cuda_event_end_to_end_only"
+      },
+      "logical_kv_read": {
+        "average_bytes_per_gpu": 11737600.0,
+        "bytes_by_tp_rank": [
+          11738112.0,
+          11737088.0,
+          11738112.0,
+          11737088.0,
+          11738112.0,
+          11737088.0,
+          11738112.0,
+          11737088.0
+        ],
+        "effective_bandwidth_gbps_per_gpu": 177.71317827340397,
+        "latency_basis": "p50_max_across_ranks",
+        "traffic_model": "logical BF16 K+V input bytes counted once"
+      },
+      "ours_no_overlap_speedup_vs_method": 1.020519142679019,
+      "output_collective_kind": "bf16_packed_all_to_all",
+      "speedup_vs_full_kv": 0.6787790491902677,
+      "stages_ms": {
+        "a2a_all_to_all_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "a2a_pack_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "a2a_unpack_combine_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "attention_end_to_end_ms": {
+          "p50": 0.06604800000786781,
+          "p90": 0.07037759944796562
+        },
+        "local_chunk_attention_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "local_history_attention_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "lse_allgather_correct_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "output_collective_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "output_reduce_scatter_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "overlap_hidden_time_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "overlapped_ag_chunk_window_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "q_allgather_and_reorder_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "state_merge_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        }
+      },
+      "workspace_policy": "framework_style_per_call"
+    },
+    "vllm_ag_rs_min_fa3_varlen": {
+      "communication": {
+        "collective_payload_bytes_per_rank_total": 199680.0,
+        "lse_allgather_receive_bytes_per_rank": 3072.0,
+        "output_collective": "bf16_reduce_scatter",
+        "output_collective_buffer_bytes_per_rank": 196608.0,
+        "output_collective_payload_bytes_per_rank": 98304.0,
+        "output_collective_remote_bytes_per_rank": 98304.0,
+        "q_allgather_receive_bytes_per_rank": 98304.0,
+        "tile_ready_remote_bytes_per_rank": 0.0
+      },
+      "effective_tflops": 166.31052285537368,
+      "execution": {
+        "capture_eager_warmup": 3,
+        "cuda_event_phase_timing_enabled": false,
+        "execution_mode": "cuda_graph",
+        "graph_static_signature": {
+          "bindings": {
+            "cu_seqlens_history_local": {
+              "address": 43073405440,
+              "device": "cuda:0",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_seqlens_history_local_host": {
+              "address": 1162328128,
+              "contents": [
+                0,
+                573,
+                3172,
+                5759,
+                19598,
+                20058,
+                22830
+              ],
+              "device": "cpu",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_seqlens_q": {
+              "address": 43073404928,
+              "device": "cuda:0",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "cu_seqlens_q_host": {
+              "address": 1105434176,
+              "contents": [
+                0,
+                16,
+                32,
+                48,
+                64,
+                80,
+                96
+              ],
+              "device": "cpu",
+              "dtype": "torch.int32",
+              "shape": [
+                7
+              ],
+              "stride": [
+                1
+              ]
+            },
+            "k_chunk": {
+              "address": 43073526272,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "k_history_local": {
+              "address": 139935556613120,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                22830,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "max_seqlen_history_local": 13839,
+            "max_seqlen_q": 16,
+            "num_splits": 0,
+            "overlap_q_allgather": false,
+            "q_local": {
+              "address": 43073427968,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                4,
+                128
+              ],
+              "stride": [
+                512,
+                128,
+                1
+              ]
+            },
+            "return_lse": false,
+            "v_chunk": {
+              "address": 43073550848,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                96,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            },
+            "v_history_local": {
+              "address": 139935336103936,
+              "device": "cuda:0",
+              "dtype": "torch.bfloat16",
+              "shape": [
+                22830,
+                1,
+                128
+              ],
+              "stride": [
+                128,
+                128,
+                1
+              ]
+            }
+          },
+          "operation": "chunk_prefill_varlen",
+          "rank": 0,
+          "runner": "TimedVLLMDCPAttentionRunner",
+          "world_size": 2
+        },
+        "overlap_q_allgather": false,
+        "post_capture_warmup": 40,
+        "rank_latency_ms": {
+          "p50": [
+            0.06667200103402138,
+            0.06574400141835213,
+            0.06603199988603592,
+            0.06745599955320358,
+            0.06515199691057205,
+            0.06788800284266472,
+            0.06515199691057205,
+            0.06513599678874016
+          ],
+          "p90": [
+            0.0704415999352932,
+            0.0678464025259018,
+            0.0676192007958889,
+            0.07381760254502297,
+            0.07018879801034927,
+            0.07035199925303459,
+            0.07190720289945603,
+            0.06646399945020676
+          ]
+        },
+        "stream_policy": "single_stream",
+        "timing_source": "runner_cuda_event_end_to_end_only"
+      },
+      "logical_kv_read": {
+        "average_bytes_per_gpu": 11737600.0,
+        "bytes_by_tp_rank": [
+          11738112.0,
+          11737088.0,
+          11738112.0,
+          11737088.0,
+          11738112.0,
+          11737088.0,
+          11738112.0,
+          11737088.0
+        ],
+        "effective_bandwidth_gbps_per_gpu": 162.91361932873934,
+        "latency_basis": "p50_max_across_ranks",
+        "traffic_model": "logical BF16 K+V input bytes counted once"
+      },
+      "ours_no_overlap_speedup_vs_method": 1.1132261445151288,
+      "output_collective_kind": "bf16_reduce_scatter",
+      "speedup_vs_full_kv": 0.6222518369345732,
+      "stages_ms": {
+        "a2a_all_to_all_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "a2a_pack_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "a2a_unpack_combine_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "attention_end_to_end_ms": {
+          "p50": 0.07204799726605415,
+          "p90": 0.07450240105390549
+        },
+        "local_chunk_attention_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "local_history_attention_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "lse_allgather_correct_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "output_collective_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "output_reduce_scatter_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "overlap_hidden_time_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "overlapped_ag_chunk_window_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "q_allgather_and_reorder_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        },
+        "state_merge_ms": {
+          "p50": 0.0,
+          "p90": 0.0
+        }
+      },
+      "workspace_policy": "framework_style_per_call"
+    }
+  },
+  "packed_tokens": {
+    "total_local_history_by_tp_rank": [
+      22830,
+      22828,
+      22830,
+      22828,
+      22830,
+      22828,
+      22830,
+      22828
+    ],
+    "total_q": 96,
+    "total_reference_k": 45754
+  },
+  "parameters": {
+    "b": 6,
+    "baseline_phase_timing": false,
+    "check": false,
+    "cuda_graph": true,
+    "dcp_size": 2,
+    "headdim": 128,
+    "implementations": [
+      "ours",
+      "vllm",
+      "sglang",
+      "full"
+    ],
+    "iters": 60,
+    "kvhead": 4,
+    "mega_block_n": "auto",
+    "mega_history_order": "auto",
+    "mega_num_comm_sm": 8,
+    "mega_phase_timestamps": false,
+    "mega_scheduler_heuristic": false,
+    "method_labels": [
+      "ours_no_overlap_varlen",
+      "ours_overlap_varlen",
+      "vllm_ag_rs_min_fa3_varlen",
+      "vllm_a2a_min_fa3_varlen",
+      "sglang_mha_ag_ar_min_fa3_varlen",
+      "full_kv_min_fa3_varlen"
+    ],
+    "num_splits": 0,
+    "output_json": "benchmark_logs/bench_dcp/20260811-222407/results/arrival_1/dcp_2/baseline_graph/case_000010_dcp2_hkv4_graph.json",
+    "qhead": 32,
+    "seqlen": "1145,5197,5174,27678,920,5544",
+    "sq": "16,16,16,16,16,16",
+    "tp_size": 8,
+    "warmup": 40,
+    "workload": "chunk"
+  },
+  "pinned_sources": {
+    "sglang": "8d6549bc4039d33635844495d86684677a4f0df8",
+    "vllm": "a89015c6df8eeb37a843b717c97a5be1355de83d"
+  },
+  "schema_version": 3,
+  "topology": {
+    "dcp_groups": [
+      [
+        0,
+        1
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        4,
+        5
+      ],
+      [
+        6,
+        7
+      ]
+    ],
+    "dcp_size": 2,
+    "kv_heads": 4,
+    "kv_replicas": 2,
+    "q_heads": 32,
+    "q_heads_local": 4,
+    "q_heads_per_kv": 8,
+    "tp_size": 8
+  }
+}
