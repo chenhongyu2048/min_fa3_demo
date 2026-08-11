@@ -2482,13 +2482,16 @@ class DCPMegaAttentionRunner:
         max_q_ready = self._max_token_blocks
         max_publish = self.world_size * self._max_token_blocks
         max_history_combine = self.world_size * max_total_q * Hq_local
-        max_final = self._max_token_blocks
-        vectors_per_work = 16 * Hq_local
+        max_final = (max_total_q + 3) // 4
+        vectors_per_publish = 16 * Hq_local
+        vectors_per_final = 4 * Hq_local
         max_q_dependencies = max_history_base_tiles * min(128, max_q_ready)
         max_publish_dependencies = (
-            max_publish * vectors_per_work * max_num_splits
+            max_publish * vectors_per_publish * max_num_splits
         )
-        max_final_dependencies = max_final * vectors_per_work * max_num_splits
+        max_final_dependencies = (
+            max_final * vectors_per_final * max_num_splits
+        )
         self._metadata_capacity = (
             self._METADATA_HEADER_INTS
             + max_attention * 8
@@ -2519,7 +2522,7 @@ class DCPMegaAttentionRunner:
             max_publish, dtype=torch.int32, **cuda
         )
         self._receive_ready = torch.empty(
-            max_final * (self.world_size - 1),
+            self._max_token_blocks * (self.world_size - 1),
             dtype=torch.int32,
             **cuda,
         )
@@ -2791,6 +2794,7 @@ class DCPMegaAttentionRunner:
             }
             self._last_queue_counts = {
                 "token_blocks": token_blocks,
+                "final_tokens_per_task": metadata.final_tokens_per_task,
                 "q_ready_counters": metadata.q_ready_count,
                 "block_n_policy": (
                     "fixed"

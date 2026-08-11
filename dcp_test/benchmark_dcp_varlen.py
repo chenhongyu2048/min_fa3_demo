@@ -664,7 +664,8 @@ def measure_mega(
             ),
             "timing_source": (
                 "external_python_cuda_events"
-                if graph_mode else "internal_cpp_cuda_events"
+                if graph_mode
+                else "internal_cpp_reused_launch_adjacent_cuda_events"
             ),
             "pre_barrier": (
                 "captured_ipc_phase_barrier"

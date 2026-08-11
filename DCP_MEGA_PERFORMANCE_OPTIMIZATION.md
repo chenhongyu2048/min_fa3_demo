@@ -1707,3 +1707,464 @@ split、`num_comm_sm=8` 和 phase timestamps。与 2026-08-07 修改前诊断 ru
 导致的伪细粒度 copy。剩余大 case tail 仍包含不可消除的约 210 MB O/LSE 搬运，
 下一步应先用 hardware counter 区分 HBM 带宽与 receive backpressure，不应重新
 把真实 split reduction 合并进一个 warp task。
+
+## 21. Metadata v7：自适应 final combine 与 pull/final 同序（2026-08-11）
+
+本节记录 DCP8 decode-only final combine 的实际实现和 100-case 验证。它建立在
+前述 history combine、receive bounded scan 和自适应 copy task 之上，不改变
+16-token IPC communication tile、remote ready phase 或 FA3 attention mainloop。
+
+### 21.1 原始问题
+
+arrival rate 1 的 DCP8 decode-only trace 中，原始 Mega 的
+`receive_done -> final_combine_done` 平均约为 `27.590 us`，而整个 kernel body
+平均约为 `87.675 us`；对应 CUDA event latency 为 `99.304 us`。final 阶段已经
+接近 body 的三分之一。
+
+同一原始 phase run、固定 `comm_sm=12` 时，DCP2/4/8 的 decode-only 结果如下。
+这里先对每个 case 的 global milestone p50 做差，再对 87 个 decode cases 求算术
+平均；`Final/body` 使用相同 case 集合的均值之比：
+
+| DCP | CUDA event | Kernel body | `receive_done -> final_done` | Final/body |
+| ---: | ---: | ---: | ---: | ---: |
+| 2 | 79.152 us | 68.907 us | 10.758 us | 15.6% |
+| 4 | 82.823 us | 72.224 us | 15.994 us | 22.1% |
+| 8 | 99.304 us | 87.675 us | 27.590 us | 31.5% |
+
+因此原始 final critical tail 随 DCP size 明显放大；DCP2 并非主要瓶颈，DCP4 已占
+body 约五分之一，而 DCP8 达到约三分之一。这也是本轮优先优化 DCP8、同时保留
+大 task-count 动态 claim 路径的原因。
+
+旧 final queue 固定一个 16-token task 对应一个 CTA。低负载 decode 的 parent
+task 数远小于 H100 上的 compute CTA 数，因此大量 CTA 无工作；有工作的 CTA
+又需要串行遍历 8 个 DCP state。单纯增加 communication task 数不能解决这个
+问题，因为 remote publication 和 TMA pull 仍应保持 16-token 对齐。
+
+### 21.2 自适应 final task 粒度
+
+Metadata v7 将 communication parent 和 final compute subtask 分离。parent 数仍为：
+
+```text
+parent_task_count = ceil(total_q / 16)
+num_compute_ctas  = num_sms - num_comm_sm
+```
+
+final task 的 token 粒度使用严格小于比较：
+
+```text
+parent_task_count <     num_compute_ctas ->  4 tokens/final task
+parent_task_count < 2 * num_compute_ctas ->  8 tokens/final task
+otherwise                                -> 16 tokens/final task
+```
+
+边界行为为：
+
+```text
+N - 1  -> 4
+N      -> 8
+2N - 1 -> 8
+2N     -> 16
+```
+
+Q all-gather、history publish、remote output pull、`tile_ready` 和
+`receive_ready` 仍基于 16-token parent tile。4/8-token final descriptor 不跨 parent
+边界；同一 parent 的 sibling subtasks 共享 publish/receive readiness。
+`FinalWorkDesc` 新增 `parent_token_block`，packed header 仍保持 40 个 int，metadata
+semantic version 升到 v7。`FINAL_TOKENS_PER_TASK=4` 继续作为容量上界中的最小粒度，
+实际选择通过 runtime queue diagnostics 的 `final_tokens_per_task` 报告。
+
+### 21.3 Pull 与 final descriptor 使用同一 parent 顺序
+
+旧实现即使为 final queue 增加 subtasks，如果 remote output pull 和 final descriptor
+采用不同 parent 顺序，排在 final queue 前面的 task 仍可能长期等待未被优先 pull
+的 parent。
+
+v7 使用同一个 `heuristic_q_block_order` 控制：
+
+```text
+Q all-gather/pull
+  -> history combine/publish
+  -> remote output pull logical order
+  -> final descriptor parent order
+```
+
+CUDA helper `receive_task_id_from_pull_ordinal()` 将 logical pull ordinal 通过
+`q_tasks[parent_ordinal * DCPSize]` 映射回原有 physical receive layout：
+
+```text
+receive_id = physical_parent_token_block * (DCPSize - 1) + source_ordinal
+```
+
+因此 IPC 地址和 `receive_ready[parent, source]` 布局没有变化。final descriptors
+先按 `heuristic_q_block_order` 分组，再按 parent 内 token offset 排列。
+
+这里对齐的是 logical scheduling priority，不是强制完成顺序。receive loop 仍是
+readiness-aware bounded scan；后排但已经 ready 的 parent 可以先完成，不引入
+device-side completion FIFO。
+
+### 21.4 Final CTA 调度与 DCP-state reduction
+
+final queue 使用两种调度：
+
+```text
+final_count <= num_compute_ctas:
+    static CTA i -> final task i
+
+final_count > num_compute_ctas:
+    atomic counter claims descriptors in metadata order
+```
+
+静态路径去掉低负载 decode 中每个 CTA 的 final ticket atomic。大 batch 保留动态
+claim，避免 task 数超过 CTA 数时只处理第一波。
+
+每个 128-d output vector 使用 16-lane subgroup。前 8 lanes 分别拥有一个 DCP
+state 的 LSE，先通过 subgroup shuffle 并行求 max 和 denominator，再对 O 做加权
+累加。该实现避免由一个 lane 串行加载 8 个 LSE，并减少原路径通过 shared memory
+广播 LSE 所需的 warp 同步。
+
+完全 unroll 最大 final task 的尝试导致明显 register spill，因此最终保留：
+
+```cpp
+#pragma unroll 1
+for (int vector_in_task = vector_in_wave;
+     vector_in_task < work.valid_vectors;
+     vector_in_task += 16)
+```
+
+代表性 DCP8、Hq-local=4、non-split 实例为 `288B spill stores / 300B spill loads`，
+没有采用 spill 更严重的全展开版本。
+
+### 21.5 正确性验证
+
+CPU metadata suite：
+
+```text
+python -m unittest scripts.test_min_fa3.test_dcp_mega_metadata
+Ran 39 tests
+OK
+```
+
+测试覆盖 DCP2/4/8、4/8/16-token 分支、严格阈值、non-16 tail、parent 不交叉、
+pull/final parent 同序和 metadata capacity。
+
+DCP8 GPU correctness 额外覆盖：
+
+1. `q=(16,16,16)`、history `(1139,44536,3167)`、实际 parent order `(1,2,0)`，
+   验证非平凡 release-LPT 顺序和 4-token final。
+2. `108 x 16-token` decode requests，命中 `num_compute_ctas=108` 的 8-token 边界。
+3. `216 x 16-token` decode requests，命中 16-token 边界。
+
+三组均通过 eager、prepared replay 和 CUDA Graph，并验证 O/LSE reference。
+完整 SM90 build 覆盖 DCP2/4/8、split/non-split、BlockN 128/176、Hq-local 4/8。
+
+### 21.6 100-case benchmark
+
+原始日志删除后，以以下 run ID 和本节内嵌结果作为归档记录：
+
+| Run ID | 代码状态与范围 | Manifest 完整性 | Timing source |
+| --- | --- | ---: | --- |
+| `20260811-150046-arrival1-phases-graph` | 原始 Metadata v5；DCP2/4/8 Mega phase sweep 和 Graph baselines | 每个 DCP 的 Mega 500/500；Graph 100/100 | Mega `internal_cpp_cuda_events`；Graph capture 内 events |
+| `20260811-174805-final4-arrival1-dcp8` | 固定 4-token final，尚未 pull/final 同序 | 500/500，5 个 comm-SM variants | `internal_cpp_cuda_events` |
+| `20260811-193634-adaptive-final-order-arrival1-dcp8` | 自适应 4/8/16-token final + pull/final 同序 | 100/100，`comm_sm=12` | `internal_cpp_cuda_events` |
+| `20260811-launch-adjacent-events-dcp8` | 相同 final kernel，加 direct-launch/event 优化 | 100/100，`comm_sm=12` | `internal_cpp_reused_launch_adjacent_cuda_events` |
+
+四次 run 的共同环境和工作负载为：8x NVIDIA H100 80GB HBM3、CUDA 12.8、
+PyTorch 2.10.0+cu128、Python 3.12.13、TP=8、Q heads=32、head dim=128、
+arrival rate 1、seed 42、warmup 40、iterations 60。trace 共 100 cases，其中 87 个
+decode-only、13 个 mixed；trace SHA256 为
+`b8cbb061a85206d729d91cdc2981f43c9e0d99209dce588d3af5f7934408b9df`。
+各 DCP 的生成配置 SHA256 为：
+
+| DCP | Trace config SHA256 |
+| ---: | --- |
+| 2 | `fe04ed59234d34eef061618bed6a82399b31a7c5f5449186998d93c519117505` |
+| 4 | `46ad02286b580356a65ec08220a4eb041925b0a6d4de91b11b37461ca8f73155` |
+| 8 | `dd35c6a45eae1863c671cfe3023173c39b4515b9c11a411851be7d362738f301` |
+
+原始 phase run 记录的 repository commit 为 `3c014397fae8b016d7d13e8ec9cdf2b3b136d9ba`；
+后三次 run 记录为 `caa5b0c580b2472decc1e0137711908d677aad54`。final 和 launch
+修改当时尚在 working tree 中，因此 commit 字段不能单独标识 kernel 版本，必须
+同时使用上表的 run ID 和代码状态。baseline source commits 为 vLLM
+`a89015c6df8eeb37a843b717c97a5be1355de83d`、SGLang
+`8d6549bc4039d33635844495d86684677a4f0df8`。
+
+DCP8 headline 对比统一选择 `comm_sm=12`。每个 iteration 先对 8 个 rank 的 local
+latency 取最大值，每个 case 再跨 iterations 取 p50，最后对 100 cases 的
+global-rank-max p50 求算术平均。fixed-final4 和原始 Mega 虽运行了
+`comm_sm=4,8,12,16,20` 五档 sweep，下表没有进行 per-case best-of-sweep 选择。
+
+| Scope | Adaptive + order | Fixed final4 | Original Mega | vLLM A2A Graph |
+| --- | ---: | ---: | ---: | ---: |
+| All 100 | 0.132733 ms | 0.135494 ms | 0.154088 ms | 0.208366 ms |
+| Decode-only 87 | 0.075730 ms | 0.076910 ms | 0.099304 ms | 0.139419 ms |
+| Mixed 13 | 0.514212 ms | 0.527554 ms | 0.520725 ms | 0.669776 ms |
+
+用于复核 phase 差值的 DCP8 decode-only 绝对 milestone 均值如下。所有 milestone
+均相对各 rank 的 `%globaltimer kernel_start`，表中仍采用每 case global-rank-max
+p50 后跨 case 求均值：
+
+| Variant | Event | Q done | Attention done | History/publish done | Receive done | Final done | Kernel done |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original Mega | 99.304 us | 7.806 us | 38.599 us | 50.215 us | 59.812 us | 87.402 us | 87.675 us |
+| Fixed final4 | 76.910 us | 7.789 us | 38.556 us | 50.223 us | 59.261 us | 65.079 us | 65.360 us |
+| Adaptive + order | 75.730 us | 7.850 us | 39.009 us | 50.757 us | 57.715 us | 63.942 us | 64.239 us |
+
+相对 fixed-final4：
+
+```text
+All:    1.0208x, wins 83/100
+Decode: 1.0156x, wins 76/87
+```
+
+相对 original Mega：
+
+```text
+All:    1.1609x, wins 96/100
+Decode: 1.3113x, wins 87/87
+```
+
+相对仓库中的 vLLM A2A CUDA Graph orchestration baseline：
+
+```text
+All:    1.5698x, wins 100/100
+Decode: 1.8410x, wins 87/87
+```
+
+这里的 vLLM baseline 使用同一个 `min_fa3_op` attention kernel，只比较仓库中的
+A2A orchestration，不代表 production vLLM 原生 kernel 性能。
+
+decode-only phase 平均值：
+
+| Phase | Adaptive + order | Fixed final4 | Original Mega |
+| --- | ---: | ---: | ---: |
+| `publish_done -> receive_done` | 6.959 us | 9.039 us | 9.597 us |
+| `history_combine_done -> final_done` | 13.185 us | 14.856 us | 37.188 us |
+| `receive_done -> final_done` | 6.226 us | 5.818 us | 27.590 us |
+
+顺序对齐主要改善 remote output arrival：publish-to-receive 相对 fixed-final4 下降
+约 23%。纯 terminal final compute 比 fixed-final4 慢约 `0.41 us`，但相对 original
+Mega 的 terminal tail 改善约 `4.43x / 77.4%`。仓库 vLLM A2A Graph 的 decode
+`a2a_unpack_combine` 平均为 `6.375 us`，当前 Mega final arithmetic 已处于同一量级。
+
+原始 Graph phase run 中，vLLM A2A baseline 的完整 decode-only stage 均值如下。
+每项都是 87 个 case 的 per-case global-rank-max p50 算术平均；stage event 独立
+测量，存在 stream overlap 和 event boundary，因此各列不要求严格相加等于 E2E：
+
+| DCP | Graph E2E | Q AG + reorder | History attention | A2A pack | A2A collective | Unpack + combine | Chunk attention | State merge |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 123.678 us | 19.505 us | 29.671 us | 6.112 us | 14.369 us | 5.870 us | 13.992 us | 5.873 us |
+| 4 | 127.250 us | 22.989 us | 27.201 us | 6.727 us | 15.908 us | 5.929 us | 13.741 us | 5.769 us |
+| 8 | 139.419 us | 29.441 us | 26.383 us | 7.834 us | 21.277 us | 6.375 us | 13.752 us | 5.760 us |
+
+`a2a_unpack_combine` 在 DCP2/4/8 decode 中分别占 Graph E2E 的约 4.75%、4.66% 和
+4.57%。它没有像原始 Mega final 一样随 DCP8 放大到 body 的三分之一；但该 kernel
+只完成 A2A 后的 unpack/LSE merge，不能脱离 Graph orchestration 总时间单独比较
+端到端优劣。
+
+同一次 Graph run 中的 SGLang-style baseline 没有同构的单个 final-combine kernel。
+它先 all-gather LSE，在 PyTorch 中计算 global LSE 和 partial-output scale，再对
+FP32 partial output 执行 all-reduce；distributed combine 成本应看
+`LSE all-gather/correction + FP32 all-reduce` 两段之和：
+
+| DCP | Graph E2E | LSE AG + correction | FP32 all-reduce | Distributed combine 合计 | Chunk state merge |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 178.091 us | 45.717 us | 18.382 us | 64.099 us | 29.499 us |
+| 4 | 188.838 us | 47.909 us | 26.207 us | 74.116 us | 29.161 us |
+| 8 | 229.207 us | 55.237 us | 51.591 us | 106.829 us | 29.661 us |
+
+这些也是 87 个 decode-only case 的 per-case global-rank-max p50 算术平均。该
+SGLang-style 数字来自仓库内使用相同 `min_fa3_op` attention kernel 的 pinned
+orchestration，并非 production SGLang 原生 kernel benchmark。其优点是逻辑直接、
+利用成熟 collectives；但在此低负载 DCP8 trace 上，FP32 payload、单独 LSE
+all-gather 和高层 correction 使它不适合作为 Mega final 的低延迟实现模板。相较之下，
+vLLM A2A 的 packed BF16 O + FP32 LSE 传输及单个 unpack/combine kernel 更接近当前
+Mega final 所需的数据流。
+
+该 trace 的粒度分布为：
+
+```text
+4-token:  93 cases
+8-token:   0 cases
+16-token:  7 cases
+```
+
+87 个 decode-only case 全部选择 4-token。6 个小 mixed case 选择 4-token，相对
+fixed-final4 基本持平；7 个大 mixed case 选择 16-token，总延迟改善 2.9%，且
+`receive_done -> final_done` 从 `73.461 us` 降到 `27.872 us`。8-token 中间分支
+由 correctness 覆盖，但该 100-case trace 没有实际命中。
+
+`case_000000` 相对 fixed-final4 有一个明显 decode 回归：`78.640 -> 99.872 us`，
+几乎全部来自 `receive_done: 61.056 -> 80.976 us`。8 个 rank 生成的 parent order
+均为 `(0,4,1,3,5,2,6)`，不是跨 rank metadata disagreement。本轮按要求暂不围绕
+该反例回退整体 ordering，因为 ordering 在 76/87 decode cases 和 83/100 overall
+cases 上获胜。
+
+## 22. Direct-launch 热路径与 event/body gap（2026-08-11）
+
+本节记录 final combine 优化完成后，对 Mega eager CUDA event 计时边界和 direct
+launch 热路径的第一阶段优化。该阶段不改变 kernel body、workspace reset、IPC
+phase 或 metadata 内容。
+
+### 22.1 固定约 11.5 us 差值的来源
+
+在上一节 100-case run 中，event 时间和 `%globaltimer` body 为：
+
+| Scope | CUDA event | `kernel_done-kernel_start` | Gap |
+| --- | ---: | ---: | ---: |
+| All 100 | 132.733 us | 121.186 us | 11.547 us |
+| Decode-only 87 | 75.730 us | 64.239 us | 11.491 us |
+| Mixed 13 | 514.212 us | 502.289 us | 11.922 us |
+
+decode gap 的范围只有 `10.96-11.92 us`，与 workload 大小基本无关。旧 C++
+binding 的顺序为：
+
+```text
+cudaEventRecord(start)
+  -> construct two FA3 KernelParams
+  -> cudaGetDevice twice
+  -> construct TK PGL/GL and Mega KernelParams
+  -> cudaFuncSetAttribute
+  -> kernel<<<...>>>()
+  -> cudaGetLastError
+cudaEventRecord(end)
+```
+
+CUDA event timestamp 在 GPU 上执行。如果 GPU 已经处理 start event，而 host 仍在
+构造参数或调用 runtime，stream 会出现可见 idle bubble，并被 event elapsed time
+计入。
+
+内部 timestamp 也不是完整 grid 生命周期。`kernel_start` 只由
+`blockIdx.x == 0 && threadIdx.x == 0` 写入，不保证等于最早 CTA entry；
+`kernel_done` 由最后一个 CTA 的 completion atomic winner 在 CTA retirement 前写入。
+因此 event-body gap 同时包含 event command、direct launch dispatch、grid ramp-up、
+timestamp 边界偏差和最后 CTA retirement。
+
+### 22.2 第一阶段修改
+
+修改保持公开 runner API 和 kernel 参数语义不变：
+
+1. C++ binding 使用 thread-local、per-device `ReusableTimingEvents`，不再每次
+   replay 执行 `cudaEventCreate/Destroy`。
+2. Binding 将 `q.get_device()` 写入 `DCPMega_fwd_params.device`，两个
+   `make_attention_kernel_params()` 不再各自调用 `cudaGetDevice()`。
+3. `cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize)` 使用每个
+   kernel specialization、每个 device 的 `std::call_once`，只设置一次。
+4. Typed launcher 完成 `KernelParams` 构造和一次性 attribute setup 后，执行：
+
+```text
+cudaEventRecord(start)
+kernel<<<...>>>()
+cudaEventRecord(end)
+cudaGetLastError
+```
+
+5. Benchmark JSON 将 eager timing source 标记为
+   `internal_cpp_reused_launch_adjacent_cuda_events`。
+
+本阶段没有引入 type-erased C++ prepared-launch handle。typed `KernelParams` 仍在
+每次 backend call 重建，只是构造发生在 device event 之前。完整缓存需要按
+DCP/BlockN/split/Hq specialization 保存不同 C++ 类型，并定义 dynamic metadata、
+header 和 pointer 更新协议；当前 device event 指标也不能衡量该 host-only 收益，
+因此没有在本轮扩大修改面。
+
+### 22.3 构建与验证
+
+完整 extension build 覆盖 DCP2/4/8、split/non-split、BlockN 128/176、Hq-local
+4/8。PTXAS register、stack 和 spill 与 final-combine 修改后的 build 一致；代表性
+DCP8、Hq-local=4、non-split 实例仍为 `288B spill stores / 300B spill loads`。
+
+聚焦 DCP8 correctness 使用 `q=(1,8,16)`、history `(129,258,515)`、Hq-local=4、
+split=1、BlockN=128、`comm_sm=8`，通过 eager、prepared replay 和 CUDA Graph。
+
+### 22.4 Paired 100-case benchmark
+
+归档 run ID 为 `20260811-launch-adjacent-events-dcp8`；原始日志可删除，必要的环境、
+trace hash、manifest 完整性和 timing source 已归档在 21.6。配置与
+`20260811-193634-adaptive-final-order-arrival1-dcp8` 相同：DCP8、arrival rate 1、
+`comm_sm=12`、warmup 40、iterations 60、同一 trace、Mega eager、phase timestamps
+enabled，100/100 cases 完成。
+
+| Scope | Old event | New event | Old body | New body | Old gap | New gap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| All 100 | 132.733 us | 128.741 us | 121.186 us | 121.533 us | 11.547 us | 7.208 us |
+| Decode-only 87 | 75.730 us | 71.283 us | 64.239 us | 64.111 us | 11.491 us | 7.172 us |
+| Mixed 13 | 514.212 us | 513.268 us | 502.289 us | 505.819 us | 11.922 us | 7.449 us |
+
+decode-only event 平均下降 `4.447 us / 5.87%`，约 `1.062x`；body 仅变化
+`-0.128 us`，可视为持平。event-body gap 下降 `4.319 us / 37.6%`。87 个 decode
+case 中 86 个 event 更短；全部 100 cases 中 97 个更短。
+
+新 decode gap 分布为：
+
+```text
+mean  7.172 us
+p50   7.168 us
+min   6.816 us
+max   7.504 us
+```
+
+三个 event 未获胜的 case 为 mixed `case_000014`、mixed `case_000044` 和 decode
+`case_000069`。三者的新 gap 均下降，event 回归来自该轮 kernel body 波动；其中
+`case_000014` body 增加约 `41 us`。
+
+约 `4.3 us` gap 收缩不能全部解释成真实 serving latency 收益。缓存 function
+attribute、删除 runtime device query 和复用 events 是实际 host 热路径优化；把
+event 移到 typed params 构造之后则修正了计时边界。真实 host-to-output latency
+仍需 CPU wall time、CUPTI 或 Nsight Systems 单独测量，不能用新的纯 device
+kernel-command event 直接代替。
+
+### 22.5 Reset、CUDA Graph 与 baseline 计时语义
+
+Mega eager prepared replay 的以下 reset 发生在 internal event 之前：
+
+```text
+q_ready.zero_()
+attention_done.zero_()
+publish_ready.zero_()
+receive_ready.zero_()
+queue_state.zero_()
+phase_timestamps.zero_()  # profiling enabled 时
+```
+
+因此 reset 不是旧 `11.5 us` gap 的来源。CUDA Graph 也支持 capture 这些
+`cudaMemsetAsync`；现有 Mega fixed-shape Graph 已经 capture：
+
+```text
+workspace reset
+  -> device phase advance
+  -> pre IPC barrier
+  -> Mega kernel
+  -> post IPC barrier
+```
+
+动态 batch 使用 Graph 的主要障碍是 dynamic metadata/header、kernel
+specialization 和 pointer 更新，不是 buffer reset。
+
+baseline Graph 当前也不是把多次 replay 放在一对 event 中再平均。每个 sample
+执行一次 `graph.replay()`；capture 内的 `attention_start/end` event nodes 记录
+单次完整 Graph 的时间。该口径：
+
+- 排除 Python、逐 kernel host launch、Graph capture/instantiate 和后续 rank
+  aggregation；
+- 通常排除 `cudaGraphLaunch` host API 和内部 start event 执行前的初始部分；
+- 包含 start/end event nodes 的扰动、Graph 内 node scheduling、每个 kernel 的
+  GPU front-end dispatch、grid ramp-up/retirement、NCCL/A2A kernel 和实际计算；
+- 开启 `--baseline-phase-timing` 时，还包含额外 phase event nodes 的扰动。
+
+因此 CUDA Graph 消除的是逐 kernel host submission，不会消除 device-side kernel
+dispatch 和 grid lifecycle。现有 Mega Graph benchmark 使用 Graph 外部 Python
+events 包住 replay，与 baseline 的 Graph-internal start/end events 仍不是严格同一
+边界。若继续做 apples-to-apples Graph 比较，应同时报告：
+
+```text
+graph_internal_ms:
+    capture 内 start/end event，匹配 baseline 当前口径
+
+external_replay_ms:
+    外部 event 包住 graph replay，包含 GPU 可见 graph submission 和 stream waits
+```
+
+headline latency 应只保留 start/end events；完整 phase events 单独 profile，避免
+大量 event nodes 扰动几十微秒级 decode。当前 batch CLI 的
+`--mega-num-comm-sms` sweep 仍限制为 eager-only，尚未产出新的 Mega Graph
+100-case 结果。

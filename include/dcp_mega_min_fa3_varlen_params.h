@@ -73,12 +73,13 @@ struct HistoryCombineWorkDesc {
 };
 
 struct FinalWorkDesc {
-    // 16-token tile flattened over CommHeads.
+    // Final compute subtask flattened over CommHeads.
     int32_t vector_begin;
     int32_t valid_vectors;
     int32_t dependency_begin;
     int32_t dependency_count;
-    int32_t reserved0;
+    // Parent 16-token communication tile shared by sibling final subtasks.
+    int32_t parent_token_block;
     int32_t reserved1;
     int32_t reserved2;
     int32_t reserved3;
@@ -176,9 +177,14 @@ struct DCPMega_fwd_params {
     int ipc_q_token_capacity = 0;
     int ipc_vector_capacity = 0;
     int ipc_token_block_capacity = 0;
+    int device = 0;
     int num_sms = 0;
     int num_comm_sm = 0;
     bool return_lse = false;
+    // Optional reusable benchmark events. The typed launcher records them
+    // immediately around the kernel command after all host-side preparation.
+    cudaEvent_t timing_start = nullptr;
+    cudaEvent_t timing_end = nullptr;
 };
 
 static_assert(alignof(DCPMega_fwd_params) >= alignof(void*));

@@ -25,8 +25,11 @@ PUBLISH_DESC_FIELDS = 8
 HISTORY_COMBINE_DESC_FIELDS = 8
 FINAL_DESC_FIELDS = 8
 METADATA_HEADER_INTS = 40
-METADATA_VERSION = 5
+METADATA_VERSION = 7
 MEGA_COMPUTE_WARPS = 12
+# Minimum adaptive final granularity and the runner capacity bound.
+FINAL_TOKENS_PER_TASK = 4
+FINAL_TOKEN_GRANULARITIES = (4, 8, 16)
 HISTORY_MAX_COPY_VECTORS = 32
 HISTORY_TASK_WAVE_TARGET = 0.8
 SCHEDULER_POLICY_FIFO = "fifo"
@@ -112,6 +115,7 @@ class DCPMegaMetadata:
     history_sequence_splits: tuple[int, ...]
     total_q: int
     total_vectors: int
+    final_tokens_per_task: int
     token_block_count: int
     q_ready_count: int
     receive_count: int
@@ -156,6 +160,17 @@ class DCPMegaMetadata:
 
 def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+def _choose_final_tokens_per_task(
+    token_block_count: int, num_compute_ctas: int
+) -> int:
+    """Choose final compute granularity from 16-token communication tasks."""
+    if token_block_count < num_compute_ctas:
+        return 4
+    if token_block_count < 2 * num_compute_ctas:
+        return 8
+    return 16
 
 
 def _combined_scheduler_policy(
@@ -1301,6 +1316,9 @@ def build_dcp_mega_metadata(
 
     total_q = cu_q[-1]
     num_token_subtiles = _ceil_div(total_q, 16)
+    final_tokens_per_task = _choose_final_tokens_per_task(
+        num_token_subtiles, num_sms - num_comm_sm
+    )
     q_tasks: list[tuple[int, ...]] = []
     for token_subtile in range(num_token_subtiles):
         for src_rank in range(dcp_size):
@@ -1440,41 +1458,48 @@ def build_dcp_mega_metadata(
 
     history_combine = tuple(
         task
-        for final_id in range(num_token_subtiles)
+        for parent_token_block in heuristic_q_block_order
         for dst_rank in range(dcp_size)
         for task in history_combine_by_publish[
-            dst_rank * num_token_subtiles + final_id
+            dst_rank * num_token_subtiles + parent_token_block
         ]
     )
 
     final: list[tuple[int, ...]] = []
     final_dependencies: list[int] = []
     total_vectors = total_q * hq_local
-    final_tile_size = 16 * hq_local
-    for vector_begin in range(0, total_vectors, final_tile_size):
-        valid_vectors = min(final_tile_size, total_vectors - vector_begin)
-        dependency_set: set[int] = set()
-        for vector in range(vector_begin, vector_begin + valid_vectors):
-            token, local_head = divmod(vector, hq_local)
-            batch_idx = batch_for_token[token]
-            dependency_set.update(
-                completion_for_vector[(CHUNK, batch_idx, token, local_head)]
+    for parent_token_block in heuristic_q_block_order:
+        parent_token_begin = parent_token_block * 16
+        parent_valid_tokens = min(16, total_q - parent_token_begin)
+        for token_offset in range(0, parent_valid_tokens, final_tokens_per_task):
+            token_begin = parent_token_begin + token_offset
+            valid_tokens = min(
+                final_tokens_per_task, parent_valid_tokens - token_offset
             )
-        dependencies = tuple(sorted(dependency_set))
-        dep_begin = len(final_dependencies)
-        final_dependencies.extend(dependencies)
-        final.append(
-            (
-                vector_begin,
-                valid_vectors,
-                dep_begin,
-                len(dependencies),
-                0,
-                0,
-                0,
-                0,
+            vector_begin = token_begin * hq_local
+            valid_vectors = valid_tokens * hq_local
+            dependency_set: set[int] = set()
+            for vector in range(vector_begin, vector_begin + valid_vectors):
+                token, local_head = divmod(vector, hq_local)
+                batch_idx = batch_for_token[token]
+                dependency_set.update(
+                    completion_for_vector[(CHUNK, batch_idx, token, local_head)]
+                )
+            dependencies = tuple(sorted(dependency_set))
+            dep_begin = len(final_dependencies)
+            final_dependencies.extend(dependencies)
+            final.append(
+                (
+                    vector_begin,
+                    valid_vectors,
+                    dep_begin,
+                    len(dependencies),
+                    parent_token_block,
+                    0,
+                    0,
+                    0,
+                )
             )
-        )
 
     result = DCPMegaMetadata(
         dispatch=dispatch,
@@ -1490,10 +1515,11 @@ def build_dcp_mega_metadata(
         history_sequence_splits=history_sequence_splits,
         total_q=total_q,
         total_vectors=total_vectors,
+        final_tokens_per_task=final_tokens_per_task,
         token_block_count=num_token_subtiles,
         q_ready_count=num_token_subtiles,
-        receive_count=len(final) * (dcp_size - 1),
-        tile_ready_count=len(final) * (dcp_size - 1),
+        receive_count=num_token_subtiles * (dcp_size - 1),
+        tile_ready_count=num_token_subtiles * (dcp_size - 1),
         dcp_size=dcp_size,
         split_policy=split_policy,
         history_order_policy=history_order_policy,
@@ -1697,12 +1723,14 @@ def validate_dcp_mega_metadata(
         raise AssertionError(
             "history combine queue does not cover every destination vector"
         )
-    expected_final = metadata.token_block_count
+    if metadata.final_tokens_per_task not in FINAL_TOKEN_GRANULARITIES:
+        raise AssertionError("invalid final task granularity")
+    expected_final = _ceil_div(metadata.total_q, metadata.final_tokens_per_task)
     if len(metadata.final) != expected_final:
         raise AssertionError("final queue does not cover every local output vector")
 
     expected_q_ready = metadata.token_block_count
-    expected_receive = len(metadata.final) * (dcp_size - 1)
+    expected_receive = metadata.token_block_count * (dcp_size - 1)
     expected_tile_ready = expected_receive
     if metadata.q_ready_count != expected_q_ready:
         raise AssertionError("invalid Q-ready counter count")
@@ -1746,13 +1774,65 @@ def validate_dcp_mega_metadata(
     if any(row[1] != 0 for row in metadata.q_tasks):
         raise AssertionError("Q tasks must not encode a local head")
 
-    final_count = len(metadata.final)
+    expected_final_layout = []
+    for parent_token_block in metadata.heuristic_q_block_order:
+        parent_token_begin = parent_token_block * 16
+        parent_valid_tokens = min(16, metadata.total_q - parent_token_begin)
+        for token_offset in range(
+            0, parent_valid_tokens, metadata.final_tokens_per_task
+        ):
+            valid_tokens = min(
+                metadata.final_tokens_per_task,
+                parent_valid_tokens - token_offset,
+            )
+            expected_final_layout.append(
+                (
+                    (parent_token_begin + token_offset) * hq_local,
+                    valid_tokens * hq_local,
+                    parent_token_block,
+                )
+            )
+    for row, expected in zip(metadata.final, expected_final_layout):
+        vector_begin, valid_vectors, _, _, parent_token_block = row[:5]
+        expected_vector_begin, expected_valid_vectors, expected_parent = expected
+        if (
+            vector_begin != expected_vector_begin
+            or valid_vectors != expected_valid_vectors
+            or parent_token_block != expected_parent
+        ):
+            raise AssertionError("final task granularity is invalid")
+        if parent_token_block != vector_begin // (16 * hq_local):
+            raise AssertionError("final task references an invalid parent tile")
+        parent_vector_begin = parent_token_block * 16 * hq_local
+        parent_vector_end = min(
+            parent_vector_begin + 16 * hq_local,
+            metadata.total_vectors,
+        )
+        if not (
+            parent_vector_begin <= vector_begin
+            and vector_begin + valid_vectors <= parent_vector_end
+        ):
+            raise AssertionError("final task crosses its parent tile")
+        if any(value != 0 for value in row[5:8]):
+            raise AssertionError("final reserved fields must be zero")
+
+    publish_tiles_per_rank = metadata.token_block_count
     for publish_id, row in enumerate(metadata.publish):
-        expected_dst, final_id = divmod(publish_id, final_count)
-        final_row = metadata.final[final_id]
-        if row[0] != expected_dst or row[1:3] != final_row[0:2]:
+        expected_dst, parent_token_block = divmod(
+            publish_id, publish_tiles_per_rank
+        )
+        expected_vector_begin = parent_token_block * 16 * hq_local
+        expected_valid_vectors = min(
+            16 * hq_local,
+            metadata.total_vectors - expected_vector_begin,
+        )
+        if (
+            row[0] != expected_dst
+            or row[1] != expected_vector_begin
+            or row[2] != expected_valid_vectors
+        ):
             raise AssertionError(
-                "publish tasks must be destination-major copies of final tiles"
+                "publish tasks must be destination-major communication tiles"
             )
         if row[5] != int(metadata.dispatch.pack_gqa):
             raise AssertionError("publish PackGQA marker mismatch")
@@ -1832,9 +1912,15 @@ def validate_dcp_mega_metadata(
     ]
     expected_coordinates = [
         (dst_rank, vector)
-        for final_row in metadata.final
+        for parent_token_block in metadata.heuristic_q_block_order
         for dst_rank in range(dcp_size)
-        for vector in range(final_row[0], final_row[0] + final_row[1])
+        for vector in range(
+            parent_token_block * 16 * hq_local,
+            min(
+                (parent_token_block + 1) * 16 * hq_local,
+                metadata.total_vectors,
+            ),
+        )
     ]
     if combine_coordinates != expected_coordinates:
         raise AssertionError("history combine descriptors are missing or duplicated")
@@ -1853,27 +1939,29 @@ def validate_dcp_mega_metadata(
 
     receive_sources = dcp_size - 1
     receive_ids = [
-        final_id * receive_sources + source
-        for final_id in range(final_count)
+        parent_token_block * receive_sources + source
+        for parent_token_block in range(metadata.token_block_count)
         for source in range(receive_sources)
     ]
-    if receive_ids != list(range(final_count * receive_sources)):
-        raise AssertionError("receive task ids must be dense final-major/source-minor")
+    if receive_ids != list(range(metadata.token_block_count * receive_sources)):
+        raise AssertionError("receive task ids must be dense parent-major/source-minor")
     if any(
         len(
             receive_ids[
-                final_id * receive_sources : (final_id + 1) * receive_sources
+                parent_token_block
+                * receive_sources : (parent_token_block + 1)
+                * receive_sources
             ]
         )
         != receive_sources
-        for final_id in range(final_count)
+        for parent_token_block in range(metadata.token_block_count)
     ):
-        raise AssertionError("each final tile has an invalid receive fan-in")
+        raise AssertionError("each parent tile has an invalid receive fan-in")
 
     seen_final: list[int] = []
     for row in metadata.final:
         seen_final.extend(range(row[0], row[0] + row[1]))
-    if seen_final != list(range(metadata.total_vectors)):
+    if sorted(seen_final) != list(range(metadata.total_vectors)):
         raise AssertionError("final descriptors have duplicate or missing vectors")
 
 
@@ -1884,7 +1972,7 @@ def pack_dcp_mega_metadata(
     post_phase: int,
     capacity: int | None = None,
 ) -> array:
-    """Serialize a validated metadata v5 image into native int32 values."""
+    """Serialize a validated metadata v7 image into native int32 values."""
     if pre_phase <= 0 or post_phase <= pre_phase:
         raise ValueError("metadata phases must be positive and strictly increasing")
     payload = array("i", [0] * METADATA_HEADER_INTS)
@@ -1960,7 +2048,7 @@ def pack_dcp_mega_metadata(
         history_combine_offset,
     )
     if len(header) != METADATA_HEADER_INTS:
-        raise AssertionError("metadata v5 header width mismatch")
+        raise AssertionError("metadata v7 header width mismatch")
     payload[:METADATA_HEADER_INTS] = array("i", header)
     return payload
 
@@ -1971,6 +2059,8 @@ __all__ = [
     "DCPMegaDispatch",
     "DCPMegaMetadata",
     "FINAL_DESC_FIELDS",
+    "FINAL_TOKEN_GRANULARITIES",
+    "FINAL_TOKENS_PER_TASK",
     "HISTORY",
     "HISTORY_COMBINE_DESC_FIELDS",
     "HISTORY_ORDER_POLICY_FIFO",
@@ -1988,6 +2078,7 @@ __all__ = [
     "METADATA_VERSION",
     "PUBLISH_DESC_FIELDS",
     "Q_TASK_FIELDS",
+    "_choose_final_tokens_per_task",
     "build_dcp_mega_metadata",
     "choose_dispatch",
     "choose_split_upper_bound",

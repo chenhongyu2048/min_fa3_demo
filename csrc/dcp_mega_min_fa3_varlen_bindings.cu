@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "kittens.cuh"
@@ -39,6 +41,44 @@ using min_fa3_varlen_demo::dcp_mega::MetadataHeader;
 using min_fa3_varlen_demo::dcp_mega::kPhaseTimestampCount;
 
 constexpr int kHeadDim = 128;
+
+struct ReusableTimingEvents {
+    explicit ReusableTimingEvents(int device_) : device(device_) {
+        c10::cuda::CUDAGuard guard(device);
+        C10_CUDA_CHECK(cudaEventCreate(&start));
+        C10_CUDA_CHECK(cudaEventCreate(&end));
+    }
+
+    ~ReusableTimingEvents() {
+        if (start == nullptr && end == nullptr) {
+            return;
+        }
+        try {
+            c10::cuda::CUDAGuard guard(device);
+            if (start != nullptr) {
+                cudaEventDestroy(start);
+            }
+            if (end != nullptr) {
+                cudaEventDestroy(end);
+            }
+        } catch (...) {
+        }
+    }
+
+    int device;
+    cudaEvent_t start = nullptr;
+    cudaEvent_t end = nullptr;
+};
+
+ReusableTimingEvents& reusable_timing_events(int device) {
+    thread_local std::unordered_map<
+        int, std::unique_ptr<ReusableTimingEvents>> events_by_device;
+    auto [it, inserted] = events_by_device.try_emplace(device);
+    if (inserted) {
+        it->second = std::make_unique<ReusableTimingEvents>(device);
+    }
+    return *it->second;
+}
 
 void check_packed_bf16(torch::Tensor const& tensor, char const* name) {
     TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
@@ -95,8 +135,8 @@ void validate_metadata_header(
     int64_t total_vectors,
     int64_t batch_size,
     int dcp_size) {
-    TORCH_CHECK(header.version == 5,
-                "unsupported DCP mega metadata version; expected version 5");
+    TORCH_CHECK(header.version == 7,
+                "unsupported DCP mega metadata version; expected version 7");
     TORCH_CHECK(header.used_ints == metadata_used,
                 "metadata_used does not match the pinned header");
     TORCH_CHECK(metadata_used >= 40 && metadata_used <= metadata_capacity,
@@ -144,9 +184,13 @@ void validate_metadata_header(
     TORCH_CHECK(header.q_task_count == header.token_block_count * dcp_size
                     && header.q_ready_count == header.token_block_count,
                 "invalid fixed-layout Q queue counts");
-    TORCH_CHECK(header.publish_count == header.token_block_count * dcp_size
-                    && header.final_count == header.token_block_count,
-                "invalid fixed-layout publish/final queue counts");
+    TORCH_CHECK(header.publish_count == header.token_block_count * dcp_size,
+                "invalid fixed-layout publish queue count");
+    TORCH_CHECK(
+        header.final_count == (total_q + 3) / 4
+            || header.final_count == (total_q + 7) / 8
+            || header.final_count == (total_q + 15) / 16,
+        "invalid adaptive final queue count");
     TORCH_CHECK(header.history_combine_count >= header.publish_count
                     && header.history_combine_count
                         <= total_vectors * dcp_size,
@@ -203,7 +247,7 @@ void validate_metadata_header(
             && header.history_splits_offset
                 == header.chunk_splits_offset + batch_size
             && header.used_ints == header.history_splits_offset + batch_size,
-        "DCP mega metadata v5 ranges must be contiguous and non-overlapping");
+        "DCP mega metadata v7 ranges must be contiguous and non-overlapping");
 }
 
 Flash_fwd_params make_attention_params(
@@ -617,6 +661,7 @@ double forward_chunk_prefill_varlen_dcp_mega(
     params.ipc_q_token_capacity = ipc_q.data_.size(0);
     params.ipc_vector_capacity = vector_capacity;
     params.ipc_token_block_capacity = token_block_capacity;
+    params.device = q.get_device();
     params.num_sms = properties->multiProcessorCount;
     params.num_comm_sm = num_comm_sm;
     params.return_lse = return_lse;
@@ -684,8 +729,6 @@ double forward_chunk_prefill_varlen_dcp_mega(
         params.tile_ready_phase = int(tile_ready_phase);
     }
 
-    cudaEvent_t timing_start = nullptr;
-    cudaEvent_t timing_end = nullptr;
     if (run_pre_barrier) {
         if (graph_replay) {
             min_fa3_varlen_demo::dcp_mega::run_dcp_mega_graph_barrier(
@@ -696,14 +739,11 @@ double forward_chunk_prefill_varlen_dcp_mega(
         }
     }
     if (measure_kernel) {
-        C10_CUDA_CHECK(cudaEventCreate(&timing_start));
-        C10_CUDA_CHECK(cudaEventCreate(&timing_end));
-        C10_CUDA_CHECK(cudaEventRecord(timing_start, stream));
+        ReusableTimingEvents& events = reusable_timing_events(q.get_device());
+        params.timing_start = events.start;
+        params.timing_end = events.end;
     }
     min_fa3_varlen_demo::dcp_mega::run_dcp_mega_varlen_fwd(params, stream);
-    if (measure_kernel) {
-        C10_CUDA_CHECK(cudaEventRecord(timing_end, stream));
-    }
     if (run_post_barrier) {
         if (graph_replay) {
             min_fa3_varlen_demo::dcp_mega::run_dcp_mega_graph_barrier(
@@ -716,12 +756,10 @@ double forward_chunk_prefill_varlen_dcp_mega(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     double elapsed_ms = 0.0;
     if (measure_kernel) {
-        C10_CUDA_CHECK(cudaEventSynchronize(timing_end));
+        C10_CUDA_CHECK(cudaEventSynchronize(params.timing_end));
         float elapsed_ms_float = 0.0f;
         C10_CUDA_CHECK(cudaEventElapsedTime(
-            &elapsed_ms_float, timing_start, timing_end));
-        C10_CUDA_CHECK(cudaEventDestroy(timing_start));
-        C10_CUDA_CHECK(cudaEventDestroy(timing_end));
+            &elapsed_ms_float, params.timing_start, params.timing_end));
         elapsed_ms = elapsed_ms_float;
     }
     return elapsed_ms;

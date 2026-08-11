@@ -7,6 +7,7 @@ import unittest
 
 from dcp_mega_metadata import (
     CHUNK,
+    FINAL_TOKEN_GRANULARITIES,
     HISTORY,
     HISTORY_COMBINE_DESC_FIELDS,
     HISTORY_ORDER_POLICY_FIFO,
@@ -21,6 +22,7 @@ from dcp_mega_metadata import (
     _AttentionScheduleProfile,
     _HistoryCombineScheduleTask,
     _choose_critical_wave_split,
+    _choose_final_tokens_per_task,
     _fifo_attention_profile,
     _history_combine_profile,
     _overlapped_attention_combine_makespan,
@@ -193,15 +195,19 @@ class DCPMegaMetadataTest(unittest.TestCase):
     def _assert_publish_receive_mapping(
         self, metadata, cu_q, hq_local, dcp_size
     ):
-        final_count = len(metadata.final)
-        self.assertEqual(len(metadata.publish), dcp_size * final_count)
+        token_blocks = metadata.token_block_count
+        self.assertEqual(len(metadata.publish), dcp_size * token_blocks)
         combine_counts = [0] * len(metadata.publish)
         for row in metadata.history_combine:
             combine_counts[row[0]] += 1
         for publish_id, publish in enumerate(metadata.publish):
-            dst_rank, final_id = divmod(publish_id, final_count)
+            dst_rank, parent_token_block = divmod(publish_id, token_blocks)
             self.assertEqual(publish[0], dst_rank)
-            self.assertEqual(publish[1:3], metadata.final[final_id][0:2])
+            vector_begin = parent_token_block * 16 * hq_local
+            valid_vectors = min(
+                16 * hq_local, metadata.total_vectors - vector_begin
+            )
+            self.assertEqual(publish[1:3], (vector_begin, valid_vectors))
             self.assertEqual(publish[6], combine_counts[publish_id])
         self.assertTrue(
             all(
@@ -252,24 +258,48 @@ class DCPMegaMetadataTest(unittest.TestCase):
             coordinates,
             [
                 (dst_rank, vector)
-                for final in metadata.final
+                for parent_token_block in metadata.heuristic_q_block_order
                 for dst_rank in range(dcp_size)
-                for vector in range(final[0], final[0] + final[1])
+                for vector in range(
+                    parent_token_block * 16 * hq_local,
+                    min(
+                        (parent_token_block + 1) * 16 * hq_local,
+                        metadata.total_vectors,
+                    ),
+                )
             ],
         )
         sources = dcp_size - 1
         receive_ids = [
-            final_id * sources + source
-            for final_id in range(final_count)
+            parent_token_block * sources + source
+            for parent_token_block in range(token_blocks)
             for source in range(sources)
         ]
-        self.assertEqual(receive_ids, list(range(final_count * sources)))
-        for final_id in range(final_count):
-            begin = final_id * sources
+        self.assertEqual(receive_ids, list(range(token_blocks * sources)))
+        for parent_token_block in range(token_blocks):
+            begin = parent_token_block * sources
             self.assertEqual(
                 receive_ids[begin : begin + sources],
                 list(range(begin, begin + sources)),
             )
+        final_vectors = []
+        for row in metadata.final:
+            self.assertLessEqual(
+                row[1], metadata.final_tokens_per_task * hq_local
+            )
+            self.assertEqual(
+                row[4], row[0] // (16 * hq_local)
+            )
+            parent_begin = row[4] * 16 * hq_local
+            self.assertGreaterEqual(row[0], parent_begin)
+            self.assertLessEqual(
+                row[0] + row[1],
+                min(parent_begin + 16 * hq_local, metadata.total_vectors),
+            )
+            final_vectors.extend(range(row[0], row[0] + row[1]))
+        self.assertEqual(sorted(final_vectors), list(range(metadata.total_vectors)))
+        final_parent_order = list(dict.fromkeys(row[4] for row in metadata.final))
+        self.assertEqual(final_parent_order, list(metadata.heuristic_q_block_order))
 
     def test_pack_ragged_split_tail_and_dependencies(self):
         cu_q = (0, 1, 9, 42)
@@ -292,11 +322,55 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertTrue(all(row[6] > 0 for row in history))
         self.assertTrue(all(row[6] == 0 for row in metadata.attention if row[0] == CHUNK))
         self.assertEqual(
-            metadata.final[-1][1], metadata.total_vectors % (16 * 4) or 16 * 4
+            metadata.final[-1][1],
+            metadata.total_vectors % (metadata.final_tokens_per_task * 4)
+            or metadata.final_tokens_per_task * 4,
+        )
+        self.assertEqual(
+            len(metadata.final),
+            (metadata.total_q + metadata.final_tokens_per_task - 1)
+            // metadata.final_tokens_per_task,
         )
         self.assertEqual(metadata.q_ready_count, metadata.token_block_count)
         self.assertEqual(metadata.receive_count, 7 * metadata.token_block_count)
         self.assertEqual(metadata.tile_ready_count, metadata.receive_count)
+
+    def test_adaptive_final_granularity_uses_parent_task_waves(self):
+        num_sms = 12
+        num_comm_sm = 4
+        num_compute_ctas = num_sms - num_comm_sm
+        cases = (
+            (num_compute_ctas - 1, 4),
+            (num_compute_ctas, 8),
+            (2 * num_compute_ctas - 1, 8),
+            (2 * num_compute_ctas, 16),
+        )
+        self.assertEqual(set(FINAL_TOKEN_GRANULARITIES), {4, 8, 16})
+        for parent_count, expected_tokens in cases:
+            with self.subTest(parent_count=parent_count):
+                self.assertEqual(
+                    _choose_final_tokens_per_task(parent_count, num_compute_ctas),
+                    expected_tokens,
+                )
+                total_q = parent_count * 16
+                metadata = build_dcp_mega_metadata(
+                    (0, total_q),
+                    (0, 257),
+                    hq_local=4,
+                    dcp_size=2,
+                    num_sms=num_sms,
+                    num_comm_sm=num_comm_sm,
+                    requested_num_splits=1,
+                    scheduler_heuristic=False,
+                )
+                self.assertEqual(metadata.final_tokens_per_task, expected_tokens)
+                self.assertEqual(
+                    len(metadata.final),
+                    (total_q + expected_tokens - 1) // expected_tokens,
+                )
+                self.assertTrue(
+                    all(row[1] <= expected_tokens * 4 for row in metadata.final)
+                )
 
     def test_default_critical_wave_preserves_fifo_when_no_split_is_selected(self):
         kwargs = {
@@ -821,6 +895,17 @@ class DCPMegaMetadataTest(unittest.TestCase):
             list(range(len(fifo.attention))),
         )
         self.assertNotEqual(fifo.attention, release_lpt.attention)
+        final_parent_order = list(
+            dict.fromkeys(row[4] for row in release_lpt.final)
+        )
+        history_parent_order = list(
+            dict.fromkeys(
+                row[0] % release_lpt.token_block_count
+                for row in release_lpt.history_combine
+            )
+        )
+        self.assertEqual(final_parent_order, list(release_lpt.heuristic_q_block_order))
+        self.assertEqual(history_parent_order, list(release_lpt.heuristic_q_block_order))
 
     def test_critical_wave_cost_model_uses_the_requested_history_order(self):
         q_lengths = [16] * 30 + [4096]
@@ -1075,15 +1160,15 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(set(map(len, case004_slots)), {35, 36})
 
         for dcp_size in (2, 4, 8):
-            for final_count in (0, 1, 3, 17):
+            for parent_count in (0, 1, 3, 17):
                 for num_comm_sm in (1, 4, 8):
                     with self.subTest(
                         dcp_size=dcp_size,
-                        final_count=final_count,
+                        parent_count=parent_count,
                         num_comm_sm=num_comm_sm,
                     ):
                         self._assert_receive_slots(
-                            final_count * (dcp_size - 1), num_comm_sm
+                            parent_count * (dcp_size - 1), num_comm_sm
                         )
 
     def test_attention_order_and_completion_ids_are_dense(self):
@@ -1144,7 +1229,11 @@ class DCPMegaMetadataTest(unittest.TestCase):
                         self.assertEqual(metadata.token_block_count, token_blocks)
                         self.assertEqual(len(metadata.q_tasks), token_blocks * dcp_size)
                         self.assertEqual(len(metadata.publish), token_blocks * dcp_size)
-                        self.assertEqual(len(metadata.final), token_blocks)
+                        self.assertEqual(
+                            len(metadata.final),
+                            (cu_q[-1] + metadata.final_tokens_per_task - 1)
+                            // metadata.final_tokens_per_task,
+                        )
                         self.assertEqual(
                             metadata.receive_count, token_blocks * (dcp_size - 1)
                         )
@@ -1368,7 +1457,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
                 )
             )
 
-    def test_metadata_v5_header_offsets_counts_and_capacity(self):
+    def test_metadata_v7_header_offsets_counts_and_capacity(self):
         metadata = build_dcp_mega_metadata(
             (0, 3, 20, 53),
             (0, 129, 516, 1541),
@@ -1380,7 +1469,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         )
         image = pack_dcp_mega_metadata(metadata, pre_phase=11, post_phase=12)
         self.assertEqual(image[0], METADATA_VERSION)
-        self.assertEqual(METADATA_VERSION, 5)
+        self.assertEqual(METADATA_VERSION, 7)
         self.assertEqual(image[30], len(image))
         self.assertEqual(image[32], 1)
         self.assertEqual(image[33], metadata.token_block_count)

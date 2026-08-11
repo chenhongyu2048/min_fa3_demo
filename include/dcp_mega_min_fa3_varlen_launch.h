@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <type_traits>
 
 #include <torch/extension.h>
@@ -300,6 +301,7 @@ struct DCPMegaKernelConfig {
         int signal_rank_stride = 0;
         int num_q_tasks = 0;
         int history_combine_count = 0;
+        int token_block_count = 0;
         int final_count = 0;
         int dcp_rank = 0;
         int tile_ready_phase = 0;
@@ -694,6 +696,20 @@ CUTLASS_DEVICE void run_history_combine(
 }
 
 template <typename Config>
+CUTLASS_DEVICE int receive_task_id_from_pull_ordinal(
+    typename Config::KernelParams const& params,
+    int pull_ordinal) {
+    constexpr int kReceiveSources = Config::kDCPSize - 1;
+    int const parent_ordinal = pull_ordinal / kReceiveSources;
+    int const source_ordinal
+        = pull_ordinal - parent_ordinal * kReceiveSources;
+    QTaskDesc const parent_q_task
+        = params.q_tasks[parent_ordinal * Config::kDCPSize];
+    int const parent_token_block = parent_q_task.token_begin / 16;
+    return parent_token_block * kReceiveSources + source_ordinal;
+}
+
+template <typename Config>
 CUTLASS_DEVICE void run_communication_post_q(
     typename Config::KernelParams const& params,
     typename Config::HelperSharedStorage& shared) {
@@ -711,7 +727,8 @@ CUTLASS_DEVICE void run_communication_post_q(
     int const warp_id = int(threadIdx.x) / cutlass::NumThreadsPerWarp;
     int const lane = kittens::laneid();
     constexpr int kReceiveSources = Config::kDCPSize - 1;
-    int const total_receive_tasks = params.final_count * kReceiveSources;
+    int const total_receive_tasks
+        = params.token_block_count * kReceiveSources;
     int const receive_stride = Config::kNumCommChunks * params.num_comm_sm;
     int const expected_phase = params.graph_post_phase != nullptr
         ? *params.graph_post_phase - 1 : params.tile_ready_phase;
@@ -736,19 +753,19 @@ CUTLASS_DEVICE void run_communication_post_q(
             int selected_task = -1;
             if (lane == 0) {
                 if (task_count == 1) {
-                    selected_task = base_task;
-                    int const final_id = selected_task / kReceiveSources;
+                    selected_task = receive_task_id_from_pull_ordinal<Config>(
+                        params, base_task);
+                    int const parent_token_block
+                        = selected_task / kReceiveSources;
                     int const source_ordinal
-                        = selected_task - final_id * kReceiveSources;
+                        = selected_task
+                            - parent_token_block * kReceiveSources;
                     int const source = source_ordinal
                         + (source_ordinal >= params.dcp_rank);
-                    FinalWorkDesc const work = params.final[final_id];
-                    int const token_block
-                        = work.vector_begin / (16 * Config::kCommHeads);
                     while (load_acquire_system_s32(
                                params.tile_ready_remote[params.dcp_rank]
                                    + source * params.token_block_capacity
-                                   + token_block) < expected_phase) {
+                                   + parent_token_block) < expected_phase) {
                         __nanosleep(64);
                     }
                 } else {
@@ -761,8 +778,11 @@ CUTLASS_DEVICE void run_communication_post_q(
                             if (probe >= task_count) {
                                 break;
                             }
-                            int const task_id
+                            int const pull_ordinal
                                 = base_task + ordinal * receive_stride;
+                            int const task_id
+                                = receive_task_id_from_pull_ordinal<Config>(
+                                    params, pull_ordinal);
                             int next_ordinal = ordinal + 1;
                             if (next_ordinal == task_count) {
                                 next_ordinal = 0;
@@ -772,18 +792,17 @@ CUTLASS_DEVICE void run_communication_post_q(
                                     params.receive_ready + task_id) >= 1) {
                                 continue;
                             }
-                            int const final_id = task_id / kReceiveSources;
+                            int const parent_token_block
+                                = task_id / kReceiveSources;
                             int const source_ordinal
-                                = task_id - final_id * kReceiveSources;
+                                = task_id
+                                    - parent_token_block * kReceiveSources;
                             int const source = source_ordinal
                                 + (source_ordinal >= params.dcp_rank);
-                            FinalWorkDesc const work = params.final[final_id];
-                            int const token_block = work.vector_begin
-                                / (16 * Config::kCommHeads);
                             if (load_acquire_system_s32(
                                     params.tile_ready_remote[params.dcp_rank]
                                         + source * params.token_block_capacity
-                                        + token_block) >= expected_phase) {
+                                        + parent_token_block) >= expected_phase) {
                                 selected_task = task_id;
                                 cursor = next_ordinal;
                                 break;
@@ -799,12 +818,16 @@ CUTLASS_DEVICE void run_communication_post_q(
             selected_task = __shfl_sync(0xffffffffu, selected_task, 0);
             __syncwarp();
 
-            int const final_id = selected_task / kReceiveSources;
+            int const parent_token_block
+                = selected_task / kReceiveSources;
             int const source_ordinal
-                = selected_task - final_id * kReceiveSources;
+                = selected_task - parent_token_block * kReceiveSources;
             int const source
                 = source_ordinal + (source_ordinal >= params.dcp_rank);
-            FinalWorkDesc const work = params.final[final_id];
+            int const publish_id
+                = params.dcp_rank * params.token_block_count
+                + parent_token_block;
+            PublishWorkDesc const work = params.publish[publish_id];
             if (lane == 0) {
                 shared.receive_task_ids[chunk] = selected_task;
             }
@@ -826,7 +849,7 @@ CUTLASS_DEVICE void run_communication_post_q(
                     shared.comm_tiles[chunk],
                     params.history_send_remote[source],
                     {0, params.dcp_rank,
-                     work.vector_begin / (16 * Config::kCommHeads), 0},
+                     parent_token_block, 0},
                     shared.arrived[chunk]);
             }
         }
@@ -846,11 +869,15 @@ CUTLASS_DEVICE void run_communication_post_q(
             task_id = __shfl_sync(0xffffffffu, task_id, 0);
             __syncwarp();
 
-            int const final_id = task_id / kReceiveSources;
-            int const source_ordinal = task_id - final_id * kReceiveSources;
+            int const parent_token_block = task_id / kReceiveSources;
+            int const source_ordinal
+                = task_id - parent_token_block * kReceiveSources;
             int const source
                 = source_ordinal + (source_ordinal >= params.dcp_rank);
-            FinalWorkDesc const work = params.final[final_id];
+            int const publish_id
+                = params.dcp_rank * params.token_block_count
+                + parent_token_block;
+            PublishWorkDesc const work = params.publish[publish_id];
             for (int vector_in_task = lane;
                  vector_in_task < work.valid_vectors;
                  vector_in_task += cutlass::NumThreadsPerWarp) {
@@ -864,8 +891,7 @@ CUTLASS_DEVICE void run_communication_post_q(
                 kittens::tma::store_async(
                     params.history_receive_local,
                     shared.comm_tiles[chunk],
-                    {0, source,
-                     work.vector_begin / (16 * Config::kCommHeads), 0});
+                    {0, source, parent_token_block, 0});
                 kittens::tma::store_async_read_wait();
                 kittens::tma::store_async_wait();
                 asm volatile("fence.proxy.async.global;" ::: "memory");
@@ -886,15 +912,25 @@ template <typename Config>
 CUTLASS_DEVICE void run_final_combine(
     typename Config::KernelParams const& params,
     typename Config::HelperSharedStorage& shared) {
+    int const compute_cta_id = int(blockIdx.x) - params.num_comm_sm;
+    int const num_compute_ctas = params.num_sms - params.num_comm_sm;
+    bool const static_schedule = params.final_count <= num_compute_ctas;
     while (true) {
-        if (threadIdx.x == 0) {
-            shared.work_id = atomicAdd(params.queue_state + kFinalCounter, 1);
+        int work_id;
+        if (static_schedule) {
+            work_id = compute_cta_id;
+        } else {
+            if (threadIdx.x == 0) {
+                shared.work_id = atomicAdd(
+                    params.queue_state + kFinalCounter, 1);
+            }
+            __syncthreads();
+            work_id = shared.work_id;
         }
-        __syncthreads();
-        if (shared.work_id >= params.final_count) {
+        if (work_id >= params.final_count) {
             break;
         }
-        FinalWorkDesc const work = params.final[shared.work_id];
+        FinalWorkDesc const work = params.final[work_id];
         if (threadIdx.x == 0) {
             for (int dep = 0; dep < work.dependency_count; ++dep) {
                 int const completion_id = params.final_dependencies[
@@ -903,7 +939,8 @@ CUTLASS_DEVICE void run_final_combine(
                     params.attention_done + completion_id, 1);
             }
             int const publish_id
-                = params.dcp_rank * params.final_count + shared.work_id;
+                = params.dcp_rank * params.token_block_count
+                + work.parent_token_block;
             PublishWorkDesc const publish = params.publish[publish_id];
             min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
                 params.publish_ready + publish_id,
@@ -913,7 +950,7 @@ CUTLASS_DEVICE void run_final_combine(
                  source_ordinal < Config::kDCPSize - 1;
                  ++source_ordinal) {
                 int const receive_id
-                    = shared.work_id * (Config::kDCPSize - 1)
+                    = work.parent_token_block * (Config::kDCPSize - 1)
                     + source_ordinal;
                 min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
                     params.receive_ready + receive_id, 1);
@@ -922,47 +959,55 @@ CUTLASS_DEVICE void run_final_combine(
         __syncthreads();
         if (threadIdx.x < 256) {
             constexpr int kVectorsPerWave = 16;
-            constexpr int kWaves = Config::kCommHeads;
             int const vector_in_wave = int(threadIdx.x) / 16;
             int const lane = int(threadIdx.x) % 16;
             unsigned const subgroup = (int(threadIdx.x) % 32) / 16;
             unsigned const mask = 0xffffu << (subgroup * 16);
-            #pragma unroll
-            for (int wave = 0; wave < kWaves; ++wave) {
-                int const vector_in_task
-                    = wave * kVectorsPerWave + vector_in_wave;
-                if (vector_in_task < work.valid_vectors) {
+            #pragma unroll 1
+            for (int vector_in_task = vector_in_wave;
+                 vector_in_task < work.valid_vectors;
+                 vector_in_task += kVectorsPerWave) {
                     int const vector = work.vector_begin + vector_in_task;
                     int const token = vector / params.hq_local;
                     int const local_head = vector - token * params.hq_local;
                     int const batch = batch_for_token(
                         token, params.cu_seqlens_q, params.batch_size);
-                    float max_lse = -INFINITY;
-                    float denominator = 0.0f;
+                    float owned_lse = -INFINITY;
+                    if (lane < Config::kDCPSize) {
+                        int const source = lane;
+                        bool const self_source = source == params.dcp_rank;
+                        float const state_lse = self_source
+                            ? params.history_send_lse[
+                                params.dcp_rank * params.signal_rank_stride
+                                + vector]
+                            : params.history_receive_lse[
+                                source * params.signal_rank_stride + vector];
+                        owned_lse = isfinite(state_lse)
+                            ? state_lse : -INFINITY;
+                    }
+                    float max_lse = owned_lse;
+                    #pragma unroll
+                    for (int offset = 8; offset > 0; offset >>= 1) {
+                        float const other = __shfl_xor_sync(
+                            mask, max_lse, offset, 16);
+                        max_lse = max_lse > other ? max_lse : other;
+                    }
+                    float denominator = isfinite(owned_lse)
+                        ? expf(owned_lse - max_lse) : 0.0f;
+                    #pragma unroll
+                    for (int offset = 8; offset > 0; offset >>= 1) {
+                        denominator += __shfl_xor_sync(
+                            mask, denominator, offset, 16);
+                    }
                     float accum[8]{};
 
                     #pragma unroll
                     for (int source = 0; source < Config::kDCPSize; ++source) {
                         bool const self_source = source == params.dcp_rank;
-                        if (lane == 0) {
-                            shared.source_lse[0][vector_in_task] = self_source
-                                ? params.history_send_lse[
-                                    params.dcp_rank * params.signal_rank_stride
-                                    + vector]
-                                : params.history_receive_lse[
-                                    source * params.signal_rank_stride + vector];
-                        }
-                        __syncwarp(mask);
                         float const state_lse
-                            = shared.source_lse[0][vector_in_task];
-                        float const next_max
-                            = max_lse > state_lse ? max_lse : state_lse;
-                        float const previous_scale
-                            = isfinite(max_lse) && isfinite(state_lse)
-                            ? expf(max_lse - next_max)
-                            : (isfinite(max_lse) ? 1.0f : 0.0f);
+                            = __shfl_sync(mask, owned_lse, source, 16);
                         float const state_scale = isfinite(state_lse)
-                            ? expf(state_lse - next_max) : 0.0f;
+                            ? expf(state_lse - max_lse) : 0.0f;
                         #pragma unroll
                         for (int item = 0; item < 8; ++item) {
                             int const dim = lane * 8 + item;
@@ -974,11 +1019,8 @@ CUTLASS_DEVICE void run_final_combine(
                                     + source * params.history_send_rank_stride;
                             float const value = static_cast<float>(
                                 source_o[vector * 128 + dim]);
-                            accum[item]
-                                = accum[item] * previous_scale + value * state_scale;
+                            accum[item] += value * state_scale;
                         }
-                        denominator = denominator * previous_scale + state_scale;
-                        if (isfinite(state_lse)) { max_lse = next_max; }
                     }
 
                     int const chunk_splits = Config::ChunkKernel::Split
@@ -1046,10 +1088,12 @@ CUTLASS_DEVICE void run_final_combine(
                             = denominator > 0.0f
                             ? max_lse + logf(denominator) : -INFINITY;
                     }
-                }
             }
         }
         __syncthreads();
+        if (static_schedule) {
+            break;
+        }
     }
 }
 
@@ -1121,6 +1165,7 @@ typename Kernel::Params make_attention_kernel_params(
     int32_t* attention_done,
     int num_compute_ctas,
     int compute_block_offset,
+    int device,
     int num_sms,
     int64_t lse_head_stride) {
     using Index = Flash_fwd_params::index_t;
@@ -1215,8 +1260,6 @@ typename Kernel::Params make_attention_kernel_params(
         nullptr,
         nullptr,
         attention_done};
-    int device = 0;
-    CHECK_CUDA(cudaGetDevice(&device));
     return Kernel::to_underlying_arguments({
         mainloop_args,
         epilogue_args,
@@ -1268,6 +1311,7 @@ void launch_dcp_mega_instance(
             params.attention_done,
             num_compute_ctas,
             params.num_comm_sm,
+            params.device,
             params.num_sms,
             params.chunk_lse_head_stride);
     auto history_kernel_params = make_attention_kernel_params<
@@ -1282,6 +1326,7 @@ void launch_dcp_mega_instance(
             params.attention_done,
             num_compute_ctas,
             params.num_comm_sm,
+            params.device,
             params.num_sms,
             params.history_lse_head_stride);
 
@@ -1352,6 +1397,7 @@ void launch_dcp_mega_instance(
     kernel_params.signal_rank_stride = params.ipc_vector_capacity;
     kernel_params.num_q_tasks = header.q_task_count;
     kernel_params.history_combine_count = header.history_combine_count;
+    kernel_params.token_block_count = header.token_block_count;
     kernel_params.final_count = header.final_count;
     kernel_params.dcp_rank = params.dcp_rank;
     kernel_params.tile_ready_phase = params.tile_ready_phase;
@@ -1367,11 +1413,23 @@ void launch_dcp_mega_instance(
     auto kernel = dcp_mega_varlen_kernel<Config>;
     int const smem_size = Config::SharedStorageSize;
     if (smem_size >= 48 * 1024) {
-        CHECK_CUDA(cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        constexpr int kMaxCachedCUDADevices = 64;
+        TORCH_CHECK(params.device >= 0 && params.device < kMaxCachedCUDADevices,
+                    "DCP mega CUDA device index exceeds launch cache capacity");
+        static std::once_flag configured[kMaxCachedCUDADevices];
+        std::call_once(configured[params.device], [=] {
+            CHECK_CUDA(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        });
+    }
+    if (params.timing_start != nullptr) {
+        CHECK_CUDA(cudaEventRecord(params.timing_start, stream));
     }
     kernel<<<params.num_sms, Config::MaxThreadsPerBlock, smem_size, stream>>>(
         kernel_params);
+    if (params.timing_end != nullptr) {
+        CHECK_CUDA(cudaEventRecord(params.timing_end, stream));
+    }
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 

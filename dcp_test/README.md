@@ -347,8 +347,10 @@ Each latency sample is the maximum over all eight global ranks; the tables show
 milliseconds. The final runs use 500 eager warmups and 100 measured calls
 because 5-20 warmups were insufficient to stabilize clocks for sub-ms jobs.
 
-Mega timings use CUDA events created inside the C++ binding after argument
-validation. Benchmark replays first complete a `torch.distributed.barrier`
+Mega timings use reusable CUDA events owned by the C++ binding after argument
+validation. The typed launcher records them immediately around the kernel
+command, after kernel-parameter construction and one-time function-attribute
+setup. Benchmark replays first complete a `torch.distributed.barrier`
 outside the timed interval, skip the binding's IPC pre-phase barrier, then place
 the start and end events immediately around the mega kernel. Host metadata
 generation, metadata H2D copy, workspace reset, Python/C++ dispatch delay, and
