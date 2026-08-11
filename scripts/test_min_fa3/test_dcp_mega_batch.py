@@ -5,11 +5,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import torch
+
 from dcp_test import benchmark_dcp_varlen
 from dcp_test.benchmark_dcp_mega_batch import (
     DEFAULT_CONFIG,
     _build_manifest,
     _case_argv,
+    _make_shared_mega_runner,
     _manifest_case,
     _result_path,
     _weighted_summary,
@@ -22,6 +25,154 @@ from dcp_test.utils import BenchmarkPhaseRecorder
 
 
 class DCPMegaBatchTest(unittest.TestCase):
+    def test_rank_local_inputs_skip_full_kv_materialization(self) -> None:
+        for dcp_size, kv_heads in ((2, 4), (4, 2), (8, 1)):
+            with self.subTest(dcp_size=dcp_size):
+                args = benchmark_dcp_varlen.parse_args(
+                    [
+                        "--b",
+                        "2",
+                        "--sq",
+                        "8,16",
+                        "--seqlen",
+                        "17,18",
+                        "--kvhead",
+                        str(kv_heads),
+                        "--dcp-size",
+                        str(dcp_size),
+                    ]
+                )
+                topology = benchmark_dcp_varlen.make_topology(
+                    args.qhead, args.kvhead, args.tp_size, args.dcp_size
+                )
+                rank = dcp_size - 1
+                with mock.patch(
+                    "dcp_test.benchmark_dcp_varlen.dist.get_rank",
+                    return_value=rank,
+                ):
+                    first = benchmark_dcp_varlen.build_inputs(
+                        args,
+                        topology,
+                        torch.device("cpu"),
+                        materialize_reference=False,
+                    )
+                    second = benchmark_dcp_varlen.build_inputs(
+                        args,
+                        topology,
+                        torch.device("cpu"),
+                        materialize_reference=False,
+                    )
+
+                expected_lengths = [
+                    benchmark_dcp_varlen.interleaved_local_length(
+                        length, rank, dcp_size
+                    )
+                    for length in (17, 18)
+                ]
+                self.assertEqual(first.local_history_lengths, expected_lengths)
+                self.assertEqual(
+                    first.k_history_local.shape,
+                    (sum(expected_lengths), 1, 128),
+                )
+                self.assertTrue(torch.equal(first.k_history_local, second.k_history_local))
+                self.assertTrue(torch.equal(first.v_history_local, second.v_history_local))
+                self.assertIsNone(first.k_reference)
+                self.assertIsNone(first.v_reference)
+                self.assertIsNone(first.cu_reference)
+                self.assertIsNone(first.cu_reference_host)
+                self.assertEqual(first.reference_lengths, [25, 34])
+
+    def test_reference_inputs_keep_full_then_shard_path(self) -> None:
+        args = benchmark_dcp_varlen.parse_args(
+            [
+                "--b",
+                "2",
+                "--sq",
+                "8,16",
+                "--seqlen",
+                "17,18",
+                "--kvhead",
+                "4",
+                "--dcp-size",
+                "2",
+            ]
+        )
+        topology = benchmark_dcp_varlen.make_topology(32, 4, 8, 2)
+        with mock.patch(
+            "dcp_test.benchmark_dcp_varlen.dist.get_rank", return_value=0
+        ):
+            inputs = benchmark_dcp_varlen.build_inputs(
+                args,
+                topology,
+                torch.device("cpu"),
+                materialize_reference=True,
+            )
+
+        self.assertEqual(inputs.local_history_lengths, [9, 9])
+        self.assertEqual(inputs.k_reference.shape, (59, 1, 128))
+        self.assertEqual(inputs.v_reference.shape, (59, 1, 128))
+        self.assertEqual(inputs.cu_reference.tolist(), [0, 25, 59])
+        self.assertEqual(inputs.cu_reference_host.tolist(), [0, 25, 59])
+
+    def test_shared_runner_uses_variant_capacity_and_mixed_topology_falls_back(
+        self,
+    ) -> None:
+        args = parse_args(
+            [
+                "--implementations",
+                "mega",
+                "--no-cuda-graph",
+                "--mega-num-comm-sms",
+                "4",
+            ]
+        )
+        config = load_batch_config(DEFAULT_CONFIG)
+        cases = expand_cases(
+            config, workloads="small1,large2", dcp_sizes="2"
+        )
+        process_group = object()
+        local_groups = {2: mock.Mock(process_group=process_group)}
+        sentinel = object()
+        with mock.patch(
+            "dcp_test.benchmark_dcp_mega_batch.DCPMegaAttentionRunner",
+            return_value=sentinel,
+        ) as factory:
+            runner = _make_shared_mega_runner(
+                args,
+                config,
+                cases,
+                4,
+                local_groups,
+            )
+
+        self.assertIs(runner, sentinel)
+        call = factory.call_args
+        self.assertIs(call.args[0], process_group)
+        self.assertEqual(
+            call.kwargs["max_total_q"],
+            max(sum(case.workload.q_lengths) for case in cases),
+        )
+        self.assertEqual(
+            call.kwargs["max_batch"],
+            max(case.workload.batch_size for case in cases),
+        )
+        self.assertEqual(call.kwargs["num_comm_sm"], 4)
+
+        mixed_cases = expand_cases(config, workloads="small1", dcp_sizes="2,4")
+        with mock.patch(
+            "dcp_test.benchmark_dcp_mega_batch.DCPMegaAttentionRunner"
+        ) as mixed_factory:
+            self.assertIsNone(
+                _make_shared_mega_runner(
+                    args,
+                    config,
+                    mixed_cases,
+                    4,
+                    {},
+                )
+            )
+        mixed_factory.assert_not_called()
+
     def test_six_load_config_expands_in_stable_order(self) -> None:
         config = load_batch_config(DEFAULT_CONFIG)
         cases = expand_cases(config)

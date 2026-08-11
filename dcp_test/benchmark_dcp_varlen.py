@@ -32,6 +32,7 @@ from dcp_test.utils import (
     append_packed_chunk as append_chunk,
     capture_cuda_graph_callable,
     initialize_distributed_sm90,
+    interleaved_local_length,
     make_cu_seqlens as make_cu,
     make_dcp_group,
     make_runner_set,
@@ -85,8 +86,8 @@ class Inputs:
     v_history_local: torch.Tensor
     k_chunk: torch.Tensor | None
     v_chunk: torch.Tensor | None
-    k_reference: torch.Tensor
-    v_reference: torch.Tensor
+    k_reference: torch.Tensor | None
+    v_reference: torch.Tensor | None
     q_lengths: list[int]
     history_lengths: list[int]
     local_history_lengths: list[int]
@@ -95,8 +96,8 @@ class Inputs:
     cu_q_host: torch.Tensor
     cu_history_local: torch.Tensor
     cu_history_local_host: torch.Tensor
-    cu_reference: torch.Tensor
-    cu_reference_host: torch.Tensor
+    cu_reference: torch.Tensor | None
+    cu_reference_host: torch.Tensor | None
 
 
 def parse_implementations(spec: str) -> tuple[str, ...]:
@@ -146,7 +147,13 @@ def expanded_method_labels(implementations: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(methods)
 
 
-def build_inputs(args: argparse.Namespace, topology, device: torch.device) -> Inputs:
+def build_inputs(
+    args: argparse.Namespace,
+    topology,
+    device: torch.device,
+    *,
+    materialize_reference: bool = True,
+) -> Inputs:
     q_lengths = [1] * args.b if args.workload == "decode" else parse_lengths(
         args.sq, args.b, "--sq"
     )
@@ -167,23 +174,43 @@ def build_inputs(args: argparse.Namespace, topology, device: torch.device) -> In
         seed + rank * 100_003,
         device,
     )
-    k_history = randn_bf16(
-        (sum(history_lengths), 1, args.headdim),
-        seed + kv_head * 1_000_003,
-        device,
-    )
-    v_history = randn_bf16(
-        (sum(history_lengths), 1, args.headdim),
-        seed + kv_head * 1_000_003 + 1,
-        device,
-    )
-    k_history_local, local_lengths = shard_interleaved(
-        k_history, history_lengths, dcp_rank, args.dcp_size
-    )
-    v_history_local, v_local_lengths = shard_interleaved(
-        v_history, history_lengths, dcp_rank, args.dcp_size
-    )
-    assert local_lengths == v_local_lengths
+    kv_seed = seed + kv_head * 1_000_003
+    k_history = None
+    v_history = None
+    if materialize_reference:
+        k_history = randn_bf16(
+            (sum(history_lengths), 1, args.headdim),
+            kv_seed,
+            device,
+        )
+        v_history = randn_bf16(
+            (sum(history_lengths), 1, args.headdim),
+            kv_seed + 1,
+            device,
+        )
+        k_history_local, local_lengths = shard_interleaved(
+            k_history, history_lengths, dcp_rank, args.dcp_size
+        )
+        v_history_local, v_local_lengths = shard_interleaved(
+            v_history, history_lengths, dcp_rank, args.dcp_size
+        )
+        assert local_lengths == v_local_lengths
+    else:
+        local_lengths = [
+            interleaved_local_length(length, dcp_rank, args.dcp_size)
+            for length in history_lengths
+        ]
+        local_seed = kv_seed + dcp_rank * 10_007
+        k_history_local = randn_bf16(
+            (sum(local_lengths), 1, args.headdim),
+            local_seed,
+            device,
+        )
+        v_history_local = randn_bf16(
+            (sum(local_lengths), 1, args.headdim),
+            local_seed + 1,
+            device,
+        )
     if any(length <= 0 for length in local_lengths):
         raise SystemExit("every rank-local sequence must be nonempty")
 
@@ -192,16 +219,25 @@ def build_inputs(args: argparse.Namespace, topology, device: torch.device) -> In
     if args.workload == "chunk":
         k_chunk = randn_bf16(
             (sum(q_lengths), 1, args.headdim),
-            seed + kv_head * 1_000_003 + 2,
+            kv_seed + 2,
             device,
         )
         v_chunk = randn_bf16(
             (sum(q_lengths), 1, args.headdim),
-            seed + kv_head * 1_000_003 + 3,
+            kv_seed + 3,
             device,
         )
-        k_reference = append_chunk(k_history, k_chunk, history_lengths, q_lengths)
-        v_reference = append_chunk(v_history, v_chunk, history_lengths, q_lengths)
+        if materialize_reference:
+            assert k_history is not None and v_history is not None
+            k_reference = append_chunk(
+                k_history, k_chunk, history_lengths, q_lengths
+            )
+            v_reference = append_chunk(
+                v_history, v_chunk, history_lengths, q_lengths
+            )
+        else:
+            k_reference = None
+            v_reference = None
         reference_lengths = [
             history + query for history, query in zip(history_lengths, q_lengths)
         ]
@@ -212,7 +248,11 @@ def build_inputs(args: argparse.Namespace, topology, device: torch.device) -> In
 
     cu_q, cu_q_host = make_cu(q_lengths, device)
     cu_local, cu_local_host = make_cu(local_lengths, device)
-    cu_reference, cu_reference_host = make_cu(reference_lengths, device)
+    if materialize_reference:
+        cu_reference, cu_reference_host = make_cu(reference_lengths, device)
+    else:
+        cu_reference = None
+        cu_reference_host = None
     return Inputs(
         q_local,
         k_history_local,
@@ -235,6 +275,13 @@ def build_inputs(args: argparse.Namespace, topology, device: torch.device) -> In
 
 
 def full_forward(inputs: Inputs, args: argparse.Namespace):
+    if (
+        inputs.k_reference is None
+        or inputs.v_reference is None
+        or inputs.cu_reference is None
+        or inputs.cu_reference_host is None
+    ):
+        raise RuntimeError("full-KV reference inputs were not materialized")
     return full_kv_reference_varlen(
         inputs.q_local,
         inputs.k_reference,
@@ -947,13 +994,15 @@ def main(
     device: torch.device | None = None,
     dcp_group: DCPGroup | None = None,
     manage_process_group: bool = True,
+    shared_mega_runner: DCPMegaAttentionRunner | None = None,
 ) -> dict[str, object]:
     args = parse_args(argv)
     if device is None:
         device = initialize_distributed_sm90("benchmark")
     elif not dist.is_initialized():
         raise RuntimeError("an externally supplied device requires an initialized process group")
-    mega_runner: DCPMegaAttentionRunner | None = None
+    mega_runner = shared_mega_runner
+    owns_mega_runner = False
     case_completed = False
     try:
         world_size = dist.get_world_size()
@@ -1004,7 +1053,13 @@ def main(
         process_group = dcp_group.process_group
         if dcp_group.ranks != topology.dcp_group_ranks(rank):
             raise RuntimeError("DCP process group crosses a KV replica boundary")
-        inputs = build_inputs(args, topology, device)
+        materialize_reference = args.check or "full" in implementations
+        inputs = build_inputs(
+            args,
+            topology,
+            device,
+            materialize_reference=materialize_reference,
+        )
         local_lengths_by_rank = all_rank_local_lengths(inputs, device)
 
         if rank == 0:
@@ -1048,19 +1103,36 @@ def main(
         )
         mega_q = None
         if "mega" in implementations:
-            mega_runner = DCPMegaAttentionRunner(
-                process_group,
-                dist.group.WORLD,
-                max_total_q=sum(inputs.q_lengths),
-                max_batch=len(inputs.q_lengths),
-                Hq_local=topology.q_heads_local,
-                max_num_splits=128,
-                num_comm_sm=args.mega_num_comm_sm,
-                block_n_override=args.mega_block_n,
-                record_phase_timestamps=args.mega_phase_timestamps,
-            )
+            if mega_runner is None:
+                mega_runner = DCPMegaAttentionRunner(
+                    process_group,
+                    dist.group.WORLD,
+                    max_total_q=sum(inputs.q_lengths),
+                    max_batch=len(inputs.q_lengths),
+                    Hq_local=topology.q_heads_local,
+                    max_num_splits=128,
+                    num_comm_sm=args.mega_num_comm_sm,
+                    block_n_override=args.mega_block_n,
+                    record_phase_timestamps=args.mega_phase_timestamps,
+                )
+                owns_mega_runner = True
+            elif (
+                mega_runner.process_group is not process_group
+                or mega_runner.device != device
+                or mega_runner.world_size != args.dcp_size
+                or mega_runner.Hq_local != topology.q_heads_local
+                or mega_runner.num_comm_sm != args.mega_num_comm_sm
+                or mega_runner.block_n_override != args.mega_block_n
+                or mega_runner.record_phase_timestamps
+                != args.mega_phase_timestamps
+                or mega_runner.max_total_q < sum(inputs.q_lengths)
+                or mega_runner.max_batch < len(inputs.q_lengths)
+            ):
+                raise RuntimeError("shared Mega runner is incompatible with this case")
             mega_q = mega_runner.q_local(sum(inputs.q_lengths))
             mega_q.copy_(inputs.q_local)
+        elif mega_runner is not None:
+            raise RuntimeError("shared Mega runner requires --implementations mega")
 
         reference_output = full_forward(inputs, args) if args.check else None
         reports: dict[str, dict[str, object]] = {}
@@ -1239,6 +1311,9 @@ def main(
             "environment": environment(device),
             "execution": {
                 "execution_mode": "cuda_graph" if args.cuda_graph else "eager",
+                "input_materialization": (
+                    "full_then_shard" if materialize_reference else "rank_local"
+                ),
                 "capture_eager_warmup": (
                     CAPTURE_EAGER_WARMUP if args.cuda_graph else 0
                 ),
@@ -1296,7 +1371,7 @@ def main(
         case_completed = True
         return result
     finally:
-        if mega_runner is not None:
+        if mega_runner is not None and owns_mega_runner:
             mega_runner.close()
         if case_completed and dist.is_initialized():
             dist.barrier()

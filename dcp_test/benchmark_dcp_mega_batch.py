@@ -27,7 +27,7 @@ from dcp_test.utils import (
     make_dcp_groups,
     require_world_size,
 )
-from min_fa3_dcp import make_topology
+from min_fa3_dcp import DCPMegaAttentionRunner, make_topology
 
 
 CONFIG_SCHEMA_VERSION = 1
@@ -1006,6 +1006,7 @@ def _run_case(
     dcp_group: DCPGroup,
     *,
     mega_num_comm_sm: int | None = None,
+    shared_mega_runner: DCPMegaAttentionRunner | None = None,
 ) -> dict[str, object]:
     return benchmark_dcp_varlen.main(
         _case_argv(
@@ -1018,6 +1019,34 @@ def _run_case(
         device=device,
         dcp_group=dcp_group,
         manage_process_group=False,
+        shared_mega_runner=shared_mega_runner,
+    )
+
+
+def _make_shared_mega_runner(
+    args: argparse.Namespace,
+    config: BatchConfig,
+    cases: Sequence[BatchCase],
+    comm_sm: int,
+    local_groups: Mapping[int, DCPGroup],
+) -> DCPMegaAttentionRunner | None:
+    topology_keys = {
+        (case.topology.dcp_size, case.topology.kv_heads) for case in cases
+    }
+    if len(topology_keys) != 1:
+        return None
+    dcp_size, kv_heads = next(iter(topology_keys))
+    topology = make_topology(config.q_heads, kv_heads, config.tp_size, dcp_size)
+    return DCPMegaAttentionRunner(
+        local_groups[dcp_size].process_group,
+        dist.group.WORLD,
+        max_total_q=max(sum(case.workload.q_lengths) for case in cases),
+        max_batch=max(case.workload.batch_size for case in cases),
+        Hq_local=topology.q_heads_local,
+        max_num_splits=128,
+        num_comm_sm=comm_sm,
+        block_n_override=args.mega_block_n,
+        record_phase_timestamps=args.mega_phase_timestamps,
     )
 
 
@@ -1229,33 +1258,42 @@ def main(argv: Sequence[str] | None = None) -> None:
                     variant["status"] = "running"
                     variant["started_at"] = datetime.now().astimezone().isoformat()
                     _write_json(args.manifest, manifest)
-                for case_index, case in enumerate(cases, start=1):
-                    active_case = case
-                    output_path = _result_path(args, case, comm_sm)
-                    if rank == 0:
-                        print("\n" + "=" * 80)
-                        print(
-                            f"Mega comm_sm={comm_sm}, case "
-                            f"{case_index}/{len(cases)}: {_case_description(case)}",
-                            flush=True,
+                shared_mega_runner = _make_shared_mega_runner(
+                    args, config, cases, comm_sm, local_groups
+                )
+                try:
+                    for case_index, case in enumerate(cases, start=1):
+                        active_case = case
+                        output_path = _result_path(args, case, comm_sm)
+                        if rank == 0:
+                            print("\n" + "=" * 80)
+                            print(
+                                f"Mega comm_sm={comm_sm}, case "
+                                f"{case_index}/{len(cases)}: "
+                                f"{_case_description(case)}",
+                                flush=True,
+                            )
+                            print("=" * 80)
+                        result = _run_case(
+                            args,
+                            config,
+                            case,
+                            output_path,
+                            device,
+                            local_groups[case.topology.dcp_size],
+                            mega_num_comm_sm=comm_sm,
+                            shared_mega_runner=shared_mega_runner,
                         )
-                        print("=" * 80)
-                    result = _run_case(
-                        args,
-                        config,
-                        case,
-                        output_path,
-                        device,
-                        local_groups[case.topology.dcp_size],
-                        mega_num_comm_sm=comm_sm,
-                    )
-                    if rank == 0:
-                        variant["cases"].append(
-                            _manifest_case(case, output_path, result)
-                        )
-                        variant["completed_case_count"] = len(variant["cases"])
-                        manifest["completed_case_count"] += 1
-                        _write_json(args.manifest, manifest)
+                        if rank == 0:
+                            variant["cases"].append(
+                                _manifest_case(case, output_path, result)
+                            )
+                            variant["completed_case_count"] = len(variant["cases"])
+                            manifest["completed_case_count"] += 1
+                            _write_json(args.manifest, manifest)
+                finally:
+                    if shared_mega_runner is not None:
+                        shared_mega_runner.close()
                 if rank == 0:
                     variant["weighted_summary"] = _weighted_summary(
                         variant["cases"], config.tp_size
