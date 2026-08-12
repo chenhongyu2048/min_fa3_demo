@@ -30,7 +30,7 @@ DEFAULT_BENCHMARK_ROOT = Path(__file__).resolve().parent
 METHOD_MEGA = "dcp_mega_varlen"
 METHOD_VLLM_A2A = "vllm_a2a_min_fa3_varlen"
 DEFAULT_DCP_SIZES = (2, 4, 8)
-DEFAULT_COMM_SMS = (8, 12, 16, 20)
+DEFAULT_COMM_SMS = (4, 8, 12, 16, 20)
 CASE_NAME_PATTERN = re.compile(r"^(case_\d+)_dcp\d+_.*\.json$")
 CASE_ID_PATTERN = re.compile(r"^case_\d+$")
 
@@ -72,17 +72,16 @@ class TailSpec:
 
 
 TAILS = (
-    TailSpec(
-        "attention_done_to_history_combine_done",
-        "Attention -> history",
-    ),
-    TailSpec("q_done_to_publish_done", "Q done -> publish"),
+    TailSpec("kernel_start_to_attention_done", "Start -> attention"),
+    TailSpec("attention_done_to_publish_done", "Attention -> publish"),
     TailSpec("publish_done_to_receive_done", "Publish -> receive"),
     TailSpec(
-        "history_combine_done_to_final_combine_done",
-        "History -> final",
+        "receive_done_to_final_combine_done",
+        "Receive -> final",
     ),
 )
+KERNEL_TOTAL = TailSpec("kernel_start_to_kernel_done", "Start -> kernel done")
+TAIL_ROWS = (*TAILS, KERNEL_TOTAL)
 
 
 @dataclass(frozen=True)
@@ -112,6 +111,7 @@ BASELINE_STAGES = (
 )
 
 COMM_SM_COLORS = {
+    4: "#1F77B4",
     8: "#4C78A8",
     12: "#59A14F",
     16: "#F28E2B",
@@ -234,7 +234,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--comm-sms",
         type=_integer_list,
         default=DEFAULT_COMM_SMS,
-        help="comma-separated communication-SM settings (default: 8,12,16,20)",
+        help="comma-separated communication-SM settings (default: 4,8,12,16,20)",
     )
     parser.add_argument(
         "--stat",
@@ -256,9 +256,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--rolling-window",
         type=_positive_integer,
-        default=9,
+        default=5,
         metavar="N",
-        help="centered rolling-median window for milestone trends (default: 9)",
+        help="centered rolling-median window for milestone trends (default: 5)",
     )
     parser.add_argument(
         "--clip-percentile",
@@ -485,12 +485,23 @@ def load_case(path: Path, *, dcp_size: int, comm_sm: int, stat: str) -> CaseReco
     if not math.isclose(publish, history, rel_tol=0.0, abs_tol=1e-9):
         raise ValueError(f"history and publish timestamps differ in {path}")
     tails = {
-        tail.key: _finite_positive(
-            tail_payload[tail.key][stat],
-            field=f"{tail.key}/{stat}",
+        "kernel_start_to_attention_done": milestones["attention_done"],
+        "attention_done_to_publish_done": _finite_positive(
+            tail_payload["attention_done_to_history_combine_done"][stat],
+            field=f"attention_done_to_publish_done/{stat}",
             source=path,
-        )
-        for tail in TAILS
+        ),
+        "publish_done_to_receive_done": _finite_positive(
+            tail_payload["publish_done_to_receive_done"][stat],
+            field=f"publish_done_to_receive_done/{stat}",
+            source=path,
+        ),
+        "receive_done_to_final_combine_done": _finite_positive(
+            milestones["final_combine_done"] - milestones["receive_done"],
+            field=f"receive_done_to_final_combine_done/{stat}",
+            source=path,
+        ),
+        "kernel_start_to_kernel_done": milestones["kernel_done"],
     }
     workload_kind = (
         KIND_DECODE if max(q_lengths) <= 16 else KIND_MIXED
@@ -1145,7 +1156,7 @@ def _tail_matrix(
 ) -> np.ndarray:
     rows: list[list[float]] = []
     for workload_kind in (KIND_DECODE, KIND_MIXED):
-        for tail in TAILS:
+        for tail in TAIL_ROWS:
             row = []
             for comm_sm in comm_sms:
                 values = [
@@ -1161,7 +1172,7 @@ def _tail_matrix(
 def _tail_row_labels() -> list[str]:
     labels = []
     for workload_label in ("Decode", "Mixed"):
-        labels.extend(f"{workload_label}: {tail.label}" for tail in TAILS)
+        labels.extend(f"{workload_label}: {tail.label}" for tail in TAIL_ROWS)
     return labels
 
 
@@ -1174,11 +1185,16 @@ def _plot_tail_heatmap(
     norm: LogNorm,
     show_y_labels: bool,
 ) -> matplotlib.image.AxesImage:
+    total_rows = np.zeros(matrix.shape, dtype=bool)
+    total_rows[len(TAILS) :: len(TAIL_ROWS), :] = True
+    heatmap_values = np.ma.array(matrix, mask=total_rows)
+    cmap = matplotlib.colormaps["viridis"].copy()
+    cmap.set_bad("#ECEFF1")
     image = axis.imshow(
-        matrix,
+        heatmap_values,
         aspect="auto",
         interpolation="nearest",
-        cmap="viridis",
+        cmap=cmap,
         norm=norm,
     )
     axis.set_xticks(
@@ -1193,7 +1209,7 @@ def _plot_tail_heatmap(
         axis.tick_params(axis="y", length=0)
     axis.tick_params(axis="x", labelsize=9)
     axis.set_xlabel("Communication SMs (* aggregate best)", fontsize=9.5)
-    axis.axhline(3.5, color="white", linewidth=2.0)
+    axis.axhline(len(TAIL_ROWS) - 0.5, color="white", linewidth=2.0)
     best_index = comm_sms.index(best_comm_sm)
     axis.add_patch(
         Rectangle(
@@ -1205,13 +1221,15 @@ def _plot_tail_heatmap(
             linewidth=2.0,
         )
     )
-    cmap = plt.get_cmap("viridis")
     for row in range(matrix.shape[0]):
         for column in range(matrix.shape[1]):
             value = float(matrix[row, column])
-            red, green, blue, _alpha = cmap(norm(value))
-            luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
-            text_color = "#111111" if luminance > 0.57 else "white"
+            if total_rows[row, column]:
+                text_color = "#111111"
+            else:
+                red, green, blue, _alpha = cmap(norm(value))
+                luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+                text_color = "#111111" if luminance > 0.57 else "white"
             axis.text(
                 column,
                 row,
@@ -1298,7 +1316,11 @@ def plot_overview(
         for dcp_size in dcp_sizes
     }
     positive_tail_values = np.concatenate(
-        [matrix[matrix > 0] for matrix in tail_matrices.values()]
+        [
+            matrix.reshape(2, len(TAIL_ROWS), len(comm_sms))[:, : len(TAILS), :]
+            .reshape(-1)
+            for matrix in tail_matrices.values()
+        ]
     )
     tail_norm = LogNorm(
         vmin=float(positive_tail_values.min()),
@@ -1520,7 +1542,9 @@ def plot_overview(
             "vLLM dashed milestones are per-case prefix sums of CUDA Event phase "
             "durations in runner order; Graph E2E is independently measured and "
             "need not equal the final prefix sum. Mega milestones are in-kernel "
-            "timestamps. Mega tail cells use explicitly recorded differences. "
+            "timestamps. Mega tail heatmap cells use explicitly recorded "
+            "differences; gray Start-to-kernel-done rows are totals excluded "
+            "from the heatmap color scale. "
             "Upward triangles mark "
             f"values above the shared row-level p{clip_percentile:g} display limit."
         ),
