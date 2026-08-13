@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Eight-method uniform-workload forward/backward benchmark on one eight-GPU SM90 node.
+# CP: Eight-method uniform-workload forward/backward benchmark on one eight-GPU SM90 node.
 # Each case keeps total context tokens fixed and sets S=context_length/batch_size.
 
 set -euo pipefail
@@ -18,12 +18,11 @@ export MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE=${MAGI_ATTENTION_BACKWARD_H
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
 WORLD_SIZE=8
-CONTEXT_LENGTHS=${CONTEXT_LENGTHS:-"262144 131072 65536"}
-BATCH_SIZES=${BATCH_SIZES:-"16"}
-DIRECTION=${DIRECTION:-backward}
+CONTEXT_LENGTHS=${CONTEXT_LENGTHS:-"65536 131072 262144 "}
+BATCH_SIZES=${BATCH_SIZES:-"1 2 4 8 16"}
+DIRECTION=${DIRECTION:-both}
 MODE=${MODE:-causal}
-# METHODS=${METHODS:-"allgather_attention,llama3_allgather_attention,fa3_ring,megatron_hybrid_cp,magi_attention,zeppelin,mega_ring_all_cp,mega_ring_hybrid"}
-METHODS=${METHODS:-"mega_ring_all_cp"}
+METHODS=${METHODS:-"allgather_attention,llama3_allgather_attention,fa3_ring,megatron_hybrid_cp,magi_attention,zeppelin,mega_ring_all_cp,mega_ring_hybrid"}
 QHEAD=${QHEAD:-32}
 KVHEAD=${KVHEAD:-8}
 HEADDIM=${HEADDIM:-128}
@@ -124,6 +123,8 @@ else
 fi
 selected_devices=("${VISIBLE_DEVICES[@]:0:WORLD_SIZE}")
 SELECTED_DEVICES=$(IFS=,; echo "${selected_devices[*]}")
+CONTEXT_LENGTHS_CSV=$(IFS=,; echo "${CONTEXT_LENGTH_LIST[*]}")
+BATCH_SIZES_CSV=$(IFS=,; echo "${BATCH_SIZE_LIST[*]}")
 
 timestamp() {
     date '+%Y-%m-%d %H:%M:%S'
@@ -174,56 +175,13 @@ if ((DRY_RUN == 0)); then
     wait_for_all_gpus
 fi
 
-make_topology() {
-    local context_length=$1
-    local batch_size=$2
-    local index
-    local -a global_lengths ring_sizes ring_starts
-
-    ((context_length % batch_size == 0)) || \
-        die "context length $context_length is not divisible by batch size $batch_size"
-    SEQ_LEN=$((context_length / batch_size))
-    case "$batch_size" in
-        1) RING_SIZE=8 ;;
-        2) RING_SIZE=4 ;;
-        4) RING_SIZE=2 ;;
-        8|16) RING_SIZE=1 ;;
-    esac
-
-    # The explicit hybrid topology gives every rank context_length/8 tokens.
-    global_lengths=()
-    ring_sizes=()
-    ring_starts=()
-    for ((index = 0; index < batch_size; ++index)); do
-        global_lengths+=("$SEQ_LEN")
-        ring_sizes+=("$RING_SIZE")
-        if ((RING_SIZE == 1)); then
-            ring_starts+=("$((index % WORLD_SIZE))")
-        else
-            ring_starts+=("$((index * RING_SIZE))")
-        fi
-    done
-
-    ((SEQ_LEN % 8 == 0)) || die "sequence length $SEQ_LEN is not divisible by 8"
-    ((SEQ_LEN % (RING_SIZE * 256) == 0)) || die \
-        "sequence length $SEQ_LEN does not satisfy causal G$RING_SIZE alignment"
-
-    local IFS=,
-    GLOBAL_SEQLENS=${global_lengths[*]}
-    RING_SIZES=${ring_sizes[*]}
-    RING_STARTS=${ring_starts[*]}
-}
-
-run_case() {
-    local case_index=$1
-    local total_cases=$2
-    local direction=$3
-    local context_length=$4
-    local batch_size=$5
+run_direction() {
+    local direction=$1
+    local direction_index=$2
+    local direction_count=$3
     local entrypoint
     local -a command
 
-    make_topology "$context_length" "$batch_size"
     if [[ "$direction" == forward ]]; then
         entrypoint=ring_test/benchmark_topology_forward.py
     else
@@ -232,9 +190,8 @@ run_case() {
     command=(
         "$TORCHRUN" --standalone --nproc_per_node="$WORLD_SIZE"
         "$entrypoint"
-        --global-seqlens "$GLOBAL_SEQLENS"
-        --ring-sizes "$RING_SIZES"
-        --ring-starts "$RING_STARTS"
+        --context-lengths "$CONTEXT_LENGTHS_CSV"
+        --batch-sizes "$BATCH_SIZES_CSV"
         --qhead "$QHEAD" --kvhead "$KVHEAD" --headdim "$HEADDIM"
         --allgather-overlapping-heads-k-stride "$ALLGATHER_OVERLAPPING_HEADS_K_STRIDE"
         --mode "$MODE" --methods "$METHODS"
@@ -249,8 +206,8 @@ run_case() {
 
     if ((DRY_RUN)); then
         printf '\n================================================================================\n'
-        printf '[uniform_%s %d/%d] context=%s, batch=%s, seqlen=%s, hybrid=G%s\n' \
-            "$direction" "$case_index" "$total_cases" "$context_length" "$batch_size" "$SEQ_LEN" "$RING_SIZE"
+        printf '[uniform_%s %d/%d] %d workloads in one torchrun\n' \
+            "$direction" "$direction_index" "$direction_count" "$workload_cases"
         printf '================================================================================\n'
         print_command "$SELECTED_DEVICES" "${command[@]}"
         return
@@ -258,8 +215,8 @@ run_case() {
 
     {
         printf '\n================================================================================\n'
-        printf '[uniform_%s %d/%d] context=%s, batch=%s, seqlen=%s, hybrid=G%s\n' \
-            "$direction" "$case_index" "$total_cases" "$context_length" "$batch_size" "$SEQ_LEN" "$RING_SIZE"
+        printf '[uniform_%s %d/%d] %d workloads in one torchrun\n' \
+            "$direction" "$direction_index" "$direction_count" "$workload_cases"
         printf '================================================================================\n'
         print_command "$SELECTED_DEVICES" "${command[@]}"
     } | tee -a "$LOG_FILE"
@@ -272,24 +229,21 @@ if ((DRY_RUN == 0)); then
 fi
 
 workload_cases=$((${#CONTEXT_LENGTH_LIST[@]} * ${#BATCH_SIZE_LIST[@]}))
-total_cases=$((workload_cases * ${#DIRECTION_LIST[@]}))
+direction_count=${#DIRECTION_LIST[@]}
+total_cases=$((workload_cases * direction_count))
 echo "Log: $LOG_FILE"
 echo "GPUs: $SELECTED_DEVICES (world_size=$WORLD_SIZE)"
 echo "Contexts: ${CONTEXT_LENGTH_LIST[*]}"
 echo "Batch sizes: ${BATCH_SIZE_LIST[*]}"
 echo "Directions: ${DIRECTION_LIST[*]}"
-echo "Workloads per direction: $workload_cases; benchmark runs: $total_cases; sequence length = context length / batch size"
+echo "Workloads per direction: $workload_cases; total benchmark points: $total_cases; torchrun launches: $direction_count"
 echo "Methods: $METHODS"
 echo "Config: direction=$DIRECTION, mode=$MODE, QH=$QHEAD, KVH=$KVHEAD, D=$HEADDIM, sm_configs=$SM_CONFIGS, warmup=$WARMUP_ITERS, iters=$NUM_ITERS, check=$CHECK"
 
-case_index=0
-for context_length in "${CONTEXT_LENGTH_LIST[@]}"; do
-    for batch_size in "${BATCH_SIZE_LIST[@]}"; do
-        for direction in "${DIRECTION_LIST[@]}"; do
-            ((case_index += 1))
-            run_case "$case_index" "$total_cases" "$direction" "$context_length" "$batch_size"
-        done
-    done
+direction_index=0
+for direction in "${DIRECTION_LIST[@]}"; do
+    ((direction_index += 1))
+    run_direction "$direction" "$direction_index" "$direction_count"
 done
 
 if ((DRY_RUN == 0)); then

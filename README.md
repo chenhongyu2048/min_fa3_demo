@@ -363,6 +363,7 @@ the import path.
 
 | Entry point | Purpose |
 | --- | --- |
+| `benchmark_uniform.sh` | Fixed-total-token uniform matrix with one reusable `torchrun` per selected direction |
 | `benchmark_dataset.sh` | Recommended dataset-shaped forward/backward benchmark wrapper for 2, 4, or 8 GPUs |
 | `scripts/test_dcp/benchmark_dcp_mega_trace.sh` | Generate `NUM_CASES` trace snapshots, then run eager Mega/baselines and graph baselines in separate 8-rank launches |
 | `benchmark_dcp_mega_arrival_matrix.sh` | Run the 3-arrival x 3-DCP trace matrix with one eager Mega comm-SM sweep plus eager/graph baselines per combination |
@@ -773,6 +774,19 @@ per-baseline accounting details.
 ### Explicit topology and ordinary ring benchmarks
 
 ```bash
+# The uniform wrapper waits for all selected GPUs, then launches once per
+# direction and runs every context-length/batch-size point in that process group.
+DIRECTION=both CONTEXT_LENGTHS="65536 131072 262144" \
+  BATCH_SIZES="1 2 4 8 16" ./benchmark_uniform.sh
+
+# The topology frontends expose the same uniform multi-case mode directly.
+torchrun --standalone --nproc_per_node=8 \
+  ring_test/benchmark_topology_forward.py \
+  --context-lengths 65536,131072,262144 --batch-sizes 1,2,4,8,16 \
+  --qhead 32 --kvhead 8 --headdim 128 --mode causal \
+  --methods mega_ring_all_cp,mega_ring_hybrid \
+  --sm-configs 128:4,124:8,120:12,116:16 --no-check
+
 torchrun --standalone --nproc_per_node=8 \
   ring_test/benchmark_topology_forward.py \
   --global-seqlens 8192,4096,2048,1024 \
@@ -798,7 +812,10 @@ torchrun --standalone --nproc_per_node=2 \
 
 These distributed paths are single-node because `TKParallelTensor` uses local
 CUDA IPC. The hybrid benchmark consumes global lengths and explicit Buddy-ring
-metadata; the ordinary ring benchmarks consume per-rank local lengths.
+metadata. Passing `--context-lengths` together with `--batch-sizes` selects the
+uniform multi-case mode; the frontend reuses one process group and its IPC pools
+across the full Cartesian product. The ordinary ring benchmarks consume per-rank
+local lengths.
 `--allgather-overlapping-heads-k-stride` is shared by the per-sequence and
 Llama3 all-gather baselines and must divide `--kvhead`.
 

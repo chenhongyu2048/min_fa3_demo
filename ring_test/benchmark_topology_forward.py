@@ -54,6 +54,7 @@ from ring_test.utils import (
     local_lengths_for_rank,
     make_cu_seqlens,
     make_local_qkv,
+    make_uniform_workload_cases,
     parse_int_list,
     zeppelin_reference,
 )
@@ -550,9 +551,17 @@ def magi_overlap_degree(value: str) -> int:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark explicit-topology mega-ring forward with all-CP baselines")
-    parser.add_argument("--global-seqlens", required=True)
-    parser.add_argument("--ring-sizes", required=True)
-    parser.add_argument("--ring-starts", required=True)
+    parser.add_argument("--global-seqlens")
+    parser.add_argument("--ring-sizes")
+    parser.add_argument("--ring-starts")
+    parser.add_argument(
+        "--context-lengths",
+        help="Comma-separated fixed total-token counts for uniform multi-case mode",
+    )
+    parser.add_argument(
+        "--batch-sizes",
+        help="Comma-separated batch sizes crossed with --context-lengths",
+    )
     parser.add_argument("--qhead", type=int, default=32)
     parser.add_argument("--kvhead", type=int, default=8)
     parser.add_argument("--headdim", type=int, default=128)
@@ -612,6 +621,15 @@ def _main_single(
     args = parse_args(argv)
     methods = parse_methods(args.methods)
     summary_samples: list[ForwardSummarySample] = []
+    if (
+        args.global_seqlens is None
+        or args.ring_sizes is None
+        or args.ring_starts is None
+    ):
+        raise SystemExit(
+            "single-case mode requires --global-seqlens, --ring-sizes, and "
+            "--ring-starts"
+        )
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         raise SystemExit("SM90 Hopper CUDA device is required")
     if args.headdim != 128:
@@ -1502,15 +1520,26 @@ def _replace_option(argv: Sequence[str], name: str, value: str) -> list[str]:
 def _argv_for_case(
     argv: Sequence[str], workload_case: HybridBenchmarkCase
 ) -> list[str]:
-    result = list(argv)
+    result: list[str] = []
+    skip_value = False
+    for token in argv:
+        if skip_value:
+            skip_value = False
+            continue
+        if token in ("--context-lengths", "--batch-sizes"):
+            skip_value = True
+            continue
+        result.append(token)
     for name, values in (
         ("--global-seqlens", workload_case.global_lengths),
         ("--ring-sizes", workload_case.ring_sizes),
         ("--ring-starts", workload_case.ring_starts),
     ):
-        result = _replace_option(
-            result, name, ",".join(str(value) for value in values)
-        )
+        value = ",".join(str(item) for item in values)
+        if name in result:
+            result = _replace_option(result, name, value)
+        else:
+            result.extend((name, value))
     return result
 
 
@@ -1554,11 +1583,39 @@ def main(
     skip_incompatible_methods: bool = False,
 ) -> None:
     if workload_cases is None:
-        _main_single(
-            argv,
-            skip_incompatible_methods=skip_incompatible_methods,
+        forwarded_argv = list(sys.argv[1:] if argv is None else argv)
+        args = parse_args(forwarded_argv)
+        uniform_requested = (
+            args.context_lengths is not None or args.batch_sizes is not None
         )
-        return
+        if not uniform_requested:
+            _main_single(
+                argv,
+                skip_incompatible_methods=skip_incompatible_methods,
+            )
+            return
+        if args.context_lengths is None or args.batch_sizes is None:
+            raise SystemExit(
+                "uniform multi-case mode requires both --context-lengths and "
+                "--batch-sizes"
+            )
+        if any(
+            value is not None
+            for value in (args.global_seqlens, args.ring_sizes, args.ring_starts)
+        ):
+            raise SystemExit(
+                "uniform multi-case mode cannot be combined with explicit topology options"
+            )
+        try:
+            world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        except (KeyError, ValueError) as exc:
+            raise SystemExit("Run this benchmark with torchrun") from exc
+        workload_cases = make_uniform_workload_cases(
+            args.context_lengths,
+            args.batch_sizes,
+            world_size,
+        )
+        argv = _argv_for_case(forwarded_argv, workload_cases[0])
     if not workload_cases:
         raise SystemExit("workload_cases must not be empty")
     if argv is None:

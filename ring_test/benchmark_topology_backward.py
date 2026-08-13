@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from collections import defaultdict
@@ -58,6 +59,7 @@ from ring_test.utils import (
     local_lengths_for_rank,
     make_cu_seqlens,
     make_local_qkv,
+    make_uniform_workload_cases,
     parse_int_list,
     zeppelin_reference,
 )
@@ -1566,6 +1568,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--global-seqlens",
         help="Explicit comma-separated global lengths; overrides --b/--seqlen generation",
     )
+    parser.add_argument(
+        "--context-lengths",
+        help="Comma-separated fixed total-token counts for uniform multi-case mode",
+    )
+    parser.add_argument(
+        "--batch-sizes",
+        help="Comma-separated batch sizes crossed with --context-lengths",
+    )
     parser.add_argument("--b", default="4", help="Comma-separated synthetic batch-size cases")
     parser.add_argument(
         "--seqlen", default="256", help="Comma-separated synthetic member-rank lengths"
@@ -1623,6 +1633,32 @@ def main(
     skip_incompatible_methods: bool = False,
 ) -> None:
     args = parse_args(argv)
+    uniform_requested = (
+        args.context_lengths is not None or args.batch_sizes is not None
+    )
+    if uniform_requested:
+        if workload_cases is not None:
+            raise SystemExit(
+                "uniform CLI options cannot be combined with programmatic workload_cases"
+            )
+        if args.context_lengths is None or args.batch_sizes is None:
+            raise SystemExit(
+                "uniform multi-case mode requires both --context-lengths and "
+                "--batch-sizes"
+            )
+        if args.global_seqlens is not None:
+            raise SystemExit(
+                "uniform multi-case mode cannot be combined with --global-seqlens"
+            )
+        try:
+            world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        except (KeyError, ValueError) as exc:
+            raise SystemExit("Run this benchmark with torchrun") from exc
+        workload_cases = make_uniform_workload_cases(
+            args.context_lengths,
+            args.batch_sizes,
+            world_size,
+        )
     requested_methods = parse_methods(args.methods)
     if args.headdim != 128:
         raise SystemExit("this benchmark requires D=128")

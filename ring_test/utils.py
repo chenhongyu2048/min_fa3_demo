@@ -87,6 +87,85 @@ def parse_int_list(spec: str, name: str) -> list[int]:
     return values
 
 
+def make_uniform_workload_cases(
+    context_lengths_spec: str,
+    batch_sizes_spec: str,
+    world_size: int,
+) -> list[HybridBenchmarkCase]:
+    """Build fixed-total-token uniform cases for one reusable process group."""
+
+    context_lengths = parse_int_list(context_lengths_spec, "--context-lengths")
+    batch_sizes = parse_int_list(batch_sizes_spec, "--batch-sizes")
+    if any(context_length <= 0 for context_length in context_lengths):
+        raise SystemExit("--context-lengths values must be positive")
+    if any(batch_size <= 0 for batch_size in batch_sizes):
+        raise SystemExit("--batch-sizes values must be positive")
+
+    case_specs: list[tuple[int, int, int, int]] = []
+    for context_length in context_lengths:
+        for batch_size in batch_sizes:
+            if context_length % batch_size:
+                raise SystemExit(
+                    f"context length {context_length} is not divisible by "
+                    f"batch size {batch_size}"
+                )
+            if batch_size <= world_size:
+                if world_size % batch_size:
+                    raise SystemExit(
+                        f"batch size {batch_size} must divide world size {world_size}"
+                    )
+                ring_size = world_size // batch_size
+            else:
+                if batch_size % world_size:
+                    raise SystemExit(
+                        f"batch size {batch_size} must be a multiple of world size "
+                        f"{world_size} when it exceeds the world size"
+                    )
+                ring_size = 1
+            if ring_size not in (1, 2, 4, 8):
+                raise SystemExit(
+                    f"uniform workload produced unsupported ring size {ring_size}"
+                )
+
+            sequence_length = context_length // batch_size
+            if sequence_length % (ring_size * 256):
+                raise SystemExit(
+                    f"sequence length {sequence_length} does not satisfy "
+                    f"G{ring_size} alignment"
+                )
+            case_specs.append(
+                (context_length, batch_size, sequence_length, ring_size)
+            )
+
+    num_cases = len(case_specs)
+    workload_cases: list[HybridBenchmarkCase] = []
+    for case_index, (
+        context_length,
+        batch_size,
+        sequence_length,
+        ring_size,
+    ) in enumerate(case_specs):
+        ring_sizes = (ring_size,) * batch_size
+        ring_starts = tuple(
+            index % world_size if ring_size == 1 else index * ring_size
+            for index in range(batch_size)
+        )
+        workload_cases.append(
+            HybridBenchmarkCase(
+                label=(
+                    f"uniform context={context_length}, batch={batch_size}, "
+                    f"seqlen={sequence_length}, hybrid=G{ring_size}"
+                ),
+                case_index=case_index,
+                num_cases=num_cases,
+                global_lengths=(sequence_length,) * batch_size,
+                ring_sizes=ring_sizes,
+                ring_starts=ring_starts,
+            )
+        )
+    return workload_cases
+
+
 def init_distributed() -> tuple[int, int]:
     if "LOCAL_RANK" not in os.environ or "LOCAL_WORLD_SIZE" not in os.environ:
         raise SystemExit("Run this benchmark with torchrun")
