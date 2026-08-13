@@ -626,8 +626,8 @@ def validate_args(
             f"got stride={args.allgather_overlapping_heads_k_stride}, "
             f"kvhead={args.kvhead}"
         )
-    if args.kvhead * args.headdim != 1024:
-        raise SystemExit("mega-ring communication requires kvhead * headdim == 1024")
+    if args.kvhead not in (1, 2, 4, 8):
+        raise SystemExit("mega-ring communication requires kvhead in {1, 2, 4, 8}")
     if not 1 <= local_world_size <= 8:
         raise SystemExit(f"mega-ring backward requires world_size in [1, 8], got {local_world_size}")
     if args.warmup_iters < 0 or args.num_iters <= 0:

@@ -441,6 +441,10 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     parsed = parse_args()
+    if parsed.headdim != 128 or parsed.kvhead not in (1, 2, 4, 8):
+        raise SystemExit("This path requires D=128 and KVH in {1, 2, 4, 8}")
+    if parsed.qhead % parsed.kvhead:
+        raise SystemExit("qhead must be divisible by kvhead")
     seqlen_cases = parse_seqlen_spec(parsed.seqlen)
     invalid_seqlens = [seqlen for seqlen in seqlen_cases if seqlen % 256 != 0]
     if invalid_seqlens:

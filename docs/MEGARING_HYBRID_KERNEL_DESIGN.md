@@ -68,8 +68,9 @@ Hopper mainloop 的前提下，重构其**执行组织**：
 4. **Causal 动态 multi-segment**。同一个 Q tile 的若干连续、已就绪 ring step
    可以合并成一次 FA3 mainloop，减少 scheduler claim、Q 重载和 O/LSE 归并次数。
 5. **与 attention tile 对齐的通信任务**。通信调度按 128 或 176 token row 的
-   logical task 计数，物理传输拆为固定 `16 x 1024` 2D TMA subtile，在通信粒度、
-   shared memory 和流水并行度之间取得可实现的平衡。
+   logical task 计数。Causal 物理传输使用 `(128/KVH) x (KVH*128)` 2D TMA
+   subtile，noncausal 使用 `16 x (KVH*128)`，在通信粒度、shared memory 和流水
+   并行度之间取得可实现的平衡。
 
 ### 1.3 “Hybrid”的含义
 
@@ -126,7 +127,8 @@ ring placement，也不在热路径中运行跨 rank metadata collective。
 | layout | varlen packed | varlen packed |
 | attention | causal、noncausal | causal |
 | GQA/MQA | `QH % KVH == 0` | `QH % KVH == 0` |
-| 通信行宽 | `KVH * D == 1024` | `KVH * D == 1024` |
+| KV heads | 1、2、4、8 | 1、2、4、8 |
+| 通信行宽 | `KVH * 128` | `KVH * 128` |
 | physical world | 2、4、8 | 1、2、4、8 |
 | hierarchy | 能放入 world 的 G8/G4/G2/G1 | 能放入 world 的 G8/G4/G2/G1 |
 
@@ -663,10 +665,10 @@ Forward SM 角色转换仍然适用。将 noncausal 也改为 multi-segment 是�
 
 | 路径 | Logical task | Physical TMA subtile |
 | --- | --- | --- |
-| causal forward K/V ingress | 128 token rows | `16 x 1024` BF16 |
-| noncausal forward K/V ingress | 176 token rows | `16 x 1024` BF16 |
-| causal backward K/V ingress | 128 token rows | `16 x 1024` BF16 |
-| backward dK/dV egress | 128-token block / KV head | `16 x 1024` FP32 |
+| causal forward K/V ingress | 128 token rows | `(128/KVH) x (KVH*128)` BF16 |
+| noncausal forward K/V ingress | 176 token rows | `16 x (KVH*128)` BF16 |
+| causal backward K/V ingress | 128 token rows | `(128/KVH) x (KVH*128)` BF16 |
+| backward dK/dV egress | 128-token block / KV head | `(128/KVH) x (KVH*128)` FP32 |
 
 Forward noncausal 最后一个 logical task 可以少于 176 rows，但 host 保证 row range
 至少 128-row aligned，因此 tail 仍是若干完整 16-row subtile，不存在单行 fallback。
@@ -690,16 +692,14 @@ target=2\left\lceil\frac{rows}{BlockN}\right\rceil.
 
 乘 2 对应 K 和 V。Scheduler 只有在达到 target 后才把该 step 纳入 merged segment。
 
-### 7.3 为什么物理 subtile 是 16 rows
+### 7.3 为什么 causal 物理 subtile 保持固定字节数
 
-固定约束 `KVH * D = 1024` 允许把一个 token row 展平为 1024 个元素：
+`D=128` 且 `KVH in {1,2,4,8}` 时，一个 token row 展平为 `KVH*128` 个元素。
+causal 路径选择 `128/KVH` rows，因此：
 
 ```text
-BF16:  1 row  = 1024 * 2 B = 2 KiB
-FP32:  1 row  = 1024 * 4 B = 4 KiB
-
-16-row BF16 tile = 32 KiB
-16-row FP32 tile = 64 KiB
+BF16: (128/KVH) * (KVH*128) * 2 B = 32 KiB
+FP32: (128/KVH) * (KVH*128) * 4 B = 64 KiB
 ```
 
 当前 forward/backward specialization 的 attention CTA 有 12 warps。通信实现把
@@ -873,10 +873,11 @@ Communication CTA 在 K/V ingress 后进入 dKV egress phase。对每个有效
 
 ```text
 128 tokens * 128 dims = 16384 FP32 values
-                       = 16 descriptor rows * 1024 values
+                       = (128/KVH) descriptor rows * (KVH*128) values
 ```
 
-因此一次 dK 或 dV egress task 正好是一笔 `16 x 1024` FP32 TMA reduce-add。
+因此一次 dK 或 dV egress task 对任一支持的 KVH 都正好是一笔 64 KiB FP32 TMA
+reduce-add。
 
 这种 owner-directed 设计使最终每个 rank 只 postprocess 自己原始 K/V shard 的梯度，
 无需在 Python 中 materialize 所有 step 的 dK/dV 再做 collective。
@@ -1054,7 +1055,7 @@ Host 侧拒绝：
 - local length 与 membership 不一致。
 - batch 未按 ring size 非递增排列。
 - local sequence、arena 或 causal half 不满足 128-row alignment。
-- `KVH * D != 1024`。
+- `D != 128`、`KVH` 不在 `{1,2,4,8}`，或 `QH % KVH != 0`。
 - arena capacity 不足或 TMA 指针不满足对齐。
 
 ### 11.3 Empty rank

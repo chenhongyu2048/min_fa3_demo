@@ -530,7 +530,7 @@ torchrun --standalone --nproc_per_node=8 \
 
 The driver accepts the same comma-separated `--sm-configs COMP:COMM` sweep
 style and default `128:4,124:8,120:12,116:16` sweep as the normal Mega Ring
-benchmark. Head configuration follows the normal fused Mega Ring constraints:
+benchmark. This ablation path retains its narrower head constraint:
 `D=128`, `KVH * D = 1024`, and `QH % KVH == 0`; the default is
 `QH=32, KVH=8, D=128`. It samples deterministic ArXiv cases with seed `0` and
 uses the dataset wrapper's `0.05` token-balance tolerance. L1-L5 run on each
@@ -571,9 +571,9 @@ Hierarchical mega-ring notes:
 - Forward supports one node with 2, 4, or 8 SM90 GPUs. Backward supports physical world size 1, 2, 4, or 8; world size 1 permits only G1. A logical ring cannot exceed the physical world size.
 - The 8-GPU path uses one fused persistent launch for G8/G4/G2/G1 sequences; the 2-GPU path similarly fuses G2/G1.
 - Batches are ordered by non-increasing ring size and explicitly pass global lengths, ring sizes, and aligned ring starts.
-- K/V use a shared rank-major capacity arena. Communication scheduling and readiness are tracked per logical KV tile: 128 rows for causal forward/backward and 176 rows for noncausal forward. Each logical task is physically transferred through 16-row 2D TMA subtiles spanning `KVH * D = 1024` values.
+- K/V use a shared rank-major capacity arena. Production all-CP and hybrid forward/backward support `KVH` in `{1, 2, 4, 8}` with `D=128` and `QH % KVH == 0`. Communication scheduling and readiness remain aligned to 128-row causal or 176-row noncausal attention tasks. Causal physical transfers use `(128/KVH) x (KVH*128)` BF16/FP32 TMA tiles, preserving a fixed byte size; noncausal forward uses `16 x (KVH*128)` BF16 tiles so its 176-row task stays evenly divisible.
 - Every local Q/K sequence length and the per-rank K/V arena capacity must be 128-row aligned. Causal G8/G4/G2 additionally requires each local half to be 128-row aligned. There is no single-row or unaligned-tail communication fallback.
-- A full 128/176-row logical tile is not staged in shared memory at once: communication CTAs reuse a small number of 16-row slots so the fused launch stays below Hopper's shared-memory limit.
+- A full logical tile is not staged at once: communication CTAs pipeline physical TMA subtiles while signaling readiness once each logical K or V task completes.
 - Causal G8/G4/G2 uses the zigzag `[front half | back half]` layout.
 - The caller must synchronize owner-local K/V initialization across ranks before entering the op.
 - Ranks with no local sequence still enter the fused kernel and exit with an empty scheduler work stream.
@@ -581,7 +581,7 @@ Hierarchical mega-ring notes:
 - All-CP backward uses `ring_size=world_size, ring_start=0`. The public `half_cu_seqlens` and `half_cu_seqlens_host` arguments no longer exist.
 - K/V are `[world_size * rank_kv_capacity, KVH, 128]` rank-major IPC arenas. `rank_kv_capacity` is positive and 128-row aligned. Each FP32 owner accumulator contains `KVH * padded_rank_capacity * 128` elements, where `padded_rank_capacity = round_up(rank_kv_capacity + B * 128, 128)`.
 - The VMM-backed FP32 dK/dV owner accumulators and one-element int32 completion counter must be zeroed on every rank, followed by CUDA synchronization and a distributed barrier, before every `backward_varlen_mega_ring` call.
-- Backward K/V ingress is `remote gmem -> local smem -> local gmem`. dK/dV egress decodes work by KV head and 128-token padded block, then uses one fixed `16 x 1024` FP32 TMA transaction for each remote reduce-add task. Padding stays zero and there is no unaligned tail path.
+- Backward K/V ingress is `remote gmem -> local smem -> local gmem`. dK/dV egress decodes work by KV head and 128-token padded block. Both use `(128/KVH) x (KVH*128)` physical tiles: 32 KiB for BF16 ingress and 64 KiB for each FP32 remote reduce-add. Padding stays zero and there is no unaligned tail path.
 - The full scheduler, readiness, owner-completion, and zero-rank contracts are documented in `docs/HIERARCHICAL_HYBRID_MEGA_RING_BACKWARD_DESIGN.md`.
 
 ## Benchmark

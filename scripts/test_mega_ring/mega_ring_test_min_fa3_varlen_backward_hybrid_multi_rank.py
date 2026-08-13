@@ -291,8 +291,8 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.headdim != 128 or args.kvhead * args.headdim != 1024:
-        raise SystemExit("This path requires D=128 and KVH * D == 1024")
+    if args.headdim != 128 or args.kvhead not in (1, 2, 4, 8):
+        raise SystemExit("This path requires D=128 and KVH in {1, 2, 4, 8}")
     if args.qhead % args.kvhead:
         raise SystemExit("qhead must be divisible by kvhead")
     rank, world_size = init_distributed()

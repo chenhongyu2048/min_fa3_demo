@@ -1043,12 +1043,17 @@ def validate_args(
                     "and causal source shards require even local_seqlen; "
                     f"invalid cases: {invalid}"
                 )
-    if any(method in methods for method in ("min_varlen_ring", "min_varlen_mega_ring")):
+    if "min_varlen_ring" in methods:
         if args.kvhead * args.headdim != 1024:
             raise SystemExit(
                 "min_fa3 ring communication path requires kvhead * headdim == 1024, "
                 f"got kvhead={args.kvhead}, headdim={args.headdim}"
             )
+        if local_world_size > 1 and any(sm_config.num_comm_sm <= 0 for sm_config in sm_configs):
+            raise SystemExit("multi-rank min_fa3 ring paths require num_comm_sm > 0")
+    if "min_varlen_mega_ring" in methods:
+        if args.kvhead not in (1, 2, 4, 8):
+            raise SystemExit("mega-ring communication requires kvhead in {1, 2, 4, 8}")
         if local_world_size > 1 and any(sm_config.num_comm_sm <= 0 for sm_config in sm_configs):
             raise SystemExit("multi-rank min_fa3 ring paths require num_comm_sm > 0")
 

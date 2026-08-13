@@ -167,11 +167,11 @@ torchrun --standalone --nproc_per_node=2 ring_test/benchmark_ring_forward.py \
 
 The fused backward communication CTAs use TMA for remote K/V load, local K/V
 store, local FP32 dK/dV load, and remote FP32 reduce-add. K/V ingress uses
-128-row logical tasks split into fixed 16-row by 1024-BF16 TMA subtiles. dKV
-egress decodes each level range by KV head and 128-token padded block; every dK
-or dV task is one fixed `16 x 1024` FP32 TMA transaction. Tasks are spread
-across all communication CTAs instead of assigning one CTA to an entire ring
-step.
+128-row logical tasks split into `(128/KVH) x (KVH*128)` BF16 TMA subtiles.
+dKV egress decodes each level range by KV head and 128-token padded block and
+uses the same physical shape in FP32. This keeps each ingress tile at 32 KiB
+and each dKV tile at 64 KiB for `KVH=1,2,4,8`. Tasks are spread across all
+communication CTAs instead of assigning one CTA to an entire ring step.
 
 Forward preparation, tensor allocation, and the fused path's required remote
 dK/dV accumulator and completion-counter reset are outside the CUDA-event

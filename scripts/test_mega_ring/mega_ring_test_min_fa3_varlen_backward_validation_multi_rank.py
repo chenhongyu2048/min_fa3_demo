@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from typing import Any
 
 import torch
@@ -15,8 +16,6 @@ from mega_ring_test_min_fa3_varlen_hybrid_multi_rank import (
 )
 
 
-Q_HEADS = 16
-KV_HEADS = 8
 HEAD_DIM = 128
 BASE_RANK_CAPACITY = 512
 
@@ -224,25 +223,25 @@ def make_cases(rank: int, world_size: int, device: torch.device) -> list[dict[st
     ]
 
 
-def run_validation(rank: int, world_size: int) -> None:
+def run_validation(rank: int, world_size: int, q_heads: int, kv_heads: int) -> None:
     device = torch.device("cuda", rank)
     guard_padded_capacity = BASE_RANK_CAPACITY + (world_size + 1) * 128
-    guard_accum_numel = KV_HEADS * guard_padded_capacity * HEAD_DIM
+    guard_accum_numel = kv_heads * guard_padded_capacity * HEAD_DIM
     arenas = {
         "base": make_parallel_pair(
-            [world_size * BASE_RANK_CAPACITY, KV_HEADS, HEAD_DIM],
+            [world_size * BASE_RANK_CAPACITY, kv_heads, HEAD_DIM],
             torch.bfloat16,
             rank,
             world_size,
         ),
         "small": make_parallel_pair(
-            [world_size * 128, KV_HEADS, HEAD_DIM],
+            [world_size * 128, kv_heads, HEAD_DIM],
             torch.bfloat16,
             rank,
             world_size,
         ),
         "unaligned": make_parallel_pair(
-            [world_size * 129, KV_HEADS, HEAD_DIM],
+            [world_size * 129, kv_heads, HEAD_DIM],
             torch.bfloat16,
             rank,
             world_size,
@@ -272,11 +271,11 @@ def run_validation(rank: int, world_size: int) -> None:
 
         total_q = int(cu_q_host[-1])
         q = torch.zeros(
-            (total_q, Q_HEADS, HEAD_DIM), device=device, dtype=torch.bfloat16
+            (total_q, q_heads, HEAD_DIM), device=device, dtype=torch.bfloat16
         )
         out = torch.zeros_like(q)
         dout = torch.zeros_like(q)
-        lse = torch.zeros((Q_HEADS, total_q), device=device, dtype=torch.float32)
+        lse = torch.zeros((q_heads, total_q), device=device, dtype=torch.float32)
 
         remote_k, remote_v = arenas[case.get("arena", "base")]
         remote_dk, remote_dv = accumulators[case.get("accum", "shape")]
@@ -327,12 +326,24 @@ def run_validation(rank: int, world_size: int) -> None:
         print(f"hierarchical mega-ring backward validation: {len(cases)} cases passed")
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run hierarchical mega-ring backward host-validation checks"
+    )
+    parser.add_argument("--qhead", type=int, default=32)
+    parser.add_argument("--kvhead", type=int, choices=(1, 2, 4, 8), default=8)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+    if args.qhead % args.kvhead:
+        raise SystemExit("qhead must be divisible by kvhead")
     rank, world_size = init_distributed()
     if world_size != 8:
         raise SystemExit("Run validation coverage with eight local ranks")
     try:
-        run_validation(rank, world_size)
+        run_validation(rank, world_size, args.qhead, args.kvhead)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

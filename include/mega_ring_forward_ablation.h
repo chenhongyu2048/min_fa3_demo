@@ -15,7 +15,7 @@ namespace forward_ablation {
 
 template<bool StepOnly, bool EnableReduction, bool CollectStats>
 struct KernelConfig {
-    using Production = mega_ring_detail::MegaRingKernelConfig<true, 8, CollectStats>;
+    using Production = mega_ring_detail::MegaRingKernelConfig<true, 8, 8, CollectStats>;
     using Config = typename Production::Config;
     using ArchTag = typename Production::ArchTag;
     using TileShape_MNK = typename Production::TileShape_MNK;

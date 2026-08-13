@@ -38,12 +38,13 @@ namespace min_fa3_backward {
 using namespace cute;
 using namespace kittens;
 
-template <typename AttnKernel, int NumDevices>
+template <typename AttnKernel, int NumDevices, int KVHeads>
 struct MegaRingBwdCommConfig {
-    static constexpr int kVecLength = 1024;
+    static_assert(KVHeads == 1 || KVHeads == 2 || KVHeads == 4 || KVHeads == 8);
+    static constexpr int kVecLength = KVHeads * kHeadDim;
     enum : int {
         kRowsPerTask = kBlockN,
-        kRowsPerTransfer = 16,
+        kRowsPerTransfer = 128 / KVHeads,
     };
     static_assert(kRowsPerTask % kRowsPerTransfer == 0);
     static constexpr int kNumWarps = AttnKernel::MaxThreadsPerBlock / cutlass::NumThreadsPerWarp;
@@ -69,9 +70,9 @@ struct MegaRingBwdCommConfig {
                   "mega-ring backward communication staging exceeds Hopper shared memory");
 };
 
-template <typename AttnKernel, int NumDevices>
+template <typename AttnKernel, int NumDevices, int KVHeads>
 struct alignas(128) MegaRingBwdKernelParams {
-    using Comm = MegaRingBwdCommConfig<AttnKernel, NumDevices>;
+    using Comm = MegaRingBwdCommConfig<AttnKernel, NumDevices, KVHeads>;
     typename AttnKernel::Params compute;
     typename Comm::KRemote remote_k;
     typename Comm::KRemote remote_v;
@@ -115,12 +116,12 @@ constexpr void check_mega_ring_bwd_tma_layout() {
     static_assert(sizeof(MegaRingBwdTmaBarriers<Comm::kNumDChunks>) % 128 == 0);
 }
 
-template <typename AttnKernel, int NumDevices>
+template <typename AttnKernel, int NumDevices, int KVHeads>
 CUTLASS_DEVICE void run_mega_ring_bwd_kv_load(
-        MegaRingBwdKernelParams<AttnKernel, NumDevices> const& params,
+        MegaRingBwdKernelParams<AttnKernel, NumDevices, KVHeads> const& params,
         int comm_bid,
         char* smem_buf) {
-    using Comm = MegaRingBwdCommConfig<AttnKernel, NumDevices>;
+    using Comm = MegaRingBwdCommConfig<AttnKernel, NumDevices, KVHeads>;
     if (params.ring_world_size <= 1) { return; }
 
     tma_swizzle_allocator allocator(reinterpret_cast<int*>(smem_buf));
@@ -254,12 +255,12 @@ CUTLASS_DEVICE void run_mega_ring_bwd_kv_load(
     }
 }
 
-template <typename AttnKernel, int NumDevices>
+template <typename AttnKernel, int NumDevices, int KVHeads>
 CUTLASS_DEVICE void run_mega_ring_bwd_dkv_store(
-        MegaRingBwdKernelParams<AttnKernel, NumDevices> const& params,
+        MegaRingBwdKernelParams<AttnKernel, NumDevices, KVHeads> const& params,
         int comm_bid,
         char* smem_buf) {
-    using Comm = MegaRingBwdCommConfig<AttnKernel, NumDevices>;
+    using Comm = MegaRingBwdCommConfig<AttnKernel, NumDevices, KVHeads>;
     tma_swizzle_allocator allocator(reinterpret_cast<int*>(smem_buf));
     typename Comm::DTile (&tile)[Comm::kNumDChunks] =
         allocator.allocate<typename Comm::DTile, Comm::kNumDChunks>();
@@ -372,13 +373,13 @@ CUTLASS_DEVICE void run_mega_ring_bwd_dkv_store(
     }
 }
 
-template <typename AttnKernel, int NumDevices>
+template <typename AttnKernel, int NumDevices, int KVHeads>
 CUTLASS_GLOBAL
 #ifdef __CUDACC__
 __launch_bounds__(AttnKernel::MaxThreadsPerBlock, AttnKernel::MinBlocksPerMultiprocessor)
 #endif
 void mega_ring_flash_attn_bwd_kernel(
-        CUTLASS_GRID_CONSTANT MegaRingBwdKernelParams<AttnKernel, NumDevices> const params) {
+        CUTLASS_GRID_CONSTANT MegaRingBwdKernelParams<AttnKernel, NumDevices, KVHeads> const params) {
     extern __shared__ char smem_buf[];
     if (int(blockIdx.x) < params.num_comp_sm) {
         AttnKernel kernel;
@@ -387,8 +388,8 @@ void mega_ring_flash_attn_bwd_kernel(
     }
 
     int const comm_bid = int(blockIdx.x) - params.num_comp_sm;
-    run_mega_ring_bwd_kv_load<AttnKernel, NumDevices>(params, comm_bid, smem_buf);
-    run_mega_ring_bwd_dkv_store<AttnKernel, NumDevices>(params, comm_bid, smem_buf);
+    run_mega_ring_bwd_kv_load<AttnKernel, NumDevices, KVHeads>(params, comm_bid, smem_buf);
+    run_mega_ring_bwd_dkv_store<AttnKernel, NumDevices, KVHeads>(params, comm_bid, smem_buf);
 }
 
 static __global__ void mega_ring_bwd_wait_for_completion(int const* completion, int expected) {
@@ -403,7 +404,7 @@ template <int Arch, int kHeadDim, int kBlockM, int kBlockN, typename Element,
           int Stages_dO=2, int Stages_dS_or_QSm80=2,
           bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
           int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-          bool V_in_regs=false, bool MegaRing=false, int NumDevices=1>
+          bool V_in_regs=false, bool MegaRing=false, int NumDevices=1, int KVHeads=8>
 void run_flash_bwd(
         Flash_bwd_params &params,
         cudaStream_t stream,
@@ -611,10 +612,10 @@ void run_flash_bwd(
         TORCH_CHECK(remote_k_tensor != nullptr && remote_v_tensor != nullptr &&
                     remote_dk_tensor != nullptr && remote_dv_tensor != nullptr,
                     "mega-ring backward TMA launch requires all remote tensors");
-        using Comm = MegaRingBwdCommConfig<AttnKernel, NumDevices>;
-        using KernelParams = MegaRingBwdKernelParams<AttnKernel, NumDevices>;
+        using Comm = MegaRingBwdCommConfig<AttnKernel, NumDevices, KVHeads>;
+        using KernelParams = MegaRingBwdKernelParams<AttnKernel, NumDevices, KVHeads>;
         check_mega_ring_bwd_tma_layout<Comm>();
-        auto kernel = mega_ring_flash_attn_bwd_kernel<AttnKernel, NumDevices>;
+        auto kernel = mega_ring_flash_attn_bwd_kernel<AttnKernel, NumDevices, KVHeads>;
         int const remote_rows = params.total_k;
         int const dkv_rows_per_step = int(params.dkv_step_stride / Comm::kVecLength);
         TORCH_CHECK(params.h_k * params.d == Comm::kVecLength,

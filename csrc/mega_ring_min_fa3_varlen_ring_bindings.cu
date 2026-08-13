@@ -419,11 +419,9 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
         k.size(0),
         ", kv_heads=",
         k.size(1));
-    // MEGA_RING_TILE_COPY: every physical 16-row TMA subtile spans the full
-    // flattened KVH * D width, which is fixed to 1024 bf16 values.
-    TORCH_CHECK(k.size(1) * k.size(2) == 1024,
-                "Mega ring communication path currently requires kv_heads * head_dim == 1024. Got kv_heads=",
-                k.size(1), ", head_dim=", k.size(2));
+    TORCH_CHECK(k.size(1) == 1 || k.size(1) == 2 || k.size(1) == 4 || k.size(1) == 8,
+                "Mega ring communication path requires kv_heads in {1, 2, 4, 8}. Got ",
+                k.size(1));
 
     auto half_cu_seqlens_host = torch::zeros({batch_size + 1}, torch::TensorOptions().dtype(torch::kInt32));
     int* half_host_ptr = half_cu_seqlens_host.data_ptr<int>();

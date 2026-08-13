@@ -1664,9 +1664,9 @@ def main(
         raise SystemExit("this benchmark requires D=128")
     if (
         any(method in FUSED_MEGA_RING_METHODS for method in requested_methods)
-        and args.kvhead * args.headdim != 1024
+        and args.kvhead not in (1, 2, 4, 8)
     ):
-        raise SystemExit("fused mega-ring methods require KVH * D == 1024")
+        raise SystemExit("fused mega-ring methods require KVH in {1, 2, 4, 8}")
     if args.qhead % args.kvhead:
         raise SystemExit("qhead must be divisible by kvhead")
     if any(

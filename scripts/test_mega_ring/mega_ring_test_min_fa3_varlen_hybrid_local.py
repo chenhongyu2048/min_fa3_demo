@@ -125,8 +125,8 @@ if __name__ == "__main__":
         raise SystemExit(f"This demo requires D=128, got D={args.headdim}")
     if args.qhead % args.kvhead != 0:
         raise SystemExit(f"qhead must be divisible by kvhead, got {args.qhead} and {args.kvhead}")
-    if args.kvhead * args.headdim != 1024:
-        raise SystemExit("Mega ring communication path requires kvhead * headdim == 1024")
+    if args.kvhead not in (1, 2, 4, 8):
+        raise SystemExit("Mega ring communication path requires kvhead in {1, 2, 4, 8}")
 
     mixed_lengths = parse_lengths(args.seqlens)
     all_local_lengths = parse_lengths(args.all_local_seqlens)

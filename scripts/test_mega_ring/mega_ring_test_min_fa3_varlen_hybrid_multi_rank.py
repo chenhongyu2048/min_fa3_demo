@@ -462,8 +462,8 @@ if __name__ == "__main__":
         raise SystemExit("CUDA is required")
     if torch.cuda.get_device_capability() != (9, 0):
         raise SystemExit("SM90 Hopper is required")
-    if args.headdim != 128 or args.kvhead * args.headdim != 1024:
-        raise SystemExit("This path requires D=128 and KVH * D == 1024")
+    if args.headdim != 128 or args.kvhead not in (1, 2, 4, 8):
+        raise SystemExit("This path requires D=128 and KVH in {1, 2, 4, 8}")
     if args.qhead % args.kvhead != 0:
         raise SystemExit("qhead must be divisible by kvhead")
     rank, world_size = init_distributed()

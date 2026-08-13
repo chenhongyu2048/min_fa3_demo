@@ -244,9 +244,9 @@ def method_incompatibility(
 ) -> str | None:
     lengths = case.global_lengths
     if method in ("mega_ring_all_cp", "mega_ring_hybrid") and (
-        args.kvhead * args.headdim != 1024
+        args.headdim != 128 or args.kvhead not in (1, 2, 4, 8)
     ):
-        return "fused mega-ring requires KVH * D == 1024"
+        return "fused mega-ring requires D=128 and KVH in {1, 2, 4, 8}"
     if method in ("allgather_attention", "llama3_allgather_attention") and (
         args.kvhead % args.allgather_overlapping_heads_k_stride
     ):

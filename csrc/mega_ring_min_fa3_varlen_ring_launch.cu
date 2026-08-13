@@ -7,6 +7,25 @@
 
 namespace min_fa3_varlen_demo {
 
+namespace {
+
+template <bool IsCausal, bool CollectStats>
+void dispatch_mega_ring_kv_heads(
+    Ring_fwd_params& params,
+    kittens::py::TKParallelTensor& remote_k,
+    kittens::py::TKParallelTensor& remote_v,
+    cudaStream_t stream) {
+    switch (params.h_k) {
+        case 1: mega_ring_detail::dispatch_mega_ring_world_size<IsCausal, 1, CollectStats>(params, remote_k, remote_v, stream); break;
+        case 2: mega_ring_detail::dispatch_mega_ring_world_size<IsCausal, 2, CollectStats>(params, remote_k, remote_v, stream); break;
+        case 4: mega_ring_detail::dispatch_mega_ring_world_size<IsCausal, 4, CollectStats>(params, remote_k, remote_v, stream); break;
+        case 8: mega_ring_detail::dispatch_mega_ring_world_size<IsCausal, 8, CollectStats>(params, remote_k, remote_v, stream); break;
+        default: TORCH_CHECK(false, "Mega ring forward requires kv_heads in {1, 2, 4, 8}. Got ", params.h_k);
+    }
+}
+
+}  // namespace
+
 void run_mega_ring_min_fa3_varlen_ring_fwd(
     Ring_fwd_params& params,
     kittens::py::TKParallelTensor& remote_k,
@@ -40,15 +59,15 @@ void run_mega_ring_min_fa3_varlen_ring_fwd(
 
     if (params.is_causal) {
         if (params.mega_ring_stats != nullptr) {
-            mega_ring_detail::dispatch_mega_ring_world_size<true, true>(params, remote_k, remote_v, stream);
+            dispatch_mega_ring_kv_heads<true, true>(params, remote_k, remote_v, stream);
         } else {
-            mega_ring_detail::dispatch_mega_ring_world_size<true, false>(params, remote_k, remote_v, stream);
+            dispatch_mega_ring_kv_heads<true, false>(params, remote_k, remote_v, stream);
         }
     } else {
         if (params.mega_ring_stats != nullptr) {
-            mega_ring_detail::dispatch_mega_ring_world_size<false, true>(params, remote_k, remote_v, stream);
+            dispatch_mega_ring_kv_heads<false, true>(params, remote_k, remote_v, stream);
         } else {
-            mega_ring_detail::dispatch_mega_ring_world_size<false, false>(params, remote_k, remote_v, stream);
+            dispatch_mega_ring_kv_heads<false, false>(params, remote_k, remote_v, stream);
         }
     }
 }

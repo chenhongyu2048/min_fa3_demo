@@ -349,10 +349,10 @@ if __name__ == "__main__":
         raise SystemExit(
             f"This demo requires qhead % kvhead == 0 for GQA/MQA, got qhead={args.qhead}, kvhead={args.kvhead}"
         )
-    if args.kvhead * args.headdim != 1024:
+    if args.kvhead not in (1, 2, 4, 8):
         raise SystemExit(
-            "Mega ring communication path requires kvhead * headdim == 1024, "
-            f"got kvhead={args.kvhead}, headdim={args.headdim}"
+            "Mega ring communication path requires kvhead in {1, 2, 4, 8}, "
+            f"got kvhead={args.kvhead}"
         )
 
     local_rank, local_world_size = init_distributed()

@@ -273,7 +273,9 @@ padded_end   = cu_seqlens_k[batch_end]   + batch_end * 128
 ```
 
 The interval is decoded by KV head and 128-token padded block. One logical dK
-or dV task is one fixed `16 x 1024` FP32 TMA transaction. The communication CTA
+or dV task is one `(128/KVH) x (KVH*128)` FP32 TMA transaction. The shape is
+`128x128`, `64x256`, `32x512`, or `16x1024` for `KVH=1,2,4,8`; every variant is
+64 KiB and represents exactly one KV head by 128 tokens. The communication CTA
 loads that transaction from the selected local step buffer and executes remote
 TMA reduce-add into the target owner's FP32 accumulator.
 

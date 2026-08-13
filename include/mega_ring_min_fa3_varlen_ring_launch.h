@@ -38,7 +38,7 @@ namespace mega_ring_detail {
 
 using namespace kittens;
 
-template <bool IsCausal, int NumDevices, bool CollectStats = false>
+template <bool IsCausal, int NumDevices, int KVHeads, bool CollectStats = false>
 struct MegaRingKernelConfig {
     // MEGA_RING: keep the same copied FA3 varlen mainloop/epilogue stack as
     // the single-step ring path, changing only the scheduler and kernel wrapper.
@@ -94,13 +94,14 @@ struct MegaRingKernelConfig {
         CollectStats>;
     using AttnKernel = flash::enable_sm90<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
 
-    static constexpr int kVecLength = 1024;
+    static_assert(KVHeads == 1 || KVHeads == 2 || KVHeads == 4 || KVHeads == 8);
+    static constexpr int kVecLength = KVHeads * kHeadDim;
     // MEGA_RING_TILE_COPY: communication is scheduled in attention-sized KV
-    // tiles, while each physical TMA transaction moves a 16-row subtile.  All
-    // mega-ring row ranges and arena offsets are at least 128-row aligned.
+    // tiles. Causal TMA transfers keep a constant byte size as KVH changes;
+    // noncausal uses 16-row transfers so BlockN=176 remains divisible.
     enum : int {
         kRowsPerTask = Config::kBlockN,
-        kRowsPerTransfer = 16,
+        kRowsPerTransfer = IsCausal ? 128 / KVHeads : 16,
     };
     static_assert(kRowsPerTask % kRowsPerTransfer == 0);
     static_assert(128 % kRowsPerTransfer == 0);
@@ -346,13 +347,13 @@ void mega_ring_flash_attn_varlen_kernel(CUTLASS_GRID_CONSTANT typename RingConfi
     }
 }
 
-template <bool IsCausal, int NumDevices, bool CollectStats>
+template <bool IsCausal, int NumDevices, int KVHeads, bool CollectStats>
 void run_mega_ring_min_fa3_varlen_ring_sm90(
     Ring_fwd_params& params,
     kittens::py::TKParallelTensor& remote_k,
     kittens::py::TKParallelTensor& remote_v,
     cudaStream_t stream) {
-    using RingConfig = MegaRingKernelConfig<IsCausal, NumDevices, CollectStats>;
+    using RingConfig = MegaRingKernelConfig<IsCausal, NumDevices, KVHeads, CollectStats>;
     using AttnKernel = typename RingConfig::AttnKernel;
     check_mega_ring_kernel_param_layout<RingConfig>();
 
@@ -570,7 +571,7 @@ void run_mega_ring_min_fa3_varlen_ring_sm90(
     }
 }
 
-template <bool IsCausal, bool CollectStats>
+template <bool IsCausal, int KVHeads, bool CollectStats>
 void dispatch_mega_ring_world_size(
     Ring_fwd_params& params,
     kittens::py::TKParallelTensor& remote_k,
@@ -580,13 +581,13 @@ void dispatch_mega_ring_world_size(
     // the same explicit local_world_size dispatch style as the ring path.
     switch (remote_k.local_world_size_) {
         case 2:
-            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 2, CollectStats>(params, remote_k, remote_v, stream);
+            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 2, KVHeads, CollectStats>(params, remote_k, remote_v, stream);
             break;
         case 4:
-            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 4, CollectStats>(params, remote_k, remote_v, stream);
+            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 4, KVHeads, CollectStats>(params, remote_k, remote_v, stream);
             break;
         case 8:
-            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 8, CollectStats>(params, remote_k, remote_v, stream);
+            run_mega_ring_min_fa3_varlen_ring_sm90<IsCausal, 8, KVHeads, CollectStats>(params, remote_k, remote_v, stream);
             break;
         default:
             TORCH_CHECK(false, "Unsupported local_world_size for mega ring varlen path: ", remote_k.local_world_size_);

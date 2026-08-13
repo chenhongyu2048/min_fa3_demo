@@ -13,7 +13,7 @@ void run_min_fa3_bwd(Flash_bwd_params& params, cudaStream_t stream) {
     }
 }
 
-template <int NumDevices>
+template <int NumDevices, int KVHeads>
 void run_min_fa3_bwd_mega_ring_sm90(
         Flash_bwd_params& params,
         kittens::py::TKParallelTensor& remote_k,
@@ -45,8 +45,30 @@ void run_min_fa3_bwd_mega_ring_sm90(
         kAtomLayoutMdQ,
         kVInRegs,
         true,   // mega ring
-        NumDevices
+        NumDevices,
+        KVHeads
     >(params, stream, &remote_k, &remote_v, &remote_dk_accum, &remote_dv_accum);
+}
+
+template <int KVHeads>
+void dispatch_mega_ring_bwd_world_size(
+        Flash_bwd_params& params,
+        kittens::py::TKParallelTensor& remote_k,
+        kittens::py::TKParallelTensor& remote_v,
+        kittens::py::TKParallelTensor& remote_dk_accum,
+        kittens::py::TKParallelTensor& remote_dv_accum,
+        cudaStream_t stream) {
+    switch (params.ring_world_size) {
+        case 1: run_min_fa3_bwd_mega_ring_sm90<1, KVHeads>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
+        case 2: run_min_fa3_bwd_mega_ring_sm90<2, KVHeads>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
+        case 3: run_min_fa3_bwd_mega_ring_sm90<3, KVHeads>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
+        case 4: run_min_fa3_bwd_mega_ring_sm90<4, KVHeads>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
+        case 5: run_min_fa3_bwd_mega_ring_sm90<5, KVHeads>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
+        case 6: run_min_fa3_bwd_mega_ring_sm90<6, KVHeads>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
+        case 7: run_min_fa3_bwd_mega_ring_sm90<7, KVHeads>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
+        case 8: run_min_fa3_bwd_mega_ring_sm90<8, KVHeads>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
+        default: TORCH_CHECK(false, "Unsupported mega-ring backward world size: ", params.ring_world_size);
+    }
 }
 
 void run_min_fa3_bwd_mega_ring(
@@ -56,16 +78,12 @@ void run_min_fa3_bwd_mega_ring(
         kittens::py::TKParallelTensor& remote_dk_accum,
         kittens::py::TKParallelTensor& remote_dv_accum,
         cudaStream_t stream) {
-    switch (params.ring_world_size) {
-        case 1: run_min_fa3_bwd_mega_ring_sm90<1>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
-        case 2: run_min_fa3_bwd_mega_ring_sm90<2>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
-        case 3: run_min_fa3_bwd_mega_ring_sm90<3>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
-        case 4: run_min_fa3_bwd_mega_ring_sm90<4>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
-        case 5: run_min_fa3_bwd_mega_ring_sm90<5>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
-        case 6: run_min_fa3_bwd_mega_ring_sm90<6>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
-        case 7: run_min_fa3_bwd_mega_ring_sm90<7>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
-        case 8: run_min_fa3_bwd_mega_ring_sm90<8>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
-        default: TORCH_CHECK(false, "Unsupported mega-ring backward world size: ", params.ring_world_size);
+    switch (params.h_k) {
+        case 1: dispatch_mega_ring_bwd_world_size<1>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
+        case 2: dispatch_mega_ring_bwd_world_size<2>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
+        case 4: dispatch_mega_ring_bwd_world_size<4>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
+        case 8: dispatch_mega_ring_bwd_world_size<8>(params, remote_k, remote_v, remote_dk_accum, remote_dv_accum, stream); break;
+        default: TORCH_CHECK(false, "Mega-ring backward requires kv_heads in {1, 2, 4, 8}. Got ", params.h_k);
     }
 }
 

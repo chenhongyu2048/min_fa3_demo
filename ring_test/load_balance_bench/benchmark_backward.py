@@ -74,8 +74,8 @@ def _validate_common_args(args: argparse.Namespace) -> None:
         raise SystemExit("five-method backward benchmark supports only --mode causal")
     if args.headdim != 128:
         raise SystemExit("this benchmark requires D=128")
-    if args.kvhead * args.headdim != 1024:
-        raise SystemExit("the fused Mega Ring methods require KVH * D == 1024")
+    if args.kvhead not in (1, 2, 4, 8):
+        raise SystemExit("the fused Mega Ring methods require KVH in {1, 2, 4, 8}")
     if args.qhead % args.kvhead:
         raise SystemExit("qhead must be divisible by kvhead")
     if args.allgather_overlapping_heads_k_stride <= 0 or (

@@ -480,8 +480,8 @@ create_backward_varlen_mega_ring_workspace(
                 "workspace world_size must be 1, 2, 4, or 8");
     TORCH_CHECK(kv_heads > 0 && kv_heads <= std::numeric_limits<int>::max(),
                 "workspace kv_heads must be a positive int32 value");
-    TORCH_CHECK(kv_heads * q.size(2) == 1024,
-                "workspace requires KVH * D == 1024");
+    TORCH_CHECK(kv_heads == 1 || kv_heads == 2 || kv_heads == 4 || kv_heads == 8,
+                "workspace requires KVH in {1, 2, 4, 8}");
     TORCH_CHECK(q.size(1) % kv_heads == 0,
                 "workspace qhead must be divisible by kvhead");
     TORCH_CHECK(rank_capacity > 0 &&
@@ -602,8 +602,8 @@ py::tuple backward_varlen_mega_ring(
                 "qhead and kvhead must be positive");
     TORCH_CHECK(q.size(1) % k.size(1) == 0, "qhead must be divisible by kvhead");
     TORCH_CHECK(k.size(1) == v.size(1) && k.size(2) == v.size(2), "k/v shapes must match");
-    TORCH_CHECK(k.size(1) * k.size(2) == 1024,
-                "mega-ring backward currently requires kvhead * head_dim == 1024");
+    TORCH_CHECK(k.size(1) == 1 || k.size(1) == 2 || k.size(1) == 4 || k.size(1) == 8,
+                "mega-ring backward requires kvhead in {1, 2, 4, 8}");
     TORCH_CHECK(softmax_lse.sizes() == torch::IntArrayRef({q.size(1), q.size(0)}),
                 "softmax_lse must have shape [QH, total_q]");
     TORCH_CHECK(num_comp_sm > 0 && num_comm_sm > 0,
