@@ -648,7 +648,7 @@ struct CollectiveMainloopBwdSm90 {
                      gLSE(_, m_block + 1), sLSE(_, smem_pipe_write.index()));
             }
         }
-        scheduler_prefetch();
+        if constexpr (!MegaRing) { scheduler_prefetch(); }
         if (lane_predicate) {
             PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
             pipeline_do.producer_acquire(smem_pipe_write_do_cur);
@@ -659,6 +659,7 @@ struct CollectiveMainloopBwdSm90 {
             if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
             ++smem_pipe_write;
         }
+        if constexpr (MegaRing) { scheduler_prefetch(); }
         if constexpr (Q_dO_same_stages) { smem_pipe_write_do = smem_pipe_write; }
     }
 
