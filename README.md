@@ -4,6 +4,51 @@ This standalone directory contains a minimal Hopper FlashAttention
 forward/backward demo copied and trimmed from the original `hopper/`
 implementation.
 
+## Install
+
+The checked-in dependency metadata targets Python 3.12, PyTorch 2.10.0 with
+its CUDA 12.8 runtime, and Triton 3.6.0. Building the extension additionally
+requires a CUDA toolkit with `nvcc`, a linkable CUDA driver library, and the
+vendored CUTLASS and ThunderKittens submodules. Runtime execution requires an
+SM90 Hopper GPU.
+
+Create the repository environment, install the locked core and build
+dependencies, and build the extension in place with:
+
+```bash
+git submodule update --init third_party/cutlass third_party/ThunderKittens
+uv venv --python 3.12
+uv sync --frozen --no-install-project --group build
+make PYTHON=.venv/bin/python
+```
+
+`--no-install-project` intentionally leaves the CUDA extension to the existing
+in-place `make` workflow. The commands above target a fresh core environment;
+when updating an existing environment that contains manually installed
+optional packages, add `--inexact` to preserve those undeclared packages. To
+use the plotting and dataset-maintenance scripts, sync their optional
+dependency groups before building:
+
+```bash
+# Plotting only.
+uv sync --frozen --no-install-project --group build --group plot
+
+# Dataset tools include the plotting dependencies.
+uv sync --frozen --no-install-project --group build --group dataset
+```
+
+The `uv.lock` file pins all transitive Python packages. CUDA toolkit, driver,
+and GPU requirements remain system prerequisites; in particular, do not
+replace the active toolkit with the separately packaged CUDA runtime libraries
+that PyTorch installs into the virtual environment. `CUTLASS_DIR` can still
+select an external CUTLASS checkout as described in the Build section below.
+
+MagiAttention remains an optional performance-only baseline with a separate
+CUDA-aware installation procedure. Follow
+[`baseline/magi_attention/README.md`](baseline/magi_attention/README.md) only
+when that benchmark method is needed; it is not part of the default dependency
+sync.
+
 ## Source provenance
 
 The local sources preserve the structure of the Hopper forward and backward
@@ -365,6 +410,7 @@ the import path.
 | --- | --- |
 | `benchmark_uniform.sh` | Fixed-total-token uniform matrix with one reusable `torchrun` per selected direction |
 | `benchmark_dataset.sh` | Recommended dataset-shaped forward/backward benchmark wrapper for 2, 4, or 8 GPUs |
+| `benchmark_dataset_kvh_matrix.sh` | Causal 128K five-dataset, KVH 1/2/4, eight-method forward/backward matrix with one `torchrun` per direction/KVH/dataset |
 | `scripts/test_dcp/benchmark_dcp_mega_trace.sh` | Generate `NUM_CASES` trace snapshots, then run eager Mega/baselines and graph baselines in separate 8-rank launches |
 | `benchmark_dcp_mega_arrival_matrix.sh` | Run the 3-arrival x 3-DCP trace matrix with one eager Mega comm-SM sweep plus eager/graph baselines per combination |
 | `dcp_test/benchmark_dcp_mega_batch.py` | Reuse one 8-rank process group across a filtered packed-varlen Mega DCP case matrix |
@@ -591,6 +637,23 @@ Hierarchical mega-ring notes:
 The root wrapper is the recommended entry point for current end-to-end
 experiments. It runs forward by default; set `DIRECTION=backward` for causal
 backward. `DRY_RUN=1` prints commands without launching CUDA work.
+
+For the full causal 128K KV-head matrix, use the dedicated wrapper. It runs one
+`torchrun` per direction, KV-head count, and dataset. The defaults cover five
+datasets and KVH 1/2/4, producing 30 independent launches. Each launch keeps
+all `NUM_CASES` for that dataset in one process group; `NUM_CASES` defaults to
+20. Mega Ring all-CP and hybrid methods traverse every entry in `SM_CONFIGS`;
+other methods run only at the first entry. Logs are isolated under
+`<LOG_DIR>/<direction>/kvh<KVH>/<dataset>.log`.
+
+Use `DIRECTIONS=forward` or `DIRECTIONS=backward` to run only one direction.
+
+```bash
+./benchmark_dataset_kvh_matrix.sh
+
+DRY_RUN=1 WARMUP_ITERS=1 NUM_ITERS=2 \
+  DATASETS=arxiv KVHEADS=1,2 ./benchmark_dataset_kvh_matrix.sh
+```
 
 ```bash
 DATASETS="arxiv github pile freelaw prolong" GPU_COUNTS=8 NUM_CASES=4 ZEPPELIN_THRESHOLD=4096 \
