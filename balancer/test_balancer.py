@@ -449,6 +449,35 @@ class HierarchicalLoadBalancerTest(unittest.TestCase):
 
 
 class DatasetBenchmarkFrontendTest(unittest.TestCase):
+    def test_matrix_helpers_validate_and_adapt_kvheads(self) -> None:
+        args = benchmark_dataset_forward.parse_args(
+            [
+                "--datasets",
+                "arxiv,github,arxiv",
+                "--kvheads",
+                "1,2,4,8,2",
+            ]
+        )
+        self.assertEqual(
+            benchmark_dataset_forward._selected_datasets(args),
+            ["arxiv", "github"],
+        )
+        self.assertEqual(
+            benchmark_dataset_forward._selected_kvheads(args),
+            [1, 2, 4, 8],
+        )
+        self.assertEqual(
+            [benchmark_dataset_forward._heads_k_stride(kvhead, 4) for kvhead in (1, 2, 4, 8)],
+            [1, 2, 4, 4],
+        )
+
+    def test_rejects_conflicting_dataset_options(self) -> None:
+        args = benchmark_dataset_forward.parse_args(
+            ["--dataset", "arxiv", "--datasets", "github"]
+        )
+        with self.assertRaisesRegex(SystemExit, "cannot be combined"):
+            benchmark_dataset_forward._selected_datasets(args)
+
     def test_pile_print_workload_uses_json_distribution(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -552,6 +581,50 @@ class DatasetBenchmarkFrontendTest(unittest.TestCase):
         self.assertNotEqual(
             workload_cases[0].global_lengths,
             workload_cases[1].global_lengths,
+        )
+
+    def test_forward_matrix_reuses_one_process_for_multiple_kvheads(self) -> None:
+        calls: list[tuple[list[str], dict[str, object]]] = []
+
+        def fake_main(argv, **kwargs) -> None:
+            calls.append((list(argv), dict(kwargs)))
+
+        fake_benchmark = types.SimpleNamespace(main=fake_main)
+        with mock.patch.dict(
+            os.environ,
+            {"LOCAL_RANK": "0", "LOCAL_WORLD_SIZE": "8"},
+        ), mock.patch.dict(
+            sys.modules,
+            {"benchmark_topology_forward": fake_benchmark},
+        ), contextlib.redirect_stdout(io.StringIO()):
+            benchmark_dataset_forward.main(
+                [
+                    "--datasets",
+                    "arxiv,github",
+                    "--kvheads",
+                    "1,2",
+                    "--target-tokens",
+                    "8192",
+                    "--no-check",
+                ]
+            )
+
+        self.assertEqual(len(calls), 2)
+        for forwarded, options in calls:
+            self.assertEqual(len(options["workload_cases"]), 2)
+            self.assertFalse(options["manage_process_group"])
+            self.assertTrue(options["skip_incompatible_methods"])
+            self.assertIn("--kvhead", forwarded)
+        first_argv, second_argv = (call[0] for call in calls)
+        self.assertEqual(first_argv[first_argv.index("--kvhead") + 1], "1")
+        self.assertEqual(second_argv[second_argv.index("--kvhead") + 1], "2")
+        self.assertEqual(
+            first_argv[first_argv.index("--allgather-overlapping-heads-k-stride") + 1],
+            "1",
+        )
+        self.assertEqual(
+            second_argv[second_argv.index("--allgather-overlapping-heads-k-stride") + 1],
+            "2",
         )
 
     def test_backward_print_workload_uses_balancer_without_cuda(self) -> None:

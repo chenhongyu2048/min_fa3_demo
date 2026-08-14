@@ -1581,6 +1581,7 @@ def main(
     *,
     workload_cases: Sequence[HybridBenchmarkCase] | None = None,
     skip_incompatible_methods: bool = False,
+    manage_process_group: bool = True,
 ) -> None:
     if workload_cases is None:
         forwarded_argv = list(sys.argv[1:] if argv is None else argv)
@@ -1592,6 +1593,7 @@ def main(
             _main_single(
                 argv,
                 skip_incompatible_methods=skip_incompatible_methods,
+                manage_process_group=manage_process_group,
             )
             return
         if args.context_lengths is None or args.batch_sizes is None:
@@ -1730,7 +1732,7 @@ def main(
             cuda_barrier()
         if pools is not None:
             pools.close()
-        if dist.is_initialized():
+        if manage_process_group and dist.is_initialized():
             dist.destroy_process_group()
 
 

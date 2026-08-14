@@ -21,6 +21,9 @@ from ring_test.utils import HybridBenchmarkCase
 from zeppelin import DEFAULT_ZEPPELIN_THRESHOLD
 
 
+SUPPORTED_KVHEADS = (1, 2, 4, 8)
+
+
 def _format_int_list(values: Sequence[int]) -> str:
     return ",".join(str(value) for value in values)
 
@@ -44,6 +47,47 @@ def _magi_overlap_degree(value: str) -> int:
     if not 1 <= parsed <= 8:
         raise argparse.ArgumentTypeError("value must be an integer in [1, 8]")
     return parsed
+
+
+def _csv_values(value: str) -> list[str]:
+    values = [item.strip() for item in value.split(",") if item.strip()]
+    if not values:
+        raise argparse.ArgumentTypeError("value must contain at least one item")
+    return values
+
+
+def _selected_datasets(args: argparse.Namespace) -> list[str]:
+    if args.dataset is not None and args.datasets is not None:
+        raise SystemExit("--dataset and --datasets cannot be combined")
+    datasets = [args.dataset] if args.dataset is not None else args.datasets
+    if datasets is None:
+        raise SystemExit("one of --dataset or --datasets is required")
+    unknown = [dataset for dataset in datasets if dataset not in balancer.DATASET_WEIGHTS]
+    if unknown:
+        raise SystemExit(
+            f"unknown datasets {unknown}; expected values from {tuple(balancer.DATASET_WEIGHTS)}"
+        )
+    return list(dict.fromkeys(datasets))
+
+
+def _selected_kvheads(args: argparse.Namespace) -> list[int]:
+    kvheads = [args.kvhead] if args.kvheads is None else args.kvheads
+    unsupported = [kvhead for kvhead in kvheads if kvhead not in SUPPORTED_KVHEADS]
+    if unsupported:
+        raise SystemExit(
+            f"--kvhead/--kvheads must contain only {SUPPORTED_KVHEADS}, got {unsupported}"
+        )
+    if any(args.qhead % kvhead for kvhead in kvheads):
+        raise SystemExit("qhead must be divisible by every requested kvhead")
+    return list(dict.fromkeys(kvheads))
+
+
+def _heads_k_stride(kvhead: int, requested: int) -> int:
+    return max(
+        stride
+        for stride in range(1, min(kvhead, requested) + 1)
+        if kvhead % stride == 0
+    )
 
 
 def print_workload(
@@ -181,7 +225,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a dataset-shaped workload and run the explicit-topology forward benchmark"
     )
-    parser.add_argument("--dataset", choices=tuple(balancer.DATASET_WEIGHTS), required=True)
+    parser.add_argument("--dataset", choices=tuple(balancer.DATASET_WEIGHTS))
+    parser.add_argument(
+        "--datasets",
+        type=_csv_values,
+        help="Comma-separated datasets to benchmark in the same torchrun",
+    )
     parser.add_argument("--target-tokens", type=int, default=balancer.MAX_SEQUENCE_TOKENS)
     parser.add_argument(
         "--compute-balance-tolerance",
@@ -225,6 +274,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--print-workload", action="store_true")
     parser.add_argument("--qhead", type=int, default=32)
     parser.add_argument("--kvhead", type=int, default=8)
+    parser.add_argument(
+        "--kvheads",
+        type=lambda value: [int(item) for item in _csv_values(value)],
+        help="Comma-separated KV head counts to benchmark in the same torchrun",
+    )
     parser.add_argument("--headdim", type=int, default=128)
     parser.add_argument(
         "--allgather-overlapping-heads-k-stride",
@@ -330,59 +384,93 @@ def _benchmark_argv(
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     world_size = _world_size(args)
-    try:
-        workloads = balancer.make_workloads(
-            dataset=args.dataset,
-            target_tokens=args.target_tokens,
-            seed=args.seed,
-            num_cases=args.num_cases,
-            world_size=world_size,
-            mode=args.mode,
-            compute_balance_tolerance=args.compute_balance_tolerance,
-            token_balance_tolerance=args.token_balance_tolerance,
-            beam_width=args.beam_width,
-            finalist_count=args.finalist_count,
-            structure_threshold=args.structure_threshold,
-            max_repair_iterations=args.max_repair_iterations,
-        )
-    except (RuntimeError, ValueError) as exc:
-        raise SystemExit(str(exc)) from exc
+    datasets = _selected_datasets(args)
+    kvheads = _selected_kvheads(args)
+    workloads_by_dataset: list[tuple[str, list[balancer.HybridWorkload]]] = []
+    for dataset in datasets:
+        try:
+            workloads = balancer.make_workloads(
+                dataset=dataset,
+                target_tokens=args.target_tokens,
+                seed=args.seed,
+                num_cases=args.num_cases,
+                world_size=world_size,
+                mode=args.mode,
+                compute_balance_tolerance=args.compute_balance_tolerance,
+                token_balance_tolerance=args.token_balance_tolerance,
+                beam_width=args.beam_width,
+                finalist_count=args.finalist_count,
+                structure_threshold=args.structure_threshold,
+                max_repair_iterations=args.max_repair_iterations,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise SystemExit(f"dataset={dataset}: {exc}") from exc
+        workloads_by_dataset.append((dataset, workloads))
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if args.print_workload or local_rank == 0:
-        for case_index, workload in enumerate(workloads):
-            print(f"\nDataset case {case_index + 1}/{args.num_cases}")
-            print_workload(
-                workload,
-                args.dataset,
-                args.seed,
-                args.target_tokens,
-                world_size,
-                args.mode,
-            )
+        for dataset, workloads in workloads_by_dataset:
+            for case_index, workload in enumerate(workloads):
+                print(f"\nDataset case {case_index + 1}/{args.num_cases}")
+                print_workload(
+                    workload,
+                    dataset,
+                    args.seed,
+                    args.target_tokens,
+                    world_size,
+                    args.mode,
+                )
     if args.print_workload:
         return
 
-    benchmark_cases = [
-        HybridBenchmarkCase(
-            label=f"dataset={args.dataset}, case={case_index + 1}/{args.num_cases}",
-            case_index=case_index,
-            num_cases=args.num_cases,
-            global_lengths=tuple(workload.global_lengths),
-            ring_sizes=tuple(workload.ring_sizes),
-            ring_starts=tuple(workload.ring_starts),
-        )
-        for case_index, workload in enumerate(workloads)
-    ]
-    forwarded_argv = _benchmark_argv(args, workloads[0])
+    total_cases = len(datasets) * args.num_cases
+    benchmark_cases: list[HybridBenchmarkCase] = []
+    for dataset, workloads in workloads_by_dataset:
+        for dataset_case_index, workload in enumerate(workloads):
+            case_index = len(benchmark_cases)
+            benchmark_cases.append(
+                HybridBenchmarkCase(
+                    label=(
+                        f"dataset={dataset}, "
+                        f"case={dataset_case_index + 1}/{args.num_cases}"
+                    ),
+                    case_index=case_index,
+                    num_cases=total_cases,
+                    global_lengths=tuple(workload.global_lengths),
+                    ring_sizes=tuple(workload.ring_sizes),
+                    ring_starts=tuple(workload.ring_starts),
+                )
+            )
 
     import benchmark_topology_forward
+    import torch
+    import torch.distributed as dist
 
-    benchmark_topology_forward.main(
-        forwarded_argv,
-        workload_cases=benchmark_cases,
-        skip_incompatible_methods=_requests_all(args.methods),
-    )
+    requested_stride = args.allgather_overlapping_heads_k_stride
+    try:
+        for kvhead in kvheads:
+            args.kvhead = kvhead
+            args.allgather_overlapping_heads_k_stride = _heads_k_stride(
+                kvhead, requested_stride
+            )
+            if local_rank == 0:
+                print(
+                    f"\nDataset matrix forward KVH={kvhead}: "
+                    f"datasets={datasets}, cases={total_cases}",
+                    flush=True,
+                )
+            forwarded_argv = _benchmark_argv(args, workloads_by_dataset[0][1][0])
+            benchmark_topology_forward.main(
+                forwarded_argv,
+                workload_cases=benchmark_cases,
+                skip_incompatible_methods=_requests_all(args.methods),
+                manage_process_group=False,
+            )
+    finally:
+        if dist.is_initialized():
+            torch.cuda.synchronize()
+            dist.barrier()
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

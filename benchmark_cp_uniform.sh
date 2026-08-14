@@ -57,6 +57,11 @@ case "$DRY_RUN" in
     *) die "DRY_RUN must be 0 or 1, got '$DRY_RUN'" ;;
 esac
 
+case "$MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE" in
+    0|1) ;;
+    *) die "MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE must be 0 or 1, got '$MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE'" ;;
+esac
+
 case "$DIRECTION" in
     forward) DIRECTION_LIST=(forward) ;;
     backward) DIRECTION_LIST=(backward) ;;
@@ -239,6 +244,7 @@ echo "Directions: ${DIRECTION_LIST[*]}"
 echo "Workloads per direction: $workload_cases; total benchmark points: $total_cases; torchrun launches: $direction_count"
 echo "Methods: $METHODS"
 echo "Config: direction=$DIRECTION, mode=$MODE, QH=$QHEAD, KVH=$KVHEAD, D=$HEADDIM, sm_configs=$SM_CONFIGS, warmup=$WARMUP_ITERS, iters=$NUM_ITERS, check=$CHECK"
+echo "Magi backward high-precision reduce: $MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE (1=FP32 reduction)"
 
 direction_index=0
 for direction in "${DIRECTION_LIST[@]}"; do

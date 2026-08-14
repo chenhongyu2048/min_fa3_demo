@@ -1631,6 +1631,7 @@ def main(
     *,
     workload_cases: Sequence[HybridBenchmarkCase] | None = None,
     skip_incompatible_methods: bool = False,
+    manage_process_group: bool = True,
 ) -> None:
     args = parse_args(argv)
     uniform_requested = (
@@ -1864,7 +1865,7 @@ def main(
             dist.barrier()
         if parallel_pools is not None:
             parallel_pools.close()
-        if dist.is_initialized():
+        if manage_process_group and dist.is_initialized():
             dist.destroy_process_group()
 
 

@@ -1,0 +1,1846 @@
+
+Dataset case 1/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=8, target_tokens=131072, actual_tokens=131072, target_delta=+0
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      18432     G8       0-7       2304           2.123e+07
+   1      18432     G4       0-3       4608           4.247e+07
+   2      12288     G4       0-3       3072           1.888e+07
+   3      26624     G4       0-3       6656           8.861e+07
+   4      20480     G4       4-7       5120           5.243e+07
+   5      28672     G4       4-7       7168           1.028e+08
+   6       3584     G2       4-5       1792           3.212e+06
+   7       2560     G2       6-7       1280           1.639e+06
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      16640    101.56%      1.712e+08       97.81%           5.914e+04
+   1      16640    101.56%      1.712e+08       97.81%           5.914e+04
+   2      16640    101.56%      1.712e+08       97.81%           5.914e+04
+   3      16640    101.56%      1.712e+08       97.81%           5.914e+04
+   4      16384    100.00%      1.796e+08      102.64%           5.478e+04
+   5      16384    100.00%      1.796e+08      102.64%           5.478e+04
+   6      15872     96.88%      1.781e+08      101.74%           5.427e+04
+   7      15872     96.88%      1.781e+08      101.74%           5.427e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       1.712e+08      1.750e+08      1.796e+08          2.64%        5.00%    True
+Tokens            15872      16384.000          16640          3.12%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=7, relaxation='unlock 2K-4K G2', repair_moves=2
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            2               2
+     4K-8K            0               0
+    8K-16K            1               2
+      >16K            5              11
+Communication: amplification=3.468750, proxy_Q=9.907e+04, active_rings=5, total_token_hops=4.547e+05
+
+Kernel metadata
+global_seqlens=18432,18432,12288,26624,20480,28672,3584,2560
+ring_sizes=8,4,4,4,4,4,2,2
+ring_starts=0,0,0,0,4,4,4,6
+
+Dataset case 2/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=6, target_tokens=131072, actual_tokens=131072, target_delta=+0
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      49152     G8       0-7       6144           1.510e+08
+   1      24576     G4       0-3       6144           7.550e+07
+   2      16384     G4       0-3       4096           3.356e+07
+   3      10240     G4       4-7       2560           1.311e+07
+   4      28672     G4       4-7       7168           1.028e+08
+   5       2048     G2       6-7       1024           1.049e+06
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      16384    100.00%      2.601e+08       98.61%           7.373e+04
+   1      16384    100.00%      2.601e+08       98.61%           7.373e+04
+   2      16384    100.00%      2.601e+08       98.61%           7.373e+04
+   3      16384    100.00%      2.601e+08       98.61%           7.373e+04
+   4      15872     96.88%      2.669e+08      101.19%           7.219e+04
+   5      15872     96.88%      2.669e+08      101.19%           7.219e+04
+   6      16896    103.12%      2.679e+08      101.59%           7.322e+04
+   7      16896    103.12%      2.679e+08      101.59%           7.322e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       2.601e+08      2.637e+08      2.679e+08          1.59%        5.00%    True
+Tokens            15872      16384.000          16896          3.12%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=7, relaxation='unlock <=2K G2', repair_moves=2
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            1               1
+     2K-4K            0               0
+     4K-8K            0               0
+    8K-16K            2               4
+      >16K            3               7
+Communication: amplification=4.468750, proxy_Q=1.039e+05, active_rings=4, total_token_hops=5.857e+05
+
+Kernel metadata
+global_seqlens=49152,24576,16384,10240,28672,2048
+ring_sizes=8,4,4,4,4,2
+ring_starts=0,0,0,4,4,6
+
+Dataset case 3/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=6, target_tokens=131072, actual_tokens=132096, target_delta=+1024
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      12288     G8       0-7       1536           9.438e+06
+   1      32768     G8       0-7       4096           6.711e+07
+   2      61440     G8       0-7       7680           2.359e+08
+   3      12288     G4       4-7       3072           1.888e+07
+   4       7168     G2       0-1       3584           1.285e+07
+   5       6144     G2       2-3       3072           9.439e+06
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      16896    102.33%      3.253e+08       99.34%           9.677e+04
+   1      16896    102.33%      3.253e+08       99.34%           9.677e+04
+   2      16384     99.22%      3.219e+08       98.30%           9.626e+04
+   3      16384     99.22%      3.219e+08       98.30%           9.626e+04
+   4      16384     99.22%      3.314e+08      101.18%           1.024e+05
+   5      16384     99.22%      3.314e+08      101.18%           1.024e+05
+   6      16384     99.22%      3.314e+08      101.18%           1.024e+05
+   7      16384     99.22%      3.314e+08      101.18%           1.024e+05
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       3.219e+08      3.275e+08      3.314e+08          1.70%        5.00%    True
+Tokens            16384      16512.000          16896          2.33%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=7, relaxation='unlock 4K-8K G2', repair_moves=1
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            0               0
+     4K-8K            2               2
+    8K-16K            2               5
+      >16K            2               6
+Communication: amplification=6.023256, proxy_Q=1.091e+05, active_rings=4, total_token_hops=7.956e+05
+
+Kernel metadata
+global_seqlens=12288,32768,61440,12288,7168,6144
+ring_sizes=8,8,8,4,2,2
+ring_starts=0,0,0,4,0,2
+
+Dataset case 4/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=9, target_tokens=131072, actual_tokens=131072, target_delta=+0
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      24576     G8       0-7       3072           3.775e+07
+   1      38912     G8       0-7       4864           9.464e+07
+   2      14336     G8       0-7       1792           1.285e+07
+   3      14336     G4       0-3       3584           2.569e+07
+   4      14336     G4       4-7       3584           2.569e+07
+   5       7168     G2       0-1       3584           1.285e+07
+   6       6144     G2       2-3       3072           9.439e+06
+   7       6144     G2       4-5       3072           9.439e+06
+   8       5120     G2       6-7       2560           6.555e+06
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      16896    103.12%      1.838e+08      101.82%           8.243e+04
+   1      16896    103.12%      1.838e+08      101.82%           8.243e+04
+   2      16384    100.00%      1.804e+08       99.93%           8.192e+04
+   3      16384    100.00%      1.804e+08       99.93%           8.192e+04
+   4      16384    100.00%      1.804e+08       99.93%           8.192e+04
+   5      16384    100.00%      1.804e+08       99.93%           8.192e+04
+   6      15872     96.88%      1.775e+08       98.33%           8.141e+04
+   7      15872     96.88%      1.775e+08       98.33%           8.141e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       1.775e+08      1.805e+08      1.838e+08          1.82%        5.00%    True
+Tokens            15872      16384.000          16896          3.12%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=7, relaxation='unlock 4K-8K G2', repair_moves=0
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            0               0
+     4K-8K            4               4
+    8K-16K            3               7
+      >16K            2               6
+Communication: amplification=5.000000, proxy_Q=1.019e+05, active_rings=7, total_token_hops=6.554e+05
+
+Kernel metadata
+global_seqlens=24576,38912,14336,14336,14336,7168,6144,6144,5120
+ring_sizes=8,8,8,4,4,2,2,2,2
+ring_starts=0,0,0,0,4,0,2,4,6
+
+Dataset case 5/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=7, target_tokens=131072, actual_tokens=131072, target_delta=+0
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      20480     G8       0-7       2560           2.622e+07
+   1      36864     G8       0-7       4608           8.494e+07
+   2      10240     G4       0-3       2560           1.311e+07
+   3      24576     G4       0-3       6144           7.550e+07
+   4      14336     G4       4-7       3584           2.569e+07
+   5      22528     G4       4-7       5632           6.344e+07
+   6       2048     G2       0-1       1024           1.049e+06
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      16896    103.12%      2.008e+08      100.26%           7.731e+04
+   1      16896    103.12%      2.008e+08      100.26%           7.731e+04
+   2      15872     96.88%      1.998e+08       99.74%           7.629e+04
+   3      15872     96.88%      1.998e+08       99.74%           7.629e+04
+   4      16384    100.00%      2.003e+08      100.00%           7.782e+04
+   5      16384    100.00%      2.003e+08      100.00%           7.782e+04
+   6      16384    100.00%      2.003e+08      100.00%           7.782e+04
+   7      16384    100.00%      2.003e+08      100.00%           7.782e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       1.998e+08      2.003e+08      2.008e+08          0.26%        5.00%    True
+Tokens            15872      16384.000          16896          3.12%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=7, relaxation='unlock <=2K G2', repair_moves=0
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            1               1
+     2K-4K            0               0
+     4K-8K            0               0
+    8K-16K            2               4
+      >16K            4              10
+Communication: amplification=4.718750, proxy_Q=1.050e+05, active_rings=4, total_token_hops=6.185e+05
+
+Kernel metadata
+global_seqlens=20480,36864,10240,24576,14336,22528,2048
+ring_sizes=8,8,4,4,4,4,2
+ring_starts=0,0,0,0,4,4,0
+
+Dataset case 6/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=11, target_tokens=131072, actual_tokens=131072, target_delta=+0
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      36864     G8       0-7       4608           8.494e+07
+   1      18432     G8       0-7       2304           2.123e+07
+   2      26624     G8       0-7       3328           4.430e+07
+   3      14336     G4       0-3       3584           2.569e+07
+   4       6144     G2       0-1       3072           9.439e+06
+   5       5120     G2       2-3       2560           6.555e+06
+   6      12288     G2       4-5       6144           3.775e+07
+   7      10240     G2       6-7       5120           2.622e+07
+   8        512     G1         6        512           1.313e+05
+   9        256     G1         7        256           3.290e+04
+  10        256     G1         7        256           3.290e+04
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      16896    103.12%      1.856e+08      101.24%           8.550e+04
+   1      16896    103.12%      1.856e+08      101.24%           8.550e+04
+   2      16384    100.00%      1.827e+08       99.66%           8.499e+04
+   3      16384    100.00%      1.827e+08       99.66%           8.499e+04
+   4      16384    100.00%      1.882e+08      102.67%           7.782e+04
+   5      16384    100.00%      1.882e+08      102.67%           7.782e+04
+   6      15872     96.88%      1.768e+08       96.45%           7.680e+04
+   7      15872     96.88%      1.768e+08       96.41%           7.680e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       1.768e+08      1.833e+08      1.882e+08          3.59%        5.00%    True
+Tokens            15872      16384.000          16896          3.12%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=7, relaxation='unlock 4K-8K G2', repair_moves=0
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            0               0
+     4K-8K            2               2
+    8K-16K            3               4
+      >16K            3               9
+Communication: amplification=4.960938, proxy_Q=9.933e+04, active_rings=8, total_token_hops=6.502e+05
+
+Kernel metadata
+global_seqlens=36864,18432,26624,14336,6144,5120,12288,10240,512,256,256
+ring_sizes=8,8,8,4,2,2,2,2,1,1,1
+ring_starts=0,0,0,0,0,2,4,6,6,7,7
+
+Dataset case 7/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=8, target_tokens=131072, actual_tokens=131072, target_delta=+0
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      43008     G8       0-7       5376           1.156e+08
+   1      34816     G8       0-7       4352           7.576e+07
+   2      10240     G8       0-7       1280           6.554e+06
+   3      10240     G2       0-1       5120           2.622e+07
+   4      10240     G2       2-3       5120           2.622e+07
+   5      10240     G2       4-5       5120           2.622e+07
+   6       5120     G2       6-7       2560           6.555e+06
+   7       7168     G2       6-7       3584           1.285e+07
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      16128     98.44%      2.241e+08      100.77%           8.218e+04
+   1      16128     98.44%      2.241e+08      100.77%           8.218e+04
+   2      16128     98.44%      2.241e+08      100.77%           8.218e+04
+   3      16128     98.44%      2.241e+08      100.77%           8.218e+04
+   4      16128     98.44%      2.241e+08      100.77%           8.218e+04
+   5      16128     98.44%      2.241e+08      100.77%           8.218e+04
+   6      17152    104.69%      2.173e+08       97.70%           8.320e+04
+   7      17152    104.69%      2.173e+08       97.70%           8.320e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       2.173e+08      2.224e+08      2.241e+08          2.30%        5.00%    True
+Tokens            16128      16384.000          17152          4.69%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=7, relaxation='unlock 4K-8K G2', repair_moves=0
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            0               0
+     4K-8K            2               2
+    8K-16K            4               6
+      >16K            2               6
+Communication: amplification=5.031250, proxy_Q=9.856e+04, active_rings=5, total_token_hops=6.595e+05
+
+Kernel metadata
+global_seqlens=43008,34816,10240,10240,10240,10240,5120,7168
+ring_sizes=8,8,8,2,2,2,2,2
+ring_starts=0,0,0,0,2,4,6,6
+
+Dataset case 8/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=8, target_tokens=131072, actual_tokens=132096, target_delta=+1024
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      26624     G8       0-7       3328           4.430e+07
+   1       6144     G4       0-3       1536           4.719e+06
+   2      14336     G4       0-3       3584           2.569e+07
+   3      30720     G4       0-3       7680           1.180e+08
+   4      14336     G4       4-7       3584           2.569e+07
+   5      28672     G4       4-7       7168           1.028e+08
+   6       6144     G2       4-5       3072           9.439e+06
+   7       5120     G2       6-7       2560           6.555e+06
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      16128     97.67%      1.927e+08      103.19%           6.170e+04
+   1      16128     97.67%      1.927e+08      103.19%           6.170e+04
+   2      16128     97.67%      1.927e+08      103.19%           6.170e+04
+   3      16128     97.67%      1.927e+08      103.19%           6.170e+04
+   4      17152    103.88%      1.822e+08       97.58%           5.862e+04
+   5      17152    103.88%      1.822e+08       97.58%           5.862e+04
+   6      16640    100.78%      1.793e+08       96.03%           5.811e+04
+   7      16640    100.78%      1.793e+08       96.03%           5.811e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       1.793e+08      1.867e+08      1.927e+08          3.97%        5.00%    True
+Tokens            16128      16512.000          17152          3.88%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=8, relaxation='unlock 4K-8K G4', repair_moves=0
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            0               0
+     4K-8K            3               4
+    8K-16K            2               4
+      >16K            3               7
+Communication: amplification=3.635659, proxy_Q=9.958e+04, active_rings=5, total_token_hops=4.803e+05
+
+Kernel metadata
+global_seqlens=26624,6144,14336,30720,14336,28672,6144,5120
+ring_sizes=8,4,4,4,4,4,2,2
+ring_starts=0,0,0,0,4,4,4,6
+
+Dataset case 9/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=7, target_tokens=131072, actual_tokens=132096, target_delta=+1024
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0       7168     G4       0-3       1792           6.423e+06
+   1      36864     G4       0-3       9216           1.699e+08
+   2      34816     G4       4-7       8704           1.515e+08
+   3      12288     G2       0-1       6144           3.775e+07
+   4      10240     G2       2-3       5120           2.622e+07
+   5      16384     G2       4-5       8192           6.711e+07
+   6      14336     G2       6-7       7168           5.138e+07
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      17152    103.88%      2.140e+08      102.16%           3.917e+04
+   1      17152    103.88%      2.140e+08      102.16%           3.917e+04
+   2      16128     97.67%      2.025e+08       96.65%           3.814e+04
+   3      16128     97.67%      2.025e+08       96.65%           3.814e+04
+   4      16896    102.33%      2.186e+08      104.35%           3.430e+04
+   5      16896    102.33%      2.186e+08      104.35%           3.430e+04
+   6      15872     96.12%      2.029e+08       96.84%           3.328e+04
+   7      15872     96.12%      2.029e+08       96.84%           3.328e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       2.025e+08      2.095e+08      2.186e+08          4.35%        5.00%    True
+Tokens            15872      16512.000          17152          3.88%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=8, relaxation='unlock 4K-8K G4', repair_moves=0
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            0               0
+     4K-8K            1               2
+    8K-16K            4               4
+      >16K            2               4
+Communication: amplification=2.193798, proxy_Q=8.576e+04, active_rings=6, total_token_hops=2.898e+05
+
+Kernel metadata
+global_seqlens=7168,36864,34816,12288,10240,16384,14336
+ring_sizes=4,4,4,2,2,2,2
+ring_starts=0,0,4,0,2,4,6
+
+Dataset case 10/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=5, target_tokens=131072, actual_tokens=131072, target_delta=+0
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      36864     G8       0-7       4608           8.494e+07
+   1      53248     G8       0-7       6656           1.772e+08
+   2      22528     G8       0-7       2816           3.172e+07
+   3      12288     G4       0-3       3072           1.888e+07
+   4       6144     G4       4-7       1536           4.719e+06
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      17152    104.69%      3.127e+08      102.32%           1.078e+05
+   1      17152    104.69%      3.127e+08      102.32%           1.078e+05
+   2      17152    104.69%      3.127e+08      102.32%           1.078e+05
+   3      17152    104.69%      3.127e+08      102.32%           1.078e+05
+   4      15616     95.31%      2.986e+08       97.68%           1.032e+05
+   5      15616     95.31%      2.986e+08       97.68%           1.032e+05
+   6      15616     95.31%      2.986e+08       97.68%           1.032e+05
+   7      15616     95.31%      2.986e+08       97.68%           1.032e+05
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       2.986e+08      3.057e+08      3.127e+08          2.32%        5.00%    True
+Tokens            15616      16384.000          17152          4.69%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=8, relaxation='unlock 4K-8K G4', repair_moves=0
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            0               0
+     4K-8K            1               2
+    8K-16K            1               2
+      >16K            3               9
+Communication: amplification=6.437500, proxy_Q=1.124e+05, active_rings=3, total_token_hops=8.438e+05
+
+Kernel metadata
+global_seqlens=36864,53248,22528,12288,6144
+ring_sizes=8,8,8,4,4
+ring_starts=0,0,0,0,4
+
+Dataset case 11/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=4, target_tokens=131072, actual_tokens=131072, target_delta=+0
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      63488     G8       0-7       7936           2.519e+08
+   1      34816     G8       0-7       4352           7.576e+07
+   2      18432     G4       0-3       4608           4.247e+07
+   3      14336     G4       4-7       3584           2.569e+07
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      16896    103.12%      3.702e+08      102.32%           9.984e+04
+   1      16896    103.12%      3.702e+08      102.32%           9.984e+04
+   2      16896    103.12%      3.702e+08      102.32%           9.984e+04
+   3      16896    103.12%      3.702e+08      102.32%           9.984e+04
+   4      15872     96.88%      3.534e+08       97.68%           9.677e+04
+   5      15872     96.88%      3.534e+08       97.68%           9.677e+04
+   6      15872     96.88%      3.534e+08       97.68%           9.677e+04
+   7      15872     96.88%      3.534e+08       97.68%           9.677e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       3.534e+08      3.618e+08      3.702e+08          2.32%        5.00%    True
+Tokens            15872      16384.000          16896          3.12%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=0, relaxation='initial', repair_moves=0
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            0               0
+     4K-8K            0               0
+    8K-16K            1               2
+      >16K            3               8
+Communication: amplification=6.000000, proxy_Q=1.106e+05, active_rings=3, total_token_hops=7.864e+05
+
+Kernel metadata
+global_seqlens=63488,34816,18432,14336
+ring_sizes=8,8,4,4
+ring_starts=0,0,0,4
+
+Dataset case 12/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=15, target_tokens=131072, actual_tokens=131328, target_delta=+256
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      24576     G8       0-7       3072           3.775e+07
+   1      12288     G4       0-3       3072           1.888e+07
+   2      10240     G2       0-1       5120           2.622e+07
+   3       6144     G2       0-1       3072           9.439e+06
+   4      10240     G2       2-3       5120           2.622e+07
+   5      10240     G2       4-5       5120           2.622e+07
+   6      12288     G2       6-7       6144           3.775e+07
+   7       2560     G1         0       2560           3.278e+06
+   8       1792     G1         1       1792           1.607e+06
+   9       5120     G1         2       5120           1.311e+07
+  10       5120     G1         3       5120           1.311e+07
+  11       8192     G1         4       8192           3.356e+07
+  12       8192     G1         5       8192           3.356e+07
+  13       7168     G1         6       7168           2.569e+07
+  14       7168     G1         7       7168           2.569e+07
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      16896    102.92%      9.556e+07       98.16%           3.891e+04
+   1      16128     98.25%      9.389e+07       96.44%           3.891e+04
+   2      16384     99.81%      9.595e+07       98.57%           3.584e+04
+   3      16384     99.81%      9.595e+07       98.57%           3.584e+04
+   4      16384     99.81%      9.753e+07      100.18%           2.662e+04
+   5      16384     99.81%      9.753e+07      100.18%           2.662e+04
+   6      16384     99.81%      1.012e+08      103.95%           2.765e+04
+   7      16384     99.81%      1.012e+08      103.95%           2.765e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       9.389e+07      9.735e+07      1.012e+08          3.95%        5.00%    True
+Tokens            16128      16416.000          16896          2.92%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=7, relaxation='unlock 4K-8K G2', repair_moves=3
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            0               0
+     4K-8K            1               1
+    8K-16K            5               6
+      >16K            1               3
+Communication: amplification=1.964912, proxy_Q=5.530e+04, active_rings=14, total_token_hops=2.580e+05
+
+Kernel metadata
+global_seqlens=24576,12288,10240,6144,10240,10240,12288,2560,1792,5120,5120,8192,8192,7168,7168
+ring_sizes=8,4,2,2,2,2,2,1,1,1,1,1,1,1,1
+ring_starts=0,0,0,0,2,4,6,0,1,2,3,4,5,6,7
+
+Dataset case 13/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=7, target_tokens=131072, actual_tokens=131072, target_delta=+0
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      10240     G8       0-7       1280           6.554e+06
+   1      18432     G4       0-3       4608           4.247e+07
+   2      30720     G4       0-3       7680           1.180e+08
+   3      12288     G4       0-3       3072           1.888e+07
+   4      30720     G4       4-7       7680           1.180e+08
+   5      10240     G4       4-7       2560           1.311e+07
+   6      18432     G4       4-7       4608           4.247e+07
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      16640    101.56%      1.859e+08      101.58%           5.504e+04
+   1      16640    101.56%      1.859e+08      101.58%           5.504e+04
+   2      16640    101.56%      1.859e+08      101.58%           5.504e+04
+   3      16640    101.56%      1.859e+08      101.58%           5.504e+04
+   4      16128     98.44%      1.801e+08       98.42%           5.350e+04
+   5      16128     98.44%      1.801e+08       98.42%           5.350e+04
+   6      16128     98.44%      1.801e+08       98.42%           5.350e+04
+   7      16128     98.44%      1.801e+08       98.42%           5.350e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       1.801e+08      1.830e+08      1.859e+08          1.58%        5.00%    True
+Tokens            16128      16384.000          16640          1.56%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=0, relaxation='initial', repair_moves=0
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            0               0
+     4K-8K            0               0
+    8K-16K            3               7
+      >16K            4               8
+Communication: amplification=3.312500, proxy_Q=9.958e+04, active_rings=3, total_token_hops=4.342e+05
+
+Kernel metadata
+global_seqlens=10240,18432,30720,12288,30720,10240,18432
+ring_sizes=8,4,4,4,4,4,4
+ring_starts=0,0,0,0,4,4,4
+
+Dataset case 14/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=6, target_tokens=131072, actual_tokens=131072, target_delta=+0
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      47104     G8       0-7       5888           1.387e+08
+   1      12288     G4       0-3       3072           1.888e+07
+   2      26624     G4       0-3       6656           8.861e+07
+   3      20480     G4       4-7       5120           5.243e+07
+   4      22528     G4       4-7       5632           6.344e+07
+   5       2048     G2       0-1       1024           1.049e+06
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      16640    101.56%      2.472e+08       98.64%           7.142e+04
+   1      16640    101.56%      2.472e+08       98.64%           7.142e+04
+   2      15616     95.31%      2.462e+08       98.22%           7.040e+04
+   3      15616     95.31%      2.462e+08       98.22%           7.040e+04
+   4      16640    101.56%      2.546e+08      101.57%           7.347e+04
+   5      16640    101.56%      2.546e+08      101.57%           7.347e+04
+   6      16640    101.56%      2.546e+08      101.57%           7.347e+04
+   7      16640    101.56%      2.546e+08      101.57%           7.347e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       2.462e+08      2.506e+08      2.546e+08          1.78%        5.00%    True
+Tokens            15616      16384.000          16640          4.69%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=7, relaxation='unlock <=2K G2', repair_moves=0
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            1               1
+     2K-4K            0               0
+     4K-8K            0               0
+    8K-16K            1               2
+      >16K            4               9
+Communication: amplification=4.406250, proxy_Q=1.037e+05, active_rings=4, total_token_hops=5.775e+05
+
+Kernel metadata
+global_seqlens=47104,12288,26624,20480,22528,2048
+ring_sizes=8,4,4,4,4,2
+ring_starts=0,0,0,4,4,0
+
+Dataset case 15/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=8, target_tokens=131072, actual_tokens=131072, target_delta=+0
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      26624     G8       0-7       3328           4.430e+07
+   1      53248     G8       0-7       6656           1.772e+08
+   2      14336     G4       0-3       3584           2.569e+07
+   3      10240     G4       0-3       2560           1.311e+07
+   4      14336     G4       4-7       3584           2.569e+07
+   5       6144     G2       4-5       3072           9.439e+06
+   6       5120     G2       6-7       2560           6.555e+06
+   7       1024     G1         6       1024           5.248e+05
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      16128     98.44%      2.603e+08      100.97%           8.832e+04
+   1      16128     98.44%      2.603e+08      100.97%           8.832e+04
+   2      16128     98.44%      2.603e+08      100.97%           8.832e+04
+   3      16128     98.44%      2.603e+08      100.97%           8.832e+04
+   4      16640    101.56%      2.566e+08       99.54%           8.371e+04
+   5      16640    101.56%      2.566e+08       99.54%           8.371e+04
+   6      17152    104.69%      2.543e+08       98.63%           8.320e+04
+   7      16128     98.44%      2.538e+08       98.42%           8.320e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       2.538e+08      2.578e+08      2.603e+08          1.58%        5.00%    True
+Tokens            16128      16384.000          17152          4.69%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=7, relaxation='unlock 4K-8K G2', repair_moves=0
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            0               0
+     4K-8K            2               2
+    8K-16K            3               6
+      >16K            2               6
+Communication: amplification=5.242188, proxy_Q=1.047e+05, active_rings=6, total_token_hops=6.871e+05
+
+Kernel metadata
+global_seqlens=26624,53248,14336,10240,14336,6144,5120,1024
+ring_sizes=8,8,4,4,4,2,2,1
+ring_starts=0,0,0,0,4,4,6,6
+
+Dataset case 16/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=14, target_tokens=131072, actual_tokens=131584, target_delta=+512
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      20480     G4       0-3       5120           5.243e+07
+   1       7168     G4       0-3       1792           6.423e+06
+   2      16384     G4       4-7       4096           3.356e+07
+   3      14336     G4       4-7       3584           2.569e+07
+   4      10240     G4       4-7       2560           1.311e+07
+   5      12288     G4       4-7       3072           1.888e+07
+   6      12288     G2       0-1       6144           3.775e+07
+   7      10240     G2       2-3       5120           2.622e+07
+   8       8192     G2       2-3       4096           1.678e+07
+   9       6144     G2       4-5       3072           9.439e+06
+  10       6144     G2       6-7       3072           9.439e+06
+  11       4096     G1         0       4096           8.391e+06
+  12       3072     G1         1       3072           4.720e+06
+  13        512     G1         2        512           1.313e+05
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      17152    104.28%      1.050e+08      103.34%           2.688e+04
+   1      16128     98.05%      1.013e+08       99.73%           2.688e+04
+   2      16640    101.17%      1.020e+08      100.37%           2.995e+04
+   3      16128     98.05%      1.019e+08      100.24%           2.995e+04
+   4      16384     99.61%      1.007e+08       99.08%           4.301e+04
+   5      16384     99.61%      1.007e+08       99.08%           4.301e+04
+   6      16384     99.61%      1.007e+08       99.08%           4.301e+04
+   7      16384     99.61%      1.007e+08       99.08%           4.301e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       1.007e+08      1.016e+08      1.050e+08          3.34%        5.00%    True
+Tokens            16128      16448.000          17152          4.28%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=8, relaxation='unlock 4K-8K G4', repair_moves=2
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            0               0
+     4K-8K            4               5
+    8K-16K            6              10
+      >16K            1               2
+Communication: amplification=2.171206, proxy_Q=8.218e+04, active_rings=9, total_token_hops=2.857e+05
+
+Kernel metadata
+global_seqlens=20480,7168,16384,14336,10240,12288,12288,10240,8192,6144,6144,4096,3072,512
+ring_sizes=4,4,4,4,4,4,2,2,2,2,2,1,1,1
+ring_starts=0,0,4,4,4,4,0,2,2,4,6,0,1,2
+
+Dataset case 17/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=7, target_tokens=131072, actual_tokens=131072, target_delta=+0
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      32768     G8       0-7       4096           6.711e+07
+   1      75776     G8       0-7       9472           3.589e+08
+   2       8192     G4       4-7       2048           8.390e+06
+   3       7168     G2       0-1       3584           1.285e+07
+   4       5120     G2       2-3       2560           6.555e+06
+   5        768     G1         4        768           2.953e+05
+   6       1280     G1         5       1280           8.198e+05
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      17152    104.69%      4.388e+08      100.84%           9.856e+04
+   1      17152    104.69%      4.388e+08      100.84%           9.856e+04
+   2      16128     98.44%      4.325e+08       99.40%           9.754e+04
+   3      16128     98.44%      4.325e+08       99.40%           9.754e+04
+   4      16384    100.00%      4.347e+08       99.89%           1.011e+05
+   5      16896    103.12%      4.352e+08      100.01%           1.011e+05
+   6      15616     95.31%      4.344e+08       99.82%           1.011e+05
+   7      15616     95.31%      4.344e+08       99.82%           1.011e+05
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       4.325e+08      4.352e+08      4.388e+08          0.84%        5.00%    True
+Tokens            15616      16384.000          17152          4.69%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=4, relaxation='unlock 4K-8K G2', repair_moves=3
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            0               0
+     4K-8K            3               4
+    8K-16K            0               0
+      >16K            2               6
+Communication: amplification=6.078125, proxy_Q=1.073e+05, active_rings=6, total_token_hops=7.967e+05
+
+Kernel metadata
+global_seqlens=32768,75776,8192,7168,5120,768,1280
+ring_sizes=8,8,4,2,2,1,1
+ring_starts=0,0,4,0,2,4,5
+
+Dataset case 18/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=8, target_tokens=131072, actual_tokens=131584, target_delta=+512
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      45056     G8       0-7       5632           1.269e+08
+   1       6144     G8       0-7        768           2.360e+06
+   2      30720     G8       0-7       3840           5.898e+07
+   3       6144     G4       0-3       1536           4.719e+06
+   4      16384     G4       0-3       4096           3.356e+07
+   5      18432     G4       4-7       4608           4.247e+07
+   6       6144     G4       4-7       1536           4.719e+06
+   7       2560     G2       0-1       1280           1.639e+06
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      17152    104.28%      2.281e+08       98.61%           8.986e+04
+   1      17152    104.28%      2.281e+08       98.61%           8.986e+04
+   2      15872     96.50%      2.265e+08       97.90%           8.858e+04
+   3      15872     96.50%      2.265e+08       97.90%           8.858e+04
+   4      16384     99.61%      2.354e+08      101.75%           9.011e+04
+   5      16384     99.61%      2.354e+08      101.75%           9.011e+04
+   6      16384     99.61%      2.354e+08      101.75%           9.011e+04
+   7      16384     99.61%      2.354e+08      101.75%           9.011e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       2.265e+08      2.314e+08      2.354e+08          2.10%        5.00%    True
+Tokens            15872      16448.000          17152          4.28%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=10, relaxation='unlock 2K-4K G2', repair_moves=1
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            1               1
+     4K-8K            3               7
+    8K-16K            1               2
+      >16K            3               8
+Communication: amplification=5.451362, proxy_Q=1.083e+05, active_rings=4, total_token_hops=7.173e+05
+
+Kernel metadata
+global_seqlens=45056,6144,30720,6144,16384,18432,6144,2560
+ring_sizes=8,8,8,4,4,4,4,2
+ring_starts=0,0,0,0,0,4,4,0
+
+Dataset case 19/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=12, target_tokens=131072, actual_tokens=131072, target_delta=+0
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      34816     G8       0-7       4352           7.576e+07
+   1       8192     G4       0-3       2048           8.390e+06
+   2      24576     G4       0-3       6144           7.550e+07
+   3      20480     G4       4-7       5120           5.243e+07
+   4       6144     G4       4-7       1536           4.719e+06
+   5       7168     G2       0-1       3584           1.285e+07
+   6      10240     G2       4-5       5120           2.622e+07
+   7      10240     G2       6-7       5120           2.622e+07
+   8       4096     G1         2       4096           8.391e+06
+   9       4096     G1         3       4096           8.391e+06
+  10        512     G1         4        512           1.313e+05
+  11        512     G1         5        512           1.313e+05
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      16128     98.44%      1.725e+08      104.71%           5.862e+04
+   1      16128     98.44%      1.725e+08      104.71%           5.862e+04
+   2      16640    101.56%      1.680e+08      102.01%           5.504e+04
+   3      16640    101.56%      1.680e+08      102.01%           5.504e+04
+   4      16640    101.56%      1.593e+08       96.68%           5.555e+04
+   5      16640    101.56%      1.593e+08       96.68%           5.555e+04
+   6      16128     98.44%      1.591e+08       96.60%           5.555e+04
+   7      16128     98.44%      1.591e+08       96.60%           5.555e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       1.591e+08      1.647e+08      1.725e+08          4.71%        5.00%    True
+Tokens            16128      16384.000          16640          1.56%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=8, relaxation='unlock 4K-8K G4', repair_moves=0
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            0               0
+     4K-8K            3               5
+    8K-16K            2               2
+      >16K            3               7
+Communication: amplification=3.429688, proxy_Q=8.883e+04, active_rings=10, total_token_hops=4.495e+05
+
+Kernel metadata
+global_seqlens=34816,8192,24576,20480,6144,7168,10240,10240,4096,4096,512,512
+ring_sizes=8,4,4,4,4,2,2,2,1,1,1,1
+ring_starts=0,0,0,4,4,0,4,6,2,3,4,5
+
+Dataset case 20/20
+Planner workload: dataset=arxiv, seed=0, world_size=8, mode=causal
+Batch: B=10, target_tokens=131072, actual_tokens=131072, target_delta=+0
+
+Sequence placement
+ Seq   Global S   Ring     Ranks    Local S  Est compute/member
+   0      28672     G8       0-7       3584           5.138e+07
+   1       5120     G4       0-3       1280           3.277e+06
+   2      16384     G4       0-3       4096           3.356e+07
+   3      20480     G4       0-3       5120           5.243e+07
+   4       8192     G4       0-3       2048           8.390e+06
+   5      10240     G4       4-7       2560           1.311e+07
+   6      14336     G4       4-7       3584           2.569e+07
+   7      18432     G4       4-7       4608           4.247e+07
+   8       5120     G2       4-5       2560           6.555e+06
+   9       4096     G2       6-7       2048           4.195e+06
+
+Per-rank load
+Rank     Tokens  Token/avg    Est compute  Compute/avg   Est communication
+   0      16128     98.44%      1.490e+08      103.84%           6.272e+04
+   1      16128     98.44%      1.490e+08      103.84%           6.272e+04
+   2      16128     98.44%      1.490e+08      103.84%           6.272e+04
+   3      16128     98.44%      1.490e+08      103.84%           6.272e+04
+   4      16896    103.12%      1.392e+08       96.99%           5.990e+04
+   5      16896    103.12%      1.392e+08       96.99%           5.990e+04
+   6      16384    100.00%      1.368e+08       95.34%           5.939e+04
+   7      16384    100.00%      1.368e+08       95.34%           5.939e+04
+
+Balance targets
+Metric          Minimum        Average        Maximum  Max deviation    Tolerance     Met
+Compute       1.368e+08      1.435e+08      1.490e+08          4.66%        5.00%    True
+Tokens            16128      16384.000          16896          3.12%        5.00%    True
+
+Planner status: feasible=True, violation=0.000000, relaxation_level=11, relaxation='unlock 2K-4K G4', repair_moves=2
+Split protection
+    Bucket  Split count   Split penalty
+      <=2K            0               0
+     2K-4K            1               1
+     4K-8K            3               5
+    8K-16K            3               6
+      >16K            3               7
+Communication: amplification=3.734375, proxy_Q=9.958e+04, active_rings=5, total_token_hops=4.895e+05
+
+Kernel metadata
+global_seqlens=28672,5120,16384,20480,8192,10240,14336,18432,5120,4096
+ring_sizes=8,4,4,4,4,4,4,4,2,2
+ring_starts=0,0,0,0,0,4,4,4,4,6
+
+Dataset matrix forward KVH=1: datasets=['arxiv'], cases=20
+Reusable forward IPC pools: cases=20, all_cp_rank_capacity=17152, hybrid_rank_capacity=17152
+
+Benchmark case: dataset=arxiv, case=1/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=8, global_tokens=131072, global_seqlens=[18432, 18432, 12288, 26624, 20480, 28672, 3584, 2560]
+Mega-ring all-CP workload: alignment=2048, global_tokens=133120, global_seqlens=[18432, 18432, 12288, 26624, 20480, 28672, 4096, 4096]
+Hybrid rings: sizes=[8, 4, 4, 4, 4, 4, 2, 2], starts=[0, 0, 0, 0, 4, 4, 4, 6]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[1, 1, 1, 3, 2, 3, 1, 1], execution_lengths=[18432, 18432, 12288, 26628, 20480, 28674, 3584, 2560], padding=6, physical_rank_token_loads=[31574, 30550, 21846, 8876, 8876, 8876, 10240, 10240]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=8, global_tokens=131072, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=8, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=5.026, t1=5.026, t2=4.983, t3=5.090, t4=4.991, t5=4.954, t6=5.013, t7=5.021 | max_across_ranks=5.125       4476.1      559.5       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=2.840, t1=7.205, t2=4.360, t3=3.598, t4=4.531, t5=3.912, t6=2.916, t7=6.693 | max_across_ranks=7.205       3184.1      398.0       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=9.591, t1=9.385, t2=9.253, t3=9.035, t4=8.834, t5=8.544, t6=8.390, t7=8.240 | max_across_ranks=9.591       2391.8      299.0       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=6.459, t1=6.543, t2=5.355, t3=5.276, t4=6.826, t5=6.851, t6=6.902, t7=6.943 | max_across_ranks=6.944       3303.5      412.9       skip  Megatron scheduler; 2 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3303.5, Avg/GPU=412.9
+magi_attention             t0=5.719, t1=5.820, t2=5.764, t3=5.751, t4=5.396, t5=5.617, t6=5.555, t7=5.567 | max_across_ranks=5.836       3930.8      491.3       skip  chunk_size=2048, tokens(original/padded)=131072/131072, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=8.727, t1=8.617, t2=5.851, t3=3.516, t4=3.568, t5=3.617, t6=2.972, t7=3.105 | max_across_ranks=8.733       2627.0      328.4       skip  L=4096; final_s0=4096; iterations=1; G1=5,G2=1,G3=2; padding=6; physical rank token loads=[31574,30550,21846,8876,8876,8876,10240,10240]; in-repo min_fa3 fallback; tokens(original/aligned)=131072/131078, padding=6 tokens; aligned-length Agg TFLOPS=2627.3, Avg/GPU=328.4
+mega_ring_all_cp           t0=5.323, t1=5.244, t2=5.306, t3=5.177, t4=5.072, t5=5.056, t6=5.129, t7=5.128 | max_across_ranks=5.373       4269.5      533.7       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4291.1, Avg/GPU=536.4
+mega_ring_hybrid           t0=4.929, t1=4.929, t2=4.619, t3=4.777, t4=5.235, t5=5.012, t6=5.126, t7=5.124 | max_across_ranks=5.253       4367.4      545.9       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=8, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.477, t1=5.437, t2=5.052, t3=4.849, t4=4.813, t5=4.980, t6=4.820, t7=5.024 | max_across_ranks=5.502       4169.7      521.2       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4190.8, Avg/GPU=523.9
+mega_ring_hybrid         t0=4.836, t1=4.852, t2=5.537, t3=5.218, t4=5.409, t5=5.219, t6=5.024, t7=4.995 | max_across_ranks=5.622       4080.4      510.1       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=8, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.300, t1=5.087, t2=5.430, t3=5.398, t4=5.415, t5=5.260, t6=5.487, t7=5.138 | max_across_ranks=5.538       4142.4      517.8       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4163.4, Avg/GPU=520.4
+mega_ring_hybrid         t0=4.843, t1=4.861, t2=4.909, t3=4.899, t4=5.199, t5=5.189, t6=5.049, t7=5.134 | max_across_ranks=5.221       4394.3      549.3       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=8, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.395, t1=5.607, t2=5.043, t3=5.085, t4=4.945, t5=5.088, t6=5.166, t7=5.111 | max_across_ranks=5.607       4091.5      511.4       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4112.2, Avg/GPU=514.0
+mega_ring_hybrid         t0=5.012, t1=5.068, t2=4.962, t3=4.893, t4=5.185, t5=5.148, t6=5.061, t7=5.196 | max_across_ranks=5.236       4381.1      547.6       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=2/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=6, global_tokens=131072, global_seqlens=[49152, 24576, 16384, 10240, 28672, 2048]
+Mega-ring all-CP workload: alignment=2048, global_tokens=131072, global_seqlens=[49152, 24576, 16384, 10240, 28672, 2048]
+Hybrid rings: sizes=[8, 4, 4, 4, 4, 2], starts=[0, 0, 0, 4, 4, 6]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[5, 2, 1, 1, 2, 1], execution_lengths=[49160, 24576, 16384, 10240, 28672, 2048], padding=8, physical_rank_token_loads=[24168, 26216, 20072, 9832, 9832, 14336, 14336, 12288]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=6, global_tokens=131072, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=6, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=7.013, t1=7.055, t2=7.009, t3=6.974, t4=6.969, t5=6.945, t6=6.905, t7=7.134 | max_across_ranks=7.270               4754.9      594.4       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=4.802, t1=6.137, t2=6.073, t3=6.569, t4=7.815, t5=11.552, t6=2.160, t7=6.475 | max_across_ranks=11.552             2992.3      374.0       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=11.276, t1=11.183, t2=10.985, t3=10.774, t4=10.428, t5=10.228, t6=10.066, t7=9.950 | max_across_ranks=11.301       3058.8      382.4       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=10.024, t1=10.048, t2=10.091, t3=10.138, t4=9.617, t5=9.651, t6=8.944, t7=8.908 | max_across_ranks=10.138          3409.7      426.2       skip  Megatron scheduler; 3 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3409.7, Avg/GPU=426.2
+magi_attention             t0=7.903, t1=7.998, t2=7.612, t3=7.965, t4=7.739, t5=7.840, t6=7.928, t7=7.773 | max_across_ranks=8.090               4272.9      534.1       skip  chunk_size=2048, tokens(original/padded)=131072/131072, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=11.581, t1=10.135, t2=8.045, t3=6.893, t4=6.834, t5=5.271, t6=5.345, t7=9.393 | max_across_ranks=11.581            2984.9      373.1       skip  L=4096; final_s0=4096; iterations=1; G1=3,G2=2,G5=1; padding=8; physical rank token loads=[24168,26216,20072,9832,9832,14336,14336,12288]; in-repo min_fa3 fallback; tokens(original/aligned)=131072/131080, padding=8 tokens; aligned-length Agg TFLOPS=2985.5, Avg/GPU=373.2
+mega_ring_all_cp           t0=7.361, t1=7.309, t2=7.148, t3=7.258, t4=7.195, t5=7.168, t6=7.059, t7=7.231 | max_across_ranks=7.496               4611.2      576.4       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4611.2, Avg/GPU=576.4
+mega_ring_hybrid           t0=7.989, t1=7.962, t2=7.326, t3=6.712, t4=6.850, t5=6.806, t6=6.977, t7=6.906 | max_across_ranks=8.120               4256.8      532.1       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=6, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=6.938, t1=6.986, t2=7.393, t3=7.888, t4=7.722, t5=7.845, t6=7.948, t7=8.375 | max_across_ranks=8.739       3955.3      494.4       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3955.3, Avg/GPU=494.4
+mega_ring_hybrid         t0=6.914, t1=6.987, t2=7.066, t3=6.983, t4=7.153, t5=7.150, t6=7.318, t7=7.519 | max_across_ranks=7.551       4577.9      572.2       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=6, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=7.919, t1=7.907, t2=7.531, t3=7.222, t4=7.083, t5=6.979, t6=6.902, t7=7.149 | max_across_ranks=7.957       4344.3      543.0       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4344.3, Avg/GPU=543.0
+mega_ring_hybrid         t0=6.990, t1=6.992, t2=7.549, t3=7.759, t4=7.923, t5=7.663, t6=8.270, t7=7.667 | max_across_ranks=8.270       4179.6      522.5       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=6, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=7.392, t1=7.380, t2=7.273, t3=7.338, t4=7.270, t5=7.377, t6=7.375, t7=7.564 | max_across_ranks=7.594       4551.8      569.0       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4551.8, Avg/GPU=569.0
+mega_ring_hybrid         t0=7.532, t1=7.457, t2=7.134, t3=7.017, t4=7.224, t5=7.168, t6=7.385, t7=7.511 | max_across_ranks=7.542       4583.5      572.9       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=3/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=6, global_tokens=132096, global_seqlens=[12288, 32768, 61440, 12288, 7168, 6144]
+Mega-ring all-CP workload: alignment=2048, global_tokens=133120, global_seqlens=[12288, 32768, 61440, 12288, 8192, 6144]
+Hybrid rings: sizes=[8, 8, 8, 4, 2, 2], starts=[0, 0, 0, 4, 0, 2]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[1, 2, 6, 1, 1, 1], execution_lengths=[12288, 32768, 61440, 12288, 7168, 6144], padding=0, physical_rank_token_loads=[22528, 22528, 17408, 16384, 10240, 10240, 16384, 16384]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=6, global_tokens=132096, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=6, global_tokens=132096, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=8.402, t1=8.580, t2=8.453, t3=8.504, t4=8.460, t5=8.426, t6=8.409, t7=8.407 | max_across_ranks=8.655                4959.5      619.9       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=2.211, t1=2.890, t2=3.143, t3=14.877, t4=16.472, t5=10.964, t6=8.078, t7=8.215 | max_across_ranks=16.472            2606.0      325.7       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=13.288, t1=13.192, t2=12.979, t3=12.899, t4=12.549, t5=12.367, t6=12.376, t7=12.149 | max_across_ranks=13.294       3228.9      403.6       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=12.491, t1=12.482, t2=12.521, t3=12.522, t4=12.470, t5=12.430, t6=12.433, t7=12.416 | max_across_ranks=12.535       3424.5      428.1       skip  Megatron scheduler; 3 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=132096/132096, padding=0 tokens; aligned-length Agg TFLOPS=3424.5, Avg/GPU=428.1
+magi_attention             t0=10.334, t1=10.094, t2=10.834, t3=10.378, t4=9.793, t5=9.829, t6=9.622, t7=9.878 | max_across_ranks=10.902           3937.3      492.2       skip  chunk_size=2064, tokens(original/padded)=132096/132096, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=10.845, t1=11.194, t2=9.531, t3=9.459, t4=8.877, t5=9.013, t6=6.662, t7=6.752 | max_across_ranks=11.194             3834.8      479.3       skip  L=4096; final_s0=4096; iterations=1; G1=4,G2=1,G6=1; padding=0; physical rank token loads=[22528,22528,17408,16384,10240,10240,16384,16384]; in-repo min_fa3 fallback; tokens(original/aligned)=132096/132096, padding=0 tokens; aligned-length Agg TFLOPS=3834.8, Avg/GPU=479.3
+mega_ring_all_cp           t0=8.971, t1=8.977, t2=8.818, t3=8.794, t4=8.743, t5=8.680, t6=8.770, t7=8.783 | max_across_ranks=9.025                4756.0      594.5       skip  all-CP fused mega-ring; tokens(original/aligned)=132096/133120, padding=1024 tokens; aligned-length Agg TFLOPS=4770.3, Avg/GPU=596.3
+mega_ring_hybrid           t0=8.920, t1=9.186, t2=9.088, t3=9.042, t4=9.312, t5=9.530, t6=9.126, t7=9.340 | max_across_ranks=9.718                4417.2      552.1       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=6, global_tokens=132096, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=8.912, t1=8.853, t2=8.616, t3=8.685, t4=8.737, t5=8.736, t6=9.132, t7=9.127 | max_across_ranks=9.229       4651.3      581.4       skip  all-CP fused mega-ring; tokens(original/aligned)=132096/133120, padding=1024 tokens; aligned-length Agg TFLOPS=4665.3, Avg/GPU=583.2
+mega_ring_hybrid         t0=9.610, t1=9.567, t2=9.327, t3=9.556, t4=9.817, t5=9.242, t6=8.836, t7=8.886 | max_across_ranks=9.828       4367.6      546.0       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=6, global_tokens=132096, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=8.960, t1=9.111, t2=8.827, t3=8.916, t4=9.013, t5=9.116, t6=9.688, t7=9.520 | max_across_ranks=9.700       4425.1      553.1       skip  all-CP fused mega-ring; tokens(original/aligned)=132096/133120, padding=1024 tokens; aligned-length Agg TFLOPS=4438.4, Avg/GPU=554.8
+mega_ring_hybrid         t0=8.695, t1=8.840, t2=8.377, t3=8.518, t4=8.804, t5=8.760, t6=8.996, t7=9.141 | max_across_ranks=9.173       4679.7      585.0       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=6, global_tokens=132096, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=9.361, t1=9.781, t2=9.461, t3=9.714, t4=9.334, t5=9.342, t6=8.778, t7=8.957 | max_across_ranks=9.802       4379.2      547.4       skip  all-CP fused mega-ring; tokens(original/aligned)=132096/133120, padding=1024 tokens; aligned-length Agg TFLOPS=4392.4, Avg/GPU=549.0
+mega_ring_hybrid         t0=8.680, t1=8.815, t2=8.540, t3=8.731, t4=8.857, t5=8.955, t6=9.463, t7=9.446 | max_across_ranks=9.532       4503.3      562.9       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=4/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=9, global_tokens=131072, global_seqlens=[24576, 38912, 14336, 14336, 14336, 7168, 6144, 6144, 5120]
+Mega-ring all-CP workload: alignment=2048, global_tokens=133120, global_seqlens=[24576, 38912, 14336, 14336, 14336, 8192, 6144, 6144, 6144]
+Hybrid rings: sizes=[8, 8, 8, 4, 4, 2, 2, 2, 2], starts=[0, 0, 0, 0, 4, 0, 2, 4, 6]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[2, 5, 1, 1, 1, 1, 1, 1, 1], execution_lengths=[24576, 38920, 14336, 14336, 14336, 7168, 6144, 6144, 5120], padding=8, physical_rank_token_loads=[22120, 22120, 14952, 13928, 13928, 17408, 12288, 14336]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=9, global_tokens=131072, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=9, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=5.188, t1=5.239, t2=5.172, t3=5.079, t4=5.162, t5=5.181, t6=5.200, t7=5.247 | max_across_ranks=5.278       4482.1      560.3       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=2.044, t1=3.407, t2=4.860, t3=3.261, t4=3.831, t5=5.848, t6=7.404, t7=6.876 | max_across_ranks=7.404       3195.1      399.4       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=9.787, t1=9.619, t2=9.522, t3=9.282, t4=9.035, t5=8.742, t6=8.568, t7=8.418 | max_across_ranks=9.787       2417.2      302.2       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=7.071, t1=7.093, t2=6.959, t3=6.982, t4=6.874, t5=6.743, t6=8.020, t7=8.093 | max_across_ranks=8.093       2923.1      365.4       skip  Megatron scheduler; 3 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=2923.1, Avg/GPU=365.4
+magi_attention             t0=5.797, t1=5.757, t2=5.695, t3=5.756, t4=5.636, t5=5.714, t6=5.786, t7=5.993 | max_across_ranks=5.993       3947.4      493.4       skip  chunk_size=2048, tokens(original/padded)=131072/131072, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=7.365, t1=7.532, t2=5.344, t3=5.246, t4=5.241, t5=4.404, t6=4.145, t7=2.386 | max_across_ranks=7.532       3140.8      392.6       skip  L=4096; final_s0=4096; iterations=1; G1=7,G2=1,G5=1; padding=8; physical rank token loads=[22120,22120,14952,13928,13928,17408,12288,14336]; in-repo min_fa3 fallback; tokens(original/aligned)=131072/131080, padding=8 tokens; aligned-length Agg TFLOPS=3141.5, Avg/GPU=392.7
+mega_ring_all_cp           t0=5.531, t1=5.680, t2=5.292, t3=5.200, t4=5.149, t5=5.221, t6=5.202, t7=5.221 | max_across_ranks=5.701       4149.8      518.7       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4188.9, Avg/GPU=523.6
+mega_ring_hybrid           t0=5.582, t1=5.465, t2=4.992, t3=5.020, t4=5.144, t5=4.946, t6=5.104, t7=5.003 | max_across_ranks=5.582       4238.1      529.8       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=9, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.381, t1=5.521, t2=5.367, t3=5.535, t4=5.360, t5=5.196, t6=5.211, t7=5.375 | max_across_ranks=5.601       4224.1      528.0       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4264.0, Avg/GPU=533.0
+mega_ring_hybrid         t0=5.333, t1=5.350, t2=5.447, t3=5.565, t4=5.568, t5=5.652, t6=5.390, t7=5.662 | max_across_ranks=5.759       4107.8      513.5       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=9, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.513, t1=5.570, t2=5.213, t3=5.293, t4=5.283, t5=5.343, t6=5.381, t7=5.401 | max_across_ranks=5.610       4217.2      527.2       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4257.0, Avg/GPU=532.1
+mega_ring_hybrid         t0=5.665, t1=5.670, t2=5.268, t3=5.234, t4=5.115, t5=5.114, t6=5.443, t7=4.900 | max_across_ranks=5.683       4162.6      520.3       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=9, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.370, t1=5.507, t2=5.497, t3=5.360, t4=5.409, t5=5.308, t6=5.258, t7=5.287 | max_across_ranks=5.548       4264.1      533.0       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4304.4, Avg/GPU=538.1
+mega_ring_hybrid         t0=5.394, t1=5.419, t2=5.479, t3=5.388, t4=5.639, t5=5.336, t6=4.982, t7=5.165 | max_across_ranks=5.646       4190.4      523.8       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=5/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=7, global_tokens=131072, global_seqlens=[20480, 36864, 10240, 24576, 14336, 22528, 2048]
+Mega-ring all-CP workload: alignment=2048, global_tokens=131072, global_seqlens=[20480, 36864, 10240, 24576, 14336, 22528, 2048]
+Hybrid rings: sizes=[8, 8, 4, 4, 4, 4, 2], starts=[0, 0, 0, 0, 4, 4, 0]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[2, 4, 1, 2, 1, 2, 1], execution_lengths=[20480, 36864, 10240, 24576, 14336, 22528, 2048], padding=0, physical_rank_token_loads=[21504, 19456, 23552, 19456, 12288, 12288, 11264, 11264]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=7, global_tokens=131072, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=7, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                     Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=5.652, t1=5.654, t2=5.770, t3=5.589, t4=5.614, t5=5.655, t6=5.663, t7=5.663 | max_across_ranks=5.771         4548.7      568.6       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=4.007, t1=5.072, t2=3.204, t3=3.991, t4=4.973, t5=8.622, t6=8.789, t7=2.284 | max_across_ranks=8.789         2986.9      373.4       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=10.059, t1=9.909, t2=9.744, t3=9.527, t4=9.295, t5=9.038, t6=8.849, t7=8.722 | max_across_ranks=10.059       2609.9      326.2       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=8.965, t1=8.981, t2=8.994, t3=9.026, t4=9.005, t5=9.027, t6=9.013, t7=9.031 | max_across_ranks=9.064         2896.4      362.0       skip  Megatron scheduler; 4 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=2896.4, Avg/GPU=362.0
+magi_attention             t0=6.386, t1=6.462, t2=6.291, t3=6.346, t4=6.293, t5=6.507, t6=6.159, t7=6.220 | max_across_ranks=6.525         4023.2      502.9       skip  chunk_size=2048, tokens(original/padded)=131072/131072, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=8.239, t1=8.500, t2=7.743, t3=6.363, t4=4.026, t5=4.154, t6=3.467, t7=3.594 | max_across_ranks=8.500         3088.4      386.0       skip  L=4096; final_s0=4096; iterations=1; G1=3,G2=3,G4=1; padding=0; physical rank token loads=[21504,19456,23552,19456,12288,12288,11264,11264]; in-repo min_fa3 fallback; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3088.4, Avg/GPU=386.0
+mega_ring_all_cp           t0=5.743, t1=5.812, t2=5.795, t3=5.638, t4=5.672, t5=5.563, t6=5.700, t7=5.565 | max_across_ranks=5.853         4485.0      560.6       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4485.0, Avg/GPU=560.6
+mega_ring_hybrid           t0=5.755, t1=5.724, t2=5.442, t3=5.572, t4=5.522, t5=5.582, t6=5.568, t7=5.601 | max_across_ranks=5.774         4546.8      568.4       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=7, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=6.121, t1=6.387, t2=6.594, t3=6.080, t4=5.471, t5=5.481, t6=5.267, t7=5.428 | max_across_ranks=6.594       3981.4      497.7       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3981.4, Avg/GPU=497.7
+mega_ring_hybrid         t0=5.635, t1=5.500, t2=5.448, t3=5.501, t4=6.277, t5=5.882, t6=6.408, t7=5.921 | max_across_ranks=6.429       4083.6      510.5       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=7, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.868, t1=5.816, t2=5.732, t3=5.812, t4=5.816, t5=5.832, t6=5.672, t7=5.808 | max_across_ranks=5.900       4449.4      556.2       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4449.4, Avg/GPU=556.2
+mega_ring_hybrid         t0=5.967, t1=5.896, t2=5.751, t3=5.604, t4=5.550, t5=5.500, t6=5.533, t7=5.546 | max_across_ranks=5.973       4394.9      549.4       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=7, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=6.069, t1=6.209, t2=6.051, t3=6.085, t4=5.679, t5=5.779, t6=5.681, t7=5.650 | max_across_ranks=6.311       4159.7      520.0       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4159.7, Avg/GPU=520.0
+mega_ring_hybrid         t0=5.772, t1=5.613, t2=5.558, t3=5.768, t4=6.109, t5=5.954, t6=6.036, t7=6.021 | max_across_ranks=6.111       4296.0      537.0       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=6/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=11, global_tokens=131072, global_seqlens=[36864, 18432, 26624, 14336, 6144, 5120, 12288, 10240, 512, 256, 256]
+Mega-ring all-CP workload: alignment=2048, global_tokens=137216, global_seqlens=[36864, 18432, 26624, 14336, 6144, 6144, 12288, 10240, 2048, 2048, 2048]
+Hybrid rings: sizes=[8, 8, 8, 4, 2, 2, 2, 2, 1, 1, 1], starts=[0, 0, 0, 0, 0, 2, 4, 6, 6, 7, 7]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[4, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1], execution_lengths=[36864, 18432, 26624, 14336, 6144, 5120, 12288, 10240, 512, 256, 256], padding=0, physical_rank_token_loads=[22016, 19712, 15616, 14336, 13312, 13312, 18432, 14336]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=11, global_tokens=131072, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=11, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=5.271, t1=5.178, t2=5.330, t3=5.089, t4=5.230, t5=5.112, t6=5.271, t7=5.290 | max_across_ranks=5.346       4495.1      561.9       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=2.464, t1=4.078, t2=4.954, t3=6.588, t4=5.368, t5=2.880, t6=7.157, t7=4.347 | max_across_ranks=7.157       3357.6      419.7       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=9.936, t1=9.786, t2=9.703, t3=9.511, t4=9.267, t5=8.964, t6=9.190, t7=8.719 | max_across_ranks=9.941       2417.4      302.2       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=8.119, t1=8.233, t2=7.784, t3=7.839, t4=7.491, t5=7.514, t6=6.943, t7=6.880 | max_across_ranks=8.233       2918.8      364.8       skip  Megatron scheduler; 3 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=2918.8, Avg/GPU=364.8
+magi_attention             t0=5.792, t1=6.005, t2=5.930, t3=6.062, t4=5.824, t5=5.831, t6=5.716, t7=5.817 | max_across_ranks=6.066       3961.4      495.2       skip  chunk_size=2048, tokens(original/padded)=131072/131072, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=7.038, t1=6.412, t2=5.495, t3=5.479, t4=4.642, t5=4.766, t6=3.773, t7=2.375 | max_across_ranks=7.038       3414.4      426.8       skip  L=4096; final_s0=4096; iterations=1; G1=9,G2=1,G4=1; padding=0; physical rank token loads=[22016,19712,15616,14336,13312,13312,18432,14336]; in-repo min_fa3 fallback; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3414.4, Avg/GPU=426.8
+mega_ring_all_cp           t0=5.375, t1=5.715, t2=5.662, t3=5.359, t4=5.245, t5=5.180, t6=5.232, t7=5.164 | max_across_ranks=5.761       4170.9      521.4       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/137216, padding=6144 tokens; aligned-length Agg TFLOPS=4204.7, Avg/GPU=525.6
+mega_ring_hybrid           t0=5.435, t1=5.272, t2=5.162, t3=5.253, t4=5.521, t5=5.477, t6=4.785, t7=4.822 | max_across_ranks=5.596       4294.5      536.8       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=11, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.348, t1=5.410, t2=5.569, t3=5.462, t4=5.482, t5=5.436, t6=5.299, t7=5.328 | max_across_ranks=5.607       4285.8      535.7       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/137216, padding=6144 tokens; aligned-length Agg TFLOPS=4320.5, Avg/GPU=540.1
+mega_ring_hybrid         t0=5.323, t1=5.271, t2=5.248, t3=5.470, t4=5.730, t5=5.727, t6=5.545, t7=5.413 | max_across_ranks=5.750       4179.0      522.4       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=11, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.771, t1=5.810, t2=5.626, t3=5.555, t4=5.308, t5=5.294, t6=5.549, t7=5.519 | max_across_ranks=5.832       4120.3      515.0       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/137216, padding=6144 tokens; aligned-length Agg TFLOPS=4153.6, Avg/GPU=519.2
+mega_ring_hybrid         t0=5.480, t1=5.407, t2=5.293, t3=5.282, t4=5.647, t5=5.473, t6=4.949, t7=4.870 | max_across_ranks=5.669       4239.2      529.9       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=11, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.511, t1=5.617, t2=5.353, t3=5.365, t4=5.516, t5=5.439, t6=5.420, t7=5.415 | max_across_ranks=5.650       4253.5      531.7       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/137216, padding=6144 tokens; aligned-length Agg TFLOPS=4287.9, Avg/GPU=536.0
+mega_ring_hybrid         t0=5.357, t1=5.461, t2=5.368, t3=5.488, t4=5.616, t5=5.596, t6=5.135, t7=4.924 | max_across_ranks=5.657       4247.6      530.9       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=7/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=8, global_tokens=131072, global_seqlens=[43008, 34816, 10240, 10240, 10240, 10240, 5120, 7168]
+Mega-ring all-CP workload: alignment=2048, global_tokens=133120, global_seqlens=[43008, 34816, 10240, 10240, 10240, 10240, 6144, 8192]
+Hybrid rings: sizes=[8, 8, 8, 2, 2, 2, 2, 2], starts=[0, 0, 0, 0, 2, 4, 6, 6]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[5, 3, 1, 1, 1, 1, 1, 1], execution_lengths=[43010, 34818, 10240, 10240, 10240, 10240, 5120, 7168], padding=4, physical_rank_token_loads=[18842, 18842, 18842, 18842, 15770, 16726, 11606, 11606]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=8, global_tokens=131072, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=8, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                        Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=6.189, t1=6.286, t2=6.117, t3=6.167, t4=6.017, t5=6.139, t6=6.191, t7=6.203 | max_across_ranks=6.311            4619.7      577.5       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=2.119, t1=3.811, t2=5.101, t3=6.500, t4=8.621, t5=3.909, t6=5.465, t7=9.156 | max_across_ranks=9.156            3184.3      398.0       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=10.552, t1=10.417, t2=10.272, t3=10.037, t4=9.895, t5=9.548, t6=9.381, t7=9.291 | max_across_ranks=10.552       2763.0      345.4       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=9.268, t1=9.269, t2=9.282, t3=9.310, t4=9.257, t5=9.213, t6=9.216, t7=9.186 | max_across_ranks=9.323            3127.2      390.9       skip  Megatron scheduler; 3 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3127.2, Avg/GPU=390.9
+magi_attention             t0=6.854, t1=6.936, t2=6.881, t3=6.869, t4=6.776, t5=6.730, t6=6.713, t7=6.967 | max_across_ranks=6.989            4171.8      521.5       skip  chunk_size=2048, tokens(original/padded)=131072/131072, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=6.964, t1=7.132, t2=7.262, t3=7.311, t4=6.339, t5=5.886, t6=5.527, t7=5.630 | max_across_ranks=7.312            3987.3      498.4       skip  L=4096; final_s0=4096; iterations=1; G1=6,G3=1,G5=1; padding=4; physical rank token loads=[18842,18842,18842,18842,15770,16726,11606,11606]; in-repo min_fa3 fallback; tokens(original/aligned)=131072/131076, padding=4 tokens; aligned-length Agg TFLOPS=3987.6, Avg/GPU=498.5
+mega_ring_all_cp           t0=6.498, t1=6.242, t2=6.213, t3=6.159, t4=6.177, t5=6.240, t6=6.281, t7=6.282 | max_across_ranks=6.565            4441.1      555.1       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4475.1, Avg/GPU=559.4
+mega_ring_hybrid           t0=6.525, t1=6.209, t2=6.339, t3=6.028, t4=6.052, t5=5.966, t6=5.886, t7=5.920 | max_across_ranks=6.564            4441.9      555.2       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=8, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=6.711, t1=7.128, t2=6.735, t3=6.863, t4=6.723, t5=6.517, t6=7.027, t7=6.482 | max_across_ranks=7.163       4070.3      508.8       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4101.5, Avg/GPU=512.7
+mega_ring_hybrid         t0=6.549, t1=6.539, t2=6.324, t3=6.241, t4=6.252, t5=6.121, t6=6.038, t7=6.055 | max_across_ranks=6.558       4445.5      555.7       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=8, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=6.597, t1=6.369, t2=6.248, t3=6.243, t4=6.135, t5=6.202, t6=6.212, t7=6.379 | max_across_ranks=6.597       4419.5      552.4       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4453.4, Avg/GPU=556.7
+mega_ring_hybrid         t0=6.694, t1=6.770, t2=6.832, t3=6.695, t4=6.506, t5=6.675, t6=6.284, t7=6.389 | max_across_ranks=6.850       4256.4      532.1       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=8, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=6.645, t1=6.807, t2=6.453, t3=6.617, t4=6.527, t5=6.455, t6=6.656, t7=6.532 | max_across_ranks=6.807       4283.0      535.4       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4315.8, Avg/GPU=539.5
+mega_ring_hybrid         t0=6.532, t1=6.518, t2=6.263, t3=6.306, t4=6.225, t5=6.088, t6=5.990, t7=5.975 | max_across_ranks=6.547       4453.3      556.7       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=8/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=8, global_tokens=132096, global_seqlens=[26624, 6144, 14336, 30720, 14336, 28672, 6144, 5120]
+Mega-ring all-CP workload: alignment=2048, global_tokens=133120, global_seqlens=[26624, 6144, 14336, 30720, 14336, 28672, 6144, 6144]
+Hybrid rings: sizes=[8, 4, 4, 4, 4, 4, 2, 2], starts=[0, 0, 0, 0, 4, 4, 4, 6]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[2, 1, 1, 3, 1, 3, 1, 1], execution_lengths=[26624, 6144, 14336, 30720, 14336, 28674, 6144, 5120], padding=2, physical_rank_token_loads=[24576, 24576, 16384, 15702, 14678, 9558, 13312, 13312]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=8, global_tokens=132096, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=8, global_tokens=132096, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                       Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=5.177, t1=5.211, t2=5.364, t3=5.244, t4=5.339, t5=5.273, t6=5.383, t7=5.270 | max_across_ranks=5.434           4504.2      563.0       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=2.120, t1=5.970, t2=8.316, t3=4.171, t4=2.442, t5=3.805, t6=4.298, t7=7.861 | max_across_ranks=8.316           2942.9      367.9       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=10.394, t1=10.325, t2=10.254, t3=9.998, t4=9.863, t5=9.557, t6=9.467, t7=9.489 | max_across_ranks=10.424       2347.7      293.5       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=8.067, t1=8.113, t2=8.900, t3=8.955, t4=9.329, t5=8.179, t6=8.247, t7=7.858 | max_across_ranks=9.389           2606.7      325.8       skip  Megatron scheduler; 3 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=132096/132096, padding=0 tokens; aligned-length Agg TFLOPS=2606.7, Avg/GPU=325.8
+magi_attention             t0=6.542, t1=6.537, t2=6.311, t3=6.482, t4=6.192, t5=6.334, t6=6.482, t7=6.496 | max_across_ranks=6.577           3721.1      465.1       skip  chunk_size=2064, tokens(original/padded)=132096/132096, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=7.198, t1=7.527, t2=5.082, t3=4.519, t4=4.357, t5=4.092, t6=4.626, t7=4.788 | max_across_ranks=7.527           3251.3      406.4       skip  L=4096; final_s0=4096; iterations=1; G1=5,G2=1,G3=2; padding=2; physical rank token loads=[24576,24576,16384,15702,14678,9558,13312,13312]; in-repo min_fa3 fallback; tokens(original/aligned)=132096/132098, padding=2 tokens; aligned-length Agg TFLOPS=3251.4, Avg/GPU=406.4
+mega_ring_all_cp           t0=5.602, t1=5.700, t2=5.339, t3=5.320, t4=5.291, t5=5.308, t6=5.318, t7=5.278 | max_across_ranks=5.725           4274.9      534.4       skip  all-CP fused mega-ring; tokens(original/aligned)=132096/133120, padding=1024 tokens; aligned-length Agg TFLOPS=4291.5, Avg/GPU=536.4
+mega_ring_hybrid           t0=5.838, t1=5.752, t2=5.507, t3=5.268, t4=5.033, t5=4.944, t6=4.907, t7=4.893 | max_across_ranks=5.843           4188.4      523.5       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=8, global_tokens=132096, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.671, t1=5.614, t2=5.774, t3=5.458, t4=5.310, t5=5.373, t6=5.289, t7=5.323 | max_across_ranks=5.789       4227.7      528.5       skip  all-CP fused mega-ring; tokens(original/aligned)=132096/133120, padding=1024 tokens; aligned-length Agg TFLOPS=4244.0, Avg/GPU=530.5
+mega_ring_hybrid         t0=5.358, t1=5.432, t2=5.754, t3=6.060, t4=5.450, t5=5.404, t6=5.185, t7=5.118 | max_across_ranks=6.060       4038.5      504.8       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=8, global_tokens=132096, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.704, t1=5.739, t2=5.527, t3=5.451, t4=5.583, t5=5.517, t6=5.365, t7=5.651 | max_across_ranks=5.744       4260.5      532.6       skip  all-CP fused mega-ring; tokens(original/aligned)=132096/133120, padding=1024 tokens; aligned-length Agg TFLOPS=4276.9, Avg/GPU=534.6
+mega_ring_hybrid         t0=5.787, t1=5.694, t2=5.485, t3=5.456, t4=5.052, t5=5.028, t6=4.900, t7=4.943 | max_across_ranks=5.787       4229.4      528.7       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=8, global_tokens=132096, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.698, t1=5.677, t2=5.673, t3=5.448, t4=5.411, t5=5.425, t6=5.345, t7=5.432 | max_across_ranks=5.748       4257.9      532.2       skip  all-CP fused mega-ring; tokens(original/aligned)=132096/133120, padding=1024 tokens; aligned-length Agg TFLOPS=4274.4, Avg/GPU=534.3
+mega_ring_hybrid         t0=5.464, t1=5.463, t2=5.778, t3=5.952, t4=5.314, t5=5.145, t6=5.169, t7=4.970 | max_across_ranks=5.952       4111.9      514.0       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=9/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=7, global_tokens=132096, global_seqlens=[7168, 36864, 34816, 12288, 10240, 16384, 14336]
+Mega-ring all-CP workload: alignment=2048, global_tokens=133120, global_seqlens=[8192, 36864, 34816, 12288, 10240, 16384, 14336]
+Hybrid rings: sizes=[4, 4, 4, 2, 2, 2, 2], starts=[0, 0, 4, 0, 2, 4, 6]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[1, 4, 3, 1, 1, 1, 1], execution_lengths=[7168, 36864, 34818, 12288, 10240, 16384, 14336], padding=2, physical_rank_token_loads=[23552, 21504, 19456, 16384, 11606, 11606, 11606, 16384]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=7, global_tokens=132096, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=7, global_tokens=132096, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=5.922, t1=5.962, t2=5.765, t3=5.902, t4=5.822, t5=5.846, t6=5.899, t7=5.921 | max_across_ranks=6.015                4565.5      570.7       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=3.125, t1=2.805, t2=4.889, t3=5.427, t4=6.726, t5=4.535, t6=5.688, t7=9.116 | max_across_ranks=9.116                3012.7      376.6       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=10.862, t1=10.756, t2=10.613, t3=10.450, t4=10.307, t5=9.986, t6=9.912, t7=10.800 | max_across_ranks=11.098         2474.7      309.3       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=10.152, t1=10.163, t2=10.175, t3=10.141, t4=10.109, t5=10.041, t6=10.092, t7=10.034 | max_across_ranks=10.239       2682.3      335.3       skip  Megatron scheduler; 3 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=132096/133120, padding=1024 tokens; aligned-length Agg TFLOPS=2694.9, Avg/GPU=336.9
+magi_attention             t0=7.009, t1=7.236, t2=6.998, t3=6.899, t4=7.037, t5=6.874, t6=7.176, t7=7.005 | max_across_ranks=7.246                3789.9      473.7       skip  chunk_size=2064, tokens(original/padded)=132096/132096, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=7.729, t1=6.943, t2=6.333, t3=5.771, t4=5.507, t5=5.551, t6=5.584, t7=3.064 | max_across_ranks=7.729                3553.3      444.2       skip  L=4096; final_s0=4096; iterations=1; G1=5,G3=1,G4=1; padding=2; physical rank token loads=[23552,21504,19456,16384,11606,11606,11606,16384]; in-repo min_fa3 fallback; tokens(original/aligned)=132096/132098, padding=2 tokens; aligned-length Agg TFLOPS=3553.5, Avg/GPU=444.2
+mega_ring_all_cp           t0=6.025, t1=5.972, t2=5.993, t3=5.916, t4=5.905, t5=5.880, t6=5.887, t7=5.917 | max_across_ranks=6.102                4500.5      562.6       skip  all-CP fused mega-ring; tokens(original/aligned)=132096/133120, padding=1024 tokens; aligned-length Agg TFLOPS=4521.6, Avg/GPU=565.2
+mega_ring_hybrid           t0=5.981, t1=5.834, t2=5.349, t3=5.531, t4=6.190, t5=5.757, t6=5.439, t7=5.421 | max_across_ranks=6.190                4436.7      554.6       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=7, global_tokens=132096, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=6.504, t1=6.885, t2=6.587, t3=6.235, t4=5.964, t5=6.296, t6=6.034, t7=5.725 | max_across_ranks=6.885       3988.6      498.6       skip  all-CP fused mega-ring; tokens(original/aligned)=132096/133120, padding=1024 tokens; aligned-length Agg TFLOPS=4007.3, Avg/GPU=500.9
+mega_ring_hybrid         t0=6.114, t1=6.055, t2=5.543, t3=5.534, t4=6.185, t5=6.046, t6=5.541, t7=5.723 | max_across_ranks=6.203       4427.2      553.4       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=7, global_tokens=132096, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.983, t1=5.964, t2=5.947, t3=5.965, t4=5.942, t5=6.073, t6=5.938, t7=6.121 | max_across_ranks=6.168       4452.6      556.6       skip  all-CP fused mega-ring; tokens(original/aligned)=132096/133120, padding=1024 tokens; aligned-length Agg TFLOPS=4473.5, Avg/GPU=559.2
+mega_ring_hybrid         t0=6.268, t1=6.106, t2=5.520, t3=5.573, t4=6.213, t5=6.032, t6=5.468, t7=5.403 | max_across_ranks=6.298       4360.7      545.1       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=7, global_tokens=132096, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=6.286, t1=6.543, t2=6.433, t3=6.197, t4=6.069, t5=6.125, t6=5.959, t7=6.094 | max_across_ranks=6.595       4163.9      520.5       skip  all-CP fused mega-ring; tokens(original/aligned)=132096/133120, padding=1024 tokens; aligned-length Agg TFLOPS=4183.5, Avg/GPU=522.9
+mega_ring_hybrid         t0=6.178, t1=6.079, t2=5.376, t3=5.487, t4=6.277, t5=6.053, t6=5.648, t7=5.470 | max_across_ranks=6.277       4375.5      546.9       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=10/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=5, global_tokens=131072, global_seqlens=[36864, 53248, 22528, 12288, 6144]
+Mega-ring all-CP workload: alignment=2048, global_tokens=131072, global_seqlens=[36864, 53248, 22528, 12288, 6144]
+Hybrid rings: sizes=[8, 8, 8, 4, 4], starts=[0, 0, 0, 0, 4]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[3, 5, 1, 1, 1], execution_lengths=[36864, 53250, 22528, 12288, 6144], padding=2, physical_rank_token_loads=[33178, 22938, 16794, 10650, 10650, 12288, 12288, 12288]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=5, global_tokens=131072, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=5, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=7.955, t1=8.002, t2=8.017, t3=7.945, t4=7.842, t5=8.038, t6=7.871, t7=7.944 | max_across_ranks=8.262                4849.5      606.2       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=2.356, t1=3.991, t2=6.813, t3=7.955, t4=4.567, t5=11.623, t6=11.455, t7=11.648 | max_across_ranks=11.676            3431.3      428.9       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=12.124, t1=12.028, t2=11.820, t3=11.675, t4=11.300, t5=11.119, t6=10.951, t7=10.805 | max_across_ranks=12.124       3304.5      413.1       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=11.566, t1=11.628, t2=11.668, t3=11.710, t4=10.661, t5=10.716, t6=9.905, t7=9.928 | max_across_ranks=11.713         3420.4      427.5       skip  Megatron scheduler; 2 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3420.4, Avg/GPU=427.5
+magi_attention             t0=8.795, t1=8.964, t2=8.843, t3=8.859, t4=8.713, t5=8.844, t6=8.686, t7=8.634 | max_across_ranks=9.090                4407.5      550.9       skip  chunk_size=2048, tokens(original/padded)=131072/131072, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=14.857, t1=9.714, t2=8.422, t3=8.063, t4=8.011, t5=5.877, t6=5.973, t7=6.148 | max_across_ranks=14.857              2696.7      337.1       skip  L=4096; final_s0=4096; iterations=1; G1=3,G3=1,G5=1; padding=2; physical rank token loads=[33178,22938,16794,10650,10650,12288,12288,12288]; in-repo min_fa3 fallback; tokens(original/aligned)=131072/131074, padding=2 tokens; aligned-length Agg TFLOPS=2696.9, Avg/GPU=337.1
+mega_ring_all_cp           t0=8.484, t1=8.339, t2=8.079, t3=8.297, t4=8.205, t5=8.166, t6=8.212, t7=8.248 | max_across_ranks=8.568                4676.2      584.5       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4676.2, Avg/GPU=584.5
+mega_ring_hybrid           t0=9.005, t1=9.007, t2=8.740, t3=8.446, t4=7.759, t5=7.718, t6=7.682, t7=7.766 | max_across_ranks=9.218                4346.1      543.3       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=5, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=8.260, t1=8.638, t2=8.479, t3=9.013, t4=8.378, t5=8.659, t6=8.780, t7=8.652 | max_across_ranks=9.053       4425.5      553.2       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4425.5, Avg/GPU=553.2
+mega_ring_hybrid         t0=8.831, t1=8.593, t2=8.355, t3=8.543, t4=7.895, t5=7.897, t6=7.808, t7=7.863 | max_across_ranks=8.836       4534.2      566.8       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=5, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=8.823, t1=8.895, t2=9.084, t3=8.810, t4=8.496, t5=8.499, t6=8.559, t7=8.488 | max_across_ranks=9.109       4398.6      549.8       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4398.6, Avg/GPU=549.8
+mega_ring_hybrid         t0=8.386, t1=8.552, t2=8.438, t3=8.895, t4=7.833, t5=7.946, t6=7.963, t7=8.124 | max_across_ranks=8.904       4499.6      562.5       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=5, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=8.799, t1=8.513, t2=8.193, t3=8.301, t4=8.313, t5=8.281, t6=8.156, t7=8.332 | max_across_ranks=8.799       4553.2      569.2       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4553.2, Avg/GPU=569.2
+mega_ring_hybrid         t0=8.947, t1=9.253, t2=9.311, t3=9.222, t4=8.235, t5=8.255, t6=8.312, t7=8.203 | max_across_ranks=9.365       4278.0      534.7       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=11/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=4, global_tokens=131072, global_seqlens=[63488, 34816, 18432, 14336]
+Mega-ring all-CP workload: alignment=2048, global_tokens=131072, global_seqlens=[63488, 34816, 18432, 14336]
+Hybrid rings: sizes=[8, 8, 4, 4], starts=[0, 0, 0, 4]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[6, 2, 1, 1], execution_lengths=[63492, 34816, 18432, 14336], padding=4, physical_rank_token_loads=[29014, 24918, 10582, 10582, 10582, 10582, 17408, 17408]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=4, global_tokens=131072, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=4, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=9.096, t1=9.383, t2=9.092, t3=9.271, t4=9.123, t5=9.207, t6=9.189, t7=9.410 | max_across_ranks=9.639                4919.4      614.9       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=3.257, t1=4.094, t2=6.466, t3=6.523, t4=14.510, t5=14.689, t6=14.632, t7=10.041 | max_across_ranks=14.796           3204.7      400.6       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=13.424, t1=13.314, t2=13.163, t3=12.939, t4=12.608, t5=12.348, t6=12.193, t7=12.101 | max_across_ranks=13.444       3527.2      440.9       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=12.961, t1=13.008, t2=13.032, t3=13.066, t4=12.464, t5=12.493, t6=12.502, t7=12.531 | max_across_ranks=13.067       3628.7      453.6       skip  Megatron scheduler; 2 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3628.7, Avg/GPU=453.6
+magi_attention             t0=10.498, t1=10.831, t2=10.667, t3=10.804, t4=10.289, t5=10.620, t6=10.730, t7=10.646 | max_across_ranks=11.135       4258.5      532.3       skip  chunk_size=2048, tokens(original/padded)=131072/131072, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=14.444, t1=12.318, t2=9.411, t3=9.508, t4=9.427, t5=9.521, t6=7.401, t7=7.637 | max_across_ranks=14.444             3282.9      410.4       skip  L=4096; final_s0=4096; iterations=1; G1=2,G2=1,G6=1; padding=4; physical rank token loads=[29014,24918,10582,10582,10582,10582,17408,17408]; in-repo min_fa3 fallback; tokens(original/aligned)=131072/131076, padding=4 tokens; aligned-length Agg TFLOPS=3283.2, Avg/GPU=410.4
+mega_ring_all_cp           t0=9.956, t1=10.075, t2=9.556, t3=9.613, t4=9.413, t5=9.570, t6=9.624, t7=9.443 | max_across_ranks=10.083              4702.5      587.8       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4702.5, Avg/GPU=587.8
+mega_ring_hybrid           t0=10.201, t1=10.277, t2=10.780, t3=10.695, t4=9.495, t5=9.638, t6=9.814, t7=9.560 | max_across_ranks=10.790           4394.7      549.3       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=4, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                        Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=9.685, t1=9.317, t2=9.500, t3=9.666, t4=9.527, t5=9.436, t6=9.671, t7=9.840 | max_across_ranks=9.994            4744.5      593.1       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4744.5, Avg/GPU=593.1
+mega_ring_hybrid         t0=10.264, t1=10.378, t2=10.427, t3=10.256, t4=9.583, t5=9.620, t6=9.279, t7=9.127 | max_across_ranks=10.578       4482.8      560.3       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=4, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                        Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=9.713, t1=9.660, t2=9.578, t3=9.936, t4=9.821, t5=9.864, t6=10.203, t7=10.264 | max_across_ranks=10.288         4609.2      576.1       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4609.2, Avg/GPU=576.1
+mega_ring_hybrid         t0=10.373, t1=10.509, t2=10.224, t3=10.080, t4=9.239, t5=9.503, t6=9.232, t7=9.149 | max_across_ranks=10.523       4506.0      563.3       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=4, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                         Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=9.789, t1=9.953, t2=10.259, t3=10.561, t4=9.895, t5=10.140, t6=10.352, t7=10.222 | max_across_ranks=10.575       4483.8      560.5       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4483.8, Avg/GPU=560.5
+mega_ring_hybrid         t0=10.157, t1=10.220, t2=10.007, t3=10.076, t4=9.249, t5=9.200, t6=9.320, t7=9.394 | max_across_ranks=10.286        4609.8      576.2       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=12/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=15, global_tokens=131328, global_seqlens=[24576, 12288, 10240, 6144, 10240, 10240, 12288, 2560, 1792, 5120, 5120, 8192, 8192, 7168, 7168]
+Mega-ring all-CP workload: alignment=2048, global_tokens=137216, global_seqlens=[24576, 12288, 10240, 6144, 10240, 10240, 12288, 4096, 2048, 6144, 6144, 8192, 8192, 8192, 8192]
+Hybrid rings: sizes=[8, 4, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1], starts=[0, 0, 0, 0, 2, 4, 6, 0, 1, 2, 3, 4, 5, 6, 7]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], execution_lengths=[24576, 12288, 10240, 6144, 10240, 10240, 12288, 2560, 1792, 5120, 5120, 8192, 8192, 7168, 7168], padding=0, physical_rank_token_loads=[18944, 16128, 14336, 13312, 19456, 18432, 15360, 15360]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=15, global_tokens=131328, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=15, global_tokens=131328, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=3.278, t1=3.333, t2=3.290, t3=3.321, t4=3.262, t5=3.288, t6=3.360, t7=3.291 | max_across_ranks=3.366       3790.6      473.8       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=2.204, t1=3.713, t2=5.333, t3=2.125, t4=2.222, t5=2.723, t6=2.091, t7=2.837 | max_across_ranks=5.333       2392.6      299.1       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=9.019, t1=8.895, t2=8.892, t3=8.640, t4=8.410, t5=8.087, t6=8.018, t7=7.851 | max_across_ranks=9.019       1414.8      176.9       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=4.777, t1=4.830, t2=4.823, t3=4.804, t4=4.780, t5=4.711, t6=4.610, t7=4.583 | max_across_ranks=4.880       2615.0      326.9       skip  Megatron scheduler; 3 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131328/131328, padding=0 tokens; aligned-length Agg TFLOPS=2615.0, Avg/GPU=326.9
+magi_attention             t0=3.926, t1=3.981, t2=4.133, t3=4.131, t4=4.062, t5=3.970, t6=4.135, t7=4.035 | max_across_ranks=4.161       3066.7      383.3       skip  chunk_size=2052, tokens(original/padded)=131328/131328, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=4.031, t1=3.492, t2=3.457, t3=3.335, t4=2.408, t5=2.248, t6=1.627, t7=1.632 | max_across_ranks=4.031       3165.2      395.7       skip  L=4096; final_s0=4096; iterations=1; G1=14,G4=1; padding=0; physical rank token loads=[18944,16128,14336,13312,19456,18432,15360,15360]; in-repo min_fa3 fallback; tokens(original/aligned)=131328/131328, padding=0 tokens; aligned-length Agg TFLOPS=3165.2, Avg/GPU=395.7
+mega_ring_all_cp           t0=3.456, t1=3.391, t2=3.355, t3=3.400, t4=3.349, t5=3.361, t6=3.311, t7=3.378 | max_across_ranks=3.457       3690.9      461.4       skip  all-CP fused mega-ring; tokens(original/aligned)=131328/137216, padding=5888 tokens; aligned-length Agg TFLOPS=3846.7, Avg/GPU=480.8
+mega_ring_hybrid           t0=3.017, t1=2.967, t2=2.899, t3=2.884, t4=2.815, t5=2.797, t6=3.045, t7=2.980 | max_across_ranks=3.047       4187.6      523.4       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=15, global_tokens=131328, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=3.522, t1=3.614, t2=3.413, t3=3.483, t4=3.354, t5=3.375, t6=3.368, t7=3.381 | max_across_ranks=3.697       3451.3      431.4       skip  all-CP fused mega-ring; tokens(original/aligned)=131328/137216, padding=5888 tokens; aligned-length Agg TFLOPS=3597.0, Avg/GPU=449.6
+mega_ring_hybrid         t0=3.316, t1=3.078, t2=3.044, t3=3.022, t4=2.899, t5=2.805, t6=2.959, t7=2.905 | max_across_ranks=3.316       3848.0      481.0       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=15, global_tokens=131328, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=3.492, t1=3.471, t2=3.517, t3=3.553, t4=3.436, t5=3.395, t6=3.334, t7=3.404 | max_across_ranks=3.581       3563.5      445.4       skip  all-CP fused mega-ring; tokens(original/aligned)=131328/137216, padding=5888 tokens; aligned-length Agg TFLOPS=3713.9, Avg/GPU=464.2
+mega_ring_hybrid         t0=3.010, t1=2.971, t2=3.002, t3=3.030, t4=2.916, t5=3.027, t6=3.084, t7=3.071 | max_across_ranks=3.112       4100.4      512.5       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=15, global_tokens=131328, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=3.359, t1=3.319, t2=3.380, t3=3.357, t4=3.532, t5=3.504, t6=3.524, t7=3.636 | max_across_ranks=3.637       3508.8      438.6       skip  all-CP fused mega-ring; tokens(original/aligned)=131328/137216, padding=5888 tokens; aligned-length Agg TFLOPS=3656.8, Avg/GPU=457.1
+mega_ring_hybrid         t0=3.073, t1=2.942, t2=2.853, t3=2.909, t4=2.786, t5=2.800, t6=3.039, t7=3.048 | max_across_ranks=3.073       4151.8      519.0       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=13/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=7, global_tokens=131072, global_seqlens=[10240, 18432, 30720, 12288, 30720, 10240, 18432]
+Mega-ring all-CP workload: alignment=2048, global_tokens=131072, global_seqlens=[10240, 18432, 30720, 12288, 30720, 10240, 18432]
+Hybrid rings: sizes=[8, 4, 4, 4, 4, 4, 4], starts=[0, 0, 0, 0, 4, 4, 4]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[1, 1, 3, 1, 3, 1, 1], execution_lengths=[10240, 18432, 30720, 12288, 30720, 10240, 18432], padding=0, physical_rank_token_loads=[22528, 20480, 20480, 10240, 10240, 10240, 18432, 18432]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=7, global_tokens=131072, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=7, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=5.220, t1=5.183, t2=5.273, t3=5.102, t4=5.213, t5=5.215, t6=5.236, t7=5.249 | max_across_ranks=5.296       4528.5      566.1       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=3.973, t1=2.655, t2=3.514, t3=5.019, t4=6.333, t5=6.354, t6=6.587, t7=3.701 | max_across_ranks=6.642       3610.9      451.4       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=9.703, t1=9.516, t2=9.404, t3=9.162, t4=8.928, t5=8.610, t6=8.494, t7=8.307 | max_across_ranks=9.703       2471.9      309.0       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=6.632, t1=6.627, t2=6.656, t3=6.692, t4=6.672, t5=6.693, t6=6.646, t7=6.687 | max_across_ranks=6.711       3573.7      446.7       skip  Megatron scheduler; 2 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3573.7, Avg/GPU=446.7
+magi_attention             t0=5.924, t1=6.035, t2=5.858, t3=6.036, t4=6.082, t5=5.780, t6=5.797, t7=5.700 | max_across_ranks=6.114       3923.1      490.4       skip  chunk_size=2048, tokens(original/padded)=131072/131072, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=6.634, t1=6.106, t2=6.163, t3=4.426, t4=4.543, t5=4.609, t6=3.808, t7=3.851 | max_across_ranks=6.634       3615.1      451.9       skip  L=4096; final_s0=4096; iterations=1; G1=5,G3=2; padding=0; physical rank token loads=[22528,20480,20480,10240,10240,10240,18432,18432]; in-repo min_fa3 fallback; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3615.1, Avg/GPU=451.9
+mega_ring_all_cp           t0=5.684, t1=5.559, t2=6.090, t3=5.077, t4=5.215, t5=5.158, t6=5.295, t7=5.084 | max_across_ranks=6.090       3938.5      492.3       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3938.5, Avg/GPU=492.3
+mega_ring_hybrid           t0=5.495, t1=5.524, t2=5.261, t3=5.199, t4=5.026, t5=4.950, t6=5.028, t7=5.026 | max_across_ranks=5.558       4315.6      539.4       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=7, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.343, t1=5.478, t2=5.442, t3=5.341, t4=5.270, t5=5.280, t6=5.418, t7=5.331 | max_across_ranks=5.517       4347.5      543.4       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4347.5, Avg/GPU=543.4
+mega_ring_hybrid         t0=5.231, t1=5.361, t2=5.305, t3=5.685, t4=5.377, t5=5.341, t6=5.598, t7=5.463 | max_across_ranks=5.689       4215.6      526.9       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=7, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.581, t1=5.576, t2=5.725, t3=5.444, t4=5.455, t5=5.348, t6=5.420, t7=5.327 | max_across_ranks=5.765       4160.2      520.0       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4160.2, Avg/GPU=520.0
+mega_ring_hybrid         t0=5.674, t1=5.647, t2=5.491, t3=5.271, t4=5.258, t5=5.094, t6=4.969, t7=5.300 | max_across_ranks=5.684       4219.5      527.4       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=7, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.527, t1=5.437, t2=5.315, t3=5.374, t4=5.260, t5=5.237, t6=5.332, t7=5.302 | max_across_ranks=5.536       4332.3      541.5       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4332.3, Avg/GPU=541.5
+mega_ring_hybrid         t0=5.186, t1=5.454, t2=5.409, t3=5.637, t4=5.296, t5=5.195, t6=5.454, t7=5.161 | max_across_ranks=5.637       4254.6      531.8       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=14/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=6, global_tokens=131072, global_seqlens=[47104, 12288, 26624, 20480, 22528, 2048]
+Mega-ring all-CP workload: alignment=2048, global_tokens=131072, global_seqlens=[47104, 12288, 26624, 20480, 22528, 2048]
+Hybrid rings: sizes=[8, 4, 4, 4, 4, 2], starts=[0, 0, 0, 4, 4, 0]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[5, 1, 2, 1, 2, 1], execution_lengths=[47110, 12288, 26624, 20480, 22528, 2048], padding=6, physical_rank_token_loads=[22734, 29902, 21710, 9422, 9422, 13312, 13312, 11264]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=6, global_tokens=131072, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=6, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                          Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=6.624, t1=6.889, t2=6.669, t3=6.789, t4=6.643, t5=6.784, t6=6.653, t7=6.902 | max_across_ranks=6.975              4709.7      588.7       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=4.024, t1=5.100, t2=5.048, t3=9.214, t4=8.949, t5=9.425, t6=5.005, t7=3.471 | max_across_ranks=9.425              3485.2      435.6       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=11.022, t1=11.089, t2=10.901, t3=10.692, t4=10.448, t5=10.083, t6=9.950, t7=9.697 | max_across_ranks=11.092       2961.5      370.2       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=9.204, t1=9.280, t2=8.241, t3=8.216, t4=9.811, t5=9.802, t6=9.871, t7=9.893 | max_across_ranks=9.895              3319.9      415.0       skip  Megatron scheduler; 3 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3319.9, Avg/GPU=415.0
+magi_attention             t0=7.581, t1=7.738, t2=7.547, t3=7.521, t4=7.487, t5=7.537, t6=7.419, t7=7.359 | max_across_ranks=7.746              4241.0      530.1       skip  chunk_size=2048, tokens(original/padded)=131072/131072, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=10.102, t1=12.581, t2=8.101, t3=6.471, t4=6.429, t5=4.657, t6=4.736, t7=8.338 | max_across_ranks=12.581           2610.9      326.4       skip  L=4096; final_s0=4096; iterations=1; G1=3,G2=2,G5=1; padding=6; physical rank token loads=[22734,29902,21710,9422,9422,13312,13312,11264]; in-repo min_fa3 fallback; tokens(original/aligned)=131072/131078, padding=6 tokens; aligned-length Agg TFLOPS=2611.3, Avg/GPU=326.4
+mega_ring_all_cp           t0=6.954, t1=7.056, t2=6.938, t3=6.997, t4=6.855, t5=6.756, t6=6.878, t7=6.762 | max_across_ranks=7.154              4591.8      574.0       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4591.8, Avg/GPU=574.0
+mega_ring_hybrid           t0=7.010, t1=6.944, t2=6.858, t3=6.630, t4=6.993, t5=6.945, t6=6.849, t7=6.919 | max_across_ranks=7.056              4655.4      581.9       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=6, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=7.447, t1=7.515, t2=7.567, t3=7.772, t4=7.498, t5=7.498, t6=7.944, t7=7.427 | max_across_ranks=8.020       4095.9      512.0       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4095.9, Avg/GPU=512.0
+mega_ring_hybrid         t0=6.593, t1=6.882, t2=6.360, t3=6.555, t4=6.936, t5=7.038, t6=6.871, t7=7.266 | max_across_ranks=7.291       4505.1      563.1       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=6, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=7.159, t1=7.177, t2=7.175, t3=6.895, t4=6.839, t5=6.850, t6=6.854, t7=6.714 | max_across_ranks=7.235       4540.5      567.6       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4540.5, Avg/GPU=567.6
+mega_ring_hybrid         t0=7.334, t1=7.028, t2=7.540, t3=7.070, t4=7.377, t5=7.108, t6=7.347, t7=7.053 | max_across_ranks=7.755       4236.1      529.5       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=6, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=6.951, t1=7.442, t2=6.920, t3=7.389, t4=7.179, t5=7.461, t6=7.396, t7=7.569 | max_across_ranks=7.638       4300.5      537.6       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=4300.5, Avg/GPU=537.6
+mega_ring_hybrid         t0=6.854, t1=6.779, t2=6.618, t3=6.646, t4=7.096, t5=6.959, t6=6.988, t7=7.132 | max_across_ranks=7.142       4599.5      574.9       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=15/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=8, global_tokens=131072, global_seqlens=[26624, 53248, 14336, 10240, 14336, 6144, 5120, 1024]
+Mega-ring all-CP workload: alignment=2048, global_tokens=133120, global_seqlens=[26624, 53248, 14336, 10240, 14336, 6144, 6144, 2048]
+Hybrid rings: sizes=[8, 8, 4, 4, 4, 2, 2, 1], starts=[0, 0, 0, 0, 4, 4, 6, 6]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[2, 6, 1, 1, 1, 1, 1, 1], execution_lengths=[26624, 53256, 14336, 10240, 14336, 6144, 5120, 1024], padding=8, physical_rank_token_loads=[24236, 23212, 19116, 15020, 13996, 8876, 13312, 13312]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=8, global_tokens=131072, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=8, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                           Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=6.908, t1=6.953, t2=6.853, t3=6.939, t4=6.864, t5=6.816, t6=6.979, t7=6.907 | max_across_ranks=7.053               4791.2      598.9       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=2.042, t1=4.186, t2=5.398, t3=3.277, t4=3.774, t5=5.066, t6=12.710, t7=16.315 | max_across_ranks=16.315            2071.4      258.9       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=11.262, t1=11.293, t2=11.129, t3=10.787, t4=10.590, t5=10.225, t6=10.316, t7=9.961 | max_across_ranks=11.321       2985.0      373.1       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=9.662, t1=9.721, t2=9.718, t3=9.669, t4=9.538, t5=9.495, t6=9.365, t7=9.318 | max_across_ranks=9.731               3472.8      434.1       skip  Megatron scheduler; 3 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3472.8, Avg/GPU=434.1
+magi_attention             t0=7.683, t1=7.838, t2=7.742, t3=7.593, t4=7.737, t5=7.451, t6=7.607, t7=7.536 | max_across_ranks=7.962               4244.6      530.6       skip  chunk_size=2048, tokens(original/padded)=131072/131072, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=10.507, t1=10.674, t2=8.920, t3=7.815, t4=7.462, t5=7.186, t6=4.644, t7=4.791 | max_across_ranks=10.701            3158.1      394.8       skip  L=4096; final_s0=4096; iterations=1; G1=6,G2=1,G6=1; padding=8; physical rank token loads=[24236,23212,19116,15020,13996,8876,13312,13312]; in-repo min_fa3 fallback; tokens(original/aligned)=131072/131080, padding=8 tokens; aligned-length Agg TFLOPS=3158.8, Avg/GPU=394.8
+mega_ring_all_cp           t0=7.353, t1=7.266, t2=7.133, t3=7.127, t4=7.019, t5=7.056, t6=7.131, t7=7.024 | max_across_ranks=7.415               4557.4      569.7       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4573.7, Avg/GPU=571.7
+mega_ring_hybrid           t0=7.363, t1=7.324, t2=7.323, t3=7.356, t4=7.088, t5=7.089, t6=6.814, t7=6.822 | max_across_ranks=7.395               4569.5      571.2       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=8, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=7.738, t1=7.498, t2=7.734, t3=7.899, t4=7.657, t5=7.749, t6=8.161, t7=7.584 | max_across_ranks=8.201       4120.6      515.1       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4135.3, Avg/GPU=516.9
+mega_ring_hybrid         t0=7.370, t1=7.202, t2=7.047, t3=7.102, t4=6.879, t5=6.992, t6=7.296, t7=7.098 | max_across_ranks=7.398       4568.0      571.0       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=8, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=7.357, t1=7.189, t2=7.350, t3=7.447, t4=7.236, t5=7.144, t6=7.040, t7=7.205 | max_across_ranks=7.463       4528.4      566.1       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4544.6, Avg/GPU=568.1
+mega_ring_hybrid         t0=7.604, t1=7.734, t2=7.694, t3=7.856, t4=7.512, t5=7.628, t6=6.966, t7=7.097 | max_across_ranks=7.865       4296.8      537.1       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=8, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=7.405, t1=7.206, t2=7.076, t3=7.187, t4=7.173, t5=7.150, t6=7.690, t7=7.462 | max_across_ranks=7.690       4394.7      549.3       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4410.3, Avg/GPU=551.3
+mega_ring_hybrid         t0=7.355, t1=7.368, t2=7.289, t3=7.189, t4=6.991, t5=6.993, t6=6.836, t7=6.895 | max_across_ranks=7.392       4571.8      571.5       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=16/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=14, global_tokens=131584, global_seqlens=[20480, 7168, 16384, 14336, 10240, 12288, 12288, 10240, 8192, 6144, 6144, 4096, 3072, 512]
+Mega-ring all-CP workload: alignment=2048, global_tokens=135168, global_seqlens=[20480, 8192, 16384, 14336, 10240, 12288, 12288, 10240, 8192, 6144, 6144, 4096, 4096, 2048]
+Hybrid rings: sizes=[4, 4, 4, 4, 4, 4, 2, 2, 2, 2, 2, 1, 1, 1], starts=[0, 0, 4, 4, 4, 4, 0, 2, 2, 4, 6, 0, 1, 2]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[3, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], execution_lengths=[20484, 7168, 16384, 14336, 10240, 12288, 12288, 10240, 8192, 6144, 6144, 4096, 3072, 512], padding=4, physical_rank_token_loads=[22188, 17580, 17068, 16384, 15360, 13312, 13312, 16384]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=14, global_tokens=131584, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=14, global_tokens=131584, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=3.392, t1=3.414, t2=3.405, t3=3.394, t4=3.429, t5=3.383, t6=3.360, t7=3.415 | max_across_ranks=3.437       3874.6      484.3       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=1.855, t1=3.709, t2=3.305, t3=2.365, t4=3.404, t5=2.971, t6=4.046, t7=2.467 | max_across_ranks=4.046       3291.4      411.4       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=8.980, t1=9.082, t2=9.063, t3=8.760, t4=8.614, t5=8.239, t6=8.206, t7=8.006 | max_across_ranks=9.145       1456.2      182.0       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=4.038, t1=4.088, t2=4.054, t3=4.099, t4=4.330, t5=4.384, t6=4.323, t7=4.387 | max_across_ranks=4.392       3032.6      379.1       skip  Megatron scheduler; 3 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131584/131584, padding=0 tokens; aligned-length Agg TFLOPS=3032.6, Avg/GPU=379.1
+magi_attention             t0=3.929, t1=4.404, t2=3.987, t3=4.347, t4=4.124, t5=4.075, t6=4.181, t7=4.191 | max_across_ranks=4.421       3012.3      376.5       skip  chunk_size=2056, tokens(original/padded)=131584/131584, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=4.480, t1=3.696, t2=3.731, t3=2.922, t4=2.802, t5=2.193, t6=2.258, t7=2.013 | max_across_ranks=4.480       2972.7      371.6       skip  L=4096; final_s0=4096; iterations=1; G1=11,G2=2,G3=1; padding=4; physical rank token loads=[22188,17580,17068,16384,15360,13312,13312,16384]; in-repo min_fa3 fallback; tokens(original/aligned)=131584/131588, padding=4 tokens; aligned-length Agg TFLOPS=2973.0, Avg/GPU=371.6
+mega_ring_all_cp           t0=3.448, t1=3.306, t2=3.359, t3=3.372, t4=3.335, t5=3.385, t6=3.313, t7=3.325 | max_across_ranks=3.450       3860.7      482.6       skip  all-CP fused mega-ring; tokens(original/aligned)=131584/135168, padding=3584 tokens; aligned-length Agg TFLOPS=3924.9, Avg/GPU=490.6
+mega_ring_hybrid           t0=3.237, t1=3.071, t2=3.224, t3=3.209, t4=3.207, t5=3.212, t6=3.211, t7=3.176 | max_across_ranks=3.243       4106.7      513.3       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=14, global_tokens=131584, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=3.422, t1=3.459, t2=3.328, t3=3.415, t4=3.408, t5=3.425, t6=3.362, t7=3.374 | max_across_ranks=3.465       3843.8      480.5       skip  all-CP fused mega-ring; tokens(original/aligned)=131584/135168, padding=3584 tokens; aligned-length Agg TFLOPS=3907.6, Avg/GPU=488.5
+mega_ring_hybrid         t0=3.213, t1=3.046, t2=3.303, t3=3.208, t4=3.043, t5=3.254, t6=3.167, t7=3.117 | max_across_ranks=3.315       4017.3      502.2       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=14, global_tokens=131584, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=3.457, t1=3.372, t2=3.543, t3=3.293, t4=3.379, t5=3.319, t6=3.392, t7=3.351 | max_across_ranks=3.552       3748.8      468.6       skip  all-CP fused mega-ring; tokens(original/aligned)=131584/135168, padding=3584 tokens; aligned-length Agg TFLOPS=3811.1, Avg/GPU=476.4
+mega_ring_hybrid         t0=3.292, t1=3.336, t2=3.499, t3=3.458, t4=3.396, t5=3.202, t6=3.172, t7=3.138 | max_across_ranks=3.513       3790.5      473.8       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=14, global_tokens=131584, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=3.424, t1=3.349, t2=3.385, t3=3.484, t4=3.479, t5=3.573, t6=3.566, t7=3.545 | max_across_ranks=3.616       3683.3      460.4       skip  all-CP fused mega-ring; tokens(original/aligned)=131584/135168, padding=3584 tokens; aligned-length Agg TFLOPS=3744.5, Avg/GPU=468.1
+mega_ring_hybrid         t0=3.266, t1=3.182, t2=3.388, t3=3.342, t4=3.158, t5=3.201, t6=3.303, t7=3.282 | max_across_ranks=3.413       3902.3      487.8       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=17/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=7, global_tokens=131072, global_seqlens=[32768, 75776, 8192, 7168, 5120, 768, 1280]
+Mega-ring all-CP workload: alignment=2048, global_tokens=135168, global_seqlens=[32768, 75776, 8192, 8192, 6144, 2048, 2048]
+Hybrid rings: sizes=[8, 8, 4, 2, 2, 1, 1], starts=[0, 0, 4, 0, 2, 4, 5]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[2, 7, 1, 1, 1, 1, 1], execution_lengths=[32768, 75782, 8192, 7168, 5120, 768, 1280], padding=6, physical_rank_token_loads=[28490, 19786, 17994, 15946, 10826, 10826, 10826, 16384]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=7, global_tokens=131072, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=7, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=10.652, t1=10.801, t2=10.888, t3=11.066, t4=10.583, t5=10.848, t6=10.673, t7=10.798 | max_across_ranks=11.160       5111.0      638.9       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=1.934, t1=3.638, t2=7.864, t3=21.354, t4=12.097, t5=12.180, t6=12.455, t7=12.242 | max_across_ranks=21.354          2671.1      333.9       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=15.049, t1=15.028, t2=14.822, t3=14.496, t4=14.172, t5=13.968, t6=14.103, t7=13.720 | max_across_ranks=15.096       3778.4      472.3       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=14.630, t1=14.776, t2=14.861, t3=14.969, t4=11.345, t5=11.168, t6=10.888, t7=10.615 | max_across_ranks=14.969       3810.4      476.3       skip  Megatron scheduler; 2 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; CP saturation: sample 1 required_cp(original/capped)=16/8, local_length=9472; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3810.4, Avg/GPU=476.3
+magi_attention             t0=13.034, t1=12.907, t2=13.055, t3=12.931, t4=11.793, t5=12.226, t6=12.100, t7=11.459 | max_across_ranks=13.263       4300.6      537.6       skip  chunk_size=2048, tokens(original/padded)=131072/131072, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=19.251, t1=12.238, t2=12.013, t3=11.579, t4=11.153, t5=11.239, t6=11.193, t7=15.566 | max_across_ranks=19.251       2962.9      370.4       skip  L=4096; final_s0=4096; iterations=1; G1=5,G2=1,G7=1; padding=6; physical rank token loads=[28490,19786,17994,15946,10826,10826,10826,16384]; in-repo min_fa3 fallback; tokens(original/aligned)=131072/131078, padding=6 tokens; aligned-length Agg TFLOPS=2963.3, Avg/GPU=370.4
+mega_ring_all_cp           t0=12.200, t1=11.792, t2=11.655, t3=11.647, t4=11.137, t5=11.327, t6=11.318, t7=11.305 | max_across_ranks=12.285       4643.0      580.4       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/135168, padding=4096 tokens; aligned-length Agg TFLOPS=4665.3, Avg/GPU=583.2
+mega_ring_hybrid           t0=11.734, t1=12.871, t2=11.917, t3=11.865, t4=12.384, t5=12.072, t6=12.109, t7=12.530 | max_across_ranks=13.073       4363.2      545.4       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=7, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                            Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=12.274, t1=11.877, t2=11.953, t3=11.717, t4=11.323, t5=11.348, t6=11.491, t7=11.356 | max_across_ranks=12.407       4597.2      574.6       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/135168, padding=4096 tokens; aligned-length Agg TFLOPS=4619.3, Avg/GPU=577.4
+mega_ring_hybrid         t0=12.015, t1=12.872, t2=11.841, t3=11.594, t4=12.187, t5=11.664, t6=11.957, t7=12.036 | max_across_ranks=12.884       4427.2      553.4       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=7, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                            Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=12.250, t1=11.878, t2=12.150, t3=11.871, t4=11.510, t5=11.410, t6=11.567, t7=11.510 | max_across_ranks=12.349       4618.9      577.4       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/135168, padding=4096 tokens; aligned-length Agg TFLOPS=4641.1, Avg/GPU=580.1
+mega_ring_hybrid         t0=12.136, t1=12.822, t2=11.712, t3=11.707, t4=11.840, t5=11.761, t6=12.030, t7=12.073 | max_across_ranks=12.822       4448.7      556.1       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=7, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                            Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=12.378, t1=11.953, t2=12.180, t3=11.895, t4=11.447, t5=11.549, t6=11.695, t7=11.451 | max_across_ranks=12.429       4589.3      573.7       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/135168, padding=4096 tokens; aligned-length Agg TFLOPS=4611.4, Avg/GPU=576.4
+mega_ring_hybrid         t0=12.185, t1=12.505, t2=11.907, t3=11.882, t4=11.872, t5=11.812, t6=11.858, t7=11.967 | max_across_ranks=12.505       4561.5      570.2       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=18/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=8, global_tokens=131584, global_seqlens=[45056, 6144, 30720, 6144, 16384, 18432, 6144, 2560]
+Mega-ring all-CP workload: alignment=2048, global_tokens=133120, global_seqlens=[45056, 6144, 30720, 6144, 16384, 18432, 6144, 4096]
+Hybrid rings: sizes=[8, 8, 8, 4, 4, 4, 4, 2], starts=[0, 0, 0, 0, 0, 4, 4, 0]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[5, 1, 3, 1, 1, 1, 1, 1], execution_lengths=[45060, 6144, 30720, 6144, 16384, 18432, 6144, 2560], padding=4, physical_rank_token_loads=[30004, 25396, 15156, 15156, 15156, 10240, 10240, 10240]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=8, global_tokens=131584, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=8, global_tokens=131584, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                            Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=6.377, t1=6.381, t2=6.161, t3=6.261, t4=6.352, t5=6.041, t6=6.272, t7=6.296 | max_across_ranks=6.430                4716.4      589.6       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=1.974, t1=5.375, t2=5.513, t3=7.815, t4=8.915, t5=4.981, t6=5.981, t7=5.882 | max_across_ranks=8.915                3401.6      425.2       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=11.308, t1=11.161, t2=11.005, t3=11.283, t4=11.470, t5=10.454, t6=10.364, t7=10.115 | max_across_ranks=11.614       2611.1      326.4       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=10.427, t1=10.557, t2=8.917, t3=8.947, t4=8.914, t5=8.931, t6=8.828, t7=8.465 | max_across_ranks=10.557             2872.5      359.1       skip  Megatron scheduler; 3 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131584/131584, padding=0 tokens; aligned-length Agg TFLOPS=2872.5, Avg/GPU=359.1
+magi_attention             t0=7.715, t1=7.430, t2=7.477, t3=7.486, t4=7.497, t5=7.532, t6=7.489, t7=7.469 | max_across_ranks=7.761                3907.6      488.5       skip  chunk_size=2056, tokens(original/padded)=131584/131584, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=11.002, t1=9.852, t2=6.420, t3=6.532, t4=6.503, t5=4.331, t6=4.419, t7=4.566 | max_across_ranks=11.002              2756.3      344.5       skip  L=4096; final_s0=4096; iterations=1; G1=6,G3=1,G5=1; padding=4; physical rank token loads=[30004,25396,15156,15156,15156,10240,10240,10240]; in-repo min_fa3 fallback; tokens(original/aligned)=131584/131588, padding=4 tokens; aligned-length Agg TFLOPS=2756.6, Avg/GPU=344.6
+mega_ring_all_cp           t0=6.566, t1=6.537, t2=6.469, t3=6.534, t4=6.381, t5=6.423, t6=6.459, t7=6.389 | max_across_ranks=6.698                4527.5      565.9       skip  all-CP fused mega-ring; tokens(original/aligned)=131584/133120, padding=1536 tokens; aligned-length Agg TFLOPS=4540.0, Avg/GPU=567.5
+mega_ring_hybrid           t0=6.625, t1=6.491, t2=6.102, t3=6.006, t4=6.489, t5=6.375, t6=6.462, t7=6.418 | max_across_ranks=6.625                4577.6      572.2       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=8, global_tokens=131584, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=6.920, t1=7.005, t2=7.274, t3=7.404, t4=7.097, t5=6.588, t6=6.411, t7=6.935 | max_across_ranks=7.504       4041.5      505.2       skip  all-CP fused mega-ring; tokens(original/aligned)=131584/133120, padding=1536 tokens; aligned-length Agg TFLOPS=4052.6, Avg/GPU=506.6
+mega_ring_hybrid         t0=6.216, t1=6.534, t2=5.994, t3=6.255, t4=6.527, t5=6.867, t6=6.763, t7=6.619 | max_across_ranks=6.893       4399.6      550.0       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=8, global_tokens=131584, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=6.483, t1=6.640, t2=6.505, t3=6.591, t4=6.419, t5=6.485, t6=6.636, t7=6.291 | max_across_ranks=6.648       4561.5      570.2       skip  all-CP fused mega-ring; tokens(original/aligned)=131584/133120, padding=1536 tokens; aligned-length Agg TFLOPS=4574.1, Avg/GPU=571.8
+mega_ring_hybrid         t0=6.775, t1=6.819, t2=6.409, t3=6.439, t4=6.705, t5=6.414, t6=6.589, t7=6.617 | max_across_ranks=6.867       4416.1      552.0       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=8, global_tokens=131584, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=6.823, t1=7.036, t2=7.340, t3=7.042, t4=7.011, t5=7.027, t6=7.212, t7=7.285 | max_across_ranks=7.361       4119.6      514.9       skip  all-CP fused mega-ring; tokens(original/aligned)=131584/133120, padding=1536 tokens; aligned-length Agg TFLOPS=4130.9, Avg/GPU=516.4
+mega_ring_hybrid         t0=6.458, t1=6.321, t2=6.203, t3=6.260, t4=6.476, t5=6.720, t6=6.649, t7=6.599 | max_across_ranks=6.753       4490.4      561.3       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=19/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=12, global_tokens=131072, global_seqlens=[34816, 8192, 24576, 20480, 6144, 7168, 10240, 10240, 4096, 4096, 512, 512]
+Mega-ring all-CP workload: alignment=2048, global_tokens=135168, global_seqlens=[34816, 8192, 24576, 20480, 6144, 8192, 10240, 10240, 4096, 4096, 2048, 2048]
+Hybrid rings: sizes=[8, 4, 4, 4, 4, 2, 2, 2, 1, 1, 1, 1], starts=[0, 0, 0, 4, 4, 0, 4, 6, 2, 3, 4, 5]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[4, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1], execution_lengths=[34816, 8192, 24576, 20480, 6144, 7168, 10240, 10240, 4096, 4096, 512, 512], padding=0, physical_rank_token_loads=[19456, 19456, 16896, 15872, 18432, 16384, 14336, 10240]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=12, global_tokens=131072, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=12, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=4.828, t1=4.830, t2=4.870, t3=4.844, t4=4.752, t5=4.812, t6=4.753, t7=4.802 | max_across_ranks=4.899       4407.8      551.0       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=1.834, t1=3.939, t2=5.265, t3=6.801, t4=3.113, t5=3.732, t6=4.277, t7=5.416 | max_across_ranks=6.801       3174.9      396.9       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=9.605, t1=9.430, t2=9.360, t3=9.113, t4=8.876, t5=8.587, t6=8.427, t7=8.252 | max_across_ranks=9.624       2243.5      280.4       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=6.960, t1=7.006, t2=6.982, t3=7.010, t4=6.743, t5=6.572, t6=6.417, t7=6.473 | max_across_ranks=7.013       3078.9      384.9       skip  Megatron scheduler; 3 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3078.9, Avg/GPU=384.9
+magi_attention             t0=5.343, t1=5.454, t2=5.450, t3=5.425, t4=5.478, t5=5.319, t6=5.302, t7=5.411 | max_across_ranks=5.493       3931.0      491.4       skip  chunk_size=2048, tokens(original/padded)=131072/131072, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=6.020, t1=6.153, t2=5.548, t3=5.306, t4=4.506, t5=4.395, t6=3.212, t7=3.107 | max_across_ranks=6.153       3509.2      438.7       skip  L=4096; final_s0=4096; iterations=1; G1=9,G2=2,G4=1; padding=0; physical rank token loads=[19456,19456,16896,15872,18432,16384,14336,10240]; in-repo min_fa3 fallback; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3509.2, Avg/GPU=438.7
+mega_ring_all_cp           t0=5.180, t1=5.152, t2=5.323, t3=5.516, t4=4.886, t5=4.807, t6=4.620, t7=4.772 | max_across_ranks=5.544       3894.7      486.8       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/135168, padding=4096 tokens; aligned-length Agg TFLOPS=3929.6, Avg/GPU=491.2
+mega_ring_hybrid           t0=5.257, t1=5.250, t2=4.885, t3=4.659, t4=4.709, t5=4.616, t6=4.319, t7=4.394 | max_across_ranks=5.272       4095.7      512.0       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=12, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=4.989, t1=5.043, t2=4.938, t3=4.973, t4=4.928, t5=4.993, t6=4.977, t7=4.901 | max_across_ranks=5.088       4243.5      530.4       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/135168, padding=4096 tokens; aligned-length Agg TFLOPS=4281.5, Avg/GPU=535.2
+mega_ring_hybrid         t0=5.115, t1=5.074, t2=4.762, t3=4.749, t4=4.616, t5=4.744, t6=4.893, t7=4.368 | max_across_ranks=5.128       4210.4      526.3       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=12, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=4.930, t1=5.000, t2=4.849, t3=4.876, t4=4.664, t5=4.791, t6=5.120, t7=5.100 | max_across_ranks=5.182       4167.0      520.9       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/135168, padding=4096 tokens; aligned-length Agg TFLOPS=4204.3, Avg/GPU=525.5
+mega_ring_hybrid         t0=5.334, t1=5.266, t2=5.059, t3=4.925, t4=4.605, t5=4.502, t6=4.426, t7=4.567 | max_across_ranks=5.334       4048.0      506.0       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=12, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=5.116, t1=5.157, t2=5.013, t3=4.908, t4=4.997, t5=4.991, t6=5.045, t7=4.902 | max_across_ranks=5.217       4138.5      517.3       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/135168, padding=4096 tokens; aligned-length Agg TFLOPS=4175.5, Avg/GPU=521.9
+mega_ring_hybrid         t0=5.129, t1=5.124, t2=4.615, t3=4.604, t4=4.601, t5=4.540, t6=4.477, t7=4.527 | max_across_ranks=5.133       4206.3      525.8       skip  hierarchical hybrid fused mega-ring
+
+Benchmark case: dataset=arxiv, case=20/20
+Config: world_size=8, methods=['allgather_attention', 'llama3_allgather_attention', 'fa3_ring', 'megatron_hybrid_cp', 'magi_attention', 'zeppelin', 'mega_ring_all_cp', 'mega_ring_hybrid'], QH=32, KVH=1, D=128, allgather_overlapping_heads_k_stride=1, mode=causal, sm_configs=128:4,124:8,120:12,116:16, zeppelin_threshold=4096, megatron_max_seqlen_per_rank=8192, magi_overlap_degree=2, warmup=20, iters=20, check=False
+Workload: B=10, global_tokens=131072, global_seqlens=[28672, 5120, 16384, 20480, 8192, 10240, 14336, 18432, 5120, 4096]
+Mega-ring all-CP workload: alignment=2048, global_tokens=133120, global_seqlens=[28672, 6144, 16384, 20480, 8192, 10240, 14336, 18432, 6144, 4096]
+Hybrid rings: sizes=[8, 4, 4, 4, 4, 4, 4, 4, 2, 2], starts=[0, 0, 0, 0, 0, 4, 4, 4, 4, 6]
+FA backend: in-repo min_fa3 fallback
+Zeppelin placement (causal): L=4096, final_s0=4096, iterations=1, groups=[3, 1, 1, 2, 1, 1, 1, 2, 1, 1], execution_lengths=[28674, 5120, 16384, 20480, 8192, 10240, 14336, 18432, 5120, 4096], padding=2, physical_rank_token_loads=[23894, 19798, 17750, 15360, 15360, 13312, 9216, 16384]
+Agg TFLOPS uses the original workload lengths and sums visible attention work across ranks; Avg/GPU divides it by world_size.
+
+Running B=10, global_tokens=131072, causal=True
+
+SM config: num_comp_sm=128, num_comm_sm=4
+
+B=10, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                     Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+allgather_attention        t0=4.300, t1=4.340, t2=4.344, t3=4.237, t4=4.264, t5=4.283, t6=4.287, t7=4.311 | max_across_ranks=4.363       4311.7      539.0       skip  per-sequence KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; zigzag causal
+llama3_allgather_attention t0=1.919, t1=5.461, t2=5.905, t3=4.602, t4=2.279, t5=3.710, t6=2.333, t7=4.798 | max_across_ranks=5.905       3186.1      398.3       skip  whole-packed zigzag KV-head-sharded all-gather (1 KVH/chunk, comm/compute overlap); in-repo min_fa3 fallback; causal
+fa3_ring                   t0=9.084, t1=8.922, t2=8.882, t3=8.617, t4=8.356, t5=8.052, t6=7.947, t7=7.765 | max_across_ranks=9.084       2071.0      258.9       skip  all-CP NCCL ring; in-repo min_fa3 fallback
+megatron_hybrid_cp         t0=5.866, t1=6.010, t2=5.490, t3=5.565, t4=4.824, t5=4.853, t6=4.612, t7=4.749 | max_across_ranks=6.010       3130.5      391.3       skip  Megatron scheduler; 2 execution groups; P2P ring; in-repo min_fa3 fallback; forward-order phase replay; tokens(original/aligned)=131072/131072, padding=0 tokens; aligned-length Agg TFLOPS=3130.5, Avg/GPU=391.3
+magi_attention             t0=4.922, t1=5.033, t2=4.845, t3=4.942, t4=4.728, t5=4.932, t6=4.784, t7=4.842 | max_across_ranks=5.033       3738.2      467.3       skip  chunk_size=2048, tokens(original/padded)=131072/131072, overlap_degree=2; dispatch excluded; performance-only
+zeppelin                   t0=6.853, t1=5.355, t2=4.938, t3=3.375, t4=3.445, t5=2.762, t6=2.605, t7=3.033 | max_across_ranks=6.853       2745.1      343.1       skip  L=4096; final_s0=4096; iterations=1; G1=7,G2=2,G3=1; padding=2; physical rank token loads=[23894,19798,17750,15360,15360,13312,9216,16384]; in-repo min_fa3 fallback; tokens(original/aligned)=131072/131074, padding=2 tokens; aligned-length Agg TFLOPS=2745.2, Avg/GPU=343.2
+mega_ring_all_cp           t0=4.504, t1=4.582, t2=4.494, t3=4.334, t4=4.196, t5=4.245, t6=4.353, t7=4.316 | max_across_ranks=4.638       4056.3      507.0       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4097.0, Avg/GPU=512.1
+mega_ring_hybrid           t0=4.559, t1=4.515, t2=4.350, t3=4.307, t4=3.995, t5=4.062, t6=3.978, t7=3.984 | max_across_ranks=4.581       4106.8      513.3       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=124, num_comm_sm=8
+
+B=10, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=4.529, t1=4.477, t2=4.486, t3=4.276, t4=4.278, t5=4.416, t6=4.256, t7=4.162 | max_across_ranks=4.534       4149.3      518.7       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=4191.0, Avg/GPU=523.9
+mega_ring_hybrid         t0=4.390, t1=4.624, t2=4.498, t3=4.492, t4=4.062, t5=4.206, t6=4.046, t7=3.922 | max_across_ranks=4.643       4052.1      506.5       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=120, num_comm_sm=12
+
+B=10, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=4.346, t1=4.462, t2=4.421, t3=4.939, t4=4.852, t5=4.599, t6=4.389, t7=4.685 | max_across_ranks=4.966       3788.4      473.6       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=3826.5, Avg/GPU=478.3
+mega_ring_hybrid         t0=4.562, t1=4.422, t2=4.399, t3=4.502, t4=4.202, t5=4.184, t6=4.067, t7=4.077 | max_across_ranks=4.574       4113.2      514.1       skip  hierarchical hybrid fused mega-ring
+
+SM config: num_comp_sm=116, num_comm_sm=16
+
+B=10, global_tokens=131072, QH=32, KVH=1, D=128, mode=causal
+Method                   Time ms                                                                                                   Agg TFLOPS    Avg/GPU      Check  Note
+mega_ring_all_cp         t0=4.674, t1=4.532, t2=4.388, t3=4.231, t4=4.734, t5=4.228, t6=4.504, t7=4.298 | max_across_ranks=4.870       3863.4      482.9       skip  all-CP fused mega-ring; tokens(original/aligned)=131072/133120, padding=2048 tokens; aligned-length Agg TFLOPS=3902.2, Avg/GPU=487.8
+mega_ring_hybrid         t0=4.505, t1=4.529, t2=4.393, t3=4.352, t4=4.210, t5=4.119, t6=4.100, t7=4.094 | max_across_ranks=4.532       4151.4      518.9       skip  hierarchical hybrid fused mega-ring
+
+Cross-case forward summary
+Method                       Mode             SM    Cases     Min ms    Mean ms     P50 ms     Max ms    Mean TFLOPS    Weighted TFLOPS   Weighted/GPU
+allgather_attention          causal        128:4    20/20      3.366      6.304      5.893     11.160         4570.8             4658.9          582.4
+llama3_allgather_attention   causal        128:4    20/20      4.046      9.819      8.852     21.354         3069.2             2991.3          373.9
+fa3_ring                     causal        128:4    20/20      9.019     10.866     10.488     15.096         2626.7             2703.1          337.9
+megatron_hybrid_cp           causal        128:4    20/20      4.392      9.145      9.356     14.969         3162.4             3211.8          401.5
+magi_attention               causal        128:4    20/20      4.161      7.320      6.783     13.263         3939.3             4012.4          501.6
+zeppelin                     causal        128:4    20/20      4.031      9.407      8.115     19.251         3167.9             3122.4          390.3
+mega_ring_all_cp             causal        128:4    20/20      3.450      6.649      6.096     12.285         4339.9             4417.2          552.2
+mega_ring_hybrid             causal        128:4    20/20      3.047      6.725      6.017     13.073         4345.3             4367.5          545.9
+mega_ring_all_cp             causal        124:8    20/20      3.465      6.929      6.740     12.407         4180.7             4238.6          529.8
+mega_ring_hybrid             causal        124:8    20/20      3.315      6.787      6.316     12.884         4278.4             4327.8          541.0
+mega_ring_all_cp             causal       120:12    20/20      3.552      6.759      6.034     12.349         4275.8             4345.4          543.2
+mega_ring_hybrid             causal       120:12    20/20      3.112      6.794      6.136     12.822         4278.6             4323.3          540.4
+mega_ring_all_cp             causal       116:16    20/20      3.616      6.852      6.453     12.429         4218.6             4286.8          535.9
+mega_ring_hybrid             causal       116:16    20/20      3.073      6.687      6.194     12.505         4346.0             4392.6          549.1
