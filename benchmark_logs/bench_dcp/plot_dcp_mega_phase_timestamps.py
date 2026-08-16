@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import re
@@ -31,6 +32,7 @@ METHOD_MEGA = "dcp_mega_varlen"
 METHOD_VLLM_A2A = "vllm_a2a_min_fa3_varlen"
 DEFAULT_DCP_SIZES = (2, 4, 8)
 DEFAULT_COMM_SMS = (4, 8, 12, 16, 20)
+SUMMARY_NAME = "mega_phase_timestamp_summary.csv"
 CASE_NAME_PATTERN = re.compile(r"^(case_\d+)_dcp\d+_.*\.json$")
 CASE_ID_PATTERN = re.compile(r"^case_\d+$")
 
@@ -153,6 +155,127 @@ class BaselineCaseRecord:
 BaselineDataset = dict[int, dict[str, BaselineCaseRecord]]
 
 
+def resolve_summary(path: Path | None) -> tuple[Path, Path]:
+    if path is None:
+        candidates = list(DEFAULT_BENCHMARK_ROOT.glob(f"*/{SUMMARY_NAME}"))
+        if not candidates:
+            raise FileNotFoundError(f"no {SUMMARY_NAME} found below {DEFAULT_BENCHMARK_ROOT}")
+        selected = max(candidates, key=lambda item: (item.stat().st_mtime_ns, item.parent.name))
+    else:
+        selected = path
+    selected = selected.expanduser().resolve()
+    run_dir = selected if selected.is_dir() else selected.parent
+    summary_path = run_dir / SUMMARY_NAME if selected.is_dir() else selected
+    if not summary_path.is_file():
+        raise FileNotFoundError(f"phase summary CSV does not exist: {summary_path}")
+    return summary_path, run_dir
+
+
+def _integer_tuple_csv(value: str) -> tuple[int, ...]:
+    return tuple(int(token) for token in value.split())
+
+
+def load_summary(
+    path: Path,
+    *,
+    arrival_time_scale: str | None,
+    dcp_sizes: Sequence[int],
+    comm_sms: Sequence[int],
+    stat: str,
+) -> tuple[Dataset, BaselineDataset, str]:
+    required = {
+        "record_type", "stat", "arrival_time_scale", "case_id", "dcp_size",
+        "comm_sm", "workload_kind", "batch_size", "total_q_tokens",
+        "global_effective_flops", "iterations", "q_global",
+        "history_or_cache_global", "e2e_latency_us",
+        *{f"milestone_{phase.key}_us" for phase in PHASES},
+        *{f"tail_{tail.key}_us" for tail in TAIL_ROWS},
+        *{f"baseline_{stage.key}_us" for stage in BASELINE_STAGES},
+    }
+    rows: list[dict[str, str]] = []
+    arrivals: set[str] = set()
+    with path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        missing = required.difference(reader.fieldnames or ())
+        if missing:
+            raise ValueError(f"{path} is missing columns: {', '.join(sorted(missing))}")
+        for row in reader:
+            if row["stat"] == stat:
+                rows.append(row)
+                arrivals.add(row["arrival_time_scale"].strip())
+    if arrival_time_scale is None:
+        if len(arrivals) != 1:
+            raise ValueError(f"select one arrival scale from {sorted(arrivals)}")
+        arrival_label = next(iter(arrivals))
+    else:
+        requested = Decimal(arrival_time_scale)
+        matches = [value for value in arrivals if Decimal(value) == requested]
+        if len(matches) != 1:
+            raise ValueError(f"arrival scale {arrival_time_scale} is unavailable")
+        arrival_label = matches[0]
+
+    dataset: Dataset = {dcp: {sm: {} for sm in comm_sms} for dcp in dcp_sizes}
+    baseline: BaselineDataset = {dcp: {} for dcp in dcp_sizes}
+    for line_number, row in enumerate(rows, start=2):
+        if row["arrival_time_scale"].strip() != arrival_label:
+            continue
+        try:
+            dcp_size = int(row["dcp_size"])
+            if dcp_size not in dcp_sizes:
+                continue
+            q_lengths = _integer_tuple_csv(row["q_global"])
+            history_lengths = _integer_tuple_csv(row["history_or_cache_global"])
+            global_flops = int(row["global_effective_flops"])
+            iterations = int(row["iterations"])
+            signature = (q_lengths, history_lengths, global_flops)
+            case_id = row["case_id"].strip()
+            workload_kind = row["workload_kind"].strip()
+            if row["record_type"] == "mega":
+                comm_sm = int(row["comm_sm"])
+                if comm_sm not in comm_sms:
+                    continue
+                record = CaseRecord(
+                    case_id=case_id,
+                    dcp_size=dcp_size,
+                    comm_sm=comm_sm,
+                    workload_kind=workload_kind,
+                    batch_size=int(row["batch_size"]),
+                    total_q_tokens=int(row["total_q_tokens"]),
+                    global_effective_flops=global_flops,
+                    iterations=iterations,
+                    workload_signature=signature,
+                    e2e_latency_us=float(row["e2e_latency_us"]),
+                    milestones_us={phase.key: float(row[f"milestone_{phase.key}_us"]) for phase in PHASES},
+                    tails_us={tail.key: float(row[f"tail_{tail.key}_us"]) for tail in TAIL_ROWS},
+                    source=path,
+                )
+                if case_id in dataset[dcp_size][comm_sm]:
+                    raise ValueError(f"duplicate Mega row at {path}:{line_number}")
+                dataset[dcp_size][comm_sm][case_id] = record
+            elif row["record_type"] == "baseline":
+                record = BaselineCaseRecord(
+                    case_id=case_id,
+                    dcp_size=dcp_size,
+                    workload_kind=workload_kind,
+                    iterations=iterations,
+                    workload_signature=signature,
+                    stages_us={stage.key: float(row[f"baseline_{stage.key}_us"]) for stage in BASELINE_STAGES},
+                    source=path,
+                )
+                if case_id in baseline[dcp_size]:
+                    raise ValueError(f"duplicate baseline row at {path}:{line_number}")
+                baseline[dcp_size][case_id] = record
+            else:
+                raise ValueError(f"invalid record_type at {path}:{line_number}")
+        except (InvalidOperation, ValueError) as error:
+            raise ValueError(f"invalid summary row at {path}:{line_number}: {error}") from error
+    validate_pairing(dataset, dcp_sizes=dcp_sizes, comm_sms=comm_sms)
+    validate_baseline_pairing(
+        dataset, baseline, dcp_sizes=dcp_sizes, reference_sm=comm_sms[0]
+    )
+    return dataset, baseline, arrival_label
+
+
 def _positive_integer(value: str) -> int:
     try:
         parsed = int(value)
@@ -215,7 +338,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="?",
         type=Path,
         help=(
-            "phase-enabled benchmark run directory; defaults to the newest "
+            "phase summary CSV or its run directory; defaults to the newest "
             "compatible run below benchmark_logs/bench_dcp"
         ),
     )
@@ -1567,26 +1690,13 @@ def plot_overview(
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        run_dir = resolve_run_dir(args.input)
-        arrival_dir, arrival_label = resolve_arrival_dir(
-            run_dir, args.arrival_time_scale
-        )
-        dataset = load_dataset(
-            arrival_dir,
+        summary_path, run_dir = resolve_summary(args.input)
+        dataset, baseline_dataset, arrival_label = load_summary(
+            summary_path,
+            arrival_time_scale=args.arrival_time_scale,
             dcp_sizes=args.dcp_sizes,
             comm_sms=args.comm_sms,
             stat=args.stat,
-        )
-        baseline_dataset = load_baseline_dataset(
-            arrival_dir,
-            dcp_sizes=args.dcp_sizes,
-            stat=args.stat,
-        )
-        validate_baseline_pairing(
-            dataset,
-            baseline_dataset,
-            dcp_sizes=args.dcp_sizes,
-            reference_sm=args.comm_sms[0],
         )
         excluded_case_ids = exclude_paired_cases(
             dataset,
@@ -1648,7 +1758,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         for workload_kind in (KIND_DECODE, KIND_MIXED)
     }
-    print(f"input={run_dir}")
+    print(f"input={summary_path}")
     print(f"arrival_time_scale={arrival_label}")
     print(f"case_count={len(reference)}")
     print(

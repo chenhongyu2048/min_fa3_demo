@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import sys
@@ -33,6 +34,7 @@ BATCH_TYPE_LABELS = {
     BATCH_TYPE_DECODE: "Decode-only batches",
     BATCH_TYPE_MIXED: "Mixed batches containing chunk prefill",
 }
+SUMMARY_NAME = "matrix_by_batch_type_summary.csv"
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,64 @@ class CaseContribution:
     global_effective_flops: int
     average_kv_bytes_per_gpu: float
     tp_size: int
+
+
+def resolve_summary(path: Path | None) -> tuple[Path, Path]:
+    selected = base._latest_run(base.DEFAULT_BENCHMARK_ROOT) if path is None else path
+    selected = selected.expanduser().resolve()
+    run_dir = selected if selected.is_dir() else selected.parent
+    summary_path = run_dir / SUMMARY_NAME if selected.is_dir() else selected
+    if not summary_path.is_file():
+        raise FileNotFoundError(f"batch-type summary CSV does not exist: {summary_path}")
+    return summary_path, run_dir
+
+
+def load_batch_type_summary(
+    path: Path, latency_stat: str
+) -> tuple[dict[str, list[base.LatencyRecord]], dict[tuple[str, int, Decimal], int]]:
+    latency_column = base.LATENCY_COLUMNS[latency_stat]
+    required = {
+        "batch_type", "arrival_time_scale", "dcp_size", "suite",
+        "execution_mode", "method", "mega_num_comm_sm", "case_count",
+        latency_column, base.TFLOPS_COLUMN, base.BANDWIDTH_COLUMN,
+    }
+    grouped = {batch_type: [] for batch_type in BATCH_TYPES}
+    case_counts: dict[tuple[str, int, Decimal], int] = {}
+    with path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        missing = required.difference(reader.fieldnames or ())
+        if missing:
+            raise ValueError(f"{path} is missing columns: {', '.join(sorted(missing))}")
+        for line_number, row in enumerate(reader, start=2):
+            batch_type = row["batch_type"].strip()
+            if batch_type not in BATCH_TYPES:
+                raise ValueError(f"invalid batch_type at {path}:{line_number}")
+            try:
+                arrival = Decimal(row["arrival_time_scale"])
+                dcp_size = int(row["dcp_size"])
+                case_count = int(row["case_count"])
+                comm_sm = int(row["mega_num_comm_sm"]) if row["mega_num_comm_sm"].strip() else None
+                record = base.LatencyRecord(
+                    arrival_time_scale=arrival,
+                    dcp_size=dcp_size,
+                    suite=row["suite"].strip(),
+                    execution_mode=row["execution_mode"].strip(),
+                    method=row["method"].strip(),
+                    mega_num_comm_sm=comm_sm,
+                    latency_ms=float(row[latency_column]),
+                    tflops_per_gpu=float(row[base.TFLOPS_COLUMN]),
+                    kv_bandwidth_gbps_per_gpu=float(row[base.BANDWIDTH_COLUMN]),
+                )
+            except (InvalidOperation, ValueError) as error:
+                raise ValueError(f"invalid summary row at {path}:{line_number}") from error
+            count_key = (batch_type, dcp_size, arrival)
+            previous = case_counts.setdefault(count_key, case_count)
+            if previous != case_count:
+                raise ValueError(f"case count mismatch at {path}:{line_number}")
+            grouped[batch_type].append(record)
+    if not all(grouped.values()):
+        raise ValueError(f"{path}: missing batch-type summary rows")
+    return grouped, case_counts
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -58,7 +118,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="?",
         type=Path,
         help=(
-            "benchmark run directory or matrix_summary.csv; defaults to the "
+            "benchmark run directory or matrix_by_batch_type_summary.csv; defaults to the "
             "newest run under benchmark_logs/bench_dcp"
         ),
     )
@@ -568,11 +628,15 @@ def plot_metric(
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        csv_path, manifest_path, run_dir = base.resolve_input(args.input)
-        base.validate_manifest(
-            manifest_path, allow_incomplete=args.allow_incomplete
+        csv_path, run_dir = resolve_summary(args.input)
+        records_by_batch_type, case_counts = load_batch_type_summary(
+            csv_path, args.latency_stat
         )
-        summary_records = base.load_records(csv_path, args.latency_stat)
+        summary_records = [
+            record
+            for records in records_by_batch_type.values()
+            for record in records
+        ]
         if args.arrival_time_scales is None:
             args.arrival_time_scales = tuple(
                 sorted({record.arrival_time_scale for record in summary_records})
@@ -586,12 +650,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "the selected matrix must contain exactly three DCP sizes; "
                 "use --dcp-sizes to select them"
             )
-        records_by_batch_type, case_counts = load_batch_type_records(
-            run_dir,
-            arrivals=args.arrival_time_scales,
-            dcp_sizes=args.dcp_sizes,
-            latency_stat=args.latency_stat,
-        )
         points_by_batch_type = {
             batch_type: base.select_plot_points(
                 batch_records,
@@ -665,7 +723,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"input={csv_path}")
     print(f"latency_column={base.LATENCY_COLUMNS[args.latency_stat]}")
-    print("aggregation=recomputed_from_per_case_json")
+    print("aggregation=loaded_from_batch_type_summary_csv")
     for batch_type, points in points_by_batch_type.items():
         for dcp_size in args.dcp_sizes:
             for arrival in args.arrival_time_scales:

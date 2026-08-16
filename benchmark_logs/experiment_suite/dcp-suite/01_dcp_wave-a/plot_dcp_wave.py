@@ -7,7 +7,6 @@ import argparse
 import csv
 import math
 import sys
-from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -21,7 +20,7 @@ import matplotlib.pyplot as plt
 
 
 DEFAULT_RUN_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = DEFAULT_RUN_DIR / "wave_ablation_cases.csv"
+DEFAULT_INPUT = DEFAULT_RUN_DIR / "wave_ablation_summary.csv"
 DEFAULT_OUTPUT = DEFAULT_RUN_DIR / "figures" / "dcp_wave_latency_by_batch_type.png"
 
 STRATEGIES = (
@@ -40,20 +39,20 @@ STRATEGY_STYLE = {
     ),
 }
 
-BATCH_TYPES = ("decode_only", "mixed")
+BATCH_TYPES = ("decode_only", "mixed_prefill")
 BATCH_TYPE_LABELS = {
     "decode_only": "Decode-only\n(chunk requests = 0)",
-    "mixed": "Mixed batch\n(chunk requests > 0)",
+    "mixed_prefill": "Mixed batch\n(chunk requests > 0)",
 }
 
 
 @dataclass(frozen=True)
-class CaseRecord:
+class SummaryRecord:
     arrival_scale: Decimal
     dcp_size: int
     strategy: str
-    case_id: str
     batch_type: str
+    case_count: int
     latency_ms: float
 
 
@@ -79,7 +78,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="?",
         type=Path,
         default=DEFAULT_INPUT,
-        help="case-level CSV (default: wave_ablation_cases.csv next to this script)",
+        help="plot-ready summary CSV (default: next to this script)",
     )
     parser.add_argument(
         "--output",
@@ -112,17 +111,17 @@ def finite_positive(value: str | None, *, column: str, line: int) -> float:
     return parsed
 
 
-def load_records(path: Path, latency_stat: str) -> list[CaseRecord]:
-    latency_column = f"{latency_stat}_ms"
+def load_records(path: Path, latency_stat: str) -> list[SummaryRecord]:
+    latency_column = f"{latency_stat}_ms_mean"
     required = {
         "arrival_time_scale",
         "dcp_size",
         "strategy",
-        "case_id",
-        "chunk_requests",
+        "batch_type",
+        "case_count",
         latency_column,
     }
-    records: list[CaseRecord] = []
+    records: list[SummaryRecord] = []
     seen: set[tuple[Decimal, int, str, str]] = set()
     try:
         handle = path.open(newline="", encoding="utf-8")
@@ -137,34 +136,34 @@ def load_records(path: Path, latency_stat: str) -> list[CaseRecord]:
             try:
                 arrival = Decimal(row["arrival_time_scale"])
                 dcp_size = int(row["dcp_size"])
-                chunk_requests = int(row["chunk_requests"])
+                case_count = int(row["case_count"])
             except (InvalidOperation, ValueError) as error:
                 raise ValueError(
-                    f"line {line}: invalid arrival scale, DCP size, or chunk count"
+                    f"line {line}: invalid arrival scale, DCP size, or case count"
                 ) from error
             strategy = row["strategy"]
-            case_id = row["case_id"]
+            batch_type = row["batch_type"]
             if not arrival.is_finite() or arrival <= 0 or dcp_size <= 0:
                 raise ValueError(
                     f"line {line}: arrival scale and DCP size must be positive"
                 )
-            if chunk_requests < 0:
-                raise ValueError(f"line {line}: chunk_requests must be nonnegative")
+            if case_count <= 0:
+                raise ValueError(f"line {line}: case_count must be positive")
             if strategy not in STRATEGY_STYLE:
                 raise ValueError(f"line {line}: unknown strategy {strategy!r}")
-            if not case_id:
-                raise ValueError(f"line {line}: case_id must not be empty")
-            key = (arrival, dcp_size, strategy, case_id)
+            if batch_type not in BATCH_TYPES:
+                raise ValueError(f"line {line}: unknown batch_type {batch_type!r}")
+            key = (arrival, dcp_size, batch_type, strategy)
             if key in seen:
-                raise ValueError(f"line {line}: duplicate case record {key}")
+                raise ValueError(f"line {line}: duplicate summary record {key}")
             seen.add(key)
             records.append(
-                CaseRecord(
+                SummaryRecord(
                     arrival_scale=arrival,
                     dcp_size=dcp_size,
                     strategy=strategy,
-                    case_id=case_id,
-                    batch_type="decode_only" if chunk_requests == 0 else "mixed",
+                    batch_type=batch_type,
+                    case_count=case_count,
                     latency_ms=finite_positive(
                         row[latency_column], column=latency_column, line=line
                     ),
@@ -180,22 +179,19 @@ def decimal_label(value: Decimal) -> str:
 
 
 def aggregate_records(
-    records: Sequence[CaseRecord],
+    records: Sequence[SummaryRecord],
     arrivals: Sequence[Decimal],
     dcp_sizes: Sequence[int],
 ) -> dict[tuple[Decimal, int, str, str], float]:
-    grouped: defaultdict[
-        tuple[Decimal, int, str, str], list[CaseRecord]
-    ] = defaultdict(list)
+    grouped: dict[tuple[Decimal, int, str, str], SummaryRecord] = {}
     for record in records:
-        grouped[
-            (
-                record.arrival_scale,
-                record.dcp_size,
-                record.batch_type,
-                record.strategy,
-            )
-        ].append(record)
+        key = (
+            record.arrival_scale,
+            record.dcp_size,
+            record.batch_type,
+            record.strategy,
+        )
+        grouped[key] = record
 
     missing = [
         (decimal_label(arrival), dcp_size, batch_type, strategy)
@@ -213,31 +209,27 @@ def aggregate_records(
     for arrival in arrivals:
         for dcp_size in dcp_sizes:
             for batch_type in BATCH_TYPES:
-                case_sets = {
-                    strategy: {
-                        record.case_id
-                        for record in grouped[
-                            (arrival, dcp_size, batch_type, strategy)
-                        ]
-                    }
+                case_counts = {
+                    strategy: grouped[
+                        (arrival, dcp_size, batch_type, strategy)
+                    ].case_count
                     for strategy in STRATEGIES
                 }
-                reference = case_sets[STRATEGIES[0]]
+                reference = case_counts[STRATEGIES[0]]
                 mismatched = [
                     strategy
                     for strategy in STRATEGIES[1:]
-                    if case_sets[strategy] != reference
+                    if case_counts[strategy] != reference
                 ]
                 if mismatched:
                     raise ValueError(
-                        "strategy case sets differ for "
+                        "strategy case counts differ for "
                         f"arrival={decimal_label(arrival)}, DCP={dcp_size}, "
                         f"batch_type={batch_type}: {mismatched}"
                     )
 
     return {
-        key: sum(record.latency_ms for record in group) / len(group)
-        for key, group in grouped.items()
+        key: record.latency_ms for key, record in grouped.items()
     }
 
 

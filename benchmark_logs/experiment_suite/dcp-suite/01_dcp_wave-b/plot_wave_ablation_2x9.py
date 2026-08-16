@@ -6,10 +6,8 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import fmean, median
 from typing import Sequence
 
 import matplotlib
@@ -20,7 +18,7 @@ import matplotlib.pyplot as plt
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = SCRIPT_DIR / "wave_ablation_cases.csv"
+DEFAULT_INPUT = SCRIPT_DIR / "wave_ablation_summary.csv"
 DEFAULT_OUTPUT = SCRIPT_DIR / "wave_ablation_2x9.png"
 
 ARRIVALS = ("1", "2", "4")
@@ -37,7 +35,8 @@ STRATEGY_COLORS = ("#4C78A8", "#E45756")
 
 @dataclass(frozen=True)
 class Metric:
-    column: str
+    mean_column: str
+    median_column: str
     ylabel: str
     scale: float
     decimals: int
@@ -45,17 +44,46 @@ class Metric:
 
 
 METRICS = {
-    "p50": Metric("p50_ms", "Mean per-case p50 latency (us)", 1000.0, 1, False),
-    "p90": Metric("p90_ms", "Mean per-case p90 latency (us)", 1000.0, 1, False),
-    "tflops": Metric("effective_tflops", "Mean effective TFLOPS", 1.0, 0, True),
+    "p50": Metric(
+        "p50_ms_mean",
+        "p50_ms_median",
+        "Mean per-case p50 latency (us)",
+        1000.0,
+        1,
+        False,
+    ),
+    "p90": Metric(
+        "p90_ms_mean",
+        "p90_ms_median",
+        "Mean per-case p90 latency (us)",
+        1000.0,
+        1,
+        False,
+    ),
+    "tflops": Metric(
+        "effective_tflops_mean",
+        "effective_tflops_median",
+        "Mean effective TFLOPS",
+        1.0,
+        0,
+        True,
+    ),
     "bandwidth": Metric(
-        "effective_kv_bandwidth_gbps_per_gpu",
+        "effective_kv_bandwidth_gbps_per_gpu_mean",
+        "effective_kv_bandwidth_gbps_per_gpu_median",
         "Mean effective KV bandwidth (GB/s/GPU)",
         1.0,
         0,
         True,
     ),
 }
+
+
+@dataclass(frozen=True)
+class SummaryValue:
+    mean: float
+    median: float
+    case_count: int
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -71,7 +99,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="?",
         type=Path,
         default=DEFAULT_INPUT,
-        help=f"wave_ablation_cases.csv (default: {DEFAULT_INPUT})",
+        help=f"plot-ready summary CSV (default: {DEFAULT_INPUT})",
     )
     parser.add_argument(
         "--output",
@@ -99,16 +127,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def load_values(
     path: Path, metric: Metric
-) -> dict[tuple[str, str, int, str], dict[str, float]]:
+) -> dict[tuple[str, str, int, str], SummaryValue]:
     required = {
         "arrival_time_scale",
         "dcp_size",
         "strategy",
-        "case_id",
-        "chunk_requests",
-        metric.column,
+        "batch_type",
+        "case_count",
+        metric.mean_column,
+        metric.median_column,
     }
-    grouped: dict[tuple[str, str, int, str], dict[str, float]] = defaultdict(dict)
+    grouped: dict[tuple[str, str, int, str], SummaryValue] = {}
     with path.open(newline="", encoding="utf-8") as source:
         reader = csv.DictReader(source)
         missing = required.difference(reader.fieldnames or ())
@@ -118,40 +147,40 @@ def load_values(
             arrival = row["arrival_time_scale"].strip()
             try:
                 dcp_size = int(row["dcp_size"])
-                chunk_requests = int(row["chunk_requests"])
-                value = float(row[metric.column]) * metric.scale
+                case_count = int(row["case_count"])
+                mean_value = float(row[metric.mean_column]) * metric.scale
+                median_value = float(row[metric.median_column]) * metric.scale
             except ValueError as error:
                 raise ValueError(f"invalid numeric value at {path}:{line_number}") from error
             strategy = row["strategy"].strip()
-            case_id = row["case_id"].strip()
+            batch_type = row["batch_type"].strip()
             if arrival not in ARRIVALS or dcp_size not in DCP_SIZES:
                 continue
             if strategy not in STRATEGIES:
                 continue
-            if not case_id:
-                raise ValueError(f"empty case_id at {path}:{line_number}")
-            if chunk_requests < 0:
+            if batch_type not in BATCH_TYPES:
+                raise ValueError(f"invalid batch_type at {path}:{line_number}")
+            if case_count <= 0:
+                raise ValueError(f"invalid case_count at {path}:{line_number}")
+            if any(
+                not math.isfinite(value) or value < 0
+                for value in (mean_value, median_value)
+            ):
                 raise ValueError(
-                    f"negative chunk_requests={chunk_requests} at {path}:{line_number}"
+                    f"invalid metric value at {path}:{line_number}"
                 )
-            if not math.isfinite(value) or value < 0:
-                raise ValueError(
-                    f"invalid {metric.column}={row[metric.column]!r} at "
-                    f"{path}:{line_number}"
-                )
-            batch_type = "mixed_prefill" if chunk_requests > 0 else "decode_only"
             key = (batch_type, arrival, dcp_size, strategy)
-            if case_id in grouped[key]:
+            if key in grouped:
                 raise ValueError(
                     f"duplicate row for arrival={arrival}, DCP={dcp_size}, "
-                    f"strategy={strategy}, case={case_id}"
+                    f"batch_type={batch_type}, strategy={strategy}"
                 )
-            grouped[key][case_id] = value
+            grouped[key] = SummaryValue(mean_value, median_value, case_count)
     return grouped
 
 
 def validate_matrix(
-    grouped: dict[tuple[str, str, int, str], dict[str, float]],
+    grouped: dict[tuple[str, str, int, str], SummaryValue],
 ) -> dict[tuple[str, str, int], int]:
     case_counts: dict[tuple[str, str, int], int] = {}
     for batch_type in BATCH_TYPES:
@@ -169,24 +198,20 @@ def validate_matrix(
                         f"missing strategy data for batch_type={batch_type}, "
                         f"arrival={arrival}, DCP={dcp_size}"
                     )
-                if native.keys() != critical.keys():
-                    native_only = sorted(native.keys() - critical.keys())
-                    critical_only = sorted(critical.keys() - native.keys())
+                if native.case_count != critical.case_count:
                     raise ValueError(
-                        f"unpaired cases for batch_type={batch_type}, "
-                        f"arrival={arrival}, DCP={dcp_size}: "
-                        f"native_only={native_only[:3]}, "
-                        f"critical_only={critical_only[:3]}"
+                        f"case count mismatch for batch_type={batch_type}, "
+                        f"arrival={arrival}, DCP={dcp_size}"
                     )
                 if arrival_case_count is None:
-                    arrival_case_count = len(native)
-                elif len(native) != arrival_case_count:
+                    arrival_case_count = native.case_count
+                elif native.case_count != arrival_case_count:
                     raise ValueError(
                         f"DCP case count mismatch for batch_type={batch_type}, "
                         f"arrival={arrival}: expected {arrival_case_count}, "
-                        f"got {len(native)} at DCP={dcp_size}"
+                        f"got {native.case_count} at DCP={dcp_size}"
                     )
-                case_counts[(batch_type, arrival, dcp_size)] = len(native)
+                case_counts[(batch_type, arrival, dcp_size)] = native.case_count
     return case_counts
 
 
@@ -197,7 +222,7 @@ def comparison_ratio(native: float, critical: float, higher_is_better: bool) -> 
 
 
 def plot(
-    grouped: dict[tuple[str, str, int, str], dict[str, float]],
+    grouped: dict[tuple[str, str, int, str], SummaryValue],
     metric: Metric,
     metric_name: str,
     case_counts: dict[tuple[str, str, int], int],
@@ -232,14 +257,12 @@ def plot(
     )
     for row, batch_type in enumerate(BATCH_TYPES):
         for axis, (arrival, dcp_size) in zip(axes[row], columns, strict=True):
-            series = [
-                list(
-                    grouped[(batch_type, arrival, dcp_size, strategy)].values()
-                )
+            summaries = [
+                grouped[(batch_type, arrival, dcp_size, strategy)]
                 for strategy in STRATEGIES
             ]
-            means = [fmean(values) for values in series]
-            medians = [median(values) for values in series]
+            means = [summary.mean for summary in summaries]
+            medians = [summary.median for summary in summaries]
             bars = axis.bar(
                 (0, 1),
                 means,

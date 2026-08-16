@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Plot the causal 128K dataset benchmark matrix by KV-head count."""
+"""Plot the causal 128K dataset benchmark matrix from summary CSV."""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import re
 import sys
@@ -20,6 +21,7 @@ import matplotlib.pyplot as plt
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_INPUT = SCRIPT_DIR / "kvh_matrix_summary.csv"
 DEFAULT_OUTPUT = SCRIPT_DIR / "kvh_matrix_weighted_gpu_tflops.png"
 
 DIRECTIONS = ("forward", "backward")
@@ -67,9 +69,6 @@ METHOD_COLORS = {
     "mega_ring_hybrid": "#B07AA1",
 }
 
-SUMMARY_RE = re.compile(r"^Cross-case (forward|backward) summary$")
-WORLD_SIZE_RE = re.compile(r"^Planner workload:.*\bworld_size=(\d+)\b")
-CASES_RE = re.compile(r"^(\d+)/(\d+)$")
 SM_RE = re.compile(r"^(?:-|\d+:\d+)$")
 
 
@@ -102,11 +101,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description="Plot the 4x2 KV-head forward/backward dataset matrix"
     )
     parser.add_argument(
-        "input_dir",
+        "input",
         nargs="?",
         type=Path,
-        default=SCRIPT_DIR,
-        help="directory containing forward/ and backward/ (default: script directory)",
+        default=DEFAULT_INPUT,
+        help="plot-ready summary CSV (default: next to this script)",
     )
     parser.add_argument(
         "--output",
@@ -118,130 +117,72 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def parse_summary_row(
-    line: str,
-    *,
-    direction: str,
-    kvhead: int,
-    dataset: str,
-    source: Path,
-) -> SummaryRecord | None:
-    fields = line.split()
-    if not fields or fields[0] not in METHODS:
-        return None
-
-    prefix_length = 4 if direction == "forward" else 3
-    if len(fields) != prefix_length + 7:
-        raise ValueError(f"malformed {direction} summary row in {source}: {line}")
-
-    method = fields[0]
-    if direction == "forward":
-        mode, sm_config, cases = fields[1:4]
-        if mode != "causal":
-            raise ValueError(f"non-causal forward summary row in {source}: {line}")
-    else:
-        sm_config, cases = fields[1:3]
-
-    cases_match = CASES_RE.fullmatch(cases)
-    if not SM_RE.fullmatch(sm_config) or cases_match is None:
-        raise ValueError(f"malformed {direction} summary row in {source}: {line}")
-    cases_done, cases_total = map(int, cases_match.groups())
-    if cases_done != cases_total:
-        raise ValueError(f"incomplete benchmark summary in {source}: {cases}")
-
-    try:
-        metrics = [float(value) for value in fields[-7:]]
-    except ValueError as error:
-        raise ValueError(f"non-numeric summary metric in {source}: {line}") from error
-    if any(not math.isfinite(value) or value <= 0.0 for value in metrics):
-        raise ValueError(f"invalid summary metric in {source}: {line}")
-
-    return SummaryRecord(
-        direction=direction,
-        kvhead=kvhead,
-        dataset=dataset,
-        method=method,
-        sm_config=sm_config,
-        cases_done=cases_done,
-        cases_total=cases_total,
-        weighted_tflops=metrics[-2],
-        weighted_gpu_tflops=metrics[-1],
-        source=source,
-    )
-
-
-def parse_log(
-    path: Path, *, direction: str, kvhead: int, dataset: str
-) -> tuple[list[SummaryRecord], int]:
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError as error:
-        raise ValueError(f"cannot read {path}: {error}") from error
-
-    world_sizes: set[int] = set()
-    summary_directions: list[str] = []
-    active_summary: str | None = None
-    records: list[SummaryRecord] = []
-    for line in lines:
-        world_match = WORLD_SIZE_RE.match(line)
-        if world_match is not None:
-            world_sizes.add(int(world_match.group(1)))
-
-        summary_match = SUMMARY_RE.match(line)
-        if summary_match is not None:
-            active_summary = summary_match.group(1)
-            summary_directions.append(active_summary)
-            continue
-
-        if active_summary is None:
-            continue
-        record = parse_summary_row(
-            line,
-            direction=active_summary,
-            kvhead=kvhead,
-            dataset=dataset,
-            source=path,
-        )
-        if record is not None:
-            records.append(record)
-
-    if summary_directions != [direction]:
-        raise ValueError(
-            f"{path}: expected one {direction} summary, found {summary_directions}"
-        )
-    if len(world_sizes) != 1:
-        raise ValueError(f"{path}: expected one world size, found {sorted(world_sizes)}")
-    if not records:
-        raise ValueError(f"{path}: no cross-case summary rows found")
-    return records, world_sizes.pop()
-
-
-def load_records(input_dir: Path) -> tuple[list[SummaryRecord], int]:
+def load_summary(path: Path) -> tuple[list[SummaryRecord], int]:
+    required = {
+        "direction",
+        "kvhead",
+        "dataset",
+        "method",
+        "sm_config",
+        "cases_done",
+        "cases_total",
+        "weighted_tflops",
+        "weighted_gpu_tflops",
+        "world_size",
+    }
     records: list[SummaryRecord] = []
     world_sizes: set[int] = set()
-    missing: list[Path] = []
-    for direction in DIRECTIONS:
-        for kvhead in KVHEADS:
-            for dataset in DATASETS:
-                path = input_dir / direction / f"kvh{kvhead}" / f"{dataset}.log"
-                if not path.is_file():
-                    missing.append(path)
-                    continue
-                parsed, world_size = parse_log(
-                    path,
+    with path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        missing = required.difference(reader.fieldnames or ())
+        if missing:
+            raise ValueError(f"{path} is missing columns: {', '.join(sorted(missing))}")
+        for line_number, row in enumerate(reader, start=2):
+            try:
+                direction = row["direction"].strip()
+                kvhead = int(row["kvhead"])
+                cases_done = int(row["cases_done"])
+                cases_total = int(row["cases_total"])
+                world_size = int(row["world_size"])
+                weighted_tflops = float(row["weighted_tflops"])
+                weighted_gpu_tflops = float(row["weighted_gpu_tflops"])
+            except ValueError as error:
+                raise ValueError(f"invalid numeric value at {path}:{line_number}") from error
+            dataset = row["dataset"].strip()
+            method = row["method"].strip()
+            sm_config = row["sm_config"].strip()
+            if direction not in DIRECTIONS or kvhead not in KVHEADS:
+                raise ValueError(f"invalid matrix key at {path}:{line_number}")
+            if dataset not in DATASETS or method not in METHODS:
+                raise ValueError(f"invalid dataset or method at {path}:{line_number}")
+            if SM_RE.fullmatch(sm_config) is None:
+                raise ValueError(f"invalid SM config at {path}:{line_number}")
+            if cases_done != cases_total or cases_done <= 0:
+                raise ValueError(f"incomplete cases at {path}:{line_number}")
+            if any(
+                not math.isfinite(value) or value <= 0.0
+                for value in (weighted_tflops, weighted_gpu_tflops)
+            ):
+                raise ValueError(f"invalid throughput at {path}:{line_number}")
+            world_sizes.add(world_size)
+            records.append(
+                SummaryRecord(
                     direction=direction,
                     kvhead=kvhead,
                     dataset=dataset,
+                    method=method,
+                    sm_config=sm_config,
+                    cases_done=cases_done,
+                    cases_total=cases_total,
+                    weighted_tflops=weighted_tflops,
+                    weighted_gpu_tflops=weighted_gpu_tflops,
+                    source=path,
                 )
-                records.extend(parsed)
-                world_sizes.add(world_size)
-
-    if missing:
-        preview = ", ".join(str(path) for path in missing[:3])
-        suffix = " ..." if len(missing) > 3 else ""
-        raise ValueError(f"missing {len(missing)} benchmark logs: {preview}{suffix}")
+            )
+    if not records:
+        raise ValueError(f"{path}: no summary rows found")
     if len(world_sizes) != 1:
-        raise ValueError(f"expected one world size across logs, found {sorted(world_sizes)}")
+        raise ValueError(f"{path}: expected one world size, found {sorted(world_sizes)}")
     return records, world_sizes.pop()
 
 
@@ -427,7 +368,7 @@ def print_summary(
     world_size: int,
 ) -> None:
     print(
-        f"Parsed {len(records)} summary rows from 40 logs; selected "
+        f"Loaded {len(records)} rows from summary CSV; selected "
         f"{len(selected)} bars for {world_size} GPUs."
     )
     for method in TUNED_METHODS:
@@ -442,7 +383,7 @@ def print_summary(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    records, world_size = load_records(args.input_dir.resolve())
+    records, world_size = load_summary(args.input.resolve())
     selected = select_results(records)
     figure = make_figure(selected, world_size)
     output = args.output.resolve()

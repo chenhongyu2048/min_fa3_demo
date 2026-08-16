@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Plot forward and backward uniform-CP benchmark results from one log.
+"""Plot forward and backward uniform-CP benchmark results from summary CSV.
 
-By default this script reads ``benchmark_uniform_both.log`` next to itself and
+By default this script reads ``cp_uniform_summary.csv`` next to itself and
 creates a 2x3 throughput overview.  The rows are forward/backward, the columns
 are total-token contexts, and each panel compares batch sizes for all methods.
 Mega-ring methods are tuned independently at every workload point by selecting
@@ -11,6 +11,7 @@ the Comp:Comm configuration with the highest per-GPU throughput.
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import re
 import sys
@@ -27,7 +28,7 @@ import matplotlib.pyplot as plt
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = SCRIPT_DIR / "benchmark_uniform_both.log"
+DEFAULT_INPUT = SCRIPT_DIR / "cp_uniform_summary.csv"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "figures"
 
 METHODS = (
@@ -77,27 +78,6 @@ METRICS = {
     "latency-ms": ("latency_ms", "Latency (ms, log scale)", True),
 }
 
-DIRECTION_RE = re.compile(r"^\[uniform_(forward|backward)\b")
-CASE_RE = re.compile(
-    r"^(?:Benchmark case:|Workload:)\s+uniform "
-    r"context=(?P<context>\d+), batch=(?P<batch>\d+), "
-    r"seqlen=(?P<seqlen>\d+), hybrid=(?P<hybrid>G\d+)"
-)
-FORWARD_SM_RE = re.compile(
-    r"^SM config: num_comp_sm=(?P<compute>\d+), "
-    r"num_comm_sm=(?P<communication>\d+)$"
-)
-WORLD_SIZE_RE = re.compile(r"--nproc_per_node(?:=|\s+)(?P<size>\d+)")
-NUMBER = r"[+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
-RESULT_RE = re.compile(
-    rf"^(?P<method>{'|'.join(map(re.escape, METHODS))})\s+"
-    rf"(?:(?P<sm>-|\d+:\d+)\s+)?"
-    rf"t0=.*?\|\s*max_across_ranks=(?P<latency>{NUMBER})\s+"
-    rf"(?P<aggregate>{NUMBER})\s+(?P<average>{NUMBER})\s+"
-    r"(?P<check>skip|pass|fail)\b"
-)
-
-
 @dataclass(frozen=True)
 class Result:
     direction: str
@@ -141,7 +121,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="?",
         type=Path,
         default=DEFAULT_INPUT,
-        help="combined benchmark log (default: next to this script)",
+        help="plot-ready summary CSV (default: next to this script)",
     )
     parser.add_argument(
         "--output",
@@ -190,116 +170,79 @@ def finite_positive(value: str, *, field: str, path: Path, line: int) -> float:
     return parsed
 
 
-def parse_log(path: Path) -> tuple[list[Result], int]:
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError as error:
-        raise ValueError(f"cannot read {path}: {error}") from error
-
+def load_summary(path: Path) -> tuple[list[Result], int]:
+    required = {
+        "direction",
+        "context",
+        "batch",
+        "seqlen",
+        "hybrid",
+        "method",
+        "sm_config",
+        "latency_ms",
+        "agg_tflops",
+        "avg_gpu_tflops",
+        "world_size",
+    }
     results: list[Result] = []
-    direction: str | None = None
-    case: tuple[int, int, int, str] | None = None
-    forward_sm: str | None = None
     world_sizes: set[int] = set()
-    exact_keys: dict[tuple[str, int, int, str, str], int] = {}
-
-    for line_number, line in enumerate(lines, start=1):
-        world_match = WORLD_SIZE_RE.search(line)
-        if world_match is not None:
-            world_sizes.add(int(world_match.group("size")))
-
-        direction_match = DIRECTION_RE.match(line)
-        if direction_match is not None:
-            direction = direction_match.group(1)
-            case = None
-            forward_sm = None
-            continue
-
-        case_match = CASE_RE.match(line)
-        if case_match is not None:
-            if direction is None:
-                raise ValueError(f"{path}:{line_number}: workload has no direction")
-            case = (
-                int(case_match.group("context")),
-                int(case_match.group("batch")),
-                int(case_match.group("seqlen")),
-                case_match.group("hybrid"),
-            )
-            forward_sm = None
-            continue
-
-        sm_match = FORWARD_SM_RE.match(line)
-        if sm_match is not None:
-            forward_sm = (
-                f"{sm_match.group('compute')}:{sm_match.group('communication')}"
-            )
-            continue
-
-        result_match = RESULT_RE.match(line)
-        if result_match is None:
-            continue
-        if direction is None or case is None:
-            raise ValueError(f"{path}:{line_number}: result has no workload metadata")
-
-        method = result_match.group("method")
-        embedded_sm = result_match.group("sm")
-        if direction == "forward":
-            if embedded_sm is not None or forward_sm is None:
-                raise ValueError(
-                    f"{path}:{line_number}: malformed forward SM configuration"
+    exact_keys: set[tuple[str, int, int, str, str]] = set()
+    with path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        missing = required.difference(reader.fieldnames or ())
+        if missing:
+            raise ValueError(f"{path} is missing columns: {', '.join(sorted(missing))}")
+        for line_number, row in enumerate(reader, start=2):
+            try:
+                direction = row["direction"].strip()
+                context = int(row["context"])
+                batch = int(row["batch"])
+                seqlen = int(row["seqlen"])
+                method = row["method"].strip()
+                sm_config = row["sm_config"].strip()
+                world_size = int(row["world_size"])
+            except ValueError as error:
+                raise ValueError(f"invalid integer at {path}:{line_number}") from error
+            if direction not in ("forward", "backward"):
+                raise ValueError(f"invalid direction at {path}:{line_number}")
+            if method not in METHODS:
+                raise ValueError(f"invalid method at {path}:{line_number}")
+            key = (direction, context, batch, method, sm_config)
+            if key in exact_keys:
+                raise ValueError(f"duplicate result at {path}:{line_number}: {key}")
+            exact_keys.add(key)
+            world_sizes.add(world_size)
+            results.append(
+                Result(
+                    direction=direction,
+                    context=context,
+                    batch=batch,
+                    seqlen=seqlen,
+                    hybrid=row["hybrid"].strip(),
+                    method=method,
+                    sm_config=sm_config,
+                    latency_ms=finite_positive(
+                        row["latency_ms"], field="latency", path=path, line=line_number
+                    ),
+                    agg_tflops=finite_positive(
+                        row["agg_tflops"],
+                        field="aggregate TFLOPS",
+                        path=path,
+                        line=line_number,
+                    ),
+                    avg_gpu_tflops=finite_positive(
+                        row["avg_gpu_tflops"],
+                        field="average GPU TFLOPS",
+                        path=path,
+                        line=line_number,
+                    ),
+                    line_number=line_number,
                 )
-            sm_config = forward_sm
-        else:
-            if embedded_sm is None:
-                raise ValueError(
-                    f"{path}:{line_number}: missing backward Comp:Comm value"
-                )
-            sm_config = embedded_sm
-
-        context, batch, seqlen, hybrid = case
-        key = (direction, context, batch, method, sm_config)
-        if key in exact_keys:
-            raise ValueError(
-                f"{path}:{line_number}: duplicate result; first seen on line "
-                f"{exact_keys[key]} for {key}"
             )
-        exact_keys[key] = line_number
-        results.append(
-            Result(
-                direction=direction,
-                context=context,
-                batch=batch,
-                seqlen=seqlen,
-                hybrid=hybrid,
-                method=method,
-                sm_config=sm_config,
-                latency_ms=finite_positive(
-                    result_match.group("latency"),
-                    field="latency",
-                    path=path,
-                    line=line_number,
-                ),
-                agg_tflops=finite_positive(
-                    result_match.group("aggregate"),
-                    field="aggregate TFLOPS",
-                    path=path,
-                    line=line_number,
-                ),
-                avg_gpu_tflops=finite_positive(
-                    result_match.group("average"),
-                    field="average GPU TFLOPS",
-                    path=path,
-                    line=line_number,
-                ),
-                line_number=line_number,
-            )
-        )
-
     if not results:
-        raise ValueError(f"{path}: no uniform benchmark result rows found")
+        raise ValueError(f"{path}: no summary rows found")
     if len(world_sizes) != 1:
-        found = ", ".join(map(str, sorted(world_sizes))) or "none"
-        raise ValueError(f"{path}: expected one torchrun world size, found {found}")
+        raise ValueError(f"{path}: expected one world size, found {sorted(world_sizes)}")
     return results, world_sizes.pop()
 
 
@@ -522,7 +465,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.direction == "both"
         else (args.direction,)
     )
-    raw_results, world_size = parse_log(args.input)
+    raw_results, world_size = load_summary(args.input)
     selected = select_results(
         raw_results,
         directions=directions,

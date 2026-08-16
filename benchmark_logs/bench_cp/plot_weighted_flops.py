@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import re
 from collections import defaultdict
 from dataclasses import dataclass, replace
@@ -18,7 +19,8 @@ import matplotlib.pyplot as plt
 
 
 LOG_DIR = Path(__file__).resolve().parent
-DEFAULT_RUN_DIR = LOG_DIR / "experiment_queue" / "20260726-002324"
+DEFAULT_RUN_DIR = LOG_DIR / "20260726-002324"
+DEFAULT_INPUT = DEFAULT_RUN_DIR / "weighted_flops_summary.csv"
 DEFAULT_TOKEN_COUNTS = (65536, 131072, 262144)
 
 METHODS = (
@@ -31,6 +33,9 @@ METHODS = (
     "mega_ring_all_cp",
     "mega_ring_hybrid",
 )
+METHOD_ALIASES = {
+    "zepplin": "zeppelin",
+}
 HYBRID_COMPARISON_METHODS = tuple(
     method
     for method in METHODS
@@ -91,6 +96,44 @@ class SummaryRecord:
     source: Path
 
 
+def canonical_method(method: str) -> str:
+    return METHOD_ALIASES.get(method, method)
+
+
+def load_summary(path: Path) -> list[SummaryRecord]:
+    required = {
+        "token_count", "dataset", "direction", "mode", "world_size", "method",
+        "sm_config", "weighted_tflops", "weighted_gpu_tflops",
+    }
+    records: list[SummaryRecord] = []
+    with path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        missing = required.difference(reader.fieldnames or ())
+        if missing:
+            raise ValueError(f"{path} is missing columns: {', '.join(sorted(missing))}")
+        for line_number, row in enumerate(reader, start=2):
+            try:
+                records.append(
+                    SummaryRecord(
+                        token_count=int(row["token_count"]),
+                        dataset=row["dataset"].strip(),
+                        direction=row["direction"].strip(),
+                        mode=row["mode"].strip(),
+                        world_size=int(row["world_size"]),
+                        method=canonical_method(row["method"].strip()),
+                        sm_config=row["sm_config"].strip(),
+                        weighted_tflops=float(row["weighted_tflops"]),
+                        weighted_gpu_tflops=float(row["weighted_gpu_tflops"]),
+                        source=path,
+                    )
+                )
+            except ValueError as error:
+                raise ValueError(f"invalid summary row at {path}:{line_number}") from error
+    if not records:
+        raise ValueError(f"{path}: no summary rows found")
+    return records
+
+
 def parse_summary_row(
     line: str,
     *,
@@ -100,14 +143,16 @@ def parse_summary_row(
     source: Path,
 ) -> SummaryRecord | None:
     fields = line.split()
-    if not fields or fields[0] not in METHODS:
+    if not fields:
+        return None
+    method = canonical_method(fields[0])
+    if method not in METHODS:
         return None
 
     prefix_length = 4 if direction == "forward" else 3
     if len(fields) != prefix_length + 7:
         raise ValueError(f"malformed {direction} summary row in {source}: {line}")
 
-    method = fields[0]
     if direction == "forward":
         mode, sm_config, cases = fields[1:4]
     else:
@@ -433,10 +478,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--run-dir",
+        "input",
+        nargs="?",
         type=Path,
-        default=DEFAULT_RUN_DIR,
-        help=f"directory containing dataset_<tokens>_<direction>.results.log (default: {DEFAULT_RUN_DIR})",
+        default=DEFAULT_INPUT,
+        help=f"plot-ready summary CSV (default: {DEFAULT_INPUT})",
     )
     parser.add_argument(
         "--token-count",
@@ -471,11 +517,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise ValueError("--token-count values must be positive")
     if len(set(token_counts)) != len(token_counts):
         raise ValueError("--token-count values must be unique")
-    records: list[SummaryRecord] = []
-    for token_count in token_counts:
-        for direction in ("forward", "backward"):
-            path = args.run_dir / f"dataset_{token_count}_{direction}.results.log"
-            records.extend(load_direction_records(path, direction, token_count))
+    records = [
+        record for record in load_summary(args.input)
+        if record.token_count in token_counts
+    ]
     world_size = choose_world_size(records, args.world_size)
     selected = select_best(records, world_size=world_size, mode=args.forward_mode)
     figure = make_figure(selected, world_size, token_counts)

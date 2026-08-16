@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +18,8 @@ import matplotlib.pyplot as plt
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_RUN_DIR = SCRIPT_DIR / "experiment_queue" / "20260726-002324"
+DEFAULT_RUN_DIR = SCRIPT_DIR / "20260726-002324"
+DEFAULT_INPUT = DEFAULT_RUN_DIR / "forward_ablation_summary.csv"
 DEFAULT_TOKEN_COUNTS = (65536, 131072, 262144)
 DEFAULT_OUTPUT = DEFAULT_RUN_DIR / "forward_ablation_arxiv.png"
 GPU_COUNT = 8
@@ -104,6 +106,36 @@ def parse_records(path: Path) -> list[AblationRecord]:
             f"in {path}; {details}"
         )
     return [records_by_level[level] for level in sorted(records_by_level)]
+
+
+def load_summary(path: Path) -> dict[int, list[AblationRecord]]:
+    required = {"token_count", "level", "profile", "sm_config", "mean_ms", "mean_gpu_tflops"}
+    grouped: dict[int, list[AblationRecord]] = {}
+    with path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        missing = required.difference(reader.fieldnames or ())
+        if missing:
+            raise ValueError(f"{path} is missing columns: {', '.join(sorted(missing))}")
+        for line_number, row in enumerate(reader, start=2):
+            try:
+                token_count = int(row["token_count"])
+                record = AblationRecord(
+                    level=int(row["level"]),
+                    profile=row["profile"].strip(),
+                    sm_config=row["sm_config"].strip(),
+                    mean_ms=float(row["mean_ms"]),
+                    mean_gpu_tflops=float(row["mean_gpu_tflops"]),
+                )
+            except ValueError as error:
+                raise ValueError(f"invalid summary row at {path}:{line_number}") from error
+            grouped.setdefault(token_count, []).append(record)
+    for token_count, records in grouped.items():
+        records.sort(key=lambda item: item.level)
+        if [record.level for record in records] != list(range(1, 7)):
+            raise ValueError(f"{path}: token_count={token_count} does not contain L1-L6")
+    if not grouped:
+        raise ValueError(f"{path}: no summary rows found")
+    return grouped
 
 
 def _style_axis(axis: plt.Axes) -> None:
@@ -220,13 +252,11 @@ def make_figure(
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--run-dir",
+        "input",
+        nargs="?",
         type=Path,
-        default=DEFAULT_RUN_DIR,
-        help=(
-            "directory containing forward_ablation_arxiv_<tokens>_20cases.console.log "
-            f"(default: {DEFAULT_RUN_DIR})"
-        ),
+        default=DEFAULT_INPUT,
+        help=f"plot-ready summary CSV (default: {DEFAULT_INPUT})",
     )
     parser.add_argument(
         "--token-count",
@@ -247,10 +277,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     if len(set(token_counts)) != len(token_counts):
         raise ValueError("--token-count values must be unique")
 
+    available = load_summary(args.input)
     records_by_token_count = []
     for token_count in token_counts:
-        path = args.run_dir / f"forward_ablation_arxiv_{token_count}_20cases.console.log"
-        records_by_token_count.append((token_count, parse_records(path)))
+        if token_count not in available:
+            raise ValueError(f"token count {token_count} is unavailable in {args.input}")
+        records_by_token_count.append((token_count, available[token_count]))
     figure = make_figure(records_by_token_count)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(args.output, dpi=220, bbox_inches="tight")

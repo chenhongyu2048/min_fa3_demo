@@ -17,6 +17,7 @@ for the case and is not part of the latency measurement.
 from __future__ import annotations
 
 import argparse
+import csv
 import re
 import sys
 from collections import defaultdict
@@ -32,7 +33,8 @@ import matplotlib.pyplot as plt
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_RUN_DIR = SCRIPT_DIR / "experiment_queue" / "20260726-002324"
+DEFAULT_RUN_DIR = SCRIPT_DIR / "20260726-002324"
+DEFAULT_INPUT = DEFAULT_RUN_DIR / "forward_resource_balance_summary.csv"
 DEFAULT_LOAD_BALANCE_LOG = DEFAULT_RUN_DIR / "theoretical_load_131072_forward.results.log"
 DEFAULT_DATASET_LOG = DEFAULT_RUN_DIR / "tile_analysis_131072_forward.results.log"
 DEFAULT_OUTPUT = DEFAULT_RUN_DIR / "forward_resource_balance.png"
@@ -141,6 +143,60 @@ class ProbeRecord:
     @property
     def kv_qo(self) -> float:
         return self.kv_tile_reads / self.qo_visits
+
+
+def load_summary(path: Path) -> tuple[list[StaticRecord], list[ProbeRecord]]:
+    required = {
+        "record_type", "dataset", "case", "case_count", "method", "sm_config",
+        "workload_tokens", "mode", "physical_tokens_min", "physical_tokens_avg",
+        "physical_tokens_max", "physical_flops_min", "physical_flops_avg",
+        "physical_flops_max", "sent_bytes_min", "sent_bytes_avg", "sent_bytes_max",
+        "kv_qo_lower", "kv_qo_upper", "qo_visits", "kv_tile_reads",
+    }
+    static: list[StaticRecord] = []
+    probes: list[ProbeRecord] = []
+    with path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        missing = required.difference(reader.fieldnames or ())
+        if missing:
+            raise ValueError(f"{path} is missing columns: {', '.join(sorted(missing))}")
+        for line_number, row in enumerate(reader, start=2):
+            try:
+                common = {
+                    "dataset": row["dataset"].strip(),
+                    "case": int(row["case"]),
+                    "case_count": int(row["case_count"]),
+                    "method": row["method"].strip(),
+                }
+                if row["record_type"] == "static":
+                    static.append(
+                        StaticRecord(
+                            **common,
+                            workload_tokens=int(row["workload_tokens"]),
+                            mode=row["mode"].strip(),
+                            physical_tokens=Range(float(row["physical_tokens_min"]), float(row["physical_tokens_avg"]), float(row["physical_tokens_max"])),
+                            physical_flops=Range(float(row["physical_flops_min"]), float(row["physical_flops_avg"]), float(row["physical_flops_max"])),
+                            sent_bytes=Range(float(row["sent_bytes_min"]), float(row["sent_bytes_avg"]), float(row["sent_bytes_max"])),
+                            kv_qo_lower=float(row["kv_qo_lower"]),
+                            kv_qo_upper=float(row["kv_qo_upper"]),
+                        )
+                    )
+                elif row["record_type"] == "probe":
+                    probes.append(
+                        ProbeRecord(
+                            **common,
+                            sm_config=row["sm_config"].strip(),
+                            qo_visits=int(row["qo_visits"]),
+                            kv_tile_reads=int(row["kv_tile_reads"]),
+                        )
+                    )
+                else:
+                    raise ValueError(f"unknown record_type {row['record_type']!r}")
+            except ValueError as error:
+                raise ValueError(f"invalid summary row at {path}:{line_number}: {error}") from error
+    if not static:
+        raise ValueError(f"{path}: no static summary rows found")
+    return static, probes
 
 
 def parse_human_value(value: str) -> float:
@@ -699,19 +755,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--load-balance-log",
+        "input",
+        nargs="?",
         type=Path,
-        default=DEFAULT_LOAD_BALANCE_LOG,
-        help=f"static load-balance log (default: {DEFAULT_LOAD_BALANCE_LOG})",
-    )
-    parser.add_argument(
-        "--dataset-log",
-        type=Path,
-        default=DEFAULT_DATASET_LOG,
-        help=(
-            "dataset log containing --collect-mega-ring-stats probes "
-            f"(default: {DEFAULT_DATASET_LOG})"
-        ),
+        default=DEFAULT_INPUT,
+        help=f"plot-ready summary CSV (default: {DEFAULT_INPUT})",
     )
     parser.add_argument(
         "--mode",
@@ -749,11 +797,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise ValueError("--case must be a positive 1-based index")
 
     selected_datasets = set(args.dataset) if args.dataset else None
-    probe_log_exists = args.dataset_log.is_file()
-    all_probe_records = parse_probe_log(args.dataset_log) if probe_log_exists else []
+    all_static_records, all_probe_records = load_summary(args.input)
 
     static_records = select_static_records(
-        parse_static_log(args.load_balance_log),
+        all_static_records,
         selected_datasets,
         args.mode,
         args.case,
@@ -770,22 +817,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(
         f"Loaded {len(static_records)} static method records across "
         f"{len(static_cases)} case(s) and {len(static_datasets)} dataset(s) "
-        f"({', '.join(static_datasets)}): {args.load_balance_log}"
+        f"({', '.join(static_datasets)}): {args.input}"
     )
     if probe_records:
         print(
             f"Loaded {len(probe_records)} mega-ring global probes across "
-            f"{len(probe_cases)} case(s): {args.dataset_log}"
+            f"{len(probe_cases)} case(s): {args.input}"
         )
     else:
         print(
-            "Warning: "
-            + (
-                f"probe log is unavailable ({args.dataset_log}); "
-                if not probe_log_exists
-                else "no mega-ring device probes were found; "
-            )
-            + "Global KV/QO shows only static values.",
+            "Warning: no mega-ring device probes were found; "
+            "Global KV/QO shows only static values.",
             file=sys.stderr,
         )
     print(f"Saved {args.output.resolve()}")

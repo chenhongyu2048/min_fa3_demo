@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Plot five-method load-balancing-suite throughput by dataset and direction."""
+"""Plot recorded load-balancing-suite throughput by dataset and direction."""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -18,7 +19,8 @@ import matplotlib.pyplot as plt
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_RUN_DIR = SCRIPT_DIR / "experiment_queue" / "20260726-002324"
+DEFAULT_RUN_DIR = SCRIPT_DIR / "20260726-002324"
+DEFAULT_INPUT = DEFAULT_RUN_DIR / "load_balance_algorithms_summary.csv"
 DEFAULT_FORWARD_LOG = DEFAULT_RUN_DIR / "load_balance_algorithms_131072_forward.results.log"
 DEFAULT_BACKWARD_LOG = DEFAULT_RUN_DIR / "load_balance_algorithms_131072_backward.results.log"
 DEFAULT_OUTPUT = DEFAULT_RUN_DIR / "load_balance_algorithms_131072.png"
@@ -30,6 +32,10 @@ METHOD_ORDER = (
     "mega_ring_hybrid_megatron_cp",
     "mega_ring_hybrid_zeppelin",
 )
+METHOD_ALIASES = {
+    "native_zepplin": "native_zeppelin",
+    "mega_ring_hybrid_zepplin": "mega_ring_hybrid_zeppelin",
+}
 METHOD_LABELS = {
     "native_megatron_hybrid_cp": "Megatron",
     "native_zeppelin": "Zeppelin",
@@ -69,6 +75,42 @@ class SummaryRecord:
     sm_config: str
     weighted_tflops: float
     weighted_gpu_tflops: float
+
+
+def canonical_method(method: str) -> str:
+    return METHOD_ALIASES.get(method, method)
+
+
+def load_summary(path: Path) -> list[SummaryRecord]:
+    required = {
+        "dataset", "direction", "world_size", "method", "sm_config",
+        "weighted_tflops", "weighted_gpu_tflops",
+    }
+    records: list[SummaryRecord] = []
+    with path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        missing = required.difference(reader.fieldnames or ())
+        if missing:
+            raise ValueError(f"{path} is missing columns: {', '.join(sorted(missing))}")
+        for line_number, row in enumerate(reader, start=2):
+            try:
+                record = SummaryRecord(
+                    dataset=row["dataset"].strip(),
+                    direction=row["direction"].strip(),
+                    world_size=int(row["world_size"]),
+                    method=canonical_method(row["method"].strip()),
+                    sm_config=row["sm_config"].strip(),
+                    weighted_tflops=float(row["weighted_tflops"]),
+                    weighted_gpu_tflops=float(row["weighted_gpu_tflops"]),
+                )
+            except ValueError as error:
+                raise ValueError(f"invalid summary row at {path}:{line_number}") from error
+            if record.direction not in {"forward", "backward"} or record.method not in METHOD_ORDER:
+                raise ValueError(f"invalid summary key at {path}:{line_number}")
+            records.append(record)
+    if not records:
+        raise ValueError(f"{path}: no summary rows found")
+    return records
 
 
 def parse_log(path: Path, expected_direction: str) -> list[SummaryRecord]:
@@ -113,7 +155,10 @@ def parse_log(path: Path, expected_direction: str) -> list[SummaryRecord]:
         if not in_summary:
             continue
         fields = line.split()
-        if not fields or fields[0] not in METHOD_ORDER:
+        if not fields:
+            continue
+        method = canonical_method(fields[0])
+        if method not in METHOD_ORDER:
             continue
         if dataset is None or world_size is None:
             raise AssertionError("summary context was lost")
@@ -137,7 +182,7 @@ def parse_log(path: Path, expected_direction: str) -> list[SummaryRecord]:
                 dataset=dataset,
                 direction=expected_direction,
                 world_size=world_size,
-                method=fields[0],
+                method=method,
                 sm_config=fields[sm_index],
                 weighted_tflops=metrics[-2],
                 weighted_gpu_tflops=metrics[-1],
@@ -242,7 +287,7 @@ def make_figure(
         fontsize=9.3,
     )
     figure.suptitle(
-        f"8-GPU 128K Load-Balancing Algorithm Comparison ({world_size} GPUs)",
+        f"128K Load-Balancing Algorithm Comparison ({world_size} GPUs)",
         y=1.055,
         fontsize=16,
         fontweight="bold",
@@ -261,16 +306,16 @@ def make_figure(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--forward-log", type=Path, default=DEFAULT_FORWARD_LOG)
-    parser.add_argument("--backward-log", type=Path, default=DEFAULT_BACKWARD_LOG)
+    parser.add_argument("input", nargs="?", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
-    forward = select_best_records(parse_log(args.forward_log, "forward"))
-    backward = select_best_records(parse_log(args.backward_log, "backward"))
+    records = load_summary(args.input)
+    forward = select_best_records(record for record in records if record.direction == "forward")
+    backward = select_best_records(record for record in records if record.direction == "backward")
     figure = make_figure(forward, backward)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(args.output, dpi=220, bbox_inches="tight")

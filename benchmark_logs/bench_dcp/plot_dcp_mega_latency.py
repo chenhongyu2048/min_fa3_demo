@@ -730,8 +730,7 @@ def plot_metric(
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        csv_path, manifest_path, run_dir = resolve_input(args.input)
-        validate_manifest(manifest_path, allow_incomplete=args.allow_incomplete)
+        csv_path, _manifest_path, run_dir = resolve_input(args.input)
         records = load_records(csv_path, args.latency_stat)
         if args.arrival_time_scales is None:
             args.arrival_time_scales = tuple(
