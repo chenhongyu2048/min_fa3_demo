@@ -40,9 +40,7 @@ class SummaryRecord:
     comm_sm: int
     case_count: int
     p50_mean_us: float
-    p50_median_us: float
     p90_mean_us: float
-    p90_median_us: float
 
 
 def positive_int(value: str) -> int:
@@ -90,9 +88,7 @@ def load_summary(
         "comm_sm",
         "case_count",
         "kernel_done_p50_us_mean",
-        "kernel_done_p50_us_median",
         "kernel_done_p90_us_mean",
-        "kernel_done_p90_us_median",
     }
     grouped: dict[tuple[str, int, int, str], SummaryRecord] = {}
     with path.open(newline="", encoding="utf-8") as source:
@@ -110,9 +106,7 @@ def load_summary(
                     name: float(row[column])
                     for name, column in (
                         ("p50_mean_us", "kernel_done_p50_us_mean"),
-                        ("p50_median_us", "kernel_done_p50_us_median"),
                         ("p90_mean_us", "kernel_done_p90_us_mean"),
-                        ("p90_median_us", "kernel_done_p90_us_median"),
                     )
                 }
             except ValueError as error:
@@ -166,30 +160,29 @@ def plot_stat(
 ) -> None:
     plt.rcParams.update(
         {
-            "font.size": 9,
-            "axes.titlesize": 10,
-            "axes.labelsize": 10,
-            "xtick.labelsize": 8,
-            "ytick.labelsize": 8,
-            "legend.fontsize": 9,
+            "font.size": 10,
+            "axes.titlesize": 11,
+            "axes.labelsize": 11,
+            "xtick.labelsize": 9,
+            "ytick.labelsize": 9,
+            "legend.fontsize": 10,
             "axes.spines.top": False,
             "axes.spines.right": False,
         }
     )
-    figure, axes = plt.subplots(2, 9, figsize=(25.5, 8.2), sharey="row")
+    figure, axes = plt.subplots(2, 9, figsize=(15.5, 7.2), sharey="row")
     figure.subplots_adjust(
-        left=0.055,
+        left=0.06,
         right=0.995,
-        bottom=0.11,
-        top=0.80,
-        hspace=0.42,
-        wspace=0.06,
+        bottom=0.10,
+        top=0.79,
+        hspace=0.52,
+        wspace=0.05,
     )
     columns = tuple(
         (arrival, dcp_size) for arrival in ARRIVALS for dcp_size in DCP_SIZES
     )
     mean_attribute = f"{stat}_mean_us"
-    median_attribute = f"{stat}_median_us"
 
     for row, batch_type in enumerate(BATCH_TYPES):
         for axis, (arrival, dcp_size) in zip(axes[row], columns, strict=True):
@@ -198,7 +191,6 @@ def plot_stat(
                 for strategy in STRATEGIES
             ]
             means = [getattr(record, mean_attribute) for record in summaries]
-            medians = [getattr(record, median_attribute) for record in summaries]
             bars = axis.bar(
                 (0, 1),
                 means,
@@ -208,25 +200,15 @@ def plot_stat(
                 linewidth=0.65,
                 zorder=2,
             )
-            axis.scatter(
-                (0, 1),
-                medians,
-                marker="D",
-                s=22,
-                color="white",
-                edgecolor="#222222",
-                linewidth=0.8,
-                zorder=3,
-            )
-            axis.set_title(f"Arrival {arrival}x\nDCP {dcp_size}", pad=7)
+            axis.set_title(f"Arrival {arrival}x\nDCP {dcp_size}", pad=4)
             axis.set_xticks((0, 1), STRATEGY_LABELS)
             axis.grid(axis="y", color="#D9D9D9", linewidth=0.7, alpha=0.8)
-            axis.tick_params(axis="x", length=0, pad=5)
-            axis.margins(y=0.28)
+            axis.tick_params(axis="x", length=0, pad=3)
+            axis.margins(y=0.25)
             if axis is axes[row, 0]:
                 axis.set_ylabel(
                     f"{BATCH_TYPE_LABELS[batch_type]}\n"
-                    f"Mean per-case kernel_done {stat} (us)",
+                    f"Mean per-case {stat} (us)",
                     fontweight="bold",
                 )
             for bar, value in zip(bars, means, strict=True):
@@ -237,7 +219,7 @@ def plot_stat(
                     textcoords="offset points",
                     ha="center",
                     va="bottom",
-                    fontsize=7.5,
+                    fontsize=8.5,
                 )
             speedup = means[0] / means[1]
             case_count = summaries[0].case_count
@@ -248,7 +230,7 @@ def plot_stat(
                 transform=axis.transAxes,
                 ha="center",
                 va="top",
-                fontsize=8.5,
+                fontsize=9.5,
                 fontweight="bold",
                 color="#2F6B3C" if speedup >= 1 else "#A33A32",
             )
@@ -263,12 +245,11 @@ def plot_stat(
         loc="upper center",
         ncol=2,
         frameon=False,
-        bbox_to_anchor=(0.5, 0.89),
+        bbox_to_anchor=(0.5, 0.88),
     )
     figure.suptitle(
-        f"Mega DCP Kernel-Done Timestamp - {stat.upper()} "
-        "(mean bars, median diamonds)",
-        fontsize=13,
+        f"Mega DCP Kernel-Done Timestamp - {stat.upper()} (mean bars)",
+        fontsize=14,
         y=0.97,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
