@@ -1,0 +1,121 @@
+digraph MegaRingBackward {
+    graph [
+        rankdir=TB,
+        bgcolor="white",
+        pad=0.20,
+        nodesep=0.40,
+        ranksep=0.62,
+        splines=polyline,
+        compound=true,
+        fontname="DejaVu Sans",
+        fontsize=18,
+        label="MegaRing Backward Core: Owner-Directed dKV Reduction",
+        labelloc=t
+    ];
+    node [
+        shape=box,
+        style="rounded,filled",
+        fontname="DejaVu Sans",
+        fontsize=9.5,
+        color="#53606C",
+        penwidth=1.3,
+        margin="0.11,0.08"
+    ];
+    edge [
+        color="#53606C",
+        penwidth=1.4,
+        arrowsize=0.72,
+        fontname="DejaVu Sans",
+        fontsize=8
+    ];
+
+    omitted [
+        shape=note,
+        label="Inherited FA3 peripheral stages\n(omitted; not a contribution)",
+        fillcolor="#F2F2F2",
+        color="#929AA1",
+        style="dashed,filled"
+    ];
+
+    subgraph cluster_core {
+        label="Persistent Backward Core";
+        color="#2D7D46";
+        penwidth=1.8;
+        style="rounded";
+        bgcolor="#F8FCF9";
+        fontname="DejaVu Sans";
+        fontsize=13;
+
+        bwd [
+            label="Compute CTA\nBackward Attention\n(level, step, KV tile, head, batch)",
+            fillcolor="#DDF2E3",
+            color="#2D7D46"
+        ];
+        dq [
+            shape=cylinder,
+            label="Local FP32\ndQ Accumulator",
+            fillcolor="#EEE6F7",
+            color="#77569B"
+        ];
+        dkv [
+            shape=cylinder,
+            label="Step-Local FP32\ndK / dV Buffers",
+            fillcolor="#EEE6F7",
+            color="#77569B"
+        ];
+        section [
+            shape=ellipse,
+            label="dKV Section Ready\n15 hierarchy-step sections",
+            fillcolor="#FFFBE6",
+            color="#A08321"
+        ];
+        comm [
+            label="Communication CTA\nWait section completion\nLoad 128-token KV-head block",
+            fillcolor="#DCEBFA",
+            color="#2F6FA3"
+        ];
+        { rank=same; dq; dkv; }
+        { rank=same; section; comm; }
+        bwd -> dq [label="reduce-add"];
+        bwd -> dkv [label="write contribution"];
+        dkv -> section [label="release"];
+        section -> comm [label="acquire"];
+        dkv -> comm [label="64 KiB FP32 tile"];
+    }
+
+    owner [
+        shape=cylinder,
+        label="K/V Owner's FP32\ndK / dV Accumulator",
+        fillcolor="#EEE6F7",
+        color="#77569B"
+    ];
+    complete [
+        shape=ellipse,
+        label="Owner Completion\nSystem-scope release",
+        fillcolor="#FFFBE6",
+        color="#A08321"
+    ];
+    consume [
+        label="Owner May Consume\nFinal dK / dV",
+        fillcolor="#DDF2E3",
+        color="#2D7D46"
+    ];
+
+    { rank=same; owner; complete; }
+
+    omitted -> bwd [style=dashed, color="#929AA1"];
+    comm -> owner [label="peer TMA reduce-add", color="#2F6FA3", penwidth=1.7];
+    comm -> complete [label="last CTA increments"];
+    owner -> consume [label="accumulated data"];
+    complete -> consume [label="system-scope acquire"];
+
+    limitation [
+        shape=note,
+        label="Current egress order: G8 -> G4 -> G2 -> G1\nA not-ready earlier section can block a later ready section.",
+        fillcolor="#FDEBEC",
+        color="#B5484D",
+        fontsize=8.5
+    ];
+    { rank=same; omitted; limitation; }
+    comm -> limitation [style=dashed, arrowhead=none, color="#B5484D", constraint=false];
+}

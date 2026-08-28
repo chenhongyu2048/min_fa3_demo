@@ -1,0 +1,98 @@
+digraph MegaCPNarrative {
+    graph [
+        rankdir=TB,
+        bgcolor="white",
+        pad=0.22,
+        nodesep=0.42,
+        ranksep=0.52,
+        splines=ortho,
+        fontname="DejaVu Sans",
+        fontsize=18,
+        label="MegaCP: One Root Cause, One Execution Abstraction, Two Policies",
+        labelloc=t
+    ];
+    node [
+        shape=box,
+        style="rounded,filled",
+        color="#4D5966",
+        penwidth=1.4,
+        fontname="DejaVu Sans",
+        fontsize=11,
+        margin="0.13,0.09"
+    ];
+    edge [
+        color="#4D5966",
+        penwidth=1.5,
+        arrowsize=0.75,
+        fontname="DejaVu Sans",
+        fontsize=9
+    ];
+
+    logical [
+        label="CP Logical Tasks\nCommunication | Attention | Reduction | Publish\nFine-grained, dependent, dynamically ready",
+        fillcolor="#E6F0FA",
+        color="#2F6FA3"
+    ];
+    operators [
+        label="GPU Operator Execution\nCoarse kernel boundaries and bulk phases",
+        fillcolor="#ECEFF1",
+        color="#7A858F"
+    ];
+    mismatch [
+        label="Granularity Mismatch\nTile readiness is hidden behind operator boundaries",
+        fillcolor="#FDEBEC",
+        color="#B5484D",
+        penwidth=2.0
+    ];
+
+    { rank=same; logical; operators; }
+    logical -> mismatch;
+    operators -> mismatch;
+
+    abstraction [
+        label="Shared GPU-Resident Execution Abstraction\nTile-level work discovery + dependency state\nRole-specialized persistent execution + publication semantics",
+        fillcolor="#DCEBFA",
+        color="#2F6FA3",
+        penwidth=2.1
+    ];
+    mismatch -> abstraction [penwidth=2.0];
+
+    megaring [
+        label="MegaRing\nTraining and Full Prefill\nThroughput-oriented",
+        fillcolor="#DDF2E3",
+        color="#2D7D46",
+        penwidth=2.0
+    ];
+    megadcp [
+        label="MegaDCP\nDecode and Chunk-Prefill\nLatency-oriented",
+        fillcolor="#FCE8D5",
+        color="#C56A18",
+        penwidth=2.0
+    ];
+    { rank=same; megaring; megadcp; }
+    abstraction -> megaring [color="#2D7D46"];
+    abstraction -> megadcp [color="#C56A18"];
+
+    ring_policy [
+        label="Persistent Ring Execution\nReadiness-Driven Segment Fusion\nOwner-Directed Backward dKV\nBuddy-Ring Placement",
+        fillcolor="#F2FAF4",
+        color="#2D7D46"
+    ];
+    dcp_policy [
+        label="Heterogeneous DCP Tasks\nDirect Combine-and-Publish\nLoad-Aware Ordering\nCritical-Wave KV Splitting",
+        fillcolor="#FFF5EB",
+        color="#C56A18"
+    ];
+    { rank=same; ring_policy; dcp_policy; }
+    megaring -> ring_policy [color="#2D7D46"];
+    megadcp -> dcp_policy [color="#C56A18"];
+
+    note [
+        shape=note,
+        label="Shared mechanism does not imply\nan identical task graph, queue, or cost model.",
+        fillcolor="#FFFBE6",
+        color="#A08321",
+        fontsize=9
+    ];
+    abstraction -> note [style=dashed, arrowhead=none, color="#A08321", constraint=false];
+}

@@ -1,0 +1,96 @@
+digraph DependencyExecution {
+    graph [
+        rankdir=TB,
+        bgcolor="white",
+        pad=0.20,
+        nodesep=0.34,
+        ranksep=0.50,
+        splines=polyline,
+        compound=true,
+        newrank=true,
+        fontname="DejaVu Sans",
+        fontsize=18,
+        label="From Operator Boundaries to Tile-Level Dependency Execution",
+        labelloc=t
+    ];
+    node [
+        shape=box,
+        style="rounded,filled",
+        fontname="DejaVu Sans",
+        fontsize=10,
+        color="#66727D",
+        penwidth=1.3,
+        margin="0.11,0.08"
+    ];
+    edge [
+        color="#59636E",
+        penwidth=1.4,
+        arrowsize=0.72,
+        fontname="DejaVu Sans",
+        fontsize=8
+    ];
+
+    subgraph cluster_operator {
+        label="Operator-Centric Execution";
+        color="#9AA3AA";
+        penwidth=1.4;
+        style="rounded,dashed";
+        bgcolor="#FAFAFA";
+        fontname="DejaVu Sans";
+        fontsize=13;
+
+        op_comm [label="Communication\nKernel", fillcolor="#ECEFF1"];
+        op_attn [label="Attention\nKernel", fillcolor="#ECEFF1"];
+        op_reduce [label="Reduction / Combine\nKernel", fillcolor="#ECEFF1"];
+        op_publish [label="Communication / Publish\nKernel", fillcolor="#ECEFF1"];
+        { rank=same; op_comm; op_attn; op_reduce; op_publish; }
+        op_comm -> op_attn [label="bulk boundary"];
+        op_attn -> op_reduce [label="HBM partials"];
+        op_reduce -> op_publish [label="bulk boundary"];
+    }
+
+    blocked [
+        shape=note,
+        label="A ready tile cannot advance until\nthe enclosing operator phase completes.",
+        fillcolor="#FDEBEC",
+        color="#B5484D",
+        penwidth=1.5
+    ];
+    op_reduce -> blocked [style=dashed, arrowhead=none, color="#B5484D"];
+
+    subgraph cluster_tile {
+        label="GPU-Resident Tile-Level Execution";
+        color="#2F6FA3";
+        penwidth=1.8;
+        style="rounded";
+        bgcolor="#F7FBFF";
+        fontname="DejaVu Sans";
+        fontsize=13;
+
+        move_a [label="Move\nTile A", fillcolor="#E6F0FA", color="#2F6FA3"];
+        move_b [label="Move\nTile B", fillcolor="#E6F0FA", color="#2F6FA3"];
+        ready_a [shape=ellipse, label="ready A", fillcolor="#FFFBE6", color="#A08321"];
+        ready_b [shape=ellipse, label="ready B", fillcolor="#FFFBE6", color="#A08321"];
+        attn_a [label="Attention\nTile A", fillcolor="#DDF2E3", color="#2D7D46"];
+        attn_b [label="Attention\nTile B", fillcolor="#DDF2E3", color="#2D7D46"];
+        partial_a [shape=cylinder, label="Partial\nO/LSE A", fillcolor="#EEE6F7", color="#77569B"];
+        partial_b [shape=cylinder, label="Partial\nO/LSE B", fillcolor="#EEE6F7", color="#77569B"];
+        combine [label="Ready Combine\nTask", fillcolor="#EEE6F7", color="#77569B"];
+        publish [shape=ellipse, label="publish / complete", fillcolor="#FFFBE6", color="#A08321"];
+
+        { rank=same; move_a; ready_a; attn_a; partial_a; }
+        { rank=same; move_b; ready_b; attn_b; partial_b; }
+
+        move_a -> ready_a [label="release"];
+        ready_a -> attn_a [label="acquire + claim"];
+        attn_a -> partial_a;
+        move_b -> ready_b [label="release"];
+        ready_b -> attn_b [label="acquire + claim"];
+        attn_b -> partial_b;
+        partial_a -> combine;
+        partial_b -> combine;
+        combine -> publish [label="release"];
+    }
+
+    blocked -> move_a [style=invis, weight=8];
+}

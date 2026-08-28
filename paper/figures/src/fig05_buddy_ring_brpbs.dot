@@ -1,0 +1,158 @@
+digraph BuddyRingBRPBS {
+    graph [
+        rankdir=LR,
+        bgcolor="white",
+        pad=0.20,
+        nodesep=0.28,
+        ranksep=0.46,
+        splines=polyline,
+        compound=true,
+        newrank=true,
+        fontname="DejaVu Sans",
+        fontsize=18,
+        label="Buddy-Ring Topology and Pareto Beam Placement",
+        labelloc=t
+    ];
+    node [
+        shape=box,
+        style="rounded,filled",
+        fontname="DejaVu Sans",
+        fontsize=9,
+        color="#53606C",
+        penwidth=1.25,
+        margin="0.10,0.07"
+    ];
+    edge [
+        color="#53606C",
+        penwidth=1.25,
+        arrowsize=0.66,
+        fontname="DejaVu Sans",
+        fontsize=7.5
+    ];
+
+    subgraph cluster_tree {
+        label="Aligned Buddy Topology (W = 8)";
+        color="#2D7D46";
+        penwidth=1.7;
+        style="rounded";
+        bgcolor="#F8FCF9";
+        fontname="DejaVu Sans";
+        fontsize=12;
+
+        g8 [label="G8\n[0..7]", fillcolor="#BFE3C9", color="#2D7D46"];
+        g4a [label="G4\n[0..3]", fillcolor="#DDF2E3", color="#2D7D46"];
+        g4b [label="G4\n[4..7]", fillcolor="#DDF2E3", color="#2D7D46"];
+        g2a [label="G2\n[0,1]", fillcolor="#EAF7ED", color="#2D7D46"];
+        g2b [label="G2\n[2,3]", fillcolor="#EAF7ED", color="#2D7D46"];
+        g2c [label="G2\n[4,5]", fillcolor="#EAF7ED", color="#2D7D46"];
+        g2d [label="G2\n[6,7]", fillcolor="#EAF7ED", color="#2D7D46"];
+        g1a [label="G1\n0", fillcolor="#F5FBF6", color="#2D7D46"];
+        g1b [label="G1\n1", fillcolor="#F5FBF6", color="#2D7D46"];
+        g1c [label="G1\n2", fillcolor="#F5FBF6", color="#2D7D46"];
+        g1d [label="G1\n3", fillcolor="#F5FBF6", color="#2D7D46"];
+        g1e [label="G1\n4", fillcolor="#F5FBF6", color="#2D7D46"];
+        g1f [label="G1\n5", fillcolor="#F5FBF6", color="#2D7D46"];
+        g1g [label="G1\n6", fillcolor="#F5FBF6", color="#2D7D46"];
+        g1h [label="G1\n7", fillcolor="#F5FBF6", color="#2D7D46"];
+
+        { rank=same; g8; }
+        { rank=same; g4a; g4b; }
+        { rank=same; g2a; g2b; g2c; g2d; }
+        { rank=same; g1a; g1b; g1c; g1d; g1e; g1f; g1g; g1h; }
+
+        g8 -> g4a [arrowhead=none];
+        g8 -> g4b [arrowhead=none];
+        g4a -> g2a [arrowhead=none];
+        g4a -> g2b [arrowhead=none];
+        g4b -> g2c [arrowhead=none];
+        g4b -> g2d [arrowhead=none];
+        g2a -> g1a [arrowhead=none];
+        g2a -> g1b [arrowhead=none];
+        g2b -> g1c [arrowhead=none];
+        g2b -> g1d [arrowhead=none];
+        g2c -> g1e [arrowhead=none];
+        g2c -> g1f [arrowhead=none];
+        g2d -> g1g [arrowhead=none];
+        g2d -> g1h [arrowhead=none];
+    }
+
+    subgraph cluster_search {
+        label="BR-PBS Search Pipeline";
+        color="#2F6FA3";
+        penwidth=1.7;
+        style="rounded";
+        bgcolor="#F7FBFF";
+        fontname="DejaVu Sans";
+        fontsize=12;
+
+        lengths [
+            shape=cylinder,
+            label="Packed Sequence\nLengths",
+            fillcolor="#E6F0FA",
+            color="#2F6FA3"
+        ];
+        legal [
+            label="Hard-Legal Candidates\nAlignment + buddy locations",
+            fillcolor="#E6F0FA",
+            color="#2F6FA3"
+        ];
+        model [
+            label="Dual-Load Proxy\nTokens + attention work\nToken-hop tie-break",
+            fillcolor="#E6F0FA",
+            color="#2F6FA3"
+        ];
+        jobs [
+            label="Core / Filler Split\nStructural jobs first",
+            fillcolor="#DDF2E3",
+            color="#2D7D46"
+        ];
+        beam [
+            label="Pareto Beam\nDominance + 2% quantization\nDiversity anchors",
+            fillcolor="#DDF2E3",
+            color="#2D7D46"
+        ];
+        fill [
+            label="Residual G1 Fill",
+            fillcolor="#F2FAF4",
+            color="#2D7D46"
+        ];
+        relax [
+            label="Progressive Relaxation\nLong to short; G2 to G8",
+            fillcolor="#FFFBE6",
+            color="#A08321"
+        ];
+        repair [
+            label="Local Repair\nMove | swap | promote | demote",
+            fillcolor="#EEE6F7",
+            color="#77569B"
+        ];
+        output [
+            shape=cylinder,
+            label="Kernel-Compatible Placement\n(G, S) + sorted batch",
+            fillcolor="#BFE3C9",
+            color="#2D7D46",
+            penwidth=1.7
+        ];
+
+        lengths -> legal -> model -> jobs -> beam -> fill -> repair -> output;
+        fill -> relax [label="if infeasible", color="#A08321"];
+        relax -> beam [label="unlock", color="#A08321"];
+    }
+
+    g8 -> legal [
+        label="finite candidate space",
+        style=dashed,
+        color="#2F6FA3",
+        ltail=cluster_tree,
+        lhead=cluster_search
+    ];
+
+    policy [
+        shape=note,
+        label="Lexicographic policy:\nfeasibility -> protect short sequences\n-> communication -> fragmentation -> residual balance",
+        fillcolor="#FFFBE6",
+        color="#A08321",
+        fontsize=8.3
+    ];
+    beam -> policy [style=dashed, arrowhead=none, color="#A08321", constraint=false];
+}

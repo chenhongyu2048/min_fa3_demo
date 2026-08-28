@@ -1,0 +1,133 @@
+digraph MegaRingForward {
+    graph [
+        rankdir=TB,
+        bgcolor="white",
+        pad=0.20,
+        nodesep=0.38,
+        ranksep=0.58,
+        splines=polyline,
+        compound=true,
+        newrank=true,
+        fontname="DejaVu Sans",
+        fontsize=18,
+        label="MegaRing Forward: Readiness-Driven Persistent Ring Execution",
+        labelloc=t
+    ];
+    node [
+        shape=box,
+        style="rounded,filled",
+        fontname="DejaVu Sans",
+        fontsize=9.5,
+        color="#53606C",
+        penwidth=1.3,
+        margin="0.11,0.08"
+    ];
+    edge [
+        color="#53606C",
+        penwidth=1.35,
+        arrowsize=0.70,
+        fontname="DejaVu Sans",
+        fontsize=8
+    ];
+
+    peer [
+        shape=cylinder,
+        label="Peer Rank-Major\nK/V Arena",
+        fillcolor="#E6F0FA",
+        color="#2F6FA3"
+    ];
+
+    subgraph cluster_persistent {
+        label="One Persistent Grid";
+        color="#2D7D46";
+        penwidth=1.8;
+        style="rounded";
+        bgcolor="#F8FCF9";
+        fontname="DejaVu Sans";
+        fontsize=13;
+
+        comm [
+            label="Communication CTA\n16-row peer TMA subtiles\nK/V logical-tile assembly",
+            fillcolor="#DCEBFA",
+            color="#2F6FA3"
+        ];
+        local [
+            shape=cylinder,
+            label="Local Rank-Major\nK/V Arena",
+            fillcolor="#E6F0FA",
+            color="#2F6FA3"
+        ];
+        kvready [
+            shape=ellipse,
+            label="kv_ready\nGPU-scope release",
+            fillcolor="#FFFBE6",
+            color="#A08321"
+        ];
+        compute [
+            label="Compute CTA\nPersistent FA3 worker",
+            fillcolor="#DDF2E3",
+            color="#2D7D46"
+        ];
+        scan [
+            label="Readiness Scan\nLongest contiguous\nready step span",
+            fillcolor="#F2FAF4",
+            color="#2D7D46"
+        ];
+        state [
+            shape=ellipse,
+            label="Per-Q-Tile State\nnext_step | BUSY",
+            fillcolor="#FFFBE6",
+            color="#A08321"
+        ];
+        segment [
+            label="CAS Segment Claim\nVirtual K/V sequence",
+            fillcolor="#DDF2E3",
+            color="#2D7D46"
+        ];
+        merge [
+            label="One FA3 Mainloop\n+ Online O/LSE Merge",
+            fillcolor="#EEE6F7",
+            color="#77569B"
+        ];
+        output [
+            shape=cylinder,
+            label="Running O / FP32 LSE",
+            fillcolor="#EEE6F7",
+            color="#77569B"
+        ];
+
+        { rank=same; comm; local; kvready; }
+        { rank=same; state; scan; segment; }
+        { rank=same; compute; merge; output; }
+
+        comm -> local [label="store complete"];
+        local -> kvready [label="release"];
+        kvready -> scan [label="acquire"];
+        state -> scan [label="next step"];
+        scan -> segment [label="CAS"];
+        segment -> compute [label="work"];
+        local -> compute [label="local TMA read"];
+        compute -> merge;
+        output -> merge [label="prior state"];
+        merge -> output [label="updated state"];
+        merge -> state [label="release end + 1"];
+    }
+
+    peer -> comm [label="peer TMA load", color="#2F6FA3"];
+    comm -> compute [
+        label="role reuse after ingress",
+        style=dashed,
+        color="#2D7D46",
+        penwidth=1.6,
+        constraint=false
+    ];
+
+    note [
+        shape=note,
+        label="Segment fusion reduces claims, Q reloads,\nand intermediate O/LSE merges.\nIt does not reduce attention FLOPs.",
+        fillcolor="#FFFBE6",
+        color="#A08321",
+        fontsize=8.5
+    ];
+    merge -> note [style=dashed, arrowhead=none, color="#A08321", constraint=false];
+}

@@ -1,0 +1,153 @@
+digraph CriticalWave {
+    graph [
+        rankdir=TB,
+        bgcolor="white",
+        pad=0.22,
+        nodesep=0.32,
+        ranksep=0.48,
+        splines=ortho,
+        newrank=true,
+        fontname="DejaVu Sans",
+        fontsize=18,
+        label="Critical-Wave-Guided KV Splitting",
+        labelloc=t
+    ];
+    node [
+        shape=box,
+        style="rounded,filled",
+        fontname="DejaVu Sans",
+        fontsize=9.3,
+        color="#53606C",
+        penwidth=1.3,
+        margin="0.10,0.07"
+    ];
+    edge [
+        color="#53606C",
+        penwidth=1.3,
+        arrowsize=0.68,
+        fontname="DejaVu Sans",
+        fontsize=8
+    ];
+
+    subgraph cluster_nosplit {
+        label="NoSplit: Long Critical Task";
+        color="#9AA3AA";
+        penwidth=1.4;
+        style="rounded";
+        bgcolor="#FAFAFA";
+        fontname="DejaVu Sans";
+        fontsize=12;
+
+        no_table [
+            shape=plain,
+            label=<
+                <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6" COLOR="#7A858F">
+                    <TR><TD BGCOLOR="#ECEFF1">CTA 0</TD><TD BGCOLOR="#FCE8D5">A</TD><TD BGCOLOR="#FCE8D5">A</TD><TD BGCOLOR="#FCE8D5">A</TD><TD BGCOLOR="#FCE8D5">A</TD></TR>
+                    <TR><TD BGCOLOR="#ECEFF1">CTA 1</TD><TD BGCOLOR="#FCE8D5">B</TD><TD BGCOLOR="#FCE8D5">B</TD><TD BGCOLOR="#FFFFFF">idle</TD><TD BGCOLOR="#FFFFFF">idle</TD></TR>
+                    <TR><TD BGCOLOR="#ECEFF1">CTA 2</TD><TD BGCOLOR="#FCE8D5">C</TD><TD BGCOLOR="#FFFFFF">idle</TD><TD BGCOLOR="#FFFFFF">idle</TD><TD BGCOLOR="#FFFFFF">idle</TD></TR>
+                </TABLE>
+            >
+        ];
+        no_tail [
+            label="Attention tail dominates\nLow final-wave utilization",
+            fillcolor="#FDEBEC",
+            color="#B5484D"
+        ];
+        no_table -> no_tail;
+    }
+
+    subgraph cluster_over {
+        label="OverSplit: Parallel Attention, Excess Combine";
+        color="#9AA3AA";
+        penwidth=1.4;
+        style="rounded";
+        bgcolor="#FAFAFA";
+        fontname="DejaVu Sans";
+        fontsize=12;
+
+        over_table [
+            shape=plain,
+            label=<
+                <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6" COLOR="#7A858F">
+                    <TR><TD BGCOLOR="#ECEFF1">CTA 0</TD><TD BGCOLOR="#FCE8D5">A1</TD><TD BGCOLOR="#FCE8D5">B1</TD><TD BGCOLOR="#EEE6F7">merge</TD><TD BGCOLOR="#EEE6F7">merge</TD></TR>
+                    <TR><TD BGCOLOR="#ECEFF1">CTA 1</TD><TD BGCOLOR="#FCE8D5">A2</TD><TD BGCOLOR="#FCE8D5">B2</TD><TD BGCOLOR="#EEE6F7">merge</TD><TD BGCOLOR="#EEE6F7">merge</TD></TR>
+                    <TR><TD BGCOLOR="#ECEFF1">CTA 2</TD><TD BGCOLOR="#FCE8D5">A3</TD><TD BGCOLOR="#FCE8D5">C1</TD><TD BGCOLOR="#EEE6F7">merge</TD><TD BGCOLOR="#EEE6F7">merge</TD></TR>
+                </TABLE>
+            >
+        ];
+        over_tail [
+            label="More descriptors and partial O/LSE\nCombine tail erases attention gain",
+            fillcolor="#FDEBEC",
+            color="#B5484D"
+        ];
+        over_table -> over_tail;
+    }
+
+    subgraph cluster_selected {
+        label="Critical-Wave: Split Only What Shortens the Tail";
+        color="#C56A18";
+        penwidth=1.9;
+        style="rounded";
+        bgcolor="#FFF9F3";
+        fontname="DejaVu Sans";
+        fontsize=12;
+
+        selected_table [
+            shape=plain,
+            label=<
+                <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6" COLOR="#C56A18">
+                    <TR><TD BGCOLOR="#FCE8D5">CTA 0</TD><TD BGCOLOR="#FCE8D5">A1</TD><TD BGCOLOR="#FCE8D5">B</TD><TD BGCOLOR="#EEE6F7">merge</TD></TR>
+                    <TR><TD BGCOLOR="#FCE8D5">CTA 1</TD><TD BGCOLOR="#FCE8D5">A2</TD><TD BGCOLOR="#FCE8D5">C</TD><TD BGCOLOR="#EEE6F7">merge</TD></TR>
+                    <TR><TD BGCOLOR="#FCE8D5">CTA 2</TD><TD BGCOLOR="#FCE8D5">A3</TD><TD BGCOLOR="#FCE8D5">A4</TD><TD BGCOLOR="#EEE6F7">merge</TD></TR>
+                </TABLE>
+            >
+        ];
+        selected_tail [
+            label="Balanced final attention wave\nBounded combine work",
+            fillcolor="#DDF2E3",
+            color="#2D7D46"
+        ];
+        selected_table -> selected_tail;
+    }
+
+    { rank=same; no_table; over_table; selected_table; }
+    { rank=same; no_tail; over_tail; selected_tail; }
+
+    model [
+        label="Dependency-Aware Score\nmax(attention makespan, latest combine finish)",
+        fillcolor="#E6F0FA",
+        color="#2F6FA3",
+        penwidth=1.7
+    ];
+    candidates [
+        label="Candidates\nNoSplit | iterative critical split | FA3 native",
+        fillcolor="#E6F0FA",
+        color="#2F6FA3"
+    ];
+    order [
+        label="Release-Aware Ordering\nQ unlock priority + LPT within an epoch",
+        fillcolor="#FFFBE6",
+        color="#A08321"
+    ];
+    choose [
+        label="Accept Only Strict Score Improvement\nPrefer fewer tasks and smaller splits on ties",
+        fillcolor="#DDF2E3",
+        color="#2D7D46",
+        penwidth=1.7
+    ];
+
+    candidates -> order -> model -> choose;
+    no_tail -> candidates [style=dashed];
+    over_tail -> model [style=dashed];
+    choose -> selected_tail [color="#2D7D46", penwidth=1.7];
+
+    legend [
+        shape=plain,
+        label=<
+            <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" COLOR="#9AA3AA">
+                <TR><TD BGCOLOR="#FCE8D5">attention</TD><TD BGCOLOR="#EEE6F7">combine</TD><TD BGCOLOR="#FFFFFF">idle</TD></TR>
+            </TABLE>
+        >
+    ];
+    choose -> legend [style=invis];
+}

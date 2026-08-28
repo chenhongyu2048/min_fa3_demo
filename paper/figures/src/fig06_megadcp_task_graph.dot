@@ -1,0 +1,179 @@
+digraph MegaDCPTaskGraph {
+    graph [
+        rankdir=TB,
+        bgcolor="white",
+        pad=0.22,
+        nodesep=0.42,
+        ranksep=0.48,
+        splines=polyline,
+        compound=true,
+        newrank=true,
+        fontname="DejaVu Sans",
+        fontsize=18,
+        label="MegaDCP: Heterogeneous GPU-Resident DCP Task Graph",
+        labelloc=t
+    ];
+    node [
+        shape=box,
+        style="rounded,filled",
+        fontname="DejaVu Sans",
+        fontsize=9.5,
+        color="#53606C",
+        penwidth=1.3,
+        margin="0.11,0.08"
+    ];
+    edge [
+        color="#53606C",
+        penwidth=1.35,
+        arrowsize=0.70,
+        fontname="DejaVu Sans",
+        fontsize=8
+    ];
+
+    qgather [
+        label="Communication CTA\nQ All-Gather\n16-token tasks",
+        fillcolor="#DCEBFA",
+        color="#2F6FA3"
+    ];
+    qready [
+        shape=ellipse,
+        label="q_ready\nrelease / acquire",
+        fillcolor="#FFFBE6",
+        color="#A08321"
+    ];
+    history [
+        label="Compute CTA\nHistory Attention\nGathered Q x local history K/V",
+        fillcolor="#FCE8D5",
+        color="#C56A18"
+    ];
+    hdone [
+        shape=ellipse,
+        label="history attention_done",
+        fillcolor="#FFFBE6",
+        color="#A08321"
+    ];
+    combine [
+        label="History Combine\nCompute CTAs drain the queue\nCommunication CTAs may help",
+        fillcolor="#EEE6F7",
+        color="#77569B"
+    ];
+    publish [
+        label="Direct Publish\nStable split O/LSE merge\n+ TMA store + ready release",
+        fillcolor="#EEE6F7",
+        color="#77569B",
+        penwidth=1.7
+    ];
+
+    localready [
+        shape=ellipse,
+        label="local publish_ready",
+        fillcolor="#FFFBE6",
+        color="#A08321"
+    ];
+    tileready [
+        shape=ellipse,
+        label="remote tile_ready\nsystem-scope release",
+        fillcolor="#FFFBE6",
+        color="#A08321"
+    ];
+    receive [
+        label="Communication CTA\nRemote History Receive\nRemote TMA load -> local workspace",
+        fillcolor="#DCEBFA",
+        color="#2F6FA3"
+    ];
+    rready [
+        shape=ellipse,
+        label="receive_ready\nrelease / acquire",
+        fillcolor="#FFFBE6",
+        color="#A08321"
+    ];
+
+    chunk [
+        label="Compute CTA\nChunk Attention\nLocal causal Q/K/V",
+        fillcolor="#FCE8D5",
+        color="#C56A18"
+    ];
+    cdone [
+        shape=ellipse,
+        label="chunk attention_done",
+        fillcolor="#FFFBE6",
+        color="#A08321"
+    ];
+    final [
+        label="Compute CTA\nFinal Combine\nChunk + local history + remote history",
+        fillcolor="#EEE6F7",
+        color="#77569B",
+        penwidth=1.8
+    ];
+    output [
+        shape=cylinder,
+        label="Final BF16 O\n+ FP32 LSE",
+        fillcolor="#DDF2E3",
+        color="#2D7D46"
+    ];
+
+    qgather -> qready -> history -> hdone -> combine -> publish;
+    publish -> localready [label="local destination"];
+    publish -> tileready [label="remote destination"];
+    tileready -> receive [label="system-scope acquire"];
+    receive -> rready [label="local store complete"];
+
+    chunk -> cdone;
+    cdone -> final [label="local chunk"];
+    localready -> final [label="local history"];
+    rready -> final [label="remote history"];
+    final -> output;
+
+    { rank=same; qgather; chunk; }
+    { rank=same; qready; cdone; }
+    { rank=same; localready; tileready; }
+
+    policy [
+        shape=diamond,
+        label="Post-Q Policy",
+        fillcolor="#E6F0FA",
+        color="#2F6FA3",
+        margin="0.07,0.04"
+    ];
+    policy -> receive [
+        label="ready receive first",
+        color="#2F6FA3",
+        style=dashed,
+        constraint=false
+    ];
+    policy -> combine [
+        label="otherwise help a ready combine",
+        color="#77569B",
+        style=dashed,
+        constraint=false
+    ];
+    qgather -> policy [
+        style=dashed,
+        color="#2F6FA3",
+        constraint=false
+    ];
+
+    note [
+        shape=note,
+        label="History combine and publish form one task.\nThere is no separate publish pass.",
+        fillcolor="#FFFBE6",
+        color="#A08321",
+        fontsize=8.5
+    ];
+    publish -> note [style=dashed, arrowhead=none, color="#A08321", constraint=false];
+
+    legend [
+        shape=plain,
+        label=<
+            <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" COLOR="#9AA3AA">
+                <TR>
+                    <TD BGCOLOR="#DCEBFA">communication CTA</TD>
+                    <TD BGCOLOR="#FCE8D5">attention</TD>
+                    <TD BGCOLOR="#EEE6F7">combine / publish</TD>
+                    <TD BGCOLOR="#FFFBE6">dependency state</TD>
+                </TR>
+            </TABLE>
+        >
+    ];
+    output -> legend [style=invis];
+}
