@@ -14,7 +14,12 @@ from allgather_attention import (
     _local_forward,
 )
 from hybrid_forward_baselines import create_zeppelin_process_groups
-from ring_common import RingComm, get_half_index, zigzag_ring_varlen_forward
+from ring_common import (
+    RingComm,
+    get_half_index,
+    selector_to_row_indices,
+    zigzag_ring_varlen_forward,
+)
 from zeppelin import ZeppelinPlan, zeppelin_note
 
 
@@ -286,6 +291,20 @@ class VarlenAllGatherBackward(_BlockBackend):
             f"({self.heads_k_stride} KVH/chunk, comm/compute overlap); "
             f"{self.backend_name}; zigzag causal"
         )
+
+    def bind_inputs(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> None:
+        """Bind projected Q/K/V while retaining all preallocated workspaces."""
+        if q.shape != self.q.shape or k.shape != self.k.shape or v.shape != self.v.shape:
+            raise ValueError("rebound Q/K/V shapes must match runner construction")
+        if q.dtype != self.q.dtype or k.dtype != self.k.dtype or v.dtype != self.v.dtype:
+            raise ValueError("rebound Q/K/V dtypes must match runner construction")
+        if q.device != self.q.device or k.device != self.k.device or v.device != self.v.device:
+            raise ValueError("rebound Q/K/V devices must match runner construction")
+        if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+            raise ValueError("rebound Q/K/V tensors must be contiguous")
+        self.q, self.k, self.v = q, k, v
 
     def _q_head_slice(self, kv_head_start: int) -> slice:
         q_head_start = kv_head_start * self.q_heads_per_kv_head
@@ -587,8 +606,12 @@ class VarlenFa3RingBackward(_BlockBackend):
         self.cu, self.cu_host = make_cu_seqlens(local_lengths, q.device)
         self.half_cu = self.cu // 2
         self.half_max = self.max_local // 2
-        self.front_index = get_half_index(self.cu, front=True)
-        self.back_index = get_half_index(self.cu, front=False)
+        self.front_index = selector_to_row_indices(
+            get_half_index(self.cu, front=True), q.size(0), q.device
+        )
+        self.back_index = selector_to_row_indices(
+            get_half_index(self.cu, front=False), q.size(0), q.device
+        )
         self.q_back = q[self.back_index].contiguous()
         self.dout_back = dout[self.back_index].contiguous()
         self.k_ring = [torch.empty_like(k), torch.empty_like(k)]
@@ -608,7 +631,34 @@ class VarlenFa3RingBackward(_BlockBackend):
     def note(self) -> str:
         return f"NCCL zigzag ring; {self.backend_name} block backward"
 
+    def bind_inputs(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dout: torch.Tensor | None = None,
+    ) -> None:
+        """Bind projected tensors without rebuilding ring scratch storage."""
+        tensors = ((q, self.q, "Q"), (k, self.k, "K"), (v, self.v, "V"))
+        for tensor, previous, name in tensors:
+            if tensor.shape != previous.shape:
+                raise ValueError(f"rebound {name} shape must match runner construction")
+            if tensor.dtype != previous.dtype or tensor.device != previous.device:
+                raise ValueError(f"rebound {name} dtype/device must match runner construction")
+            if not tensor.is_contiguous():
+                raise ValueError(f"rebound {name} must be contiguous")
+        if dout is not None:
+            if dout.shape != self.dout.shape:
+                raise ValueError("rebound dO shape must match runner construction")
+            if dout.dtype != self.dout.dtype or dout.device != self.dout.device:
+                raise ValueError("rebound dO dtype/device must match runner construction")
+            if not dout.is_contiguous():
+                raise ValueError("rebound dO must be contiguous")
+            self.dout = dout
+        self.q, self.k, self.v = q, k, v
+
     def forward(self) -> torch.Tensor:
+        torch.index_select(self.q, 0, self.back_index, out=self.q_back)
         result = zigzag_ring_varlen_forward(
             self.process_group,
             self.q,
@@ -663,6 +713,7 @@ class VarlenFa3RingBackward(_BlockBackend):
             raise RuntimeError("FA3 ring backward requires a prepared forward")
         if self.out_back is None or self.lse_back is None:
             raise RuntimeError("FA3 ring backward is missing back-half state")
+        torch.index_select(self.dout, 0, self.back_index, out=self.dout_back)
         kv_comm = RingComm(self.process_group, self.ring_members)
         dkv_comm = RingComm(self.process_group, self.ring_members)
         cur_k, cur_v = self.k, self.v
@@ -838,6 +889,39 @@ class ZeppelinBackward(_BlockBackend):
     @property
     def note(self) -> str:
         return zeppelin_note(self.plan, self.backend_name)
+
+    def bind_inputs(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dout: torch.Tensor | None = None,
+    ) -> None:
+        """Bind a new packed Zeppelin input to this plan and its child rings."""
+        tensors = ((q, self.q, "Q"), (k, self.k, "K"), (v, self.v, "V"))
+        for tensor, previous, name in tensors:
+            if tensor.shape != previous.shape:
+                raise ValueError(f"rebound {name} shape must match runner construction")
+            if tensor.dtype != previous.dtype or tensor.device != previous.device:
+                raise ValueError(f"rebound {name} dtype/device must match runner construction")
+            if not tensor.is_contiguous():
+                raise ValueError(f"rebound {name} must be contiguous")
+        if dout is not None:
+            if dout.shape != self.dout.shape:
+                raise ValueError("rebound dO shape must match runner construction")
+            if dout.dtype != self.dout.dtype or dout.device != self.dout.device:
+                raise ValueError("rebound dO dtype/device must match runner construction")
+            if not dout.is_contiguous():
+                raise ValueError("rebound dO must be contiguous")
+            self.dout = dout
+        self.q, self.k, self.v = q, k, v
+        for begin, end, runner in self.ring_runners:
+            runner.bind_inputs(
+                q[begin:end],
+                k[begin:end],
+                v[begin:end],
+                self.dout[begin:end],
+            )
 
     def forward(self) -> torch.Tensor:
         dist.barrier(group=self.process_group)

@@ -122,6 +122,15 @@ class _LocalSampleRunner:
         self.dk = torch.empty_like(k)
         self.dv = torch.empty_like(v)
 
+    def bind_inputs(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dout: Optional[torch.Tensor],
+    ) -> None:
+        self.q, self.k, self.v, self.dout = q, k, v, dout
+
     def forward(self) -> tuple[torch.Tensor, torch.Tensor]:
         self.out, self.lse = self.backend.forward_block(
             self.q,
@@ -247,6 +256,17 @@ class _RingBackwardSampleRunner:
 
     def backward(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.runner.backward()
+
+    def bind_inputs(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dout: Optional[torch.Tensor],
+    ) -> None:
+        if dout is None:
+            raise ValueError("ring backward runner requires dO")
+        self.runner.bind_inputs(q, k, v, dout)
 
 
 class MegatronHybridCPAttention:
@@ -396,6 +416,41 @@ class MegatronHybridCPAttention:
             f"Megatron scheduler; {self.plan.num_execution_groups} execution groups; "
             f"P2P ring; {backend_name}; forward-order phase replay"
         )
+
+    def bind_inputs(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dout: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Bind a projected packed input while preserving the compiled schedule."""
+        tensors = ((q, self.q, "Q"), (k, self.k, "K"), (v, self.v, "V"))
+        for tensor, previous, name in tensors:
+            if tensor.shape != previous.shape:
+                raise ValueError(f"rebound {name} shape must match runner construction")
+            if tensor.dtype != previous.dtype or tensor.device != previous.device:
+                raise ValueError(f"rebound {name} dtype/device must match runner construction")
+            if not tensor.is_contiguous():
+                raise ValueError(f"rebound {name} must be contiguous")
+        if dout is not None:
+            if self.dout is None or dout.shape != self.dout.shape:
+                raise ValueError("rebound dO shape must match backward runner construction")
+            if dout.dtype != self.dout.dtype or dout.device != self.dout.device:
+                raise ValueError("rebound dO dtype/device must match runner construction")
+            if not dout.is_contiguous():
+                raise ValueError("rebound dO must be contiguous")
+            self.dout = dout
+        self.q, self.k, self.v = q, k, v
+        for sample_id in self.sample_ids:
+            token_slice = self.sample_slices[sample_id]
+            runner = self._runners[sample_id]
+            runner.bind_inputs(  # type: ignore[attr-defined]
+                q[token_slice],
+                k[token_slice],
+                v[token_slice],
+                None if self.dout is None else self.dout[token_slice],
+            )
 
     def _barrier_after_group(self, group_index: int) -> None:
         if _needs_inter_group_barrier(

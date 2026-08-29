@@ -111,6 +111,23 @@ def get_half_index(cu_seqlens: torch.Tensor, *, front: bool):
     return index
 
 
+def selector_to_row_indices(
+    selector: slice | torch.Tensor,
+    total_tokens: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Materialize a half selector once as int64 rows for reusable out= gathers."""
+    if isinstance(selector, slice):
+        return torch.arange(
+            total_tokens, dtype=torch.int64, device=device
+        )[selector].contiguous()
+    if selector.dtype == torch.bool:
+        return torch.nonzero(selector, as_tuple=False).flatten().contiguous()
+    if selector.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"half selector must be slice/bool/integer, got {selector.dtype}")
+    return selector.to(device=device, dtype=torch.int64).contiguous()
+
+
 def normalize_lse(block_lse: torch.Tensor, total_q: int, num_heads: int) -> torch.Tensor:
     """Normalize backend-specific LSE layouts to [heads, total_q].
 

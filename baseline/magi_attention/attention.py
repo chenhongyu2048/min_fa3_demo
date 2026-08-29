@@ -303,3 +303,61 @@ class MagiAttentionBaseline:
             raise RuntimeError("MagiAttention backward did not produce all Q/K/V gradients")
         self._out = None
         return dq, dk, dv
+
+
+class MagiProjectedAttention:
+    """Magi runtime prepared once for Q/K/V produced by an enclosing layer."""
+
+    def __init__(
+        self,
+        process_group: dist.ProcessGroup,
+        global_lengths: Sequence[int],
+        q_heads: int,
+        kv_heads: int,
+        head_dim: int,
+        is_causal: bool,
+        device: torch.device,
+        *,
+        config: MagiAttentionConfig = MagiAttentionConfig(),
+    ) -> None:
+        self.metadata = build_magi_attention_metadata(
+            process_group,
+            global_lengths,
+            q_heads,
+            kv_heads,
+            head_dim,
+            is_causal,
+            config=config,
+        )
+        api = _load_magi_api()
+        self._key = self.metadata.key
+        self._calc_attn = api.calc_attn
+
+        # Dispatch is layout preparation, so only a narrow stub is needed to
+        # discover the rank-local padded token count before layer timing.
+        global_stub = torch.empty(
+            (sum(global_lengths), 1), dtype=torch.bfloat16, device=device
+        )
+        local_stub = api.dispatch(global_stub, self._key)
+        self.local_tokens = int(local_stub.size(0))
+        del local_stub, global_stub
+
+    @property
+    def note(self) -> str:
+        return (
+            f"chunk_size={self.metadata.chunk_size}, "
+            f"tokens(original/padded)={self.metadata.original_tokens}/"
+            f"{self.metadata.padded_tokens}, "
+            f"overlap_degree={self.metadata.overlap_degree}; dispatch excluded; "
+            "native autograd; performance-only"
+        )
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        if q.size(0) != self.local_tokens:
+            raise ValueError(
+                f"Magi projected Q has {q.size(0)} tokens, expected {self.local_tokens}"
+            )
+        out, _meta = self._calc_attn(q, k, v, self._key)
+        return out

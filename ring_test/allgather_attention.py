@@ -1180,6 +1180,20 @@ class Llama3AllGatherAttention:
             f"({self.heads_k_stride} KVH/chunk, comm/compute overlap); {backend}; {mode}"
         )
 
+    def bind_inputs(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> None:
+        """Bind projected Q/K/V while retaining preallocated communication buffers."""
+        tensors = ((q, self.q, "Q"), (k, self.k, "K"), (v, self.v, "V"))
+        for tensor, previous, name in tensors:
+            if tensor.shape != previous.shape:
+                raise ValueError(f"rebound {name} shape must match runner construction")
+            if tensor.dtype != previous.dtype or tensor.device != previous.device:
+                raise ValueError(f"rebound {name} dtype/device must match runner construction")
+            if not tensor.is_contiguous():
+                raise ValueError(f"rebound {name} must be contiguous")
+        self.q, self.k, self.v = q, k, v
+
     def _q_head_slice(self, kv_head_start: int) -> slice:
         q_head_start = kv_head_start * self.q_heads_per_kv_head
         return slice(q_head_start, q_head_start + self.q_heads_per_chunk)

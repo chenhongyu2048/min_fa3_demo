@@ -437,6 +437,7 @@ the import path.
 | --- | --- |
 | `benchmark_uniform.sh` | Fixed-total-token uniform matrix with one reusable `torchrun` per selected direction |
 | `benchmark_dataset.sh` | Recommended dataset-shaped forward/backward benchmark wrapper for 2, 4, or 8 GPUs |
+| `benchmark_transformer_layer.sh` | CP=8 single Megatron Transformer-layer forward+backward benchmark over all eight CP methods |
 | `benchmark_dataset_kvh_matrix.sh` | Causal 128K five-dataset, KVH 1/2/4, eight-method forward/backward matrix with one `torchrun` per direction/KVH/dataset |
 | `scripts/test_dcp/benchmark_dcp_mega_trace.sh` | Generate `NUM_CASES` trace snapshots, then run eager Mega/baselines and graph baselines in separate 8-rank launches |
 | `benchmark_dcp_mega_arrival_matrix.sh` | Run the 3-arrival x 3-DCP trace matrix with one eager Mega comm-SM sweep plus eager/graph baselines per combination |
@@ -658,6 +659,103 @@ Hierarchical mega-ring notes:
 - The full scheduler, readiness, owner-completion, and zero-rank contracts are documented in `docs/HIERARCHICAL_HYBRID_MEGA_RING_BACKWARD_DESIGN.md`.
 
 ## Benchmark
+
+### Single Megatron Transformer layer with CP=8
+
+`benchmark_transformer_layer.sh` measures one complete Llama-3-8B-style
+Megatron-Core Transformer layer, including BF16 RMSNorm, GQA QKV and output
+projections, residual/BDA work, and the SwiGLU MLP. The attention core is
+selected from the existing eight-method suite:
+
+```text
+allgather_attention, llama3_allgather_attention, fa3_ring,
+megatron_hybrid_cp, magi_attention, zeppelin,
+mega_ring_all_cp, mega_ring_hybrid
+```
+
+The fixed parallel configuration is CP=8, TP=1, PP=1, DP=1. The layer uses
+hidden size 4096, QH=32, KVH=8, head dim 128, FFN size 14336, no bias, no
+dropout, and no RoPE. Parameter gradients and input hidden-state gradients are
+computed, but the benchmark does not build an optimizer, synchronize parameter
+gradients, update weights, or run embeddings and an LM head. Transformer Engine
+is required for every non-attention Megatron module. MagiAttention is mandatory
+when `magi_attention` is selected; a formal `METHODS=all` run fails collectively
+during preflight if it is absent. The block baselines prefer external FA3 when
+forward and backward are present on every rank, otherwise all ranks use the
+in-repo min-FA3 implementation.
+
+The default Megatron checkout is the pinned `third_party/Megatron-LM`
+submodule. `MEGATRON_PATH` and `--megatron-path` remain available for explicit
+compatibility experiments with another checkout. Prepare the locked Python
+dependencies and source-built TE/Magi packages using
+[`third_party/README.md`](third_party/README.md) before launching this
+benchmark.
+
+The default launch runs 20 seed-0, 128K-token cases for each of ArXiv, GitHub,
+Pile, FreeLaw, and ProLong, one `torchrun` per dataset:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  ./benchmark_transformer_layer.sh
+```
+
+Use a one-case/one-iteration smoke run before the full matrix:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  DATASETS=arxiv NUM_CASES=1 WARMUP_ITERS=1 NUM_ITERS=1 \
+  ./benchmark_transformer_layer.sh
+```
+
+If one of the eight devices is unavailable or configured as MIG, a functional
+CP=4 smoke run can use four full GPUs. This exercises all eight method adapters
+and the complete layer forward/backward path, but is explicitly marked
+`formal_cp8_result=false` and must not be used as the requested CP=8 performance
+result:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  WORLD_SIZE=4 DATASETS=arxiv NUM_CASES=1 \
+  WARMUP_ITERS=1 NUM_ITERS=1 SM_CONFIGS=70:8 \
+  ./benchmark_transformer_layer.sh
+```
+
+The default MegaRing split is one point, `(device_sm_count - 8):8`. Override it
+with, for example, `SM_CONFIGS=64:8,60:12`. Non-MegaRing methods still run once
+per case. The wrapper writes rank-0 JSONL files under
+`results/transformer_layer_cp/`; set `OUTPUT_DIR` or `RUN_ID` to control their
+location and names.
+
+Sampling, planning, physical layout allocation, process-group creation, and
+workspace construction are outside timing. Gradient clearing and the
+pre-iteration CUDA/WORLD synchronization are also outside. Complete layer
+forward and backward are timed; for MegaRing this explicitly includes K/V arena
+population and synchronization in forward plus dK/dV accumulator/completion
+reset and synchronization in backward. For each measured iteration, the primary
+CUDA critical rank is selected by the largest `forward_cuda + backward_cuda`.
+Both reported phase times are taken from that same rank, so
+`total_cuda_critical_rank_avg_ms` is exactly
+`forward_cuda_critical_rank_avg_ms + backward_cuda_critical_rank_avg_ms` after
+averaging. The same critical rank supplies the forward and backward breakdowns.
+`self_attn` covers the complete Megatron SelfAttention module, including the QKV
+projection, selected CP attention core, and output projection. `others` is the
+algebraic remainder of the complete layer phase and covers both RMSNorms,
+residual/BDA work, and the SwiGLU MLP. Therefore each full phase is exactly
+`self_attn + others`. The independently reduced `total_wall_max_avg_ms` remains
+a separate host/launch/synchronization diagnostic and is not expected to equal
+the CUDA phase sum. Every rank's average total wall time, original/executed/
+padding token counts, critical-rank counts, physical rank loads, plan metadata,
+dependency versions, FA3 backend, SM split, and Megatron commit are recorded as
+well.
+
+For a CPU-only inspection of one generated case and all physical layouts (no TE,
+Magi, CUDA, or process group required), run:
+
+```bash
+.venv/bin/python ring_test/benchmark_transformer_layer.py \
+  --dataset arxiv --num-cases 1 --methods all \
+  --output-jsonl /tmp/unused.jsonl --dry-run-layout
+```
 
 ### Dataset-shaped topology benchmark
 
