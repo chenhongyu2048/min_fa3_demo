@@ -16,18 +16,20 @@ or compare dense output, LSE, or gradient references.
 ## Installation
 
 The tested environment contains `magi_attention==1.1.1.post16+g872717e1` with
-PyTorch CUDA 12.8. Initialize MagiAttention and its recursive CUTLASS submodule
-before building, then install the two additional build-time packages needed by
-this revision:
+PyTorch CUDA 12.8. MagiAttention is pinned as a recursive submodule. Prepare
+and install it using the repository's canonical two-node scripts:
 
 ```bash
-git submodule update --init --recursive third_party/MagiAttention
-uv pip install --python .venv/bin/python debugpy wheel
-
-MAGI_ATTENTION_ALLOW_BUILD_WITH_CUDA12=1 \
-  uv pip install --python .venv/bin/python --no-build-isolation \
-  ./third_party/MagiAttention
+git submodule update --init --checkout --recursive third_party/MagiAttention
+third_party/install_magi_attention.sh install
+third_party/precompile_magi_ffa_training.sh
+third_party/install_magi_attention.sh verify
 ```
+
+The complete dependency order, offline build flags, NVSHMEM wheel handling,
+and targeted FFA kernel set are documented in
+[`../../third_party/README.md`](../../third_party/README.md) and
+[`../../docs/TRANSFORMER_ENGINE_MAGI_BUILD_GUIDE.md`](../../docs/TRANSFORMER_ENGINE_MAGI_BUILD_GUIDE.md).
 
 Upstream recommends CUDA 13 or newer. On Hopper, CUDA 12.8 may make some WGMMA
 instructions synchronous and can be materially slower; the environment flag

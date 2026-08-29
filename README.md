@@ -6,19 +6,39 @@ implementation.
 
 ## Install
 
-The checked-in dependency metadata targets Python 3.12, PyTorch 2.10.0 with
-its CUDA 12.8 runtime, and Triton 3.6.0. Building the extension additionally
+The checked-in dependency metadata targets Python 3.12, PyTorch 2.11.0 with
+its CUDA 12.8 runtime, and Triton 3.6.0. PyTorch and TorchVision are resolved
+from the official cu128 wheel index instead of a user-level pip configuration.
+Building the extension additionally
 requires a CUDA toolkit with `nvcc`, a linkable CUDA driver library, and the
 vendored CUTLASS and ThunderKittens submodules. Runtime execution requires an
 SM90 Hopper GPU.
 
-Create the repository environment, install the locked core and build
-dependencies, and build the extension in place with:
+For the complete Mega-CP environment starting immediately after `git clone`,
+use the root bootstrap script. The two commands may run on different machines
+when they share this checkout:
 
 ```bash
-git submodule update --init third_party/cutlass third_party/ThunderKittens
+# Internet-connected node: initialize submodules, bootstrap uv, and create .venv.
+./setup_fresh_environment.sh prepare
+
+# H20 CUDA node: build min-FA3, TE, Magi, and the three targeted FFA kernels.
+CUDA_VISIBLE_DEVICES=0 ./setup_fresh_environment.sh install
+```
+
+Eight GPUs are not required for the build. After installation, a non-rebuilding
+check is available as `CUDA_VISIBLE_DEVICES=0 ./setup_fresh_environment.sh
+verify`. For a machine with both network access and a visible H20, use
+`CUDA_VISIBLE_DEVICES=0 ./setup_fresh_environment.sh all`.
+
+The equivalent manual core-environment and in-place extension build is:
+
+```bash
+git submodule update --init --checkout --recursive
 uv venv --python 3.12
-uv sync --frozen --no-install-project --group build
+UV_CACHE_DIR=.cache/uv \
+  uv sync --frozen --no-install-project \
+    --group build --group transformer-layer
 make PYTHON=.venv/bin/python
 ```
 
@@ -43,11 +63,18 @@ replace the active toolkit with the separately packaged CUDA runtime libraries
 that PyTorch installs into the virtual environment. `CUTLASS_DIR` can still
 select an external CUTLASS checkout as described in the Build section below.
 
-MagiAttention remains an optional performance-only baseline with a separate
-CUDA-aware installation procedure. Follow
-[`baseline/magi_attention/README.md`](baseline/magi_attention/README.md) only
-when that benchmark method is needed; it is not part of the default dependency
-sync.
+Megatron-LM, Transformer Engine, and MagiAttention are pinned as submodules
+under `third_party/`. TE and Magi require separate CUDA-aware source builds
+after the locked Python environment is synchronized. Starting from a fresh
+clone, run `./setup_fresh_environment.sh prepare` on the Internet node followed
+by `CUDA_VISIBLE_DEVICES=0 ./setup_fresh_environment.sh install` on the H20
+node using the same checkout/shared filesystem. See
+[`third_party/README.md`](third_party/README.md) for the equivalent manual
+steps and component installers. An exact
+`uv sync` removes those undeclared native packages, so use `--inexact` when
+synchronizing an already completed CUDA environment. Official FlashAttention
+is not required by the single-layer benchmark: when its Hopper interface is
+absent, all ranks use the in-repository min-FA3 fallback.
 
 ## Source provenance
 
