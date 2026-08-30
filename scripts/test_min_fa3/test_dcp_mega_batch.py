@@ -16,6 +16,7 @@ from dcp_test.benchmark_dcp_mega_batch import (
     _manifest_case,
     _result_path,
     _weighted_summary,
+    apply_topology_override,
     expand_cases,
     load_batch_config,
     load_trace_workloads,
@@ -186,6 +187,121 @@ class DCPMegaBatchTest(unittest.TestCase):
         self.assertEqual(cases[-1].workload.q_lengths, (128,) * 16)
         self.assertEqual(cases[-1].workload.history_lengths, (65536,) * 16)
 
+    def test_batch_config_accepts_tp2_tp4_and_tp8(self) -> None:
+        for tp_size, q_heads, dcp_size in ((2, 8, 2), (4, 16, 4), (8, 32, 8)):
+            with self.subTest(tp_size=tp_size):
+                payload = self._payload()
+                payload.update(tp_size=tp_size, qhead=q_heads)
+                payload["topologies"] = [
+                    {
+                        "name": f"dcp{dcp_size}_hkv1",
+                        "dcp_size": dcp_size,
+                        "kvhead": 1,
+                    }
+                ]
+                config = self._load(payload)
+                self.assertEqual(config.tp_size, tp_size)
+                self.assertEqual(config.q_heads, q_heads)
+                self.assertEqual(config.topologies[0].dcp_size, dcp_size)
+
+    def test_tp2_and_tp4_example_configs_load(self) -> None:
+        config_dir = DEFAULT_CONFIG.parent
+        for filename, tp_size, q_heads, dcp_size in (
+            ("dcp_mega_tp2.json", 2, 8, 2),
+            ("dcp_mega_tp4.json", 4, 16, 4),
+        ):
+            with self.subTest(filename=filename):
+                config = load_batch_config(config_dir / filename)
+                self.assertEqual(config.tp_size, tp_size)
+                self.assertEqual(config.q_heads, q_heads)
+                self.assertEqual(len(config.topologies), 1)
+                self.assertEqual(config.topologies[0].dcp_size, dcp_size)
+                self.assertEqual(config.topologies[0].kv_heads, 1)
+
+    def test_cli_topology_override_replaces_only_topology_fields(self) -> None:
+        config = load_batch_config(DEFAULT_CONFIG)
+        overridden, selected = apply_topology_override(
+            config,
+            tp_size=4,
+            dcp_size=4,
+            q_heads=16,
+            kv_heads=1,
+            dcp_sizes="all",
+        )
+        self.assertEqual(overridden.tp_size, 4)
+        self.assertEqual(overridden.q_heads, 16)
+        self.assertEqual(overridden.workloads, config.workloads)
+        self.assertEqual(len(overridden.topologies), 1)
+        self.assertEqual(overridden.topologies[0].name, "dcp4_hkv1")
+        self.assertEqual(overridden.topologies[0].dcp_size, 4)
+        self.assertEqual(overridden.topologies[0].kv_heads, 1)
+        self.assertEqual(selected, "4")
+
+    def test_cli_topology_override_requires_all_four_values(self) -> None:
+        config = load_batch_config(DEFAULT_CONFIG)
+        with self.assertRaisesRegex(ValueError, "requires --tp-size"):
+            apply_topology_override(
+                config,
+                tp_size=2,
+                dcp_size=2,
+                q_heads=8,
+                kv_heads=None,
+                dcp_sizes="all",
+            )
+
+    def test_cli_topology_override_reuses_topology_validation(self) -> None:
+        config = load_batch_config(DEFAULT_CONFIG)
+        invalid = (
+            (3, 2, 12, 1),
+            (4, 2, 12, 1),
+            (4, 4, 16, 2),
+        )
+        for tp_size, dcp_size, q_heads, kv_heads in invalid:
+            with self.subTest(
+                tp_size=tp_size,
+                dcp_size=dcp_size,
+                q_heads=q_heads,
+                kv_heads=kv_heads,
+            ), self.assertRaises(ValueError):
+                apply_topology_override(
+                    config,
+                    tp_size=tp_size,
+                    dcp_size=dcp_size,
+                    q_heads=q_heads,
+                    kv_heads=kv_heads,
+                    dcp_sizes="all",
+                )
+
+    def test_cli_topology_override_rejects_dcp_filter_conflict(self) -> None:
+        config = load_batch_config(DEFAULT_CONFIG)
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            apply_topology_override(
+                config,
+                tp_size=4,
+                dcp_size=4,
+                q_heads=16,
+                kv_heads=1,
+                dcp_sizes="2",
+            )
+
+    def test_parse_args_exposes_grouped_topology_override(self) -> None:
+        args = parse_args(
+            [
+                "--tp-size",
+                "2",
+                "--dcp-size",
+                "2",
+                "--qhead",
+                "8",
+                "--kvhead",
+                "1",
+            ]
+        )
+        self.assertEqual(
+            (args.tp_size, args.dcp_size, args.qhead, args.kvhead),
+            (2, 2, 8, 1),
+        )
+
     def test_workload_and_dcp_filters_preserve_config_order(self) -> None:
         config = load_batch_config(DEFAULT_CONFIG)
         cases = expand_cases(
@@ -235,6 +351,7 @@ class DCPMegaBatchTest(unittest.TestCase):
             "invalid topology": lambda payload: payload["topologies"][0].update(
                 kvhead=3
             ),
+            "unsupported TP size": lambda payload: payload.update(tp_size=3),
         }
         for label, mutate in mutations.items():
             with self.subTest(label=label):

@@ -439,9 +439,9 @@ the import path.
 | `benchmark_dataset.sh` | Recommended dataset-shaped forward/backward benchmark wrapper for 2, 4, or 8 GPUs |
 | `benchmark_transformer_layer.sh` | CP=8 single Megatron Transformer-layer forward+backward benchmark over all eight CP methods |
 | `benchmark_dataset_kvh_matrix.sh` | Causal 128K five-dataset, KVH 1/2/4, eight-method forward/backward matrix with one `torchrun` per direction/KVH/dataset |
-| `scripts/test_dcp/benchmark_dcp_mega_trace.sh` | Generate `NUM_CASES` trace snapshots, then run eager Mega/baselines and graph baselines in separate 8-rank launches |
+| `scripts/test_dcp/benchmark_dcp_mega_trace.sh` | Generate `NUM_CASES` trace snapshots, then run eager Mega/baselines and graph baselines with configurable TP/DCP topology |
 | `benchmark_dcp_mega_arrival_matrix.sh` | Run the 3-arrival x 3-DCP trace matrix with one eager Mega comm-SM sweep plus eager/graph baselines per combination |
-| `dcp_test/benchmark_dcp_mega_batch.py` | Reuse one 8-rank process group across a filtered packed-varlen Mega DCP case matrix |
+| `dcp_test/benchmark_dcp_mega_batch.py` | Reuse one TP process group across a filtered packed-varlen Mega DCP case matrix |
 | `dcp_test/summarize_dcp_mega_matrix.py` | Validate matrix manifests and flatten workload-weighted summaries to JSON and CSV |
 | `benchmark_load_balance.sh` | Dataset/GPU matrix wrapper for the metadata-only forward/backward load-balance benchmark |
 | `ring_test/load_balance_bench/run.sh` | Dataset/GPU wrapper for the fixed five-method runtime load-balance suite |
@@ -1187,7 +1187,8 @@ present as zero.
 For multi-case Mega DCP measurements, the checked-in
 `dcp_test/configs/dcp_mega_six_loads.json` defines six workloads and three
 `DCP/Hkv` topologies. The batch frontend expands their 18-case Cartesian
-product and reuses one initialized 8-rank world plus cached DCP subgroups:
+product and, by default, reuses one initialized 8-rank world plus cached DCP
+subgroups:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 --module \
@@ -1196,6 +1197,31 @@ torchrun --standalone --nproc_per_node=8 --module \
   --implementations mega,ours,vllm,sglang --no-cuda-graph \
   --warmup 5 --iters 20 --output-dir benchmarks/results/dcp_batch_eager
 ```
+
+The batch frontend also supports a single explicit topology. The four topology
+arguments are an all-or-none group: `--tp-size`, `--dcp-size`, `--qhead`, and
+`--kvhead`. `torchrun --nproc_per_node` must equal `--tp-size`. Existing
+topology validation checks TP/DCP divisibility, KV replica boundaries, Q/KV
+head divisibility, and the Mega requirement `QH / TP in {4, 8}`:
+
+```bash
+torchrun --standalone --nproc_per_node=2 --module \
+  dcp_test.benchmark_dcp_mega_batch \
+  --tp-size 2 --dcp-size 2 --qhead 8 --kvhead 1 \
+  --workloads small1 --implementations mega,full \
+  --no-cuda-graph --check --warmup 1 --iters 2
+
+torchrun --standalone --nproc_per_node=4 --module \
+  dcp_test.benchmark_dcp_mega_batch \
+  --tp-size 4 --dcp-size 4 --qhead 16 --kvhead 1 \
+  --workloads small1 --implementations mega,full \
+  --no-cuda-graph --check --warmup 1 --iters 2
+```
+
+Equivalent ready-to-run configs are available as
+`dcp_test/configs/dcp_mega_tp2.json` and
+`dcp_test/configs/dcp_mega_tp4.json`. Omitting the four CLI overrides preserves
+the JSON topology matrix, including the existing TP8/DCP2,4,8 configuration.
 
 `scripts/test_dcp/benchmark_dcp_mega_trace.sh` applies the same one-launch-per-mode and
 eager-only Mega grouping to the Mooncake-derived scheduler replay under
@@ -1241,8 +1267,8 @@ The larger arrival/DCP matrix has a separate wrapper:
 ```
 
 Its defaults independently replay and reservoir-sample 20 cases for every
-`arrival_time_scale=1,2,4` and `DCP=2,4,8` combination. Each combination uses
-three 8-rank launches: one eager Mega launch sweeps
+`arrival_time_scale=1,2,4` and `DCP=2,4,8` combination. With the default
+config, each combination uses three 8-rank launches: one eager Mega launch sweeps
 `num_comm_sms=4,8,12,16,20` inside the same process group, one launch runs the
 six eager baseline method labels (including full-KV), and one runs the same
 six baselines under CUDA Graph. Thus the default run has 9 trace generations,

@@ -37,8 +37,10 @@ LOG_DIR=${LOG_DIR:-"benchmark_logs/dcp_mega_trace_$(date +%Y%m%d-%H%M%S)"}
 RESULT_DIR=${RESULT_DIR:-"$LOG_DIR/results"}
 TRACE_CASES=${TRACE_CASES:-"$RESULT_DIR/trace_cases.jsonl"}
 MASTER_LOG=${MASTER_LOG:-"$LOG_DIR/benchmark_dcp_mega_trace.log"}
-
-TP_SIZE=8
+TP_SIZE=${TP_SIZE:-8}
+DCP_SIZE=${DCP_SIZE:-}
+QHEAD=${QHEAD:-}
+KVHEAD=${KVHEAD:-}
 
 die() {
     echo "error: $*" >&2
@@ -91,6 +93,7 @@ case "$DRY_RUN" in
 esac
 
 require_positive_integer NUM_CASES "$NUM_CASES"
+require_positive_integer TP_SIZE "$TP_SIZE"
 require_nonnegative_integer WARMUP "$WARMUP"
 require_positive_integer ITERS "$ITERS"
 require_nonnegative_integer NUM_SPLITS "$NUM_SPLITS"
@@ -98,6 +101,29 @@ require_positive_integer MEGA_NUM_COMM_SM "$MEGA_NUM_COMM_SM"
 ((NUM_SPLITS <= 128)) || die "NUM_SPLITS must be at most 128, got '$NUM_SPLITS'"
 ((MEGA_NUM_COMM_SM < 132)) || die \
     "MEGA_NUM_COMM_SM must leave at least one of 132 SMs for compute"
+case "$TP_SIZE" in
+    2|4|8) ;;
+    *) die "TP_SIZE must be 2, 4, or 8, got '$TP_SIZE'" ;;
+esac
+
+TOPOLOGY_ARGS=()
+if [[ -n "$DCP_SIZE" || -n "$QHEAD" || -n "$KVHEAD" ]]; then
+    [[ -n "$DCP_SIZE" && -n "$QHEAD" && -n "$KVHEAD" ]] || die \
+        "DCP_SIZE, QHEAD, and KVHEAD must be provided together"
+    require_positive_integer DCP_SIZE "$DCP_SIZE"
+    require_positive_integer QHEAD "$QHEAD"
+    require_positive_integer KVHEAD "$KVHEAD"
+    case "$DCP_SIZE" in
+        2|4|8) ;;
+        *) die "DCP_SIZE must be 2, 4, or 8, got '$DCP_SIZE'" ;;
+    esac
+    ((DCP_SIZE <= TP_SIZE && TP_SIZE % DCP_SIZE == 0)) || die \
+        "DCP_SIZE must divide TP_SIZE and cannot exceed it"
+    TOPOLOGY_ARGS=(
+        --tp-size "$TP_SIZE" --dcp-size "$DCP_SIZE"
+        --qhead "$QHEAD" --kvhead "$KVHEAD"
+    )
+fi
 case "$MEGA_BLOCK_N" in
     auto|128|176) ;;
     *) die "MEGA_BLOCK_N must be auto, 128, or 176, got '$MEGA_BLOCK_N'" ;;
@@ -114,7 +140,11 @@ for mode in "${MODE_LIST[@]}"; do
 done
 
 if [[ -z ${CUDA_VISIBLE_DEVICES:-} ]]; then
-    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+    case "$TP_SIZE" in
+        2) CUDA_VISIBLE_DEVICES=0,1 ;;
+        4) CUDA_VISIBLE_DEVICES=0,1,2,3 ;;
+        8) CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ;;
+    esac
 else
     IFS=',' read -r -a visible_devices <<< "$CUDA_VISIBLE_DEVICES"
     ((${#visible_devices[@]} >= TP_SIZE)) || die \
@@ -141,6 +171,9 @@ build_generate_command() {
         --output "$TRACE_CASES"
         --num-cases "$NUM_CASES"
     )
+    if [[ -n "$DCP_SIZE" ]]; then
+        GENERATE_COMMAND+=(--dcp-size "$DCP_SIZE")
+    fi
     if ((FORCE_TRACE)); then
         GENERATE_COMMAND+=(--force)
     fi
@@ -165,6 +198,7 @@ build_batch_args() {
         --trace-config "$TRACE_CONFIG"
         --trace-cases "$TRACE_CASES"
         --num-cases "$NUM_CASES"
+        "${TOPOLOGY_ARGS[@]}"
         --implementations "$implementations"
         --num-splits "$NUM_SPLITS"
         --mega-block-n "$MEGA_BLOCK_N"

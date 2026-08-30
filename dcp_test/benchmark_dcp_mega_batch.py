@@ -156,8 +156,8 @@ def load_batch_config(path: Path) -> BatchConfig:
     tp_size = _positive_int(root["tp_size"], "tp_size")
     q_heads = _positive_int(root["qhead"], "qhead")
     head_dim = _positive_int(root["headdim"], "headdim")
-    if tp_size != 8:
-        raise ValueError("Mega DCP batch configs currently require tp_size=8")
+    if tp_size not in (2, 4, 8):
+        raise ValueError("Mega DCP batch configs require tp_size=2, 4, or 8")
     if head_dim != 128:
         raise ValueError("Mega DCP batch configs require headdim=128")
 
@@ -466,6 +466,77 @@ def default_output_dir() -> Path:
     return Path("benchmarks/results") / f"dcp_mega_batch_{timestamp}"
 
 
+def apply_topology_override(
+    config: BatchConfig,
+    *,
+    tp_size: int | None,
+    dcp_size: int | None,
+    q_heads: int | None,
+    kv_heads: int | None,
+    dcp_sizes: str,
+) -> tuple[BatchConfig, str]:
+    """Replace a config's topology matrix with one explicitly requested topology."""
+    values = {
+        "--tp-size": tp_size,
+        "--dcp-size": dcp_size,
+        "--qhead": q_heads,
+        "--kvhead": kv_heads,
+    }
+    provided = tuple(name for name, value in values.items() if value is not None)
+    if not provided:
+        return config, dcp_sizes
+    if len(provided) != len(values):
+        missing = ", ".join(name for name, value in values.items() if value is None)
+        raise ValueError(
+            "topology override requires --tp-size, --dcp-size, --qhead, and "
+            f"--kvhead together; missing {missing}"
+        )
+
+    assert tp_size is not None
+    assert dcp_size is not None
+    assert q_heads is not None
+    assert kv_heads is not None
+    if tp_size not in (2, 4, 8):
+        raise ValueError("--tp-size must be 2, 4, or 8")
+    if dcp_size not in (2, 4, 8):
+        raise ValueError("--dcp-size must be 2, 4, or 8")
+    try:
+        topology = make_topology(q_heads, kv_heads, tp_size, dcp_size)
+    except ValueError as error:
+        raise ValueError(f"CLI topology override is invalid: {error}") from error
+    if topology.q_heads_local not in (4, 8):
+        raise ValueError(
+            "CLI topology override gives "
+            f"Hq_local={topology.q_heads_local}; Mega requires 4 or 8"
+        )
+
+    if dcp_sizes != "all":
+        tokens = _csv_tokens(dcp_sizes, "--dcp-sizes")
+        if tokens is not None:
+            try:
+                selected = {int(token) for token in tokens}
+            except ValueError as error:
+                raise ValueError(
+                    "--dcp-sizes must contain comma-separated integers"
+                ) from error
+            if selected != {dcp_size}:
+                raise ValueError(
+                    "--dcp-sizes conflicts with the CLI topology override: "
+                    f"expected only {dcp_size}, got {sorted(selected)}"
+                )
+
+    topology_name = f"dcp{dcp_size}_hkv{kv_heads}"
+    return (
+        replace(
+            config,
+            tp_size=tp_size,
+            q_heads=q_heads,
+            topologies=(BatchTopology(topology_name, dcp_size, kv_heads),),
+        ),
+        str(dcp_size),
+    )
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a JSON-defined packed-varlen Mega DCP case matrix"
@@ -504,6 +575,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--workloads", default="all")
     parser.add_argument("--dcp-sizes", default="all")
+    parser.add_argument(
+        "--tp-size",
+        type=_arg_positive_int,
+        default=None,
+        help="physical TP/world size for a single CLI topology override",
+    )
+    parser.add_argument(
+        "--dcp-size",
+        type=_arg_positive_int,
+        default=None,
+        help="DCP group size for a single CLI topology override",
+    )
+    parser.add_argument(
+        "--qhead",
+        type=_arg_positive_int,
+        default=None,
+        help="global Q-head count for a single CLI topology override",
+    )
+    parser.add_argument(
+        "--kvhead",
+        type=_arg_positive_int,
+        default=None,
+        help="global KV-head count for a single CLI topology override",
+    )
     parser.add_argument(
         "--implementations", default="mega,ours,vllm,sglang"
     )
@@ -1113,14 +1208,25 @@ def main(argv: Sequence[str] | None = None) -> None:
     trace_config: ReplayConfig | None = None
     try:
         config = load_batch_config(args.config)
-        selected_dcp_sizes = args.dcp_sizes
+        config, selected_dcp_sizes = apply_topology_override(
+            config,
+            tp_size=args.tp_size,
+            dcp_size=args.dcp_size,
+            q_heads=args.qhead,
+            kv_heads=args.kvhead,
+            dcp_sizes=args.dcp_sizes,
+        )
         if args.trace_cases is not None:
             assert args.trace_config is not None
             trace_config = load_trace_config(
                 args.trace_config,
                 num_cases=args.num_cases,
                 arrival_time_scale=args.trace_arrival_time_scale,
-                dcp_size=args.trace_dcp_size,
+                dcp_size=(
+                    args.trace_dcp_size
+                    if args.trace_dcp_size is not None
+                    else args.dcp_size
+                ),
             )
             config = replace(
                 config,

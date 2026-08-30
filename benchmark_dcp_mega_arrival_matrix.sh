@@ -38,8 +38,9 @@ RESULT_DIR=${RESULT_DIR:-"$LOG_DIR/results"}
 MASTER_LOG=${MASTER_LOG:-"$LOG_DIR/benchmark.log"}
 SUMMARY_JSON=${SUMMARY_JSON:-"$LOG_DIR/matrix_manifest.json"}
 SUMMARY_CSV=${SUMMARY_CSV:-"$LOG_DIR/matrix_summary.csv"}
-
-TP_SIZE=8
+TP_SIZE=${TP_SIZE:-8}
+QHEAD=${QHEAD:-}
+KVHEAD=${KVHEAD:-}
 SUMMARY_COMPLETE=0
 
 die() {
@@ -111,10 +112,21 @@ for flag_name in GENERATE_TRACE FORCE_TRACE DRY_RUN; do
 done
 
 require_positive_integer NUM_CASES "$NUM_CASES"
+require_positive_integer TP_SIZE "$TP_SIZE"
 require_nonnegative_integer WARMUP "$WARMUP"
 require_positive_integer ITERS "$ITERS"
 require_nonnegative_integer NUM_SPLITS "$NUM_SPLITS"
 ((NUM_SPLITS <= 128)) || die "NUM_SPLITS must be at most 128"
+case "$TP_SIZE" in
+    2|4|8) ;;
+    *) die "TP_SIZE must be 2, 4, or 8, got '$TP_SIZE'" ;;
+esac
+if [[ -n "$QHEAD" || -n "$KVHEAD" ]]; then
+    [[ -n "$QHEAD" && -n "$KVHEAD" ]] || die \
+        "QHEAD and KVHEAD must be provided together"
+    require_positive_integer QHEAD "$QHEAD"
+    require_positive_integer KVHEAD "$KVHEAD"
+fi
 [[ "$BASELINE_IMPLEMENTATIONS" == "ours,vllm,sglang,full" ]] || die \
     "BASELINE_IMPLEMENTATIONS must be ours,vllm,sglang,full for matrix summaries"
 case "$MEGA_BLOCK_N" in
@@ -143,6 +155,8 @@ for dcp_size in "${DCP_LIST[@]}"; do
         2|4|8) ;;
         *) die "DCP_SIZES must contain only 2, 4, or 8, got '$dcp_size'" ;;
     esac
+    ((dcp_size <= TP_SIZE && TP_SIZE % dcp_size == 0)) || die \
+        "every DCP size must divide TP_SIZE=$TP_SIZE and cannot exceed it"
 done
 for comm_sm in "${COMM_SM_LIST[@]}"; do
     require_positive_integer MEGA_NUM_COMM_SMS "$comm_sm"
@@ -155,7 +169,11 @@ command -v "$PYTHON" >/dev/null 2>&1 || die "PYTHON command was not found: '$PYT
 command -v "$TORCHRUN" >/dev/null 2>&1 || die "TORCHRUN command was not found: '$TORCHRUN'"
 
 if [[ -z ${CUDA_VISIBLE_DEVICES:-} ]]; then
-    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+    case "$TP_SIZE" in
+        2) CUDA_VISIBLE_DEVICES=0,1 ;;
+        4) CUDA_VISIBLE_DEVICES=0,1,2,3 ;;
+        8) CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ;;
+    esac
 else
     IFS=',' read -r -a visible_devices <<< "$CUDA_VISIBLE_DEVICES"
     ((${#visible_devices[@]} >= TP_SIZE)) || die \
@@ -249,6 +267,13 @@ run_combo_mode() {
     local mode_log=$7
     local implementations graph_arg phase_arg
     local -a extra_args=()
+    local -a topology_args=()
+    if [[ -n "$QHEAD" ]]; then
+        topology_args=(
+            --tp-size "$TP_SIZE" --dcp-size "$dcp_size"
+            --qhead "$QHEAD" --kvhead "$KVHEAD"
+        )
+    fi
     case "$suite" in
         mega)
             implementations=mega
@@ -279,6 +304,7 @@ run_combo_mode() {
         --trace-dcp-size "$dcp_size"
         --num-cases "$NUM_CASES"
         --dcp-sizes "$dcp_size"
+        "${topology_args[@]}"
         --implementations "$implementations"
         --num-splits "$NUM_SPLITS"
         --mega-block-n "$MEGA_BLOCK_N"

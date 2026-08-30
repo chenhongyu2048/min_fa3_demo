@@ -13,7 +13,6 @@ export NCCL_CGA_CLUSTER_SIZE=${NCCL_CGA_CLUSTER_SIZE:-1}
 export TORCH_NCCL_HIGH_PRIORITY=${TORCH_NCCL_HIGH_PRIORITY:-1}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 
 PYTHON=${PYTHON:-"$SCRIPT_DIR/.venv/bin/python"}
 TORCHRUN=${TORCHRUN:-"$SCRIPT_DIR/.venv/bin/torchrun"}
@@ -28,9 +27,42 @@ WARMUP=${WARMUP:-40}
 ITERS=${ITERS:-60}
 
 readonly ARRIVAL_RATE=4
-readonly TP_SIZE=8
+TP_SIZE=${TP_SIZE:-8}
+QHEAD=${QHEAD:-}
+KVHEAD=${KVHEAD:-}
 readonly BASELINE_IMPLEMENTATIONS="ours,vllm,sglang,full"
-readonly -a DCP_SIZES=(2 4 8)
+DCP_SIZES_SPEC=${DCP_SIZES:-"2,4,8"}
+DCP_SIZES_SPEC=${DCP_SIZES_SPEC//,/ }
+read -r -a DCP_SIZES <<< "$DCP_SIZES_SPEC"
+
+case "$TP_SIZE" in
+    2|4|8) ;;
+    *) printf 'error: TP_SIZE must be 2, 4, or 8, got %q\n' "$TP_SIZE" >&2; exit 2 ;;
+esac
+if [[ -n "$QHEAD" || -n "$KVHEAD" ]]; then
+    [[ "$QHEAD" =~ ^[1-9][0-9]*$ && "$KVHEAD" =~ ^[1-9][0-9]*$ ]] || {
+        printf 'error: QHEAD and KVHEAD must be positive integers and provided together\n' >&2
+        exit 2
+    }
+fi
+for dcp_size in "${DCP_SIZES[@]}"; do
+    case "$dcp_size" in
+        2|4|8) ;;
+        *) printf 'error: DCP_SIZES must contain only 2, 4, or 8\n' >&2; exit 2 ;;
+    esac
+    ((dcp_size <= TP_SIZE && TP_SIZE % dcp_size == 0)) || {
+        printf 'error: every DCP size must divide TP_SIZE=%s and cannot exceed it\n' "$TP_SIZE" >&2
+        exit 2
+    }
+done
+if [[ -z ${CUDA_VISIBLE_DEVICES:-} ]]; then
+    case "$TP_SIZE" in
+        2) CUDA_VISIBLE_DEVICES=0,1 ;;
+        4) CUDA_VISIBLE_DEVICES=0,1,2,3 ;;
+        8) CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ;;
+    esac
+fi
+export CUDA_VISIBLE_DEVICES
 
 log() {
     printf '[%s] %s\n' "$(date --iso-8601=seconds)" "$*" | tee -a "$MASTER_LOG"
@@ -106,6 +138,12 @@ for dcp_size in "${DCP_SIZES[@]}"; do
         --iters "$ITERS"
         --no-check
     )
+    if [[ -n "$QHEAD" ]]; then
+        common_args+=(
+            --tp-size "$TP_SIZE" --dcp-size "$dcp_size"
+            --qhead "$QHEAD" --kvhead "$KVHEAD"
+        )
+    fi
 
     run_logged "arrival=$ARRIVAL_RATE dcp=$dcp_size suite=mega_timestamps" \
         "$LOG_DIR/logs/arrival_${ARRIVAL_RATE}_dcp_${dcp_size}_mega.log" \

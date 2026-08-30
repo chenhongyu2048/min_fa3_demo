@@ -13,7 +13,6 @@ export NCCL_CGA_CLUSTER_SIZE=${NCCL_CGA_CLUSTER_SIZE:-1}
 export TORCH_NCCL_HIGH_PRIORITY=${TORCH_NCCL_HIGH_PRIORITY:-1}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 
 PYTHON=${PYTHON:-"$SCRIPT_DIR/.venv/bin/python"}
 TORCHRUN=${TORCHRUN:-"$SCRIPT_DIR/.venv/bin/torchrun"}
@@ -37,8 +36,9 @@ RESULT_DIR=${RESULT_DIR:-"$RUN_DIR/results"}
 LOG_DIR=${LOG_DIR:-"$RUN_DIR/logs"}
 MASTER_LOG=${MASTER_LOG:-"$RUN_DIR/benchmark.log"}
 TRACE_CASES_ROOT=${TRACE_CASES_ROOT:-"$RESULT_DIR"}
-
-readonly TP_SIZE=8
+TP_SIZE=${TP_SIZE:-8}
+QHEAD=${QHEAD:-}
+KVHEAD=${KVHEAD:-}
 readonly -a STRATEGIES=(fa3_native_fifo critical_wave_auto_lpt)
 
 die() {
@@ -164,6 +164,13 @@ run_strategy() {
     local strategy_dir="$RESULT_DIR/arrival_${arrival}/dcp_${dcp_size}/$strategy"
     local strategy_log="$LOG_DIR/arrival_${arrival}_dcp_${dcp_size}_${strategy}.log"
     local -a scheduler_args
+    local -a topology_args=()
+    if [[ -n "$QHEAD" ]]; then
+        topology_args=(
+            --tp-size "$TP_SIZE" --dcp-size "$dcp_size"
+            --qhead "$QHEAD" --kvhead "$KVHEAD"
+        )
+    fi
 
     case "$strategy" in
         fa3_native_fifo)
@@ -185,6 +192,7 @@ run_strategy() {
         --trace-dcp-size "$dcp_size"
         --num-cases "$NUM_CASES"
         --dcp-sizes "$dcp_size"
+        "${topology_args[@]}"
         --implementations mega
         --num-splits 0
         --mega-block-n auto
@@ -216,6 +224,7 @@ for flag_name in GENERATE_TRACE FORCE_TRACE DRY_RUN; do
 done
 
 require_positive_integer NUM_CASES "$NUM_CASES"
+require_positive_integer TP_SIZE "$TP_SIZE"
 require_nonnegative_integer WARMUP "$WARMUP"
 require_positive_integer ITERS "$ITERS"
 require_positive_integer DCP2_COMM_SM "$DCP2_COMM_SM"
@@ -224,6 +233,16 @@ require_positive_integer DCP8_COMM_SM "$DCP8_COMM_SM"
 for comm_sm in "$DCP2_COMM_SM" "$DCP4_COMM_SM" "$DCP8_COMM_SM"; do
     ((comm_sm < 132)) || die "comm-SM values must be less than 132, got '$comm_sm'"
 done
+case "$TP_SIZE" in
+    2|4|8) ;;
+    *) die "TP_SIZE must be 2, 4, or 8, got '$TP_SIZE'" ;;
+esac
+if [[ -n "$QHEAD" || -n "$KVHEAD" ]]; then
+    [[ -n "$QHEAD" && -n "$KVHEAD" ]] || die \
+        "QHEAD and KVHEAD must be provided together"
+    require_positive_integer QHEAD "$QHEAD"
+    require_positive_integer KVHEAD "$KVHEAD"
+fi
 
 parse_csv ARRIVAL_TIME_SCALES "$ARRIVAL_TIME_SCALES" ARRIVAL_LIST
 parse_csv DCP_SIZES "$DCP_SIZES" DCP_LIST
@@ -243,6 +262,8 @@ for dcp_size in "${DCP_LIST[@]}"; do
         2|4|8) ;;
         *) die "DCP_SIZES must contain only 2, 4, or 8, got '$dcp_size'" ;;
     esac
+    ((dcp_size <= TP_SIZE && TP_SIZE % dcp_size == 0)) || die \
+        "every DCP size must divide TP_SIZE=$TP_SIZE and cannot exceed it"
 done
 
 [[ -f "$TRACE_CONFIG" ]] || die "TRACE_CONFIG was not found: '$TRACE_CONFIG'"
@@ -252,6 +273,14 @@ done
 [[ -x "$TORCHRUN" ]] || command -v "$TORCHRUN" >/dev/null 2>&1 || \
     die "TORCHRUN command was not found: '$TORCHRUN'"
 
+if [[ -z ${CUDA_VISIBLE_DEVICES:-} ]]; then
+    case "$TP_SIZE" in
+        2) CUDA_VISIBLE_DEVICES=0,1 ;;
+        4) CUDA_VISIBLE_DEVICES=0,1,2,3 ;;
+        8) CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ;;
+    esac
+fi
+export CUDA_VISIBLE_DEVICES
 IFS=',' read -r -a visible_devices <<< "$CUDA_VISIBLE_DEVICES"
 ((${#visible_devices[@]} == TP_SIZE)) || die \
     "CUDA_VISIBLE_DEVICES must expose exactly $TP_SIZE GPUs, got '$CUDA_VISIBLE_DEVICES'"

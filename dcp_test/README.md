@@ -150,6 +150,50 @@ workloads are expanded against topologies in file order:
 }
 ```
 
+`tp_size` may be 2, 4, or 8. For a one-off topology, the JSON workload can be
+reused while replacing its topology from the command line. All four arguments
+must be supplied together, and the physical torchrun world must equal TP:
+
+```bash
+torchrun --standalone --nproc_per_node=4 --module \
+  dcp_test.benchmark_dcp_mega_batch \
+  --tp-size 4 --dcp-size 4 --qhead 16 --kvhead 1 \
+  --workloads small1 --implementations mega,full \
+  --no-cuda-graph --check --warmup 1 --iters 2
+```
+
+The override retains the config's workload and head dimension, replaces its
+topology list with the requested single topology, and uses the same
+`make_topology()` validation as the other DCP frontends. Ready-to-run TP2 and
+TP4 examples live in `configs/dcp_mega_tp2.json` and
+`configs/dcp_mega_tp4.json`.
+
+The Mega DCP topology constraints are:
+
+- `tp_size` and `dcp_size` must be in `{2, 4, 8}`, and `dcp_size` must divide
+  `tp_size`.
+- The physical `torchrun` world size must equal `tp_size`.
+- `qhead` and `kvhead` are global head counts. `qhead` must be divisible by
+  both `tp_size` and `kvhead`.
+- The local query-head count is fixed to `Hq_local = qhead / tp_size` and must
+  be 4 or 8. Equivalently, `qhead` must be `4 * tp_size` or `8 * tp_size`.
+- `kvhead` must divide `tp_size / dcp_size`. This is equivalent to requiring
+  each KV head's TP replica set to contain an integral number of complete DCP
+  groups. In particular, `kvhead < tp_size`.
+- The Mega path remains BF16, head dimension 128, single-node NCCL, and Hopper
+  SM90 only.
+
+The resulting legal head/topology combinations are:
+
+| TP | DCP | Legal QH | Legal KVH |
+| ---: | ---: | ---: | ---: |
+| 2 | 2 | 8 or 16 | 1 |
+| 4 | 2 | 16 or 32 | 1 or 2 |
+| 4 | 4 | 16 or 32 | 1 |
+| 8 | 2 | 32 or 64 | 1, 2, or 4 |
+| 8 | 4 | 32 or 64 | 1 or 2 |
+| 8 | 8 | 32 or 64 | 1 |
+
 Run one custom execution mode directly with:
 
 ```bash
