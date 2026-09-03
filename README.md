@@ -1,5 +1,18 @@
 # min_fa3_demo
 
+The vLLM online-service integration and Mega versus in-repository vLLM-style
+DCP TBT benchmark are documented in
+[infer/vllm_bench/README.md](infer/vllm_bench/README.md). They use the pinned
+`third_party/vllm` submodule and dummy Llama 3.1 8B configurations, with no
+model weights or tokenizer. The dummy loader initializes random weights in
+memory and does not download a checkpoint. Requests retain the trace's
+variable input/output lengths, while `min_tokens=max_tokens` plus
+`ignore_eos=true` enforces the requested output length. No separate
+`vllm-flash-attention` submodule is required. Its eight-GPU smoke run uses a
+one-layer Hugging Face config override
+and low GPU-memory utilization while preserving the TP/DCP attention topology;
+the formal matrix retains the full 32-layer synthetic architecture by default.
+
 This standalone directory contains a minimal Hopper FlashAttention
 forward/backward demo copied and trimmed from the original `hopper/`
 implementation.
@@ -15,8 +28,10 @@ vendored CUTLASS and ThunderKittens submodules. Runtime execution requires an
 SM90 Hopper GPU.
 
 For the complete Mega-CP environment starting immediately after `git clone`,
-use the root bootstrap script. The two commands may run on different machines
-when they share this checkout:
+use the root `setup_fresh_environment.sh`, the repository's single environment
+orchestrator. Component-specific TE, Magi, FFA, and optional vLLM integration
+installers remain under `third_party/`. The two commands may run on different
+machines when they share this checkout:
 
 ```bash
 # Internet-connected node: initialize submodules, bootstrap uv, and create .venv.
@@ -25,6 +40,27 @@ when they share this checkout:
 # H20 CUDA node: build min-FA3, TE, Magi, and the three targeted FFA kernels.
 CUDA_VISIBLE_DEVICES=0 ./setup_fresh_environment.sh install
 ```
+
+The optional vLLM service benchmark uses its component installer after the
+base environment is prepared:
+
+```bash
+# Internet-connected node.
+./third_party/setup_vllm_dcp.sh prepare
+
+# H20 CUDA node, after setup_fresh_environment.sh install.
+CUDA_VISIBLE_DEVICES=0 ./third_party/setup_vllm_dcp.sh verify
+```
+
+For a vLLM-only environment that deliberately skips TE, MagiAttention, and the
+Transformer-layer benchmark dependencies, replace the root `install` plus
+vLLM `verify` with `CUDA_VISIBLE_DEVICES=0
+./third_party/setup_vllm_dcp.sh install`.
+
+Run the formal matrix from the repository root with
+`./benchmark_vllm_dcp_matrix.sh`; see
+[`infer/vllm_bench/README.md`](infer/vllm_bench/README.md) for smoke-test and workload
+details.
 
 Eight GPUs are not required for the build. After installation, a non-rebuilding
 check is available as `CUDA_VISIBLE_DEVICES=0 ./setup_fresh_environment.sh
@@ -63,12 +99,12 @@ replace the active toolkit with the separately packaged CUDA runtime libraries
 that PyTorch installs into the virtual environment. `CUTLASS_DIR` can still
 select an external CUTLASS checkout as described in the Build section below.
 
-Megatron-LM, Transformer Engine, and MagiAttention are pinned as submodules
-under `third_party/`. TE and Magi require separate CUDA-aware source builds
-after the locked Python environment is synchronized. Starting from a fresh
-clone, run `./setup_fresh_environment.sh prepare` on the Internet node followed
-by `CUDA_VISIBLE_DEVICES=0 ./setup_fresh_environment.sh install` on the H20
-node using the same checkout/shared filesystem. See
+Megatron-LM, Transformer Engine, MagiAttention, and vLLM are pinned as
+submodules under `third_party/`. TE and Magi require separate CUDA-aware source
+builds after the locked Python environment is synchronized. Starting from a
+fresh clone, run `./setup_fresh_environment.sh prepare` on the Internet node
+followed by `CUDA_VISIBLE_DEVICES=0 ./setup_fresh_environment.sh install` on
+the H20 node using the same checkout/shared filesystem. See
 [`third_party/README.md`](third_party/README.md) for the equivalent manual
 steps and component installers. An exact
 `uv sync` removes those undeclared native packages, so use `--inexact` when
@@ -441,6 +477,7 @@ the import path.
 | `benchmark_dataset_kvh_matrix.sh` | Causal 128K five-dataset, KVH 1/2/4, eight-method forward/backward matrix with one `torchrun` per direction/KVH/dataset |
 | `scripts/test_dcp/benchmark_dcp_mega_trace.sh` | Generate `NUM_CASES` trace snapshots, then run eager Mega/baselines and graph baselines with configurable TP/DCP topology |
 | `benchmark_dcp_mega_arrival_matrix.sh` | Run the 3-arrival x 3-DCP trace matrix with one eager Mega comm-SM sweep plus eager/graph baselines per combination |
+| `benchmark_vllm_dcp_matrix.sh` | Run the vLLM service TBT matrix for in-repository AG+RS, A2A, and Mega backends |
 | `dcp_test/benchmark_dcp_mega_batch.py` | Reuse one TP process group across a filtered packed-varlen Mega DCP case matrix |
 | `dcp_test/summarize_dcp_mega_matrix.py` | Validate matrix manifests and flatten workload-weighted summaries to JSON and CSV |
 | `benchmark_load_balance.sh` | Dataset/GPU matrix wrapper for the metadata-only forward/backward load-balance benchmark |

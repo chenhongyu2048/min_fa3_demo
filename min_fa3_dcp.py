@@ -2505,7 +2505,16 @@ class DCPMegaAttentionRunner:
             + 2 * max_batch
         )
         self._metadata_hosts = tuple(
-            torch.empty(self._metadata_capacity, dtype=torch.int32, pin_memory=True)
+            # vLLM constructs attention implementations under a CUDA
+            # ``torch.device`` context.  Metadata hosts are intentionally
+            # page-locked CPU tensors for the IPC/async copy path, so make
+            # the device explicit instead of inheriting that context.
+            torch.empty(
+                self._metadata_capacity,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            )
             for _ in range(self._METADATA_HOST_SLOTS)
         )
         self._metadata_host_arrays = tuple(

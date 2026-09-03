@@ -23,8 +23,9 @@ git submodule update --init --checkout --recursive
 
 完整 fresh-environment 公共入口已经集中到根目录的
 [`../setup_fresh_environment.sh`](../setup_fresh_environment.sh)；它会在刚完成
-`git clone`、尚无 `.venv` 的环境中先准备仓库本地 `uv==0.12.4`，再调用
-`third_party/setup_fresh_environment.sh` 完成实际环境编排。
+`git clone`、尚无 `.venv` 的环境中准备仓库本地 `uv==0.12.4`，并直接完成
+submodule、基础 Python 环境、原生组件构建与验证的编排。TE、Magi 和 FFA 的
+组件级实现仍由 `third_party/` 下的专用脚本负责。
 共享文件系统的两节点环境只需分别执行：
 
 ```bash
@@ -171,7 +172,7 @@ cuDNN 和 NVSHMEM 来自当前虚拟环境中的 NVIDIA wheel：
 脚本：
 
 ```text
-third_party/setup_fresh_environment.sh
+setup_fresh_environment.sh
 third_party/install_transformer_engine.sh
 third_party/install_magi_attention.sh
 third_party/precompile_magi_ffa_training.sh
@@ -186,7 +187,7 @@ install_magi_attention.log
 precompile_magi_ffa_training.log
 ```
 
-四个脚本均位于仓库的 `third_party/` 目录：
+根目录脚本是唯一环境编排入口，其余三个组件脚本位于 `third_party/` 目录：
 
 ```text
 /home/LOCAL/shixuan/hongyu/min_fa3_demo/third_party

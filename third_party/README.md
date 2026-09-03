@@ -8,6 +8,7 @@ Mega-CP benchmark as Git submodules:
 | Megatron-LM | `third_party/Megatron-LM` | `5eb0744c700e3791f3992fdce08cc41d5a469326` |
 | Transformer Engine | `third_party/TransformerEngine` | `4329ff84bfbdaa778a33cba02a15fb0807c64689` |
 | MagiAttention | `third_party/MagiAttention` | `872717e1f88fa6938593e452a28a41597c849a00` |
+| vLLM | `third_party/vllm` | `c6fe94b4d5b418fa213af0e5884eddd304333dcd` |
 
 The gitlinks in the parent repository are the version source of truth. The
 installation scripts validate those gitlinks and every recursive submodule;
@@ -22,10 +23,11 @@ top-level `flash-attn` package.
 
 ## Prepare the repository and Python environment
 
-The fresh-clone public entry point is the root
-`setup_fresh_environment.sh`; it bootstraps repository-local uv 0.12.4 before
-delegating native work to `third_party/setup_fresh_environment.sh`. On the
-shared filesystem, run the two phases on their corresponding nodes:
+The root `setup_fresh_environment.sh` is the only fresh-clone environment
+orchestrator. It bootstraps repository-local uv 0.12.4, prepares the base
+environment, and invokes the component-specific installers in this directory
+for native work. On the shared filesystem, run the two phases on their
+corresponding nodes:
 
 ```bash
 # Internet-connected node.
@@ -39,6 +41,24 @@ The scripted environment is pinned to Linux x86_64, Python 3.12, uv 0.12.4,
 PyTorch 2.11.0+cu128, and CUDA toolkit 12.8. `prepare` needs Git and network
 access. `install` needs GNU Make plus at least one visible SM90 Hopper GPU; it
 does not require all eight benchmark GPUs to be available during compilation.
+
+The optional vLLM service integration follows the same component-installer
+layout:
+
+```bash
+# Internet-connected node, after the root prepare action.
+./third_party/setup_vllm_dcp.sh prepare
+
+# H20 CUDA node, after the root install action.
+./third_party/setup_vllm_dcp.sh verify
+```
+
+It installs the pinned `third_party/vllm` source and local benchmark plugin
+into the shared `.venv`; it is intentionally separate from the base
+environment orchestrator. A vLLM-only environment may instead run
+`CUDA_VISIBLE_DEVICES=0 ./third_party/setup_vllm_dcp.sh install`; that action
+builds min-FA3 but intentionally omits TE, MagiAttention, and their AOT
+artifacts.
 
 `verify` repeats all source, package, extension, Megatron integration, and
 three-kernel AOT checks without rebuilding. `all` is available only when one
