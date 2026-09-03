@@ -27,7 +27,7 @@ directly.
 - BF16, head dimension 128, TP=8, global QH=32
 - benchmark model configs with global KVH 1, 2, or 4
 - DCP=`8 / KVH`, so each DCP group is one replicated KV-head group
-- formal comparison: KVH=1, DCP=8
+- formal matrix: KVH=1/2/4, corresponding to DCP=8/4/2
 
 Backend names are `vllm-ag-rs`, `vllm-a2a`, and `mega`. All three are custom
 vLLM backends backed by this repository's `min_fa3_op`: the first two use
@@ -129,12 +129,16 @@ with a different token count as a failed request.
 
 ## Running and results
 
-Run short smoke tests, then the formal 100-warmup/1000-measured matrix:
+Run short smoke tests, then the formal 100-warmup/1000-measured KV-head matrix:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./scripts/smoke_vllm_dcp.sh
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./benchmark_vllm_dcp_matrix.sh
 ```
+
+The formal wrapper defaults to `KV_HEADS=1,2,4` and stores each configuration
+under `benchmark_logs/vllm_dcp/kvh{1,2,4}`. Set a comma- or space-separated
+subset when needed, for example `KV_HEADS=1,4` or `KV_HEADS="1 4"`.
 
 Both wrappers default to port 8000. Set `PORT` when that endpoint is already
 used by another service; the matrix rejects any existing listener before
@@ -176,10 +180,10 @@ automatic profiling unless `--kv-cache-memory-bytes` is supplied to
 `vllm_bench.matrix`.
 
 The formal script continues to default to 32 layers and 0.9 utilization. Its
-`NUM_HIDDEN_LAYERS` and `GPU_MEMORY_UTILIZATION` environment variables may be
-overridden for a deliberately reduced experiment; every run manifest records
-the effective values. Only runs with the same layer count and memory setting
-should be compared.
+`KV_HEADS`, `NUM_HIDDEN_LAYERS`, and `GPU_MEMORY_UTILIZATION` environment
+variables may be overridden for a deliberately reduced experiment; every run
+manifest records the effective values. Only runs with the same KV-head count,
+layer count, and memory setting should be compared.
 
 The equivalent Slurm entry is `scripts/vllm_dcp_matrix.slurm`; override
 `ROOT_DIR`, module names, or the partition for the target cluster when needed.
