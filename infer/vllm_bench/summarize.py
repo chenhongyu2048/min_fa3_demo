@@ -18,6 +18,11 @@ def _value(summary: dict[str, Any], path: str) -> float | None:
     return float(value)
 
 
+def _comm_sm(summary: dict[str, Any]) -> int | None:
+    value = summary.get("mega_num_comm_sm")
+    return None if value is None else int(value)
+
+
 METRICS = (
     "offered_rps",
     "achieved_rps",
@@ -46,39 +51,50 @@ def aggregate(result_dir: Path) -> dict[str, Any]:
     for path in sorted(result_dir.glob("*-scale*/summary.json")):
         summaries.append(json.loads(path.read_text(encoding="utf-8")))
     by_key = {
-        (summary["backend"], float(summary["arrival_time_scale"])): summary
+        (
+            summary["backend"],
+            float(summary["arrival_time_scale"]),
+            _comm_sm(summary),
+        ): summary
         for summary in summaries
     }
     comparisons = []
-    scales = sorted({scale for _, scale in by_key})
+    scales = sorted({scale for _, scale, _ in by_key})
     for scale in scales:
-        mega = by_key.get(("mega", scale))
-        if mega is None:
-            continue
-        for baseline in ("vllm-ag-rs", "vllm-a2a"):
-            baseline_summary = by_key.get((baseline, scale))
-            if baseline_summary is None:
-                continue
-            ratios = {}
-            for metric in METRICS:
-                numerator = _value(mega, metric)
-                denominator = _value(baseline_summary, metric)
-                ratios[metric] = (
-                    numerator / denominator
-                    if numerator is not None and denominator not in (None, 0)
-                    else None
+        mega_runs = sorted(
+            [
+                (comm_sm, summary)
+                for (backend, run_scale, comm_sm), summary in by_key.items()
+                if backend == "mega" and run_scale == scale
+            ],
+            key=lambda item: (item[0] is None, item[0] or 0),
+        )
+        for comm_sm, mega in mega_runs:
+            for baseline in ("vllm-ag-rs", "vllm-a2a"):
+                baseline_summary = by_key.get((baseline, scale, None))
+                if baseline_summary is None:
+                    continue
+                ratios = {}
+                for metric in METRICS:
+                    numerator = _value(mega, metric)
+                    denominator = _value(baseline_summary, metric)
+                    ratios[metric] = (
+                        numerator / denominator
+                        if numerator is not None and denominator not in (None, 0)
+                        else None
+                    )
+                comparisons.append(
+                    {
+                        "arrival_time_scale": scale,
+                        "mega_num_comm_sm": comm_sm,
+                        "comparison": f"mega/{baseline}",
+                        "ratios": ratios,
+                        "interpretation": {
+                            "latency_and_tbt": "ratio < 1 is lower",
+                            "throughput": "ratio > 1 is higher",
+                        },
+                    }
                 )
-            comparisons.append(
-                {
-                    "arrival_time_scale": scale,
-                    "comparison": f"mega/{baseline}",
-                    "ratios": ratios,
-                    "interpretation": {
-                        "latency_and_tbt": "ratio < 1 is lower",
-                        "throughput": "ratio > 1 is higher",
-                    },
-                }
-            )
     return {"runs": summaries, "comparisons": comparisons}
 
 
@@ -95,6 +111,7 @@ def main() -> None:
         row = {
             "backend": summary["backend"],
             "arrival_time_scale": summary["arrival_time_scale"],
+            "mega_num_comm_sm": _comm_sm(summary),
             "successful_requests": summary["successful_requests"],
             "failed_requests": summary["failed_requests"],
         }

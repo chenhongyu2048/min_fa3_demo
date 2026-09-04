@@ -69,6 +69,9 @@ class ServiceConfigTest(unittest.TestCase):
             self.assertEqual(
                 environments[backend]["MIN_FA3_DCP_BACKEND"], backend
             )
+            self.assertEqual(
+                environments[backend]["VLLM_USE_FLASHINFER_SAMPLER"], "0"
+            )
             self.assertIn("--hf-overrides", command)
             self.assertIn('{"num_hidden_layers":32}', command)
             self.assertIn(
@@ -82,6 +85,12 @@ class ServiceConfigTest(unittest.TestCase):
         _, command = build_serve_command(args)
         index = command.index("--kv-cache-memory-bytes")
         self.assertEqual(command[index + 1], str(1 << 30))
+
+    def test_flashinfer_sampler_override_is_preserved(self) -> None:
+        args = self._args("mega")
+        with patch.dict(os.environ, {"VLLM_USE_FLASHINFER_SAMPLER": "1"}):
+            environment, _ = build_serve_command(args)
+        self.assertEqual(environment["VLLM_USE_FLASHINFER_SAMPLER"], "1")
 
     def test_custom_port_is_forwarded(self) -> None:
         args = self._args("mega")

@@ -136,9 +136,28 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./scripts/smoke_vllm_dcp.sh
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./benchmark_vllm_dcp_matrix.sh
 ```
 
-The formal wrapper defaults to `KV_HEADS=1,2,4` and stores each configuration
-under `benchmark_logs/vllm_dcp/kvh{1,2,4}`. Set a comma- or space-separated
-subset when needed, for example `KV_HEADS=1,4` or `KV_HEADS="1 4"`.
+The smoke wrapper uses the same default `MEGA_NUM_COMM_SMS=4,8,12,16,20`
+communication-SM sweep as the formal matrix. Override it with a smaller set
+for a quick check, for example `MEGA_NUM_COMM_SMS=8` or
+`MEGA_NUM_COMM_SMS=4,8`.
+
+Both the smoke and formal wrappers explicitly default and export
+`VLLM_USE_FLASHINFER_SAMPLER=0`, because the custom attention backend does not
+use FlashInfer's sampling kernel and this avoids an unrelated sampling JIT
+during server startup. The smoke wrapper only requires a complete CUDA toolkit
+when this is explicitly set to `1`; otherwise an already-built min-FA3
+extension can run without sampling JIT. Set
+`VLLM_USE_FLASHINFER_SAMPLER=1` only when the CUDA toolkit and headers are
+available and that sampler path is intentionally being tested.
+
+The formal wrapper defaults to `KV_HEADS=1,2,4` and
+`MEGA_NUM_COMM_SMS=4,8,12,16,20`, matching the Mega comm-SM sweep used by
+`benchmark_dcp_mega_arrival_matrix.sh`. It stores each KV-head configuration
+under `benchmark_logs/vllm_dcp/kvh{1,2,4}`. Baseline services run once per
+arrival scale; Mega gets one isolated service run per communication-SM value,
+with runs recorded as `mega-comm_sm{N}-scale{S}`. Set comma- or
+space-separated subsets when needed, for example `KV_HEADS=1,4` or
+`MEGA_NUM_COMM_SMS="8 16"`.
 
 Both wrappers default to port 8000. Set `PORT` when that endpoint is already
 used by another service; the matrix rejects any existing listener before

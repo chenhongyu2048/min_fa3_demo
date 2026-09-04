@@ -477,7 +477,7 @@ the import path.
 | `benchmark_dataset_kvh_matrix.sh` | Causal 128K five-dataset, KVH 1/2/4, eight-method forward/backward matrix with one `torchrun` per direction/KVH/dataset |
 | `scripts/test_dcp/benchmark_dcp_mega_trace.sh` | Generate `NUM_CASES` trace snapshots, then run eager Mega/baselines and graph baselines with configurable TP/DCP topology |
 | `benchmark_dcp_mega_arrival_matrix.sh` | Run the 3-arrival x 3-DCP trace matrix with one eager Mega comm-SM sweep plus eager/graph baselines per combination |
-| `benchmark_vllm_dcp_matrix.sh` | Run the vLLM service TBT matrix for in-repository AG+RS, A2A, and Mega backends |
+| `benchmark_vllm_dcp_matrix.sh` | Run the vLLM service TBT matrix for in-repository AG+RS, A2A, and Mega backends, including the configurable Mega comm-SM sweep |
 | `dcp_test/benchmark_dcp_mega_batch.py` | Reuse one TP process group across a filtered packed-varlen Mega DCP case matrix |
 | `dcp_test/summarize_dcp_mega_matrix.py` | Validate matrix manifests and flatten workload-weighted summaries to JSON and CSV |
 | `benchmark_load_balance.sh` | Dataset/GPU matrix wrapper for the metadata-only forward/backward load-balance benchmark |
@@ -757,9 +757,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
   ./benchmark_transformer_layer.sh
 ```
 
-The default MegaRing split is one point, `(device_sm_count - 8):8`. Override it
-with, for example, `SM_CONFIGS=64:8,60:12`. Non-MegaRing methods still run once
-per case. The wrapper writes rank-0 JSONL files under
+The wrapper defaults to the same MegaRing sweep as `benchmark_dataset.sh`:
+`SM_CONFIGS=128:4,124:8,120:12,116:16`. Override it with, for example,
+`SM_CONFIGS=64:8,60:12`. Non-MegaRing methods still run once per case. The
+wrapper writes rank-0 JSONL files under
 `results/transformer_layer_cp/`; set `OUTPUT_DIR` or `RUN_ID` to control their
 location and names.
 

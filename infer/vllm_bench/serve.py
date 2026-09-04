@@ -124,6 +124,13 @@ def build_serve_command(args: argparse.Namespace) -> tuple[dict[str, str], list[
         {
             "VLLM_PLUGINS": "min_fa3_dcp",
             "MIN_FA3_DCP_BACKEND": args.backend,
+            # The benchmark uses a CUSTOM attention backend and does not
+            # measure FlashInfer's unrelated sampling kernel.  Disable its
+            # optional JIT by default; callers with a complete CUDA toolkit
+            # can opt back in with VLLM_USE_FLASHINFER_SAMPLER=1.
+            "VLLM_USE_FLASHINFER_SAMPLER": env.get(
+                "VLLM_USE_FLASHINFER_SAMPLER", "0"
+            ),
             # Keep all three source trees importable in the vLLM API process:
             # repository modules, the benchmark package, and the plugin's
             # src-layout package.  The explicit plugin path also repairs
@@ -183,7 +190,12 @@ def main() -> None:
         benchmark_env = {
             key: value
             for key, value in env.items()
-            if key in ("VLLM_PLUGINS", "MIN_FA3_DCP_BACKEND")
+            if key
+            in (
+                "VLLM_PLUGINS",
+                "MIN_FA3_DCP_BACKEND",
+                "VLLM_USE_FLASHINFER_SAMPLER",
+            )
             or key.startswith("MEGA_DCP_")
         }
         print(json.dumps({"env": benchmark_env, "command": command}, indent=2))

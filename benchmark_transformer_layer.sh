@@ -21,6 +21,7 @@ WARMUP_ITERS=${WARMUP_ITERS:-10}
 NUM_ITERS=${NUM_ITERS:-40}
 METHODS=${METHODS:-all}
 WORLD_SIZE=${WORLD_SIZE:-8}
+SM_CONFIGS=${SM_CONFIGS:-"128:4,124:8,120:12,116:16"}
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/results/transformer_layer_cp}
 RUN_ID=${RUN_ID:-$(date +%Y%m%d-%H%M%S)}
 
@@ -73,9 +74,7 @@ for dataset in "${dataset_list[@]}"; do
         --magi-overlap-degree 2
         --allgather-heads-k-stride 4
     )
-    if [[ -n "${SM_CONFIGS:-}" ]]; then
-        args+=(--sm-configs "$SM_CONFIGS")
-    fi
+    args+=(--sm-configs "$SM_CONFIGS")
     echo "Launching dataset=$dataset -> $output_jsonl"
     "$TORCHRUN" "${args[@]}"
 done

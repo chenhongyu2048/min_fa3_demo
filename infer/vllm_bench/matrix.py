@@ -21,6 +21,29 @@ from .serve import BACKENDS, build_serve_command, parser as serve_parser
 from .workload import load_manifest
 
 
+def _parse_positive_int_list(value: str) -> tuple[int, ...]:
+    """Parse a comma- or whitespace-separated list of communication SMs."""
+    tokens = value.replace(",", " ").split()
+    if not tokens:
+        raise argparse.ArgumentTypeError("list must not be empty")
+    result: list[int] = []
+    for token in tokens:
+        try:
+            parsed = int(token)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"invalid integer value {token!r}"
+            ) from exc
+        if parsed <= 0 or parsed >= 132:
+            raise argparse.ArgumentTypeError(
+                "values must be positive integers below 132"
+            )
+        if parsed in result:
+            raise argparse.ArgumentTypeError(f"duplicate value {parsed}")
+        result.append(parsed)
+    return tuple(result)
+
+
 def _healthy(url: str) -> bool:
     try:
         with urlopen(f"{url.rstrip('/')}/health", timeout=2) as response:
@@ -185,6 +208,15 @@ def main() -> None:
     )
     parser.add_argument("--kv-heads", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument(
+        "--mega-num-comm-sms",
+        type=_parse_positive_int_list,
+        default=None,
+        help=(
+            "Comma- or whitespace-separated Mega communication-SM sweep; "
+            "non-Mega backends run once per load point."
+        ),
+    )
+    parser.add_argument(
         "--gpu-memory-utilization", type=float, default=0.9,
         help="vLLM per-GPU memory target; lower this when GPUs are shared.",
     )
@@ -200,6 +232,8 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--server-start-timeout", type=float, default=900)
     args = parser.parse_args()
+    if args.mega_num_comm_sms is not None and "mega" not in args.backends:
+        parser.error("--mega-num-comm-sms requires the mega backend")
     # ``infer/`` is an archive directory; the repository root is two levels
     # above this module (``infer/vllm_bench/matrix.py``).
     root = Path(__file__).resolve().parents[2]
@@ -208,9 +242,20 @@ def main() -> None:
     runtime_versions = _runtime_versions(root)
     url = f"http://{args.host}:{args.port}"
     summaries = []
+    backend_variants: list[tuple[str, int | None]] = []
     for backend in args.backends:
+        if backend == "mega" and args.mega_num_comm_sms is not None:
+            backend_variants.extend(
+                (backend, comm_sm) for comm_sm in args.mega_num_comm_sms
+            )
+        else:
+            backend_variants.append((backend, 8 if backend == "mega" else None))
+    for backend, comm_sm in backend_variants:
         for scale in args.arrival_time_scales:
-            run_dir = args.result_dir / f"{backend}-scale{scale:g}"
+            run_dir_name = f"{backend}-scale{scale:g}"
+            if backend == "mega" and args.mega_num_comm_sms is not None:
+                run_dir_name = f"mega-comm_sm{comm_sm}-scale{scale:g}"
+            run_dir = args.result_dir / run_dir_name
             run_dir.mkdir(parents=True, exist_ok=True)
             serve_args = serve_parser().parse_args(
                 [
@@ -218,6 +263,8 @@ def main() -> None:
                     backend,
                     "--kv-heads",
                     str(args.kv_heads),
+                    "--mega-num-comm-sm",
+                    str(comm_sm or 8),
                     "--host",
                     args.host,
                     "--port",
@@ -245,6 +292,7 @@ def main() -> None:
                 "kv_heads": args.kv_heads,
                 "tp_size": 8,
                 "dcp_size": 8 // args.kv_heads,
+                "mega_num_comm_sm": comm_sm,
                 "num_hidden_layers": args.num_hidden_layers,
                 "gpu_memory_utilization": args.gpu_memory_utilization,
                 "kv_cache_memory_bytes": args.kv_cache_memory_bytes,
@@ -300,6 +348,7 @@ def main() -> None:
                         run_dir,
                     )
                     summary["workload_sha256"] = workload_hash
+                    summary["mega_num_comm_sm"] = comm_sm
                     (run_dir / "summary.json").write_text(
                         json.dumps(summary, indent=2) + "\n", encoding="utf-8"
                     )
