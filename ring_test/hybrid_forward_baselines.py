@@ -384,7 +384,9 @@ def fa3_ring_forward(
     is_causal: bool,
     backend: str,
     ring_members: tuple[int, ...] | None = None,
-) -> torch.Tensor:
+    *,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     block_backend = _BlockBackend(backend)
     max_local_len = max(local_lengths)
     if is_causal:
@@ -397,6 +399,7 @@ def fa3_ring_forward(
             cu_seqlens_host,
             max_local_len,
             block_backend.forward_block,
+            return_lse=return_lse,
             ring_members=ring_members,
         )
     return ring_varlen_forward(
@@ -417,6 +420,7 @@ def fa3_ring_forward(
             max_local_len,
             causal_,
         ),
+        return_lse=return_lse,
         ring_members=ring_members,
     )
 

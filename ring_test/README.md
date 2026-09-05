@@ -58,6 +58,20 @@ current attention work while preserving the GQA mapping from each KV slice to
 its corresponding Q-head range. It uses the same external-FA3/local-min-FA3
 backend selection as `allgather_attention`.
 
+`ulysses` uses per-sequence contiguous CP shards. It exchanges projected Q/K/V
+from sequence-parallel to head-parallel layout with NCCL all-to-all, runs one
+full-sequence varlen attention per owned head slice, then applies the inverse
+all-to-all to O. When KVH is smaller than CP, each KV head is replicated across
+the ranks that own its Q-head group; backward reduces those replica gradients
+in FP32. Forward retains head-sharded O/LSE but not Q/K/V, so backward repeats
+the Q/K/V all-to-all before FA3 backward and then exchanges dQ/dK/dV.
+
+`usp` selects `U=min(CP, KVH)` for all-to-all and uses `R=CP/U` for the existing
+FA3 ring. It does not replicate KV heads. Only causal `R>1` uses the existing
+zigzag `[front | back]` layout; Ulysses, `R=1` USP, and noncausal USP use
+contiguous sequence shards. Ring backward retains the existing semantics of
+resending K/V blocks and returning FP32 dK/dV to their owners.
+
 `--allgather-overlapping-heads-k-stride` controls the number of KV heads in
 one pipeline slice for both `allgather_attention` and
 `llama3_allgather_attention`. It must be a positive divisor of `--kvhead`.
@@ -205,6 +219,8 @@ divisible by 256, and the current fused backward requires causal mode,
 
 - `allgather_attention`: overlapped KV-head-sliced per-sequence zigzag all-gather backward
 - `llama3_allgather_attention`: overlapped KV-head-sliced whole-packed two-block all-gather backward
+- `ulysses`: contiguous sequence-to-head all-to-all with FP32 replica-gradient reduction
+- `usp`: U-way all-to-all plus R-way FA3 ring backward
 - `fa3_ring`: NCCL zigzag K/V and FP32 dKV ring using FA3 block backward
 - `megatron_hybrid_cp`: Megatron length schedule with CP1/2/4/8 FA3 P2P phases
 - `magi_attention`: full-WORLD MagiAttention dynamic packing/dispatch baseline
@@ -212,10 +228,10 @@ divisible by 256, and the current fused backward requires causal mode,
 - `mega_ring_all_cp`: fused backward with every sequence split across all ranks
 - `mega_ring_hybrid`: fused G8/G4/G2/G1 hierarchical backward
 
-The five block baselines prefer external FA3 consistently across all ranks
+The local block baselines prefer external FA3 consistently across all ranks
 and fall back to this repository's min-FA3 varlen forward/backward ops when it
 is unavailable. `mega_ring_all_cp` and `mega_ring_hybrid` sweep every requested
-SM configuration; the five block baselines run once. Results
+SM configuration; the non-fused block baselines run once. Results
 include the average of the per-iteration maximum end-to-end wall times and
 each rank's average time, aggregate/average-per-GPU causal backward TFLOP/s,
 and the fused compute/communication SM split. Forward preparation is outside
@@ -342,11 +358,13 @@ forward/backward threshold and defaults to `4096`.
 ## Forward/backward load-balance metadata benchmark
 
 `benchmark_load_balance.py` is the unified static analysis entry point for all
-eight baselines in `benchmark_topology_forward.py` and
+ten baselines in `benchmark_topology_forward.py` and
 `benchmark_topology_backward.py`:
 
 - `allgather_attention`
 - `llama3_allgather_attention`
+- `ulysses`
+- `usp`
 - `fa3_ring`
 - `megatron_hybrid_cp`
 - `magi_attention`
@@ -498,11 +516,13 @@ Backward communication follows each runner's actual boundary:
 
 ## Explicit-topology mega-ring benchmark
 
-`benchmark_topology_forward.py` compares the same global varlen batch with eight
+`benchmark_topology_forward.py` compares the same global varlen batch with ten
 methods:
 
 - `allgather_attention`: KV-head-sliced, overlapped all-CP K/V all-gather with per-sequence zigzag partitioning
 - `llama3_allgather_attention`: KV-head-sliced, overlapped all-CP K/V all-gather with whole-packed zigzag partitioning
+- `ulysses`: full-CP Q/K/V/O all-to-all with contiguous sequence shards and small-KVH replication
+- `usp`: U-way Q/K/V/O all-to-all followed by an R-way FA3 ring
 - `fa3_ring`: all-CP Python ring using FA3 blocks plus NCCL P2P
 - `megatron_hybrid_cp`: independently scheduled Megatron CP1/2/4/8 groups
 - `magi_attention`: full-WORLD dynamic packing/dispatch through MagiAttention
@@ -515,11 +535,11 @@ the built demo extension. Their shared workload and reference helpers live in
 `ring_test/utils.py`; running them does not require the scripts under
 `scripts/test_mega_ring/` or an additional `PYTHONPATH`.
 
-The first three methods are all-CP baselines. Every global sequence is divided
+The first five methods are all-CP baselines. Every global sequence is divided
 evenly over all physical ranks. `mega_ring_hybrid` instead uses `--ring-sizes` and
 `--ring-starts`; rank-local length is `global_len / ring_size` for members of
-that batch's ring and zero for other ranks. External FA3 is used by all three
-all-CP block baselines and Zeppelin when available; all four consistently fall
+that batch's ring and zero for other ranks. External FA3 is used by all five
+all-CP block baselines and Zeppelin when available; all six consistently fall
 back to the local min-FA3 varlen block when it is unavailable.
 
 `magi_attention` is a performance-only baseline using the same global lengths
@@ -608,14 +628,14 @@ queue. Empty queues skip their kernel launch.
 
 Forward selection requires the external FA3 varlen forward entry point on
 every rank. Backward selection requires both its forward and backward entry
-points; otherwise all four block baselines use the current repository's matching
-min-FA3 operators for the entire run.
+points; otherwise all local block baselines use the current repository's
+matching min-FA3 operators for the entire run.
 
-For an `--sm-configs` list, the four block baselines run once using the first
+For an `--sm-configs` list, the non-fused block baselines run once using the first
 configuration. `mega_ring_all_cp` and `mega_ring_hybrid` run once for every
 configuration in both hybrid forward and backward.
 
-The three block-based all-CP baseline lengths must be divisible by the physical
+The five block-based all-CP baseline lengths must be divisible by the physical
 world size. The total global token count for `llama3_allgather_attention` must
 also be divisible by `2 * world_size`. `mega_ring_all_cp` is benchmarked on a
 separate workload where every global sequence is rounded upward to a multiple
@@ -634,7 +654,7 @@ KV work, and a KV read is one attention mainloop KV tile. It excludes the
 and collection are outside event timing and TFLOPS. Causal ready-segment timing
 can make the observed Q/O visit count and ratio fall anywhere in the static
 `benchmark_load_balance.py` lower/upper range, while KV reads remain stable.
-Use `--methods` to select a subset or `--methods all` for all eight. Native
+Use `--methods` to select a subset or `--methods all` for all ten. Native
 Zeppelin does not skip non-divisible raw lengths: after planning, noncausal
 execution length is rounded up to a multiple of G and causal execution length
 to a multiple of `2*G`. This padding does not quantize or recompute G. The

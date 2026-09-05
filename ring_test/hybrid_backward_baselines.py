@@ -618,6 +618,8 @@ class VarlenFa3RingBackward(_BlockBackend):
         self.v_ring = [torch.empty_like(v), torch.empty_like(v)]
         self.dk_ring = [torch.empty_like(k, dtype=torch.float32) for _ in range(2)]
         self.dv_ring = [torch.empty_like(v, dtype=torch.float32) for _ in range(2)]
+        self.local_dk_fp32 = self.dk_ring[0]
+        self.local_dv_fp32 = self.dv_ring[0]
         self.dq_scratch = torch.empty_like(q)
         self.dk_scratch = torch.empty_like(k)
         self.dv_scratch = torch.empty_like(v)
@@ -708,11 +710,16 @@ class VarlenFa3RingBackward(_BlockBackend):
             self.dv_scratch[: v.size(0)],
         )
 
-    def backward(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def backward(
+        self, *, return_fp32: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.out is None or self.lse is None:
             raise RuntimeError("FA3 ring backward requires a prepared forward")
         if self.out_back is None or self.lse_back is None:
             raise RuntimeError("FA3 ring backward is missing back-half state")
+        # ``bind_inputs`` may install Q rebuilt by a preceding all-to-all (USP).
+        # Refresh the derived half instead of relying on forward scratch.
+        torch.index_select(self.q, 0, self.back_index, out=self.q_back)
         torch.index_select(self.dout, 0, self.back_index, out=self.dout_back)
         kv_comm = RingComm(self.process_group, self.ring_members)
         dkv_comm = RingComm(self.process_group, self.ring_members)
@@ -805,10 +812,20 @@ class VarlenFa3RingBackward(_BlockBackend):
         dkv_comm.wait()
         if next_dk is None or next_dv is None:
             raise RuntimeError("dKV ring did not return owner gradients")
+        self.local_dk_fp32 = next_dk
+        self.local_dv_fp32 = next_dv
         return (
             self.dq_accum.to(self.q.dtype),
-            next_dk.to(self.k.dtype),
-            next_dv.to(self.v.dtype),
+            (
+                self.local_dk_fp32
+                if return_fp32
+                else self.local_dk_fp32.to(self.k.dtype)
+            ),
+            (
+                self.local_dv_fp32
+                if return_fp32
+                else self.local_dv_fp32.to(self.v.dtype)
+            ),
         )
 
 

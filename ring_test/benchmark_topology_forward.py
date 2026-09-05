@@ -64,11 +64,14 @@ from zeppelin import (
     make_zeppelin_plan,
     zeppelin_incompatibility,
 )
+from ulysses_attention import USPAttention, UlyssesAttention
 
 
 METHOD_ORDER = [
     "allgather_attention",
     "llama3_allgather_attention",
+    "ulysses",
+    "usp",
     "fa3_ring",
     "megatron_hybrid_cp",
     "magi_attention",
@@ -86,6 +89,8 @@ OVERLAPPED_ALLGATHER_METHODS = {
 ALL_CP_METHODS = {
     "allgather_attention",
     "llama3_allgather_attention",
+    "ulysses",
+    "usp",
     "fa3_ring",
     "mega_ring_all_cp",
 }
@@ -260,7 +265,28 @@ def method_incompatibility(
     is_causal: bool,
     zeppelin_threshold: int = DEFAULT_ZEPPELIN_THRESHOLD,
     megatron_max_seqlen_per_rank: int = 8192,
+    *,
+    q_heads: int | None = None,
+    kv_heads: int | None = None,
 ) -> str | None:
+    if q_heads is None:
+        q_heads = world_size
+    if kv_heads is None:
+        kv_heads = world_size
+    if method == "ulysses":
+        if q_heads % world_size:
+            return f"Ulysses requires QH={q_heads} divisible by CP={world_size}"
+        if kv_heads >= world_size:
+            if kv_heads % world_size:
+                return "Ulysses requires KVH divisible by CP"
+        elif world_size % kv_heads:
+            return "Ulysses requires CP divisible by small KVH"
+    if method == "usp":
+        ulysses_degree = min(world_size, kv_heads)
+        if world_size % ulysses_degree or kv_heads % ulysses_degree:
+            return "USP Ulysses degree must divide CP and KVH"
+        if q_heads % ulysses_degree:
+            return "USP requires QH divisible by its Ulysses degree"
     if method == "megatron_hybrid_cp":
         return hybrid_cp_incompatibility(
             global_lengths,
@@ -285,7 +311,10 @@ def method_incompatibility(
                 f"batch={idx}, global_len={global_len}, world_size={world_size}"
             )
         local_len = global_len // world_size
-        if is_causal and local_len % 2:
+        needs_zigzag = method == "fa3_ring" or (
+            method == "usp" and kv_heads < world_size
+        )
+        if is_causal and needs_zigzag and local_len % 2:
             return (
                 "causal all-CP methods require even local lengths: "
                 f"batch={idx}, local_len={local_len}"
@@ -303,6 +332,8 @@ def compatible_methods_for_mode(
     global_lengths: list[int],
     world_size: int,
     is_causal: bool,
+    q_heads: int,
+    kv_heads: int,
     *,
     skip_incompatible: bool,
     zeppelin_threshold: int = DEFAULT_ZEPPELIN_THRESHOLD,
@@ -318,6 +349,8 @@ def compatible_methods_for_mode(
             is_causal,
             zeppelin_threshold,
             megatron_max_seqlen_per_rank,
+            q_heads=q_heads,
+            kv_heads=kv_heads,
         )
         if reason is None:
             compatible.append(method)
@@ -674,15 +707,18 @@ def _main_single(
         mega_ring_all_cp_global_lengths = align_mega_ring_all_cp_lengths(global_lengths)
         ring_sizes = parse_int_list(args.ring_sizes, "--ring-sizes")
         ring_starts = parse_int_list(args.ring_starts, "--ring-starts")
-        if any(
-            method
-            not in {"zeppelin", "magi_attention", "megatron_hybrid_cp"}
-            for method in methods
-        ):
+        layout_independent = {
+            "zeppelin",
+            "magi_attention",
+            "megatron_hybrid_cp",
+            "ulysses",
+            "usp",
+        }
+        if any(method not in layout_independent for method in methods):
             validate_metadata(
                 global_lengths, ring_sizes, ring_starts, world_size, args.mode
             )
-        elif "zeppelin" in methods and not (
+        elif not (
             len(global_lengths) == len(ring_sizes) == len(ring_starts)
         ):
             raise SystemExit(
@@ -715,6 +751,8 @@ def _main_single(
                 skip_incompatible=skip_incompatible_methods,
                 zeppelin_threshold=args.zeppelin_threshold,
                 megatron_max_seqlen_per_rank=args.megatron_max_seqlen_per_rank,
+                q_heads=args.qhead,
+                kv_heads=args.kvhead,
             )
             methods_by_mode[is_causal] = active_methods
             skipped_by_mode[is_causal] = skipped_methods
@@ -739,6 +777,8 @@ def _main_single(
                     for method in (
                         "allgather_attention",
                         "llama3_allgather_attention",
+                        "ulysses",
+                        "usp",
                         "fa3_ring",
                         "megatron_hybrid_cp",
                         "zeppelin",
@@ -836,6 +876,7 @@ def _main_single(
                 )
             all_cp_runs: dict[str, tuple[Callable[[], object], str]] = {}
             expected_all_cp_out = None
+            expected_contiguous_all_cp_out = None
             expected_llama3_out = None
             if any(method in BLOCK_ALL_CP_METHODS for method in active_methods):
                 all_cp_lengths = [length // world_size for length in global_lengths]
@@ -911,6 +952,35 @@ def _main_single(
                         ),
                         f"all-CP NCCL ring; {backend_note}",
                     )
+                if "ulysses" in active_methods:
+                    if block_backend is None:
+                        raise RuntimeError("Ulysses baseline requires a block backend")
+                    ulysses_runner = UlyssesAttention(
+                        dist.group.WORLD,
+                        all_cp_q,
+                        all_cp_k,
+                        all_cp_v,
+                        global_lengths,
+                        is_causal,
+                        block_backend,
+                    )
+                    all_cp_runs["ulysses"] = (
+                        ulysses_runner.forward,
+                        ulysses_runner.note,
+                    )
+                if "usp" in active_methods:
+                    if block_backend is None:
+                        raise RuntimeError("USP baseline requires a block backend")
+                    usp_runner = USPAttention(
+                        dist.group.WORLD,
+                        all_cp_q,
+                        all_cp_k,
+                        all_cp_v,
+                        global_lengths,
+                        is_causal,
+                        block_backend,
+                    )
+                    all_cp_runs["usp"] = (usp_runner.forward, usp_runner.note)
                 if args.check:
                     gathered_all_cp_k = gather_padded_rank_tensor(all_cp_k, all_cp_total)
                     gathered_all_cp_v = gather_padded_rank_tensor(all_cp_v, all_cp_total)
@@ -926,6 +996,23 @@ def _main_single(
                         rank,
                         is_causal,
                     )
+                    if "ulysses" in active_methods or (
+                        "usp" in active_methods
+                        and (not is_causal or args.kvhead >= world_size)
+                    ):
+                        expected_contiguous_all_cp_out, _ = hierarchical_reference(
+                            all_cp_q,
+                            gathered_all_cp_k,
+                            gathered_all_cp_v,
+                            [all_cp_lengths for _ in range(world_size)],
+                            all_cp_cu_host,
+                            global_lengths,
+                            [world_size] * len(global_lengths),
+                            [0] * len(global_lengths),
+                            rank,
+                            is_causal,
+                            causal_layout="contiguous",
+                        )
                     if "llama3_allgather_attention" in active_methods:
                         expected_llama3_out = repartition_sequence_shards_to_llama3(
                             dist.group.WORLD,
@@ -1266,7 +1353,15 @@ def _main_single(
                         expected_out = (
                             expected_llama3_out
                             if method == "llama3_allgather_attention"
-                            else expected_all_cp_out
+                            else (
+                                expected_contiguous_all_cp_out
+                                if method == "ulysses"
+                                or (
+                                    method == "usp"
+                                    and (not is_causal or args.kvhead >= world_size)
+                                )
+                                else expected_all_cp_out
+                            )
                         )
                         runs.append(
                             MethodRun(
@@ -1647,11 +1742,14 @@ def main(
             f"kvhead={args.kvhead}"
         )
     for workload_case in workload_cases:
-        if any(
-            method
-            not in {"zeppelin", "magi_attention", "megatron_hybrid_cp"}
-            for method in methods
-        ):
+        layout_independent = {
+            "zeppelin",
+            "magi_attention",
+            "megatron_hybrid_cp",
+            "ulysses",
+            "usp",
+        }
+        if any(method not in layout_independent for method in methods):
             validate_metadata(
                 list(workload_case.global_lengths),
                 list(workload_case.ring_sizes),
@@ -1659,7 +1757,7 @@ def main(
                 int(os.environ["LOCAL_WORLD_SIZE"]),
                 args.mode,
             )
-        elif "zeppelin" in methods and not (
+        elif not (
             len(workload_case.global_lengths)
             == len(workload_case.ring_sizes)
             == len(workload_case.ring_starts)

@@ -69,11 +69,14 @@ from zeppelin import (
     make_zeppelin_plan,
     zeppelin_incompatibility,
 )
+from ulysses_attention import USPAttention, UlyssesAttention
 
 
 METHOD_ORDER = [
     "allgather_attention",
     "llama3_allgather_attention",
+    "ulysses",
+    "usp",
     "fa3_ring",
     "megatron_hybrid_cp",
     "magi_attention",
@@ -84,6 +87,8 @@ METHOD_ORDER = [
 BLOCK_BASELINE_METHODS = {
     "allgather_attention",
     "llama3_allgather_attention",
+    "ulysses",
+    "usp",
     "fa3_ring",
     "zeppelin",
 }
@@ -215,7 +220,28 @@ def method_incompatibility(
     world_size: int,
     zeppelin_threshold: int = DEFAULT_ZEPPELIN_THRESHOLD,
     megatron_max_seqlen_per_rank: int = 8192,
+    *,
+    q_heads: int | None = None,
+    kv_heads: int | None = None,
 ) -> str | None:
+    if q_heads is None:
+        q_heads = world_size
+    if kv_heads is None:
+        kv_heads = world_size
+    if method == "ulysses":
+        if q_heads % world_size:
+            return f"Ulysses requires QH={q_heads} divisible by CP={world_size}"
+        if kv_heads >= world_size:
+            if kv_heads % world_size:
+                return "Ulysses requires KVH divisible by CP"
+        elif world_size % kv_heads:
+            return "Ulysses requires CP divisible by small KVH"
+    if method == "usp":
+        ulysses_degree = min(world_size, kv_heads)
+        if world_size % ulysses_degree or kv_heads % ulysses_degree:
+            return "USP Ulysses degree must divide CP and KVH"
+        if q_heads % ulysses_degree:
+            return "USP requires QH divisible by its Ulysses degree"
     if method == "megatron_hybrid_cp":
         return hybrid_cp_incompatibility(
             global_lengths,
@@ -239,7 +265,10 @@ def method_incompatibility(
                 f"world_size={world_size}"
             )
         local_len = global_len // world_size
-        if local_len % 2:
+        needs_zigzag = method == "fa3_ring" or (
+            method == "usp" and kv_heads < world_size
+        )
+        if needs_zigzag and local_len % 2:
             return (
                 "causal all-CP baselines require even local lengths: "
                 f"batch={batch_idx}, local_len={local_len}"
@@ -256,6 +285,8 @@ def compatible_methods(
     methods: list[str],
     global_lengths: list[int],
     world_size: int,
+    q_heads: int,
+    kv_heads: int,
     *,
     skip_incompatible: bool,
     zeppelin_threshold: int = DEFAULT_ZEPPELIN_THRESHOLD,
@@ -270,6 +301,8 @@ def compatible_methods(
             world_size,
             zeppelin_threshold,
             megatron_max_seqlen_per_rank,
+            q_heads=q_heads,
+            kv_heads=kv_heads,
         )
         if reason is None:
             active.append(method)
@@ -530,6 +563,8 @@ def make_reference(
     ring_starts: list[int],
     rank_capacity: int,
     rank: int,
+    *,
+    causal_layout: str = "zigzag",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     gathered_k = gather_padded_rank_tensor(local_k, rank_capacity)
     gathered_v = gather_padded_rank_tensor(local_v, rank_capacity)
@@ -547,6 +582,7 @@ def make_reference(
         ring_starts,
         rank,
         True,
+        causal_layout=causal_layout,
     )
     if q.size(0) > 0:
         dq_ref, dk_ref_all, dv_ref_all = torch.autograd.grad(
@@ -754,12 +790,16 @@ def benchmark_topology(
         raise ValueError(
             "metric_global_lengths must contain one positive raw length per sample"
         )
-    if any(
-        method not in {"zeppelin", "magi_attention", "megatron_hybrid_cp"}
-        for method in methods
-    ):
+    layout_independent = {
+        "zeppelin",
+        "magi_attention",
+        "megatron_hybrid_cp",
+        "ulysses",
+        "usp",
+    }
+    if any(method not in layout_independent for method in methods):
         validate_backward_metadata(global_lengths, ring_sizes, ring_starts, world_size)
-    elif "zeppelin" in methods and not (
+    elif not (
         len(global_lengths) == len(ring_sizes) == len(ring_starts)
     ):
         raise SystemExit(
@@ -917,6 +957,7 @@ def benchmark_topology(
         ).to(torch.bfloat16)
 
         all_cp_reference = None
+        contiguous_all_cp_reference = None
         if args.check:
             all_cp_reference = make_reference(
                 all_cp_q,
@@ -931,6 +972,23 @@ def benchmark_topology(
                 all_cp_total,
                 rank,
             )
+            if "ulysses" in methods or (
+                "usp" in methods and args.kvhead >= world_size
+            ):
+                contiguous_all_cp_reference = make_reference(
+                    all_cp_q,
+                    all_cp_k,
+                    all_cp_v,
+                    all_cp_dout,
+                    [all_cp_lengths for _ in range(world_size)],
+                    all_cp_cu_host,
+                    global_lengths,
+                    [world_size] * len(global_lengths),
+                    [0] * len(global_lengths),
+                    all_cp_total,
+                    rank,
+                    causal_layout="contiguous",
+                )
 
         if "allgather_attention" in methods:
             allgather_runner = VarlenAllGatherBackward(
@@ -1003,6 +1061,49 @@ def benchmark_topology(
                 fa3_ring_runner.backward,
                 None if all_cp_reference is None else all_cp_reference[2:],
                 fa3_ring_runner.note,
+            )
+
+        if "ulysses" in methods:
+            ulysses_runner = UlyssesAttention(
+                dist.group.WORLD,
+                all_cp_q,
+                all_cp_k,
+                all_cp_v,
+                global_lengths,
+                True,
+                allgather_backend,
+                enable_backward=True,
+            )
+            baseline_runs["ulysses"] = MethodRun(
+                ulysses_runner.forward,
+                lambda: ulysses_runner.backward(all_cp_dout),
+                None
+                if contiguous_all_cp_reference is None
+                else contiguous_all_cp_reference[2:],
+                ulysses_runner.note,
+            )
+
+        if "usp" in methods:
+            usp_runner = USPAttention(
+                dist.group.WORLD,
+                all_cp_q,
+                all_cp_k,
+                all_cp_v,
+                global_lengths,
+                True,
+                allgather_backend,
+                enable_backward=True,
+            )
+            usp_reference = (
+                contiguous_all_cp_reference
+                if usp_runner.topology.ring_degree == 1
+                else all_cp_reference
+            )
+            baseline_runs["usp"] = MethodRun(
+                usp_runner.forward,
+                lambda: usp_runner.backward(all_cp_dout),
+                None if usp_reference is None else usp_reference[2:],
+                usp_runner.note,
             )
 
     if "mega_ring_all_cp" in methods:
@@ -1784,15 +1885,20 @@ def main(
                     )
 
         for _label, global_lengths, ring_sizes, ring_starts in workloads:
+            layout_independent = {
+                "zeppelin",
+                "magi_attention",
+                "megatron_hybrid_cp",
+                "ulysses",
+                "usp",
+            }
             if any(
-                method
-                not in {"zeppelin", "magi_attention", "megatron_hybrid_cp"}
-                for method in requested_methods
+                method not in layout_independent for method in requested_methods
             ):
                 validate_backward_metadata(
                     global_lengths, ring_sizes, ring_starts, world_size
                 )
-            elif "zeppelin" in requested_methods and not (
+            elif not (
                 len(global_lengths) == len(ring_sizes) == len(ring_starts)
             ):
                 raise SystemExit(
@@ -1834,6 +1940,8 @@ def main(
                 skip_incompatible=skip_incompatible_methods,
                 zeppelin_threshold=args.zeppelin_threshold,
                 megatron_max_seqlen_per_rank=args.megatron_max_seqlen_per_rank,
+                q_heads=args.qhead,
+                kv_heads=args.kvhead,
             )
             if rank == 0 and skipped_methods:
                 print(f"\nSkipped methods for {label}:")

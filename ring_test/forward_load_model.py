@@ -17,11 +17,14 @@ from ring_test.utils import (
     hybrid_cp_saturation_note,
 )
 from ring_test.zeppelin import DEFAULT_ZEPPELIN_THRESHOLD, make_zeppelin_plan
+from ring_test.ulysses_attention import make_usp_topology
 
 
 METHOD_ORDER = (
     "allgather_attention",
     "llama3_allgather_attention",
+    "ulysses",
+    "usp",
     "fa3_ring",
     "megatron_hybrid_cp",
     "magi_attention",
@@ -373,6 +376,119 @@ def analyze_allgather(
         f"{mode}; communication excludes setup repartition"
     )
     return _finalize(method, is_causal, loads, q_heads, head_dim, note)
+
+
+def analyze_ulysses(
+    global_lengths: Sequence[int],
+    world_size: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    is_causal: bool,
+) -> MethodLoadResult:
+    """Account for full-CP QKVO A2A with optional small-KVH replication."""
+    if q_heads % world_size:
+        raise ValueError("Ulysses requires QH divisible by CP")
+    if kv_heads >= world_size:
+        if kv_heads % world_size:
+            raise ValueError("Ulysses requires KVH divisible by CP")
+        effective_kv_heads = kv_heads
+    else:
+        if world_size % kv_heads:
+            raise ValueError("Ulysses requires CP divisible by small KVH")
+        effective_kv_heads = world_size
+
+    local_tokens = sum(global_lengths) / world_size
+    remote_fraction = (world_size - 1) / world_size
+    communication = (
+        remote_fraction
+        * local_tokens
+        * head_dim
+        * BF16_BYTES
+        * (2 * q_heads + 2 * effective_kv_heads)
+    )
+    loads = [_MutableRankLoad() for _ in range(world_size)]
+    local_q_heads = q_heads // world_size
+    mask = CAUSAL if is_causal else FULL
+    for load in loads:
+        load.effective_tokens = local_tokens
+        load.physical_tokens = local_tokens
+        load.comm_tx_bytes = communication
+        load.comm_rx_bytes = communication
+        for length in global_lengths:
+            task = AttentionTask(length, length, mask)
+            area = attention_area(task) / world_size
+            load.effective_scores += area
+            load.physical_scores += area
+            reads, visits = task_tile_counters(task, local_q_heads)
+            load.kv_tile_reads += reads
+            load.qo_visits_worst += visits
+            load.qo_visits_best += visits
+    replica = effective_kv_heads // kv_heads
+    note = (
+        "full-sequence QKVO all-to-all; contiguous sequence shards; "
+        f"KV replica factor={replica}"
+    )
+    return _finalize("ulysses", is_causal, loads, q_heads, head_dim, note)
+
+
+def analyze_usp(
+    global_lengths: Sequence[int],
+    world_size: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    is_causal: bool,
+) -> MethodLoadResult:
+    """Account for U-way head A2A followed by an R-way FA3 ring."""
+    topology = make_usp_topology(world_size, kv_heads)
+    u_degree, ring_degree = topology.ulysses_degree, topology.ring_degree
+    if q_heads % u_degree:
+        raise ValueError("USP requires QH divisible by its Ulysses degree")
+    local_tokens = sum(global_lengths) / world_size
+    super_tokens = local_tokens * u_degree
+    remote_fraction = (u_degree - 1) / u_degree
+    a2a_bytes = (
+        remote_fraction
+        * local_tokens
+        * head_dim
+        * BF16_BYTES
+        * (2 * q_heads + 2 * kv_heads)
+    )
+    ring_bytes = (
+        (ring_degree - 1)
+        * super_tokens
+        * (kv_heads / u_degree)
+        * head_dim
+        * 2
+        * BF16_BYTES
+    )
+    loads = [_MutableRankLoad() for _ in range(world_size)]
+    local_q_heads = q_heads // u_degree
+    for rank, load in enumerate(loads):
+        load.effective_tokens = local_tokens
+        load.physical_tokens = local_tokens
+        load.comm_tx_bytes = a2a_bytes + ring_bytes
+        load.comm_rx_bytes = a2a_bytes + ring_bytes
+        ring_rank = rank // u_degree
+        for length in global_lengths:
+            layer_length = length // ring_degree
+            for task in _ring_tasks(
+                layer_length, ring_degree, ring_rank, is_causal
+            ):
+                area = attention_area(task) / u_degree
+                load.effective_scores += area
+                load.physical_scores += area
+                reads, visits = task_tile_counters(task, local_q_heads)
+                load.kv_tile_reads += reads
+                load.qo_visits_worst += visits
+                load.qo_visits_best += visits
+    layout = "zigzag causal" if is_causal and ring_degree > 1 else "contiguous"
+    note = (
+        f"USP U={u_degree}, R={ring_degree}; QKVO all-to-all plus FA3 ring; "
+        f"{layout}"
+    )
+    return _finalize("usp", is_causal, loads, q_heads, head_dim, note)
 
 
 def _ring_tasks(
@@ -831,6 +947,24 @@ def analyze_method(
             llama3=True,
             heads_k_stride=heads_k_stride,
         )
+    if method == "ulysses":
+        return analyze_ulysses(
+            global_lengths,
+            world_size,
+            q_heads,
+            kv_heads,
+            head_dim,
+            is_causal,
+        )
+    if method == "usp":
+        return analyze_usp(
+            global_lengths,
+            world_size,
+            q_heads,
+            kv_heads,
+            head_dim,
+            is_causal,
+        )
     if method == "fa3_ring":
         return analyze_fa3_ring(
             global_lengths,
@@ -1227,6 +1361,8 @@ __all__ = [
     "RankLoadRecord",
     "TILE_TOKENS",
     "analyze_allgather",
+    "analyze_ulysses",
+    "analyze_usp",
     "analyze_fa3_ring",
     "analyze_mega_ring_all_cp",
     "analyze_mega_ring_hybrid",

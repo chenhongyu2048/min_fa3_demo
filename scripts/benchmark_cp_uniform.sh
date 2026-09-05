@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 
-# CP: Eight-method uniform-workload forward/backward benchmark on one eight-GPU SM90 node.
+# CP: Ten-method uniform-workload forward/backward benchmark on one eight-GPU SM90 node.
 # Each case keeps total context tokens fixed and sets S=context_length/batch_size.
 
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-cd "$SCRIPT_DIR"
+ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
+cd "$ROOT_DIR"
 
-source /home/hychen/min_fa3_demo/.venv/bin/activate
+# Use the checkout-local environment when present.  The historical benchmark
+# used an absolute path from the original author's workspace, which is not
+# available in every clone and is unnecessary when TORCHRUN is supplied.
+VENV_ACTIVATE=${VENV_ACTIVATE:-"$ROOT_DIR/.venv/bin/activate"}
+if [[ -f "$VENV_ACTIVATE" ]]; then
+    source "$VENV_ACTIVATE"
+fi
 
 # Match the distributed-attention settings used by benchmark_dataset.sh.
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-8}
@@ -22,7 +29,7 @@ CONTEXT_LENGTHS=${CONTEXT_LENGTHS:-"65536 131072 262144 "}
 BATCH_SIZES=${BATCH_SIZES:-"1 2 4 8 16"}
 DIRECTION=${DIRECTION:-both}
 MODE=${MODE:-causal}
-METHODS=${METHODS:-"allgather_attention,llama3_allgather_attention,fa3_ring,megatron_hybrid_cp,magi_attention,zeppelin,mega_ring_all_cp,mega_ring_hybrid"}
+METHODS=${METHODS:-"allgather_attention,llama3_allgather_attention,ulysses,usp,fa3_ring,megatron_hybrid_cp,magi_attention,zeppelin,mega_ring_all_cp,mega_ring_hybrid"}
 QHEAD=${QHEAD:-32}
 KVHEAD=${KVHEAD:-8}
 HEADDIM=${HEADDIM:-128}

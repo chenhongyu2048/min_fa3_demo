@@ -30,10 +30,12 @@ from ring_test.forward_load_model import (
     _magi_mask_name,
     _range_bounds,
     _ring_tasks,
+    analyze_ulysses,
     attention_area,
     iter_global_q_score,
     score_count,
 )
+from ring_test.ulysses_attention import make_usp_topology
 from ring_test.utils import (
     align_mega_ring_all_cp_lengths,
     hybrid_cp_saturation_note,
@@ -330,6 +332,114 @@ def analyze_backward_allgather(
         "forward preparation excluded"
     )
     return _finalize(method, loads, q_heads, head_dim, note)
+
+
+def analyze_backward_ulysses(
+    global_lengths: Sequence[int],
+    world_size: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+) -> BackwardMethodLoadResult:
+    """Account for recomputed QKV A2A plus dO/dQ/dK/dV A2A."""
+    forward = analyze_ulysses(
+        global_lengths, world_size, q_heads, kv_heads, head_dim, True
+    )
+    effective_kv_heads = kv_heads if kv_heads >= world_size else world_size
+    local_tokens = sum(global_lengths) / world_size
+    remote_fraction = (world_size - 1) / world_size
+    communication = (
+        remote_fraction
+        * local_tokens
+        * head_dim
+        * (
+            BF16_BYTES * (3 * q_heads + 2 * effective_kv_heads)
+            + FP32_BYTES * 2 * effective_kv_heads
+        )
+    )
+    loads = [_MutableBackwardRankLoad() for _ in range(world_size)]
+    for load, forward_record in zip(loads, forward.records):
+        load.effective_tokens = forward_record.effective_tokens
+        load.physical_tokens = forward_record.physical_tokens
+        load.effective_scores = forward_record.effective_scores
+        load.physical_scores = forward_record.physical_scores
+        load.comm_tx_bytes = int(communication)
+        load.comm_rx_bytes = int(communication)
+        for length in global_lengths:
+            _add_task(
+                load,
+                AttentionTask(length, length, CAUSAL),
+                q_heads // world_size,
+            )
+    note = (
+        "full-sequence Ulysses backward; redo BF16 Q/K/V A2A; BF16 dO/dQ "
+        "A2A; FP32 dK/dV A2A and replica reduction"
+    )
+    return _finalize("ulysses", loads, q_heads, head_dim, note)
+
+
+def analyze_backward_usp(
+    global_lengths: Sequence[int],
+    world_size: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+) -> BackwardMethodLoadResult:
+    """Account for recomputed U-way A2A and optional R-way ring backward."""
+    topology = make_usp_topology(world_size, kv_heads)
+    u_degree, ring_degree = topology.ulysses_degree, topology.ring_degree
+    if q_heads % u_degree:
+        raise ValueError("USP requires QH divisible by its Ulysses degree")
+    local_tokens = sum(global_lengths) / world_size
+    super_tokens = local_tokens * u_degree
+    remote_fraction = (u_degree - 1) / u_degree
+    a2a_bytes = (
+        remote_fraction
+        * local_tokens
+        * head_dim
+        * (
+            BF16_BYTES * (3 * q_heads + 2 * kv_heads)
+            + FP32_BYTES * 2 * kv_heads
+        )
+    )
+    ring_kv_bytes = (
+        (ring_degree - 1)
+        * super_tokens
+        * (kv_heads / u_degree)
+        * head_dim
+        * 2
+        * BF16_BYTES
+    )
+    ring_dkv_bytes = (
+        (ring_degree if ring_degree > 1 else 0)
+        * super_tokens
+        * (kv_heads / u_degree)
+        * head_dim
+        * 2
+        * FP32_BYTES
+    )
+    communication = int(a2a_bytes + ring_kv_bytes + ring_dkv_bytes)
+    loads = [_MutableBackwardRankLoad() for _ in range(world_size)]
+    local_q_heads = q_heads // u_degree
+    for rank, load in enumerate(loads):
+        load.effective_tokens = local_tokens
+        load.physical_tokens = local_tokens
+        load.comm_tx_bytes = communication
+        load.comm_rx_bytes = communication
+        ring_rank = rank // u_degree
+        for length in global_lengths:
+            layer_length = length // ring_degree
+            tasks = _ring_tasks(layer_length, ring_degree, ring_rank, True)
+            for task in tasks:
+                area = attention_area(task) / u_degree
+                load.effective_scores += area
+                load.physical_scores += area
+                _add_task(load, task, local_q_heads)
+    note = (
+        f"USP backward U={u_degree}, R={ring_degree}; redo Q/K/V A2A; "
+        "ring backward resends BF16 K/V and returns FP32 dK/dV"
+    )
+    return _finalize("usp", loads, q_heads, head_dim, note)
 
 
 def _add_python_ring_communication(
@@ -703,6 +813,14 @@ def analyze_backward_method(
             llama3=True,
             heads_k_stride=heads_k_stride,
         )
+    if method == "ulysses":
+        return analyze_backward_ulysses(
+            global_lengths, world_size, q_heads, kv_heads, head_dim
+        )
+    if method == "usp":
+        return analyze_backward_usp(
+            global_lengths, world_size, q_heads, kv_heads, head_dim
+        )
     if method == "fa3_ring":
         return analyze_backward_fa3_ring(
             global_lengths, world_size, q_heads, kv_heads, head_dim
@@ -1000,6 +1118,8 @@ __all__ = [
     "BackwardRankLoadRecord",
     "METHOD_ORDER",
     "analyze_backward_allgather",
+    "analyze_backward_ulysses",
+    "analyze_backward_usp",
     "analyze_backward_fa3_ring",
     "analyze_backward_magi_rank",
     "analyze_backward_mega_ring_all_cp",

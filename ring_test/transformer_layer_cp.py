@@ -28,6 +28,8 @@ for _path in (THIS_DIR, DEMO_DIR):
 METHOD_ORDER = (
     "allgather_attention",
     "llama3_allgather_attention",
+    "ulysses",
+    "usp",
     "fa3_ring",
     "megatron_hybrid_cp",
     "magi_attention",
@@ -40,6 +42,8 @@ ALL_CP_METHODS = frozenset(
     (
         "allgather_attention",
         "llama3_allgather_attention",
+        "ulysses",
+        "usp",
         "fa3_ring",
         "mega_ring_all_cp",
     )
@@ -193,6 +197,15 @@ def build_physical_layout(
             f"this benchmark supports CP=4 smoke tests or formal CP=8 runs, got {world_size}"
         )
     validate_hybrid_metadata(original, ring_sizes, ring_starts, world_size)
+
+    if method in ("ulysses", "usp"):
+        return PhysicalLayout(
+            method,
+            original,
+            original,
+            _all_cp_rank_lengths(original, world_size),
+            "per-sequence contiguous all-CP; QKVO all-to-all",
+        )
 
     if method in ("allgather_attention", "llama3_allgather_attention", "fa3_ring"):
         rank_lengths = _all_cp_rank_lengths(original, world_size)
@@ -612,6 +625,7 @@ def prepare_method(
     )
     from ring_test.utils import local_lengths_for_rank
     from ring_test.zeppelin import make_zeppelin_plan
+    from ring_test.ulysses_attention import USPAttention, UlyssesAttention
 
     layout = build_physical_layout(
         method,
@@ -703,6 +717,19 @@ def prepare_method(
             block_backend,
         )
         adapter = _RunnerAdapter(runner, False)
+    elif method in ("ulysses", "usp"):
+        runner_type = UlyssesAttention if method == "ulysses" else USPAttention
+        runner = runner_type(
+            dist.group.WORLD,
+            q,
+            k,
+            v,
+            global_lengths,
+            True,
+            block_backend,
+            enable_backward=True,
+        )
+        adapter = _RunnerAdapter(runner, True)
     elif method == "megatron_hybrid_cp":
         plan = build_hybrid_cp_plan_for_fa3_ring(
             global_lengths,

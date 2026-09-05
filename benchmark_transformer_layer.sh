@@ -19,11 +19,23 @@ SEED=${SEED:-0}
 TARGET_TOKENS=${TARGET_TOKENS:-131072}
 WARMUP_ITERS=${WARMUP_ITERS:-10}
 NUM_ITERS=${NUM_ITERS:-40}
-METHODS=${METHODS:-all}
+# Keep the default method set explicit so the two all-to-all baselines are part
+# of the Transformer-layer benchmark even when the parser's `all` expansion is
+# changed independently.
+METHODS=${METHODS:-"allgather_attention,llama3_allgather_attention,ulysses,usp,fa3_ring,megatron_hybrid_cp,magi_attention,zeppelin,mega_ring_all_cp,mega_ring_hybrid"}
 WORLD_SIZE=${WORLD_SIZE:-8}
 SM_CONFIGS=${SM_CONFIGS:-"128:4,124:8,120:12,116:16"}
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/results/transformer_layer_cp}
 RUN_ID=${RUN_ID:-$(date +%Y%m%d-%H%M%S)}
+DRY_RUN=${DRY_RUN:-0}
+
+case "$DRY_RUN" in
+    0|1) ;;
+    *)
+        echo "error: DRY_RUN must be 0 or 1, got '$DRY_RUN'" >&2
+        exit 2
+        ;;
+esac
 
 SITE_PACKAGES=$(
     "$PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])'
@@ -39,7 +51,9 @@ PY
 )
 export LD_LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-mkdir -p "$OUTPUT_DIR"
+if ((DRY_RUN == 0)); then
+    mkdir -p "$OUTPUT_DIR"
+fi
 
 IFS=',' read -r -a dataset_list <<< "$DATASETS"
 for dataset in "${dataset_list[@]}"; do
@@ -76,5 +90,11 @@ for dataset in "${dataset_list[@]}"; do
     )
     args+=(--sm-configs "$SM_CONFIGS")
     echo "Launching dataset=$dataset -> $output_jsonl"
-    "$TORCHRUN" "${args[@]}"
+    if ((DRY_RUN)); then
+        printf 'CUDA_VISIBLE_DEVICES=%q' "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+        printf ' %q' "$TORCHRUN" "${args[@]}"
+        printf '\n'
+    else
+        "$TORCHRUN" "${args[@]}"
+    fi
 done

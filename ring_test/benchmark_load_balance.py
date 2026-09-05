@@ -243,6 +243,20 @@ def method_incompatibility(
     magi_reason: str | None,
 ) -> str | None:
     lengths = case.global_lengths
+    if method == "ulysses":
+        if args.qhead % world_size:
+            return "Ulysses requires QH divisible by CP"
+        if args.kvhead >= world_size:
+            if args.kvhead % world_size:
+                return "Ulysses requires KVH divisible by CP"
+        elif world_size % args.kvhead:
+            return "Ulysses requires CP divisible by small KVH"
+    if method == "usp":
+        ulysses_degree = min(world_size, args.kvhead)
+        if world_size % ulysses_degree or args.kvhead % ulysses_degree:
+            return "USP Ulysses degree must divide CP and KVH"
+        if args.qhead % ulysses_degree:
+            return "USP requires QH divisible by its Ulysses degree"
     if method in ("mega_ring_all_cp", "mega_ring_hybrid") and (
         args.headdim != 128 or args.kvhead not in (1, 2, 4, 8)
     ):
@@ -275,7 +289,10 @@ def method_incompatibility(
                 f"world_size={world_size}"
             )
         local_length = length // world_size
-        if is_causal and local_length % 2:
+        needs_zigzag = method == "fa3_ring" or (
+            method == "usp" and args.kvhead < world_size
+        )
+        if is_causal and needs_zigzag and local_length % 2:
             return f"causal all-CP batch {index} local length {local_length} is odd"
     if method == "llama3_allgather_attention" and sum(lengths) % (
         2 * world_size

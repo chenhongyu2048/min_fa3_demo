@@ -7,7 +7,8 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-cd "$SCRIPT_DIR"
+ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
+cd "$ROOT_DIR"
 export CUDA_DEVICE_MAX_CONNECTIONS=8
 
 GPU_COUNTS=${GPU_COUNTS:-"8"}

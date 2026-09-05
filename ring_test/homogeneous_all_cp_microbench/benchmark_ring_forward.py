@@ -32,6 +32,7 @@ from allgather_attention import (
     repartition_sequence_shards_to_llama3,
     select_fa3_backend,
 )
+from ulysses_attention import USPAttention, UlyssesAttention, make_usp_topology
 from ring_common import (
     flash_varlen_block_attention,
     gather_rank_tensor,
@@ -60,6 +61,8 @@ except ImportError:
 METHOD_ORDER = [
     "allgather_attention",
     "llama3_allgather_attention",
+    "ulysses",
+    "usp",
     # "pytorch",
     # "fa2",
     "fa3",
@@ -102,6 +105,7 @@ class MethodRun:
     timing_fn: Callable[[], torch.Tensor]
     note: str = ""
     checkable: bool = True
+    reference_layout: str = "zigzag"
 
 
 @dataclass
@@ -546,6 +550,35 @@ def build_method_runs(
                 heads_k_stride=args.allgather_overlapping_heads_k_stride,
             )
             runs.append(MethodRun(method, runner.forward, runner.note))
+        elif method in ("ulysses", "usp"):
+            global_seqlens = [
+                case.seqlen * local_world_size
+            ] * case.batch_size
+            runner_type = UlyssesAttention if method == "ulysses" else USPAttention
+            runner = runner_type(
+                dist.group.WORLD,
+                q,
+                k,
+                v,
+                global_seqlens,
+                case.is_causal,
+                args.allgather_backend,
+            )
+            reference_layout = (
+                "zigzag"
+                if method == "usp"
+                and case.is_causal
+                and runner.topology.ring_degree > 1
+                else "contiguous"
+            )
+            runs.append(
+                MethodRun(
+                    method,
+                    runner.forward,
+                    runner.note,
+                    reference_layout=reference_layout,
+                )
+            )
         elif method == "pytorch":
             def fn(method=method):
                 # Full Python-side ring: P2P K/V exchange, one PyTorch block
@@ -917,6 +950,7 @@ def run_case(
     )
 
     ref = None
+    contiguous_ref = None
     llama3_ref = None
     if args.check:
         # The reference gathers all rank-local K/V blocks. Noncausal uses the
@@ -933,6 +967,16 @@ def run_case(
                 case.seqlen,
                 local_rank,
             )
+            if {"ulysses", "usp"}.intersection(methods):
+                contiguous_ref = reference_ring_varlen(
+                    q,
+                    k_by_rank,
+                    v_by_rank,
+                    case.batch_size,
+                    case.seqlen,
+                    local_rank,
+                    True,
+                )
         else:
             ref = reference_ring_varlen(
                 q,
@@ -943,6 +987,7 @@ def run_case(
                 local_rank,
                 False,
             )
+            contiguous_ref = ref
         if "llama3_allgather_attention" in methods:
             global_seqlens = [case.seqlen * local_world_size] * case.batch_size
             llama3_ref = repartition_sequence_shards_to_llama3(
@@ -961,7 +1006,15 @@ def run_case(
             avg_gpu_tflops = tflops / local_world_size
             check = "skip"
             if args.check and run.checkable and ref is not None:
-                expected = llama3_ref if run.name == "llama3_allgather_attention" else ref
+                expected = (
+                    llama3_ref
+                    if run.name == "llama3_allgather_attention"
+                    else (
+                        contiguous_ref
+                        if run.reference_layout == "contiguous"
+                        else ref
+                    )
+                )
                 check = check_output(run.name, run.timing_fn, expected, args.atol, args.rtol)
             elif args.check and not run.checkable:
                 check = "timing-only"
@@ -1010,6 +1063,22 @@ def validate_args(
         raise SystemExit(f"This demo requires D=128, got D={args.headdim}")
     if args.qhead % args.kvhead != 0:
         raise SystemExit(f"qhead must be divisible by kvhead, got qhead={args.qhead}, kvhead={args.kvhead}")
+    if "ulysses" in methods:
+        if args.qhead % local_world_size:
+            raise SystemExit("Ulysses requires qhead divisible by CP size")
+        if not (
+            args.kvhead % local_world_size == 0
+            or local_world_size % args.kvhead == 0
+        ):
+            raise SystemExit("Ulysses requires KVH and CP size to divide one another")
+    if "usp" in methods:
+        topology = make_usp_topology(local_world_size, args.kvhead)
+        if args.qhead % topology.ulysses_degree:
+            raise SystemExit("USP requires qhead divisible by Ulysses degree")
+        if topology.ring_degree > 1 and any(
+            case.is_causal and case.seqlen % 2 for case in make_cases(args)
+        ):
+            raise SystemExit("causal USP ring requires even local sequence lengths")
     for sm_config in sm_configs:
         if sm_config.num_comp_sm <= 0:
             raise SystemExit(f"num_comp_sm must be positive, got {sm_config.num_comp_sm}")

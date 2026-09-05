@@ -1,4 +1,4 @@
-"""Dataset benchmark for one Megatron Transformer layer with eight CP methods."""
+"""Dataset benchmark for one Megatron Transformer layer with ten CP methods."""
 
 from __future__ import annotations
 

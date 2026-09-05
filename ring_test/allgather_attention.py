@@ -21,6 +21,10 @@ import torch.distributed as dist
 
 import min_fa3_op
 from ring_common import get_default_args
+try:
+    from .utils import sequence_shards_to_global_order
+except ImportError:
+    from utils import sequence_shards_to_global_order
 
 try:
     from flash_attn_interface import (
@@ -224,38 +228,6 @@ def _local_backward(
 def _uniform_cu(batch_size: int, seqlen: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     host = torch.arange(0, (batch_size + 1) * seqlen, seqlen, dtype=torch.int32)
     return host.to(device=device), host
-
-
-def sequence_shards_to_global_order(
-    global_seqlens: list[int], world_size: int, causal: bool
-) -> list[int]:
-    """Map rank-major per-sequence shards to the original packed sequence order."""
-    if world_size <= 0:
-        raise ValueError(f"world_size must be positive, got {world_size}")
-    if any(length <= 0 or length % world_size for length in global_seqlens):
-        raise ValueError("every global sequence length must be positive and divisible by world_size")
-
-    local_lengths = [length // world_size for length in global_seqlens]
-    local_total = sum(local_lengths)
-    order: list[int] = []
-    local_offset = 0
-    for local_len in local_lengths:
-        if causal:
-            if local_len % 2:
-                raise ValueError("causal per-sequence shards require even local sequence lengths")
-            half = local_len // 2
-            for source_rank in range(world_size):
-                source = source_rank * local_total + local_offset
-                order.extend(range(source, source + half))
-            for source_rank in reversed(range(world_size)):
-                source = source_rank * local_total + local_offset + half
-                order.extend(range(source, source + half))
-        else:
-            for source_rank in range(world_size):
-                source = source_rank * local_total + local_offset
-                order.extend(range(source, source + local_len))
-        local_offset += local_len
-    return order
 
 
 def llama3_rank_local_global_indices(

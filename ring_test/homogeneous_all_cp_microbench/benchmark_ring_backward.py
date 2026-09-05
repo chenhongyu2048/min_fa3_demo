@@ -33,11 +33,14 @@ from allgather_attention import (
 )
 from hybrid_backward_baselines import VarlenFa3RingBackward
 from ring_common import raise_if_any_rank_failed
+from ulysses_attention import USPAttention, UlyssesAttention, make_usp_topology
 
 
 METHOD_ORDER = [
     "allgather_attention",
     "llama3_allgather_attention",
+    "ulysses",
+    "usp",
     "min_varlen_python_ring",
     "min_varlen_mega_ring",
 ]
@@ -65,6 +68,7 @@ class MethodRun:
     prepare_fn: Callable[[], None]
     timing_fn: Callable[[], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
     note: str = ""
+    reference: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass
@@ -250,6 +254,7 @@ def build_method_runs(
     allgather_backend: str,
     methods: list[str],
     overlapping_heads_k_stride: int = 1,
+    check: bool = False,
 ) -> dict[str, MethodRun]:
     q, local_k, local_v, dout = make_inputs(case, local_rank, seed)
     cu, cu_host = make_cu_seqlens(case, q.device)
@@ -309,6 +314,81 @@ def build_method_runs(
             llama3_attention.forward,
             lambda: llama3_attention.backward(llama3_dout),
             llama3_attention.note,
+        )
+    global_seqlens = [case.seqlen * local_world_size] * case.batch_size
+    contiguous_reference = None
+    zigzag_reference = None
+    needs_reference = "ulysses" in methods or "usp" in methods
+    needs_contiguous_reference = "ulysses" in methods or (
+        "usp" in methods
+        and make_usp_topology(local_world_size, case.kv_heads).ring_degree == 1
+    )
+    if check and needs_reference:
+        from benchmark_topology_backward import make_reference
+
+        if needs_contiguous_reference:
+            reference = make_reference(
+                q,
+                local_k,
+                local_v,
+                dout,
+                [[case.seqlen] * case.batch_size for _ in range(local_world_size)],
+                cu_host,
+                global_seqlens,
+                [local_world_size] * case.batch_size,
+                [0] * case.batch_size,
+                q.size(0),
+                local_rank,
+                causal_layout="contiguous",
+            )
+            contiguous_reference = reference[2:]
+        if "usp" in methods and make_usp_topology(
+            local_world_size, case.kv_heads
+        ).ring_degree > 1:
+            reference = make_reference(
+                q,
+                local_k,
+                local_v,
+                dout,
+                [[case.seqlen] * case.batch_size for _ in range(local_world_size)],
+                cu_host,
+                global_seqlens,
+                [local_world_size] * case.batch_size,
+                [0] * case.batch_size,
+                q.size(0),
+                local_rank,
+                causal_layout="zigzag",
+            )
+            zigzag_reference = reference[2:]
+
+    ulysses_runs: dict[str, MethodRun] = {}
+    for method in ("ulysses", "usp"):
+        if method not in methods:
+            continue
+        runner_type = UlyssesAttention if method == "ulysses" else USPAttention
+        runner = runner_type(
+            dist.group.WORLD,
+            q,
+            local_k,
+            local_v,
+            global_seqlens,
+            True,
+            allgather_backend,
+            enable_backward=True,
+        )
+        method_reference = (
+            contiguous_reference
+            if method == "ulysses" or runner.topology.ring_degree == 1
+            else None
+            if zigzag_reference is None
+            else zigzag_reference
+        )
+        ulysses_runs[method] = MethodRun(
+            method,
+            runner.forward,
+            lambda runner=runner: runner.backward(dout),
+            runner.note,
+            method_reference,
         )
     remote_k, remote_v = make_mega_parallel_tensors(local_k, local_v, local_rank, local_world_size)
     torch.cuda.synchronize()
@@ -407,6 +487,7 @@ def build_method_runs(
     }
     if llama3_run is not None:
         runs["llama3_allgather_attention"] = llama3_run
+    runs.update(ulysses_runs)
     return runs
 
 
@@ -506,16 +587,18 @@ def run_case(
         args.allgather_backend,
         methods,
         overlapping_heads_k_stride=args.allgather_overlapping_heads_k_stride,
+        check=args.check,
     )
     reference = None
     llama3_reference = None
     if args.check:
-        reference_run = runs["min_varlen_python_ring"]
-        prepare_method(reference_run)
-        reference = reference_run.timing_fn()
-        torch.cuda.synchronize()
-        cuda_barrier()
-        if "llama3_allgather_attention" in methods:
+        if "min_varlen_python_ring" in runs:
+            reference_run = runs["min_varlen_python_ring"]
+            prepare_method(reference_run)
+            reference = reference_run.timing_fn()
+            torch.cuda.synchronize()
+            cuda_barrier()
+        if "llama3_allgather_attention" in methods and reference is not None:
             global_seqlens = [case.seqlen * local_world_size] * case.batch_size
             llama3_reference = tuple(
                 repartition_sequence_shards_to_llama3(
@@ -533,13 +616,19 @@ def run_case(
             check = "skip"
             if args.check and method == "min_varlen_python_ring":
                 check = "reference"
-            elif args.check and reference is not None:
+            elif args.check and (run.reference is not None or reference is not None):
                 expected = (
-                    llama3_reference
-                    if method == "llama3_allgather_attention"
-                    else reference
+                    run.reference
+                    if run.reference is not None
+                    else (
+                        llama3_reference
+                        if method == "llama3_allgather_attention"
+                        else reference
+                    )
                 )
                 check = check_gradients(method, run, expected, args.atol, args.rtol)
+            elif args.check:
+                check = "no-reference"
             results[method] = Result(
                 timing.max_time_ms,
                 aggregate_tflops,
@@ -601,6 +690,7 @@ def validate_args(
     cases: list[Case],
     sm_configs: list[SmConfig],
     local_world_size: int,
+    methods: list[str],
 ) -> None:
     invalid_batches = [case.batch_size for case in cases if case.batch_size <= 0]
     if invalid_batches:
@@ -616,6 +706,18 @@ def validate_args(
         raise SystemExit(f"This benchmark requires D=128, got {args.headdim}")
     if args.qhead % args.kvhead != 0:
         raise SystemExit("qhead must be divisible by kvhead")
+    if "ulysses" in methods:
+        if args.qhead % local_world_size:
+            raise SystemExit("Ulysses requires qhead divisible by CP size")
+        if not (
+            args.kvhead % local_world_size == 0
+            or local_world_size % args.kvhead == 0
+        ):
+            raise SystemExit("Ulysses requires KVH and CP size to divide one another")
+    if "usp" in methods:
+        topology = make_usp_topology(local_world_size, args.kvhead)
+        if args.qhead % topology.ulysses_degree:
+            raise SystemExit("USP requires qhead divisible by Ulysses degree")
     if (
         args.allgather_overlapping_heads_k_stride <= 0
         or args.kvhead % args.allgather_overlapping_heads_k_stride
@@ -674,7 +776,7 @@ def main() -> None:
         args.allgather_backend = select_fa3_backend(
             dist.group.WORLD, require_backward=True
         )
-        validate_args(args, cases, sm_configs, local_world_size)
+        validate_args(args, cases, sm_configs, local_world_size, methods)
         if local_rank == 0:
             configs = ",".join(f"{cfg.num_comp_sm}:{cfg.num_comm_sm}" for cfg in sm_configs)
             print(

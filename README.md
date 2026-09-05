@@ -473,14 +473,16 @@ the import path.
 | --- | --- |
 | `benchmark_uniform.sh` | Fixed-total-token uniform matrix with one reusable `torchrun` per selected direction |
 | `benchmark_dataset.sh` | Recommended dataset-shaped forward/backward benchmark wrapper for 2, 4, or 8 GPUs |
-| `benchmark_transformer_layer.sh` | CP=8 single Megatron Transformer-layer forward+backward benchmark over all eight CP methods |
-| `benchmark_dataset_kvh_matrix.sh` | Causal 128K five-dataset, KVH 1/2/4, eight-method forward/backward matrix with one `torchrun` per direction/KVH/dataset |
+| `benchmark_transformer_layer.sh` | CP=8 single Megatron Transformer-layer forward+backward benchmark over all ten CP methods |
+| `benchmark_dataset_kvh_matrix.sh` | Causal 128K five-dataset, KVH 1/2/4, ten-method forward/backward matrix with one `torchrun` per direction/KVH/dataset |
 | `scripts/test_dcp/benchmark_dcp_mega_trace.sh` | Generate `NUM_CASES` trace snapshots, then run eager Mega/baselines and graph baselines with configurable TP/DCP topology |
 | `benchmark_dcp_mega_arrival_matrix.sh` | Run the 3-arrival x 3-DCP trace matrix with one eager Mega comm-SM sweep plus eager/graph baselines per combination |
 | `benchmark_vllm_dcp_matrix.sh` | Run the vLLM service TBT matrix for in-repository AG+RS, A2A, and Mega backends, including the configurable Mega comm-SM sweep |
 | `dcp_test/benchmark_dcp_mega_batch.py` | Reuse one TP process group across a filtered packed-varlen Mega DCP case matrix |
 | `dcp_test/summarize_dcp_mega_matrix.py` | Validate matrix manifests and flatten workload-weighted summaries to JSON and CSV |
 | `benchmark_load_balance.sh` | Dataset/GPU matrix wrapper for the metadata-only forward/backward load-balance benchmark |
+| `scripts/smoke_ulysses_usp.sh` | Minimal eight-GPU Ulysses/USP smoke matrix for KVH 1/2/4/8 |
+| `scripts/benchmark_ulysses_usp_suite.sh` | Supplementary Ulysses/USP replay of the uniform, dataset, KVH, and Transformer-layer CP suites |
 | `ring_test/load_balance_bench/run.sh` | Dataset/GPU wrapper for the fixed five-method runtime load-balance suite |
 | `ring_test/benchmark_dataset_{forward,backward}.py` | Dataset sampling, BR-PBS placement, and topology benchmark frontend |
 | `ring_test/load_balance_bench/benchmark_{forward,backward}.py` | Native Megatron/Zeppelin versus three placement-mapped fused Mega Ring runtime frontends |
@@ -498,6 +500,28 @@ the import path.
 | `dataset/build_length_bucket_stats.py` | Rebuild checked-in 256-token dataset bucket statistics |
 | `dataset/plot_sequence_length_buckets.py` | Plot the checked-in dataset length distributions |
 | `benchmark_logs/plot_weighted_flops.py` | Plot weighted throughput summaries from dataset benchmark logs |
+
+The supplementary Ulysses/USP suite replays the CP matrices used for the
+historical `benchmark_logs/bench_cp` and `benchmark_logs/experiment_suite/cp-suite`
+runs, while selecting only `ulysses,usp`. It covers the 64K/128K/256K uniform
+forward/backward matrix, the five-dataset 64K/128K/256K dataset matrix, the
+128K KVH=1/2/4/8 matrix, and the Transformer-layer benchmark. Forward ablation,
+tile analysis, metadata load-balance analysis, and the separate runtime
+load-balance suite remain excluded because they measure scheduler/fused-kernel
+behavior rather than these two all-to-all baselines. Results are written below
+a timestamped
+`benchmark_logs/experiment_suite/cp-suite/03_ulysses_usp/` directory.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  ./scripts/benchmark_ulysses_usp_suite.sh
+```
+
+The full replay is intentionally large. Sections can be selected with
+`RUN_UNIFORM_TEST`, `RUN_DATASET_TEST`, `RUN_KVH_MATRIX_TEST`,
+and `RUN_TRANSFORMER_LAYER_TEST`; set `DRY_RUN=1` to
+print every underlying `torchrun` command. `METHODS`, `DATASETS`,
+`NUM_CASES`, `WARMUP_ITERS`, `NUM_ITERS`, and `CHECK` are also overridable.
 
 ## Test
 
@@ -702,10 +726,10 @@ Hierarchical mega-ring notes:
 `benchmark_transformer_layer.sh` measures one complete Llama-3-8B-style
 Megatron-Core Transformer layer, including BF16 RMSNorm, GQA QKV and output
 projections, residual/BDA work, and the SwiGLU MLP. The attention core is
-selected from the existing eight-method suite:
+selected from the existing ten-method suite:
 
 ```text
-allgather_attention, llama3_allgather_attention, fa3_ring,
+allgather_attention, llama3_allgather_attention, ulysses, usp, fa3_ring,
 megatron_hybrid_cp, magi_attention, zeppelin,
 mega_ring_all_cp, mega_ring_hybrid
 ```
@@ -745,7 +769,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 ```
 
 If one of the eight devices is unavailable or configured as MIG, a functional
-CP=4 smoke run can use four full GPUs. This exercises all eight method adapters
+CP=4 smoke run can use four full GPUs. This exercises all ten method adapters
 and the complete layer forward/backward path, but is explicitly marked
 `formal_cp8_result=false` and must not be used as the requested CP=8 performance
 result:
@@ -936,7 +960,7 @@ measured five-case results.
 
 ### Forward/backward load-balance metadata benchmark
 
-`ring_test/benchmark_load_balance.py` statically analyzes the same eight
+`ring_test/benchmark_load_balance.py` statically analyzes the same ten
 baselines registered by the explicit-topology forward and backward latency
 benchmarks. It does not time or launch an attention kernel, dispatch tensors,
 or build an autograd graph. `--direction` defaults to `forward`; backward is
