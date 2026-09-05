@@ -1,226 +1,85 @@
-# AGENTS.md
+# Repository Guidelines
 
-This file provides local instructions for Codex when working inside `hopper/min_fa3_demo/`.
+## Core Principles
 
-## Scope
+1. **Think Before Coding** — State assumptions explicitly, surface ambiguities and tradeoffs, push back when a simpler path exists, and ask for clarification rather than guessing. When multiple interpretations are plausible, present them instead of picking silently.
 
-This directory is a standalone minimal Hopper FlashAttention demo derived from the original FA3 Hopper forward path under `hopper/`.
+2. **Simplicity First** — Write the minimum code that solves the stated problem. No speculative features, single-use abstractions, unrequested configurability, or error handling for impossible cases. If 200 lines could be 50, rewrite it. Test: would a senior engineer call this overcomplicated?
 
-It contains two sibling forward-only kernels:
+3. **Surgical Changes** — Touch only what the task requires. Don't "improve" adjacent code, refactor what isn't broken, or reformat to your preference — match existing style even if you'd do it differently. Clean up orphans (imports, variables, functions) that *your* changes made unused, but leave pre-existing dead code alone — mention it instead of deleting. Every changed line must trace directly to the user's request.
 
-- Fixed-layout BSHD forward
-- Varlen forward
+4. **Goal-Driven Execution** — Convert tasks into verifiable success criteria before coding:
+   - "Fix the bug" → "Write a test that reproduces it, then make it pass"
+   - "Add validation" → "Write tests for invalid inputs, then make them pass"
+   - "Refactor X" → "Ensure tests pass before and after"
+   
+   For multi-step work, state a brief plan with a verification check per step, then loop until each check passes.
 
-The goal of this directory is not to design a new attention implementation. The goal is to preserve a small, buildable, runnable, Python-callable demo that is clearly copied and trimmed from the original Hopper sources.
+5. **Context Health Canary** — End every response with the marker " 喵~ (ฅ• . •ฅ)ﻌﻌﻌ♥ ". This serves as a liveness signal for instruction adherence: if the marker disappears, degrades (wrong format, skipped numbering, drift to plain "meow"), treat it as evidence that this CLAUDE.md is being crowded out of effective attention — context is likely saturated. Do not suppress the marker for "serious" outputs (code blocks, formal docs, tool calls) — append it on a new line after everything else. The marker's reliability is the signal; skipping it "just this once" defeats the purpose.
 
-## Highest-priority rules
+6. **先读再改，优先小范围编辑，避免整文件重写**; 不做与当前实验无关的重构或完整测试套件。
 
-1. Preserve the "copied + trimmed" design.
-   - Do not rewrite the main kernel path from scratch.
-   - Do not replace copied Hopper structures with new custom abstractions just because they look simpler.
-   - `params`, `launch`, `kernel`, `prologue`, `mainloop`, `epilogue`, and scheduler-related code should remain traceable to the original Hopper sources.
+7. **严禁过度防御**: 我们不是在写安全攻防论文。除非任务明确要求，否则不主动增加 SHA256/hash/checksum；不为极低概率（大致 <0.1%）的 corner case 编写防御代码；能确定性解决的问题，不引入 rubric 或模糊判断。
 
-2. Preserve params provenance.
-   - `include/min_fa3_params.h` and `include/min_fa3_varlen_params.h` are trimmed copies of the original Hopper forward params path.
-   - If a field must be added or removed, keep original naming and layout style whenever possible.
-   - Do not redesign params into a brand-new struct family.
+8. **路径不硬编码**; 优先沿用项目现有环境和依赖管理方式，不确定时再询问。
 
-3. Keep the demo self-contained.
-   - Do not reintroduce direct `#include "hopper/..."` dependencies.
-   - If a small Hopper helper is required, prefer copying it into `include/hopper_compat/` first, then trimming it there.
-   - The extension should build from this directory with local headers plus CUTLASS, PyTorch, and CUDA.
+## Project Structure
 
-4. Do not broaden feature scope unless explicitly requested.
-   - This demo is intentionally narrow.
-   - Avoid adding generality, extra template branches, or feature flags unless they are required by the task.
+This repository is a minimal Hopper/SM90 FlashAttention and Mega-CP benchmark
+stack. CUDA extension sources live in `csrc/`, public and copied CUDA headers in
+`include/`, and Python bindings/wrappers at the repository root (`min_fa3_op.py`,
+`min_fa3_dcp.py`). Correctness tests and multi-rank experiments are under
+`scripts/test_min_fa3/` and `scripts/test_mega_ring/`; higher-level benchmark
+frontends are in `ring_test/`, `dcp_test/`, `infer/`, and `balancer/`. Dataset
+helpers are in `dataset/`, documentation and figures in `docs/` and `paper/`,
+and pinned external projects are submodules under `third_party/`.
 
-## Supported configurations
+## Build and Development Commands
 
-### BSHD path
-
-- GPU: Hopper SM90 only
-- Direction: forward only
-- Dtype: `torch.bfloat16`
-- Head dim: `128`
-- Input layout:
-  - `q: [B, S, QH, D]`
-  - `k: [B, S, KVH, D]`
-  - `v: [B, S, KVH, D]`
-- Output layout:
-  - `o: [B, S, QH, D]`
-- Modes:
-  - causal
-  - noncausal
-- GQA/MQA:
-  - supported when `qhead % kvhead == 0`
-
-### Varlen path
-
-- GPU: Hopper SM90 only
-- Direction: forward only
-- Dtype: `torch.bfloat16`
-- Head dim: `128`
-- Input layout:
-  - `q: [total_q, QH, D]`
-  - `k: [total_k, KVH, D]`
-  - `v: [total_k, KVH, D]`
-  - `cu_seqlens_q: [B + 1]`
-  - `cu_seqlens_k: [B + 1]`
-- Modes:
-  - causal
-  - noncausal
-- GQA/MQA:
-  - supported when `qhead % kvhead == 0`
-
-## Explicitly out of scope
-
-Unless the user asks for it, do not add:
-
-- backward
-- fp16/fp8 or non-bf16 dtype support
-- non-128 head dims
-- non-SM90 architectures
-- paged KV
-- append KV
-- rotary
-- local attention
-- softcap
-- split-KV
-- pack-gqa rearchitecture
-- new public APIs unrelated to the minimal demo
-
-## Important file ownership
-
-Core copied-and-trimmed files:
-
-- `include/min_fa3_params.h`
-- `include/min_fa3_traits.h`
-- `include/min_fa3_launch.h`
-- `include/min_fa3_prologue.h`
-- `include/min_fa3_epilogue.h`
-- `include/min_fa3_mainloop.h`
-- `include/min_fa3_kernel.h`
-- `include/min_fa3_scheduler.h`
-- `include/min_fa3_varlen_params.h`
-- `include/min_fa3_varlen_traits.h`
-- `include/min_fa3_varlen_launch.h`
-- `include/min_fa3_varlen_scheduler.h`
-- `csrc/min_fa3_kernel.cu`
-- `csrc/min_fa3_launch.cu`
-- `csrc/min_fa3_varlen_kernel.cu`
-- `csrc/min_fa3_varlen_launch.cu`
-- `csrc/min_fa3_varlen_prepare_scheduler.cu`
-- `bindings.cpp`
-
-Copied support headers live in:
-
-- `include/hopper_compat/`
-
-Do not edit generated artifacts unless the task explicitly requires it:
-
-- `_min_fa3_op.so`
-- `build/`
-- `__pycache__/`
-- `fa_min_demo_h200-*.out`
-
-## Build
-
-Default in-repo build:
+Install the locked Python environment with `uv sync --frozen --no-install-project
+--group build --group transformer-layer`, then build the in-place extension:
 
 ```bash
-cd hopper/min_fa3_demo
-make
-```
-
-Standalone or out-of-tree style build with explicit CUTLASS path:
-
-```bash
-cd hopper/min_fa3_demo
-CUTLASS_DIR=/path/to/cutlass make
-```
-
-`CUTLASS_DIR` may point either to the CUTLASS root or directly to its `include/` directory.
-
-Clean:
-
-```bash
-cd hopper/min_fa3_demo
+make PYTHON=.venv/bin/python
+# Use an external CUTLASS checkout when needed:
+CUTLASS_DIR=/path/to/cutlass make PYTHON=.venv/bin/python
 make clean
 ```
 
-## Test
+The build requires CUDA, a linkable driver library, CUTLASS, and an SM90-capable
+GPU for execution. `./setup_fresh_environment.sh prepare|install|verify` is the
+supported end-to-end setup path.
 
-BSHD correctness:
+## Coding Style and Naming
+
+Use four-space indentation in Python and follow existing type hints, docstrings,
+and `snake_case` module/function names. Keep CUDA/C++20 code consistent with
+neighboring files: descriptive `snake_case` filenames, conventional CUDA/C++
+types, and small, surgical changes. Preserve provenance comments and the copied-
+and-trimmed Hopper structure; do not edit generated `.so`, `build/`, or cache
+files. No repository-wide formatter is configured, so review diffs carefully.
+
+## Testing Guidelines
+
+Name Python tests `test_*.py` and keep focused cases near the subsystem they
+exercise. CPU-only checks can run without GPUs:
 
 ```bash
-cd hopper/min_fa3_demo
-python test_min_fa3.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --mode both
+python -m unittest balancer.test_balancer ring_test.load_balance_bench.test_topology \
+  scripts.test_min_fa3.test_dcp_topology scripts.test_min_fa3.test_dcp_mega_batch
 ```
 
-Varlen correctness:
+After building, run the relevant kernel module (for example,
+`python -m scripts.test_min_fa3.test_min_fa3 ...`). Distributed tests use
+`torchrun`; document GPU count and `CUDA_VISIBLE_DEVICES` in results. Validate
+both correctness and benchmark changes on Hopper hardware when possible.
 
-```bash
-cd hopper/min_fa3_demo
-python test_min_fa3_varlen.py --b 1 --seqlen 128 --qhead 8 --kvhead 8 --headdim 128 --mode both
-```
+## Commits and Pull Requests
 
-Benchmarks:
-
-```bash
-cd hopper/min_fa3_demo
-python benchmark.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 32 --headdim 128 --mode both
-python benchmark_varlen.py --b 4 --seqlen 512,1024,2048 --qhead 32 --kvhead 8 --headdim 128 --mode both
-```
-
-Note:
-
-- `benchmark.py` and `benchmark_varlen.py` try to compare against PyTorch, FA2, and FA3 when those imports are available.
-- The demo itself does not require FA2 or FA3 to build.
-
-## Unified CLI conventions
-
-Keep the Python test and benchmark entry points aligned around the same arguments:
-
-- `--b`
-- `--seqlen`
-- `--qhead`
-- `--kvhead`
-- `--headdim`
-- `--mode`
-
-Do not reintroduce older rectangular `SqxSk` CLI formats unless the user explicitly requests them.
-
-## Modification guidelines
-
-1. Prefer surgical edits.
-   - Change the smallest number of files and lines needed.
-   - Preserve existing naming, file roles, and directory layout.
-
-2. Keep provenance comments at the top of copied files.
-   - When adding a new copied helper file, include a short source comment.
-
-3. Keep BSHD and varlen as sibling paths.
-   - Do not collapse them into one confusing API layer.
-   - Shared concepts are fine, but avoid premature abstraction.
-
-4. Be careful with performance conclusions.
-   - Current benchmarks measure end-to-end op time, not just kernel body time.
-   - Host allocations and scheduler-prep overhead matter for short-sequence comparisons.
-
-5. Validate on actual supported hardware when possible.
-   - This demo targets SM90 only.
-   - If Hopper hardware is unavailable, state that clearly rather than guessing.
-
-## When adding dependencies
-
-If a new helper is needed, prefer this order:
-
-1. Reuse an existing local file in `include/` or `include/hopper_compat/`
-2. Copy a small required Hopper helper into `include/hopper_compat/`
-3. Use CUTLASS/CuTe includes directly
-
-Avoid creating a new dependency on broader repository internals when a local copied helper is sufficient.
-
-## Slurm
-
-This directory contains `run.slurm` for cluster execution. If you change script arguments or benchmark entry points, keep `run.slurm` and `README.md` synchronized.
+Use short imperative commit subjects, optionally with the established prefixes
+`feat:`, `fix:`, `perf:`, `bench:`, `build:`, `refactor:`, or `chore:` (for
+example, `fix: guard varlen workspace reuse`). Pull requests should explain the
+behavior or performance change, identify affected paths, list exact build/test
+commands and GPU topology, and include benchmark tables or plots when results
+change. Call out new dependencies, submodule updates, environment variables,
+and any limitations or untested hardware explicitly.
