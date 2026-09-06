@@ -180,6 +180,9 @@ struct DCPMega_fwd_params {
     int device = 0;
     int num_sms = 0;
     int num_comm_sm = 0;
+    int64_t* cta_trace = nullptr;
+    int cta_trace_capacity = 0;
+    int cta_trace_iteration = 0;
     bool return_lse = false;
     // Optional reusable benchmark events. The typed launcher records them
     // immediately around the kernel command after all host-side preparation.

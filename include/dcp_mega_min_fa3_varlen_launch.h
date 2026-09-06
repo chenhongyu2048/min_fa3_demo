@@ -47,6 +47,48 @@ enum QueueStateIndex : int {
     kQueueStateCount = 9,
 };
 
+enum TracePhase : int {
+    kTraceQAllGather = 0,
+    kTraceAttention = 1,
+    kTraceHistoryCombine = 2,
+    kTraceReceive = 3,
+    kTraceFinalCombine = 4,
+    kTracePhaseCount = 5,
+};
+
+CUTLASS_DEVICE uint64_t read_globaltimer();
+
+CUTLASS_DEVICE int trace_smid() {
+    int value;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(value));
+    return value;
+}
+
+template <typename TraceParams>
+CUTLASS_DEVICE void record_cta_trace(
+    TraceParams const& params,
+    int phase,
+    uint64_t start_ns,
+    uint64_t useful_end_ns,
+    int valid_work_count) {
+    if (params.cta_trace == nullptr || phase < 0 || phase >= kTracePhaseCount) {
+        return;
+    }
+    int const slot = int(blockIdx.x) * kTracePhaseCount + phase;
+    if (slot >= params.cta_trace_capacity || threadIdx.x != 0) {
+        return;
+    }
+    int64_t* record = params.cta_trace + slot * 8;
+    record[0] = static_cast<int64_t>(start_ns);
+    record[1] = static_cast<int64_t>(useful_end_ns);
+    record[2] = static_cast<int64_t>(read_globaltimer());
+    record[3] = params.cta_trace_iteration;
+    record[4] = int(blockIdx.x);
+    record[5] = trace_smid();
+    record[6] = phase;
+    record[7] = valid_work_count;
+}
+
 CUTLASS_DEVICE uint64_t read_globaltimer() {
     uint64_t value;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
@@ -290,6 +332,9 @@ struct DCPMegaKernelConfig {
         int32_t* queue_state = nullptr;
         uint64_t* phase_timestamps = nullptr;
         int32_t const* graph_post_phase = nullptr;
+        int64_t* cta_trace = nullptr;
+        int cta_trace_capacity = 0;
+        int cta_trace_iteration = 0;
         int const* cu_seqlens_q = nullptr;
         int total_q = 0;
         int batch_size = 0;
@@ -1103,6 +1148,7 @@ __launch_bounds__(Config::MaxThreadsPerBlock, 1)
 void dcp_mega_varlen_kernel(
     CUTLASS_GRID_CONSTANT typename Config::KernelParams const params) {
     extern __shared__ char smem_buf[];
+    uint64_t const cta_start = read_globaltimer();
     // DCP_MEGA: communication/reduction phases reuse the copied FA dynamic
     // shared region only while the FA pipeline is inactive.
     typename Config::HelperSharedStorage& helper_shared
@@ -1114,11 +1160,15 @@ void dcp_mega_varlen_kernel(
     bool const communication_cta = int(blockIdx.x) < params.num_comm_sm;
     if (communication_cta) {
         run_q_allgather<Config>(params, helper_shared);
+        uint64_t const q_done = read_globaltimer();
+        record_cta_trace(params, kTraceQAllGather, cta_start, q_done, params.num_q_tasks);
         record_phase_completion(
             params.queue_state, params.phase_timestamps,
             kQAllGatherPhaseCounter, kQAllGatherDoneTimestamp,
             params.num_comm_sm);
         run_communication_post_q<Config>(params, helper_shared);
+        uint64_t const receive_done = read_globaltimer();
+        record_cta_trace(params, kTraceReceive, q_done, receive_done, params.token_block_count);
         record_phase_completion(
             params.queue_state, params.phase_timestamps,
             kKernelPhaseCounter, kKernelDoneTimestamp,
@@ -1130,12 +1180,16 @@ void dcp_mega_varlen_kernel(
     // threads rendezvous before the shared region is reused by local combines.
     typename Config::AttentionKernel attention_kernel;
     attention_kernel(params, smem_buf);
+    uint64_t const attention_done = read_globaltimer();
+    record_cta_trace(params, kTraceAttention, cta_start, attention_done, 1);
     __syncthreads();
     record_phase_completion(
         params.queue_state, params.phase_timestamps,
         kAttentionPhaseCounter, kAttentionDoneTimestamp,
         params.num_sms - params.num_comm_sm);
     run_history_combine<Config>(params, helper_shared);
+    uint64_t const history_done = read_globaltimer();
+    record_cta_trace(params, kTraceHistoryCombine, attention_done, history_done, params.history_combine_count);
     // History combine uses independent per-warp queues. This is the only CTA
     // convergence point before the existing CTA-oriented final combine.
     __syncthreads();
@@ -1143,6 +1197,8 @@ void dcp_mega_varlen_kernel(
         params.queue_state, params.phase_timestamps,
         params.num_sms - params.num_comm_sm);
     run_final_combine<Config>(params, helper_shared);
+    uint64_t const final_done = read_globaltimer();
+    record_cta_trace(params, kTraceFinalCombine, history_done, final_done, params.final_count);
     record_phase_completion(
         params.queue_state, params.phase_timestamps,
         kFinalCombinePhaseCounter, kFinalCombineDoneTimestamp,
@@ -1386,6 +1442,9 @@ void launch_dcp_mega_instance(
     kernel_params.queue_state = params.queue_state;
     kernel_params.phase_timestamps = params.phase_timestamps;
     kernel_params.graph_post_phase = params.graph_post_phase;
+    kernel_params.cta_trace = params.cta_trace;
+    kernel_params.cta_trace_capacity = params.cta_trace_capacity;
+    kernel_params.cta_trace_iteration = params.cta_trace_iteration;
     kernel_params.cu_seqlens_q = params.chunk.cu_seqlens_q;
     kernel_params.total_q = header.total_q;
     kernel_params.batch_size = header.batch_size;

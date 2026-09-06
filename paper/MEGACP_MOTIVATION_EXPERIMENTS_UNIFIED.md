@@ -97,12 +97,11 @@ Motivation 的任务是用少量实验建立这些问题存在的证据，不提
 |---|---|---|
 | FA3 Ring | 完整 zigzag P2P ring | 独立通信与计算的 ring 基线 |
 | AllGather-CP | AllGatherAttention | KV-head 分块流水基线 |
-| Llama3-style AllGather-CP | Llama3AllGatherAttention | 对应 packed/two-block zigzag 基线 |
 | MegaRing All-CP | min_varlen_mega_ring，每样本 G=W | 完整设备端执行参照 |
 
-起始建议：BF16、causal、Hq=32、Hkv=8、D=128、B=4、W=4；global per-sequence L=8K/32K/128K。先实现 32K 代表点，再补其余点。K 按 1024 定义。
+起始建议：BF16、causal、Hq=32、Hkv=8、D=128；沿用 cp-uniform 的 64K global-context 五个均匀 shape。CP4 使用 B=1/2/4/8/16、local L=16K/8K/4K/2K/1K；CP8 使用相同 B、local L=8K/4K/2K/1K/512。两者都保持 64K global token budget，不是 T3 的变长 dataset batch。K 按 1024 定义。
 
-三 baseline 的每条序列长度相同；使用正确匹配的 causal sharding，确认每 rank 有效 attention 工作量。均匀长度不意味着任意 causal 分片都均衡。
+两条 baseline 的每条序列长度相同；使用正确匹配的 causal sharding，确认每 rank 有效 attention 工作量。均匀长度不意味着任意 causal 分片都均衡。
 
 现有 homogeneous microbench 的 case.seqlen 是 local length，global L=local length×W。配置和图必须统一 global context length。
 
@@ -110,12 +109,14 @@ Motivation 的任务是用少量实验建立这些问题存在的证据，不提
 
 ### 4.3 具体操作
 
-对三种 baseline 的 FWD 和 BWD 各实现四种模式：
+对两种 baseline 的 FWD 和 BWD 各实现四种模式：
 
 1. COMM-ONLY：去除 attention，重放原通信的消息序列、大小、dtype、算法和拓扑；使用预先准备好的 payload。
 2. COMP-ONLY：提前准备原执行中各 step 的真实 KV 输入，重放相同 shape/mask/stride/head chunk 的 attention 及必要合并，去掉跨 GPU 传输。
 3. SERIAL：保留完整依赖、通信和计算，明确禁止它们并发。
 4. OVERLAP：原来的合法异步流水，不插入逐 step device synchronize。
+
+为了直接展示并发干扰，额外记录一个受控 co-run 诊断：在独立 CUDA stream 上同时启动预先就绪的 COMM-ONLY 与 COMP-ONLY replay，分别用所属 stream 的 CUDA events 记录 Cov/Aov，并记录 co-run 总时长。该诊断不替代原合法 OVERLAP 完整调用，也不把两个组件相加重建 critical path。
 
 MegaRing 主测完整 All-CP 调用；不要将 fused kernel 任意拆出“纯通信/纯计算”，再认为成本与原 fused 执行相同。
 
@@ -136,7 +137,7 @@ CUDA API 调用时间、Work.wait 时间不是 GPU 通信时间；调用方 stre
 
 原始数据表：case、direction、method、mode、rank、iteration、step、kernel_kind、start/end、duration、完整调用时间。
 
-推荐图：一个代表 context 的通信/计算 slowdown 配对柱，与 SERIAL/OVERLAP/Mega 完整调用时间。FWD/BWD 用两个小面板或并列分组。
+推荐图：五个均匀 shape 上 standalone/co-run 的通信与计算时间，以及 SERIAL/OVERLAP 合法完整调用时间。Mega All-CP 的 shape sensitivity 不作为该 motivation 图的主面板；完整 Mega 调用数据仍保留在 JSON。FWD/BWD 用两个小面板或并列分组。
 
 ### 4.5 预期结果与结论门槛
 
@@ -162,12 +163,13 @@ max(C0,A0) 只可作理想化参考，不是整个 ring 的可达最优时间；
 
 ### 5.2 具体操作
 
-沿用 T1 的均匀输入和匹配后端，预置完整所需 KV：
+沿用 T1 的五个均匀输入 shape 和匹配后端，预置完整所需 KV；T2 与 T1 对每个 `context65k_b{1,2,4,8,16}` case 使用相同的 B、local length 和 global token budget：
 
 - COMP-STEP：仍按原 ring step 顺序执行并合并状态。
+- COMP-STEP-NONFUSED：仍按原 ring step 顺序执行，但每个 step 使用独立 external reduce kernel，隔离 fused reduction 的贡献。
 - COMP-SEGMENT：在数学等价的前提下合并可连续消费的 KV 段，减少重复状态访问。
 
-先验证两个版本的 Q 区域、KV 范围、global causal mask 和数学工作一致，再比较输出。不能直接拿一次普通 causal FA3 替换任意 zigzag rank 的计算；不合法时先限制为可正确映射的代表子问题，并说明范围。
+先验证三个版本的 Q 区域、KV 范围、global causal mask 和数学工作一致，再比较输出。实现映射为 `step_external_reduce`、`step_fused_reduce` 和 `linear_queue_recycle`。不能直接拿一次普通 causal FA3 替换任意 zigzag rank 的计算；不合法时先限制为可正确映射的代表子问题，并说明范围。
 
 分别报告 attention kernel body 总量与包含 merge/pre/post 的 compute-only 完整时间，记录调用次数、tile 数、状态访问次数的实现统计及 useful TFLOP/s。
 
@@ -195,7 +197,7 @@ Forward 合法配对是首轮重点。Backward 先完成按 step 的数学、pre
 
 ### 6.2 数据和公平性
 
-方法：megatron_hybrid_cp、zeppelin、全均匀切分 all-cp。
+方法：megatron_hybrid_cp、zeppelin、全均匀切分 all-cp。首轮覆盖 arxiv、github、pile、freelaw、prolong 五个长度分布，并在每个数据集内使用同一批配对 cases。
 
 先用项目已有长度数据选一个长尾数据集，冻结 30–50 个 batch；主线成立后增加短序列/长序列占主导的两个分布。固定 global token budget（起始可用 128K）、sample IDs、原始长度、seed 和容量限制，所有方法处理同一个 manifest。
 
@@ -308,9 +310,13 @@ Mega mixed 的 kernel-only 延迟对 comm CTA 很敏感：DCP=8 从 4 CTA 的 10
 
 ### 9.2 对照与输入
 
-首轮以 vLLM A2A Graph 和 Mega Graph 为详细 trace 对照；同时保留 vLLM AG-RS、SGLang AG-AR 的原有阶段时间和总延迟。无需立即为所有通信实现做内核插桩。
+首轮以 vLLM A2A Graph 和 Mega Graph 为详细 trace 对照；每个冻结 case 都运行一次 vLLM A2A Graph，并记录 Q all-gather/reorder、history/chunk attention、A2A pack/all-to-all/unpack、state merge 和完整调用时间。Mega 每个 case 分别运行 critical-wave 优化版与 FA3-native/FIFO 控制版。无需立即为所有通信实现做内核插桩。
 
-先固定一个合法 TP/DCP 配置，从旧 manifest 预先选 decode-only、mixed 各一个中位区域代表 case，并可追加一个尾部 case。选择依据使用长度/任务数或基线延迟分位，不根据 Mega 的最佳加速挑样本；全 case 汇总用于确认代表性。
+D1 的 topology 扩展为 CP4/KVH1、CP4/KVH2 以及 CP8/KVH1、CP8/KVH2、CP8/KVH4。实际 torchrun world 同时是 TP/CP world，固定 QH=32；每个 KV head 的 DCP group size 为 `TP/KVH`，不同 KV head 的 subgroup 在同一物理 world 内并行。
+
+默认解析的配置为 CP4/KVH1→TP4/DCP4、CP4/KVH2→TP4/DCP2、CP8/KVH1→TP8/DCP8、CP8/KVH2→TP8/DCP4、CP8/KVH4→TP8/DCP2。CP4 时 `Hq_local=8`，CP8 时 `Hq_local=4`，均满足 Mega runner 的 GQA 约束。
+
+先固定一个合法 TP/DCP 配置，从旧 manifest 预先选 decode-only、mixed 各两个中位区域代表 case。当前 DCP4 选择规则是：在历史 vLLM A2A Graph baseline p50 延迟中，取距离各 workload-kind 中位数最近的 case；距离相同时取较小 numeric case ID。当前冻结选择为 decode-only q=16 的 `case_000017`/`case_000064` 与 mixed 的 `case_000003`/`case_000078`。选择不根据 Mega 的最佳加速；全 case 汇总用于确认代表性。
 
 自然 mixed 比 decode-only 工作更多，其绝对延迟差不能直接归因于不规则性。主对照是同一 case 的两种执行方式。
 
@@ -459,6 +465,13 @@ AG-RS 与 SGLang 的逐 kernel counter 可暂缓，后续补在代表点即可�
 
 ### 10.8 哪些可暂缓
 
+**当前状态（2026-09-06，H20-2）：D2 pending。** 已成功运行普通 DCP4
+CUDA-Graph latency benchmark，但 Nsight Compute 的多进程 CUDA Graph/NCCL
+整图采集返回非零状态，且当前可见 metric 查询没有形成可靠的 DRAM/L2
+计数。因此本轮 motivation 不报告已实测的 HBM round trip 或 DRAM 字节
+下降；在 D2 恢复前只使用 D1 阶段时间、正常 Graph latency 和逻辑
+buffer/通信账本。NCU 失败不能解释为流量为零。
+
 先完成 decode-only/mixed 各一个代表点的 NCU 整体或明确定义的局部测量。其余基线的全 kernel 指标、所有 DCP 扫描、跨 L2 容量探针可以暂缓。
 
 Staging 消融可以晚于首轮 counter；暂缓时只写方法级流量差。若 NCU 整项暂缓，motivation 暂用“中间结果物化存在额外访问路径”的代码事实，不写“HBM round trip 已被实验证明”。
@@ -512,10 +525,10 @@ CUDA Graph 可以表达独立节点和依赖，因此不写“CUDA Graph 无法 
 
 第二批：得到最小现象证据。
 
-- T1 先跑一个 context 的 FWD，再覆盖 BWD 与其他 baseline 四模式。
+- T1 先跑 cp-uniform 64K global-context 的五个均匀 shape，再覆盖 BWD 与其他 baseline 四模式。
 - T2 做合法 forward compute-only 对照。
-- T3 先出一个数据集的三策略负载与 attention 时间。
-- D1 实现 CTA/SM 记录，先做两类输入与 vLLM A2A/Mega 的图。
+- T3 先出五个数据集的三策略负载与 attention 时间。
+- D1 实现 CTA/SM 记录，先做 decode-only q=16 与 mixed 各两个中位 case，并做 vLLM A2A/Mega 的图。
 
 第三批：补物理机制和收敛正文。
 
@@ -575,7 +588,7 @@ benchmark_logs/motivation/<run_id>/
 建议两张组合图：
 
 - 图 1（训练/full-prefill）：重叠 slowdown 与完整调用时间为主面板；step 对照和负载三目标取紧凑子图。详细 FWD/BWD/长度结果留 evaluation，正文仍明确数据覆盖两方向。
-- 图 2（decode）：同一代表 case 的逐 SM 阶段时间，加 decode-only/mixed 的 DRAM/L2 流量与正常延迟小图。另一类别的完整时间线可放附录。
+- 图 2（decode）：decode-only q=16 与 mixed 各两个冻结 case 的 Mega 逐 SM 阶段时间，配对展示 critical-wave 优化/FIFO 控制与 vLLM A2A Graph 的各阶段时间。D2 的 DRAM/L2 流量尚无可靠结果时不放入主图；另一类别的完整时间线可放附录。
 
 如果版面接近 1 页，T2 用一句配对数字，T4 和全部强因果消融放 evaluation；不要靠缩小字体塞满所有曲线。若尚无可靠 NCU 数据，图 2 先只展示阶段时间，并在文本中将物化解释保留为待证实假设。
 
@@ -585,10 +598,10 @@ benchmark_logs/motivation/<run_id>/
 
 首轮完成需满足：
 
-- [ ] T1 三基线 FWD/BWD 四模式，以及合法 Mega All-CP 完整调用时间。
-- [ ] T2 一个合法 forward 分步/合并对照；backward 分步成本范围写清。
+- [ ] T1 两条基线 FWD/BWD 四模式，以及合法 Mega All-CP 完整调用时间。
+- [ ] T2 五个与 T1 相同的合法 forward 分步/合并对照；backward 分步成本范围写清。
 - [ ] T3 固定 batch 的三类负载和实际 attention 时间，未实现通信明确标注。
-- [ ] D1 两类输入的 CTA/SM 阶段记录与无插桩 Graph 时间，图没有虚构通信 SM 轨迹。
+- [ ] D1 两类输入各两个冻结代表 case 的 CTA/SM 阶段记录与 Mega 优化/非优化、vLLM A2A Graph 时间，图没有虚构通信 SM 轨迹。
 - [ ] D2 至少代表点的可靠 NCU 内存层级数据；若未完成，正文不保留 HBM 强结论。
 - [ ] 所有主结果有 correctness、配置、原始样本和可复现汇总。
 - [ ] 原生系统、适配器、历史/新硬件、分析值/实测值清楚区分。

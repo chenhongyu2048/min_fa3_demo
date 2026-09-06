@@ -624,7 +624,7 @@ class AllGatherAttention:
             q, k, v, cu_q, cu_k, cu_q_host, cu_k_host, max_q, max_k, causal
         )
 
-    def forward(self) -> torch.Tensor:
+    def forward(self, *, overlap: bool = True) -> torch.Tensor:
         self._forward_ready = False
         current_buffer = 0
         current_work = self._start_kv_all_gather(current_buffer, 0)
@@ -635,8 +635,8 @@ class AllGatherAttention:
             q_head_slice = self._q_head_slice(kv_head_start)
             self.q_chunk.copy_(self.q[:, q_head_slice])
             next_kv_head_start = kv_head_start + self.heads_k_stride
-            if next_kv_head_start < self.k.size(1):
-                next_buffer = 1 - current_buffer
+            next_buffer = 1 - current_buffer
+            if overlap and next_kv_head_start < self.k.size(1):
                 current_work = self._start_kv_all_gather(
                     next_buffer, next_kv_head_start
                 )
@@ -656,7 +656,11 @@ class AllGatherAttention:
                 )
                 self.out[:, q_head_slice].copy_(out)
                 self.forward_lse_front[q_head_slice].copy_(lse)
-                current_buffer = 1 - current_buffer
+                if not overlap and next_kv_head_start < self.k.size(1):
+                    current_work = self._start_kv_all_gather(
+                        next_buffer, next_kv_head_start
+                    )
+                current_buffer = next_buffer
                 continue
 
             ordered_k = self.kv_ordered[current_buffer, 0].view(
@@ -730,7 +734,11 @@ class AllGatherAttention:
             self.forward_lse_front[q_head_slice].copy_(lse_front)
             assert self.forward_lse_back is not None
             self.forward_lse_back[q_head_slice].copy_(lse_back)
-            current_buffer = 1 - current_buffer
+            if not overlap and next_kv_head_start < self.k.size(1):
+                current_work = self._start_kv_all_gather(
+                    next_buffer, next_kv_head_start
+                )
+            current_buffer = next_buffer
 
         self._forward_ready = True
         return self.out
@@ -1235,7 +1243,7 @@ class Llama3AllGatherAttention:
             self.causal,
         )
 
-    def forward(self) -> torch.Tensor:
+    def forward(self, *, overlap: bool = True) -> torch.Tensor:
         self._forward_ready = False
         current_buffer = 0
         current_work = self._start_kv_all_gather(current_buffer, 0)
@@ -1246,8 +1254,8 @@ class Llama3AllGatherAttention:
             q_head_slice = self._q_head_slice(kv_head_start)
             self.q_chunk.copy_(self.q[:, q_head_slice])
             next_kv_head_start = kv_head_start + self.heads_k_stride
-            if next_kv_head_start < self.k.size(1):
-                next_buffer = 1 - current_buffer
+            next_buffer = 1 - current_buffer
+            if overlap and next_kv_head_start < self.k.size(1):
                 current_work = self._start_kv_all_gather(
                     next_buffer, next_kv_head_start
                 )
@@ -1268,7 +1276,11 @@ class Llama3AllGatherAttention:
                     )
                 target_lse.copy_(lse)
 
-            current_buffer = 1 - current_buffer
+            if not overlap and next_kv_head_start < self.k.size(1):
+                current_work = self._start_kv_all_gather(
+                    next_buffer, next_kv_head_start
+                )
+            current_buffer = next_buffer
         self._forward_ready = True
         return self.out
 

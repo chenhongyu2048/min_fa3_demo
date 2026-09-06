@@ -363,6 +363,8 @@ double forward_chunk_prefill_varlen_dcp_mega(
     torch::Tensor queue_state,
     torch::Tensor phase_timestamps,
     torch::Tensor graph_post_phase,
+    torch::Tensor cta_trace,
+    int64_t cta_trace_iteration,
     bool record_phase_timestamps,
     std::vector<int64_t> dcp_node_ranks,
     int64_t dcp_rank,
@@ -392,6 +394,10 @@ double forward_chunk_prefill_varlen_dcp_mega(
     check_cuda_int32(receive_ready, "receive_ready");
     check_cuda_int32(queue_state, "queue_state");
     check_cuda_int32(graph_post_phase, "graph_post_phase");
+    TORCH_CHECK(cta_trace.is_cuda() && cta_trace.scalar_type() == torch::kInt64
+                    && cta_trace.is_contiguous() && cta_trace.dim() == 2
+                    && cta_trace.size(1) == 8,
+                "cta_trace must be a contiguous CUDA int64 [capacity, 8] tensor");
     TORCH_CHECK(phase_timestamps.is_cuda()
                     && phase_timestamps.scalar_type() == torch::kInt64
                     && phase_timestamps.is_contiguous()
@@ -433,7 +439,8 @@ double forward_chunk_prefill_varlen_dcp_mega(
              {&publish_ready, "publish_ready"},
              {&receive_ready, "receive_ready"}, {&queue_state, "queue_state"},
              {&phase_timestamps, "phase_timestamps"},
-             {&graph_post_phase, "graph_post_phase"}}) {
+             {&graph_post_phase, "graph_post_phase"},
+             {&cta_trace, "cta_trace"}}) {
         check_same_device(q, *named.first, named.second);
     }
 
@@ -664,6 +671,9 @@ double forward_chunk_prefill_varlen_dcp_mega(
     params.device = q.get_device();
     params.num_sms = properties->multiProcessorCount;
     params.num_comm_sm = num_comm_sm;
+    params.cta_trace = cta_trace.numel() == 0 ? nullptr : cta_trace.data_ptr<int64_t>();
+    params.cta_trace_capacity = static_cast<int>(cta_trace.size(0));
+    params.cta_trace_iteration = static_cast<int>(cta_trace_iteration);
     params.return_lse = return_lse;
     for (int rank = 0; rank < dcp_size; ++rank) {
         int const node_rank = dcp_node_ranks[rank];
@@ -716,6 +726,10 @@ double forward_chunk_prefill_varlen_dcp_mega(
                 phase_timestamps.data_ptr<int64_t>(), 0,
                 kPhaseTimestampCount * sizeof(int64_t), stream));
         }
+    }
+    if (cta_trace.numel() > 0) {
+        C10_CUDA_CHECK(cudaMemsetAsync(
+            cta_trace.data_ptr<int64_t>(), 0, cta_trace.nbytes(), stream));
     }
     if (graph_replay) {
         min_fa3_varlen_demo::dcp_mega::advance_dcp_mega_graph_phase(
@@ -857,6 +871,8 @@ void bind_dcp_mega_varlen(py::module_& module) {
         py::arg("queue_state"),
         py::arg("phase_timestamps"),
         py::arg("graph_post_phase"),
+        py::arg("cta_trace"),
+        py::arg("cta_trace_iteration"),
         py::arg("record_phase_timestamps"),
         py::arg("dcp_node_ranks"),
         py::arg("dcp_rank"),
