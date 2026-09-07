@@ -359,9 +359,21 @@ class LocalDCPAttentionImpl(AttentionImpl[LocalDCPAttentionMetadata]):
             cls._runner = VLLMA2ADCPAttentionRunner(dcp.device_group)
         else:
             raise AssertionError(f"unknown local DCP runner {cls.runner_kind!r}")
-        logger.info_once(
-            "Using in-repository %s DCP attention runner", cls.runner_kind
-        )
+        if isinstance(cls._runner, DCPMegaAttentionRunner):
+            split_policy = {
+                None: "auto",
+                True: "critical_wave",
+                False: "fa3_native",
+            }[runtime.scheduler_heuristic]
+            logger.info_once(
+                "Using in-repository Mega DCP attention runner "
+                "(scheduler_mode=%s)",
+                split_policy,
+            )
+        else:
+            logger.info_once(
+                "Using in-repository %s DCP attention runner", cls.runner_kind
+            )
 
         max_model_len = vllm_config.model_config.max_model_len
         max_history = runtime.max_batch * (
@@ -532,8 +544,20 @@ class LocalDCPAttentionImpl(AttentionImpl[LocalDCPAttentionMetadata]):
             result = runner.forward_chunk_prefill_varlen(
                 *common_args,
                 **common_kwargs,
-                scheduler_heuristic=True,
-                reorder_history_override=False,
+                scheduler_heuristic=runtime.scheduler_heuristic,
+                reorder_history_override=(
+                    None if runtime.scheduler_heuristic is None else False
+                ),
+            )
+            dispatch = runner.last_queue_counts
+            assert dispatch is not None
+            logger.info_once(
+                "Mega DCP batch dispatch: scheduler_mode=%s, "
+                "split_policy=%s, history_order=%s, block_n=%s",
+                dispatch["scheduler_mode"],
+                dispatch["split_policy"],
+                dispatch["history_order_policy"],
+                dispatch["effective_block_n"],
             )
         else:
             result = runner.forward_chunk_prefill_varlen(

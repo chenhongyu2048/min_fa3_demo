@@ -2782,6 +2782,7 @@ class DCPMegaAttentionRunner:
                 num_comm_sm=self.num_comm_sm,
                 requested_num_splits=num_splits,
                 block_n_override=self.block_n_override,
+                max_num_splits=self.max_num_splits,
                 scheduler_heuristic=scheduler_heuristic,
                 reorder_history_override=reorder_history_override,
             )
@@ -2821,6 +2822,7 @@ class DCPMegaAttentionRunner:
                 ),
                 "effective_block_n": metadata.dispatch.block_n,
                 "heuristic_model_block_n": metadata.heuristic_model_block_n,
+                "scheduler_mode": metadata.scheduler_mode,
                 "history_combine_worker_warps": (
                     (self.num_sms - self.num_comm_sm) * MEGA_COMPUTE_WARPS
                 ),

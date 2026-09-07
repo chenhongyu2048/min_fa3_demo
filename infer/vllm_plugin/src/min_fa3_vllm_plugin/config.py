@@ -52,9 +52,10 @@ def _positive_env(name: str, default: int) -> int:
 class MegaRuntimeConfig:
     max_total_q: int = 4096
     max_batch: int = 64
-    max_num_splits: int = 8
+    max_num_splits: int = 128
     num_comm_sm: int = 8
     block_n: int | None = None
+    scheduler_heuristic: bool | None = None
 
     @classmethod
     def from_env(cls) -> "MegaRuntimeConfig":
@@ -70,12 +71,24 @@ class MegaRuntimeConfig:
                 ) from exc
             if block_n not in (128, 176):
                 raise ValueError("MEGA_DCP_BLOCK_N must be auto, 128, or 176")
+        raw_scheduler_heuristic = os.environ.get(
+            "MEGA_DCP_SCHEDULER_HEURISTIC", "auto"
+        )
+        if raw_scheduler_heuristic not in ("0", "1", "auto"):
+            raise ValueError(
+                "MEGA_DCP_SCHEDULER_HEURISTIC must be auto, 0, or 1"
+            )
         config = cls(
             max_total_q=_positive_env("MEGA_DCP_MAX_TOTAL_Q", 4096),
             max_batch=_positive_env("MEGA_DCP_MAX_BATCH", 64),
-            max_num_splits=_positive_env("MEGA_DCP_MAX_NUM_SPLITS", 8),
+            max_num_splits=_positive_env("MEGA_DCP_MAX_NUM_SPLITS", 128),
             num_comm_sm=_positive_env("MEGA_DCP_NUM_COMM_SM", 8),
             block_n=block_n,
+            scheduler_heuristic=(
+                None
+                if raw_scheduler_heuristic == "auto"
+                else raw_scheduler_heuristic == "1"
+            ),
         )
         if config.max_batch > config.max_total_q:
             raise ValueError("MEGA_DCP_MAX_BATCH cannot exceed MEGA_DCP_MAX_TOTAL_Q")

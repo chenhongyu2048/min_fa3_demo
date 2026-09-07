@@ -7,7 +7,8 @@ import json
 import os
 from pathlib import Path
 
-BACKENDS = ("vllm-ag-rs", "vllm-a2a", "mega")
+MEGA_BACKENDS = ("mega", "mega-fa3-native")
+BACKENDS = ("vllm-ag-rs", "vllm-a2a", "mega-fa3-native", "mega")
 
 
 def repo_root() -> Path:
@@ -34,6 +35,8 @@ def build_serve_command(args: argparse.Namespace) -> tuple[dict[str, str], list[
         raise ValueError(f"backend must be one of {BACKENDS}")
     if not 0 < args.gpu_memory_utilization <= 1:
         raise ValueError("gpu_memory_utilization must be in (0, 1]")
+    if not 1 <= args.mega_max_num_splits <= 128:
+        raise ValueError("mega_max_num_splits must be in [1, 128]")
     # ``hf_overrides`` is intentionally used for smoke runs instead of
     # maintaining a second, non-Llama model config.  vLLM applies this to the
     # HuggingFace config before constructing the model, so changing the layer
@@ -142,6 +145,9 @@ def build_serve_command(args: argparse.Namespace) -> tuple[dict[str, str], list[
             "MEGA_DCP_MAX_NUM_SPLITS": str(args.mega_max_num_splits),
             "MEGA_DCP_NUM_COMM_SM": str(args.mega_num_comm_sm),
             "MEGA_DCP_BLOCK_N": args.mega_block_n,
+            "MEGA_DCP_SCHEDULER_HEURISTIC": (
+                "0" if args.backend == "mega-fa3-native" else "auto"
+            ),
         }
     )
     return env, command
@@ -174,7 +180,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--seed", type=int, default=42)
     result.add_argument("--fill-mean", type=float, default=0.015)
     result.add_argument("--mega-max-total-q", type=int, default=4096)
-    result.add_argument("--mega-max-num-splits", type=int, default=8)
+    result.add_argument("--mega-max-num-splits", type=int, default=128)
     result.add_argument("--mega-num-comm-sm", type=int, default=8)
     result.add_argument(
         "--mega-block-n", choices=("auto", "128", "176"), default="auto"

@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from vllm_bench.serve import build_serve_command, dcp_size, main, model_dir
+from vllm_bench.serve import BACKENDS, build_serve_command, dcp_size, main, model_dir
 
 
 class ServiceConfigTest(unittest.TestCase):
@@ -29,7 +29,7 @@ class ServiceConfigTest(unittest.TestCase):
             seed=42,
             fill_mean=0.015,
             mega_max_total_q=4096,
-            mega_max_num_splits=8,
+            mega_max_num_splits=128,
             mega_num_comm_sm=8,
             mega_block_n="auto",
             dry_run=True,
@@ -49,7 +49,7 @@ class ServiceConfigTest(unittest.TestCase):
     def test_backend_selector_changes_only_attention_path(self) -> None:
         commands = {}
         environments = {}
-        for backend in ("vllm-ag-rs", "vllm-a2a", "mega"):
+        for backend in BACKENDS:
             environments[backend], commands[backend] = build_serve_command(
                 self._args(backend)
             )
@@ -71,6 +71,13 @@ class ServiceConfigTest(unittest.TestCase):
             )
             self.assertEqual(
                 environments[backend]["VLLM_USE_FLASHINFER_SAMPLER"], "0"
+            )
+            self.assertEqual(
+                environments[backend]["MEGA_DCP_SCHEDULER_HEURISTIC"],
+                "0" if backend == "mega-fa3-native" else "auto",
+            )
+            self.assertEqual(
+                environments[backend]["MEGA_DCP_MAX_NUM_SPLITS"], "128"
             )
             self.assertIn("--hf-overrides", command)
             self.assertIn('{"num_hidden_layers":32}', command)
@@ -166,8 +173,22 @@ class PluginPureConfigTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             config = MegaRuntimeConfig.from_env()
         self.assertEqual(config.max_total_q, 4096)
-        self.assertEqual(config.max_num_splits, 8)
+        self.assertEqual(config.max_num_splits, 128)
         self.assertIsNone(config.block_n)
+        self.assertIsNone(config.scheduler_heuristic)
+        with patch.dict(
+            os.environ, {"MEGA_DCP_SCHEDULER_HEURISTIC": "0"}, clear=True
+        ):
+            self.assertFalse(MegaRuntimeConfig.from_env().scheduler_heuristic)
+        with patch.dict(
+            os.environ, {"MEGA_DCP_SCHEDULER_HEURISTIC": "1"}, clear=True
+        ):
+            self.assertTrue(MegaRuntimeConfig.from_env().scheduler_heuristic)
+        with patch.dict(
+            os.environ, {"MEGA_DCP_SCHEDULER_HEURISTIC": "invalid"}, clear=True
+        ):
+            with self.assertRaises(ValueError):
+                MegaRuntimeConfig.from_env()
         with patch.dict(os.environ, {"MEGA_DCP_BLOCK_N": "64"}, clear=True):
             with self.assertRaises(ValueError):
                 MegaRuntimeConfig.from_env()
@@ -177,6 +198,7 @@ class PluginPureConfigTest(unittest.TestCase):
 
         expected_suffixes = {
             "mega": "MegaDCPAttentionBackend",
+            "mega-fa3-native": "MegaDCPAttentionBackend",
             "vllm-ag-rs": "VLLMAGRSDCPAttentionBackend",
             "vllm-a2a": "VLLMA2ADCPAttentionBackend",
         }
@@ -199,6 +221,10 @@ class PluginPureConfigTest(unittest.TestCase):
         self.assertNotIn(
             "from vllm.v1.attention.backends.flash_attn import", backend
         )
+        self.assertIn(
+            "scheduler_heuristic=runtime.scheduler_heuristic", backend
+        )
+        self.assertNotIn("scheduler_heuristic=True", backend)
 
     def test_supported_service_config_uses_pinned_vllm_model_api(self) -> None:
         import torch

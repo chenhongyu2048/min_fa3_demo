@@ -36,6 +36,7 @@ GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.05}
 NUM_HIDDEN_LAYERS=${NUM_HIDDEN_LAYERS:-1}
 KV_CACHE_MEMORY_BYTES=${KV_CACHE_MEMORY_BYTES:-1073741824}
 MEGA_NUM_COMM_SMS=${MEGA_NUM_COMM_SMS:-"4,8,12,16,20"}
+MEGA_MAX_NUM_SPLITS=${MEGA_MAX_NUM_SPLITS:-128}
 PORT=${PORT:-18000}
 
 mkdir -p "$(dirname -- "$WORKLOAD")" "$RESULT_DIR"
@@ -52,8 +53,9 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7} \
         --port "$PORT" \
         --kv-heads 1 \
         --mega-num-comm-sms "$MEGA_NUM_COMM_SMS" \
+        --mega-max-num-splits "$MEGA_MAX_NUM_SPLITS" \
         --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
         --kv-cache-memory-bytes "$KV_CACHE_MEMORY_BYTES" \
         --num-hidden-layers "$NUM_HIDDEN_LAYERS" \
         --arrival-time-scales 4 \
-        --backends vllm-ag-rs vllm-a2a mega
+        --backends vllm-ag-rs vllm-a2a mega-fa3-native mega

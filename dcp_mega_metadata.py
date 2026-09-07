@@ -121,6 +121,7 @@ class DCPMegaMetadata:
     receive_count: int
     tile_ready_count: int
     dcp_size: int
+    scheduler_mode: str
     split_policy: str
     history_order_policy: str
     scheduler_policy: str
@@ -252,9 +253,14 @@ def choose_split_upper_bound(
     block_n: int,
     is_causal: bool,
     requested_num_splits: int,
+    max_num_splits: int = 128,
 ) -> int:
     if requested_num_splits < 0 or requested_num_splits > 128:
         raise ValueError("num_splits must be 0 (auto), 1, or in [2, 128]")
+    if max_num_splits < 1 or max_num_splits > 128:
+        raise ValueError("max_num_splits must be in [1, 128]")
+    if requested_num_splits > max_num_splits:
+        raise ValueError("num_splits cannot exceed max_num_splits")
     if requested_num_splits:
         return requested_num_splits
     num_m_blocks = _ceil_div(max_seqlen_q * q_heads, 128)
@@ -266,6 +272,7 @@ def choose_split_upper_bound(
         num_m_blocks,
         max_seqlen_k * (128 + 128) * 2,
         is_causal,
+        max_splits=max_num_splits,
     )
 
 
@@ -278,6 +285,7 @@ def choose_dispatch(
     num_sms: int,
     requested_num_splits: int,
     block_n_override: int | None = None,
+    max_num_splits: int = 128,
 ) -> DCPMegaDispatch:
     """Apply the existing Split/Pack rules to the two attention domains."""
     if block_n_override not in (None, 128, 176):
@@ -298,6 +306,7 @@ def choose_dispatch(
         block_n=block_n,
         is_causal=True,
         requested_num_splits=requested_num_splits,
+        max_num_splits=max_num_splits,
     )
     history_splits = choose_split_upper_bound(
         max_seqlen_q=max_seqlen_q,
@@ -307,6 +316,7 @@ def choose_dispatch(
         block_n=block_n,
         is_causal=False,
         requested_num_splits=requested_num_splits,
+        max_num_splits=max_num_splits,
     )
     effective = max(chunk_splits, history_splits)
     return DCPMegaDispatch(
@@ -552,6 +562,9 @@ def _critical_wave_plan(
     num_comm_sm: int,
     chunk_sequence_splits: Sequence[int],
     include_legacy_candidate: bool,
+    max_num_splits: int,
+    native_chunk_sequence_splits: Sequence[int] | None,
+    legacy_is_native: bool,
     reorder_no_split: bool,
     reorder_split: bool,
 ) -> tuple[_CriticalWavePlan, _CriticalWavePlan]:
@@ -567,6 +580,13 @@ def _critical_wave_plan(
 
     def profile(sequence_splits: Sequence[int], source: str) -> _CriticalWavePlan:
         splits = tuple(int(value) for value in sequence_splits)
+        effective_chunk_splits = (
+            tuple(native_chunk_sequence_splits)
+            if legacy_is_native
+            and source == "legacy_dynamic"
+            and native_chunk_sequence_splits is not None
+            else tuple(chunk_sequence_splits)
+        )
         attention_profile, _, completion_for_vector = _attention_schedule_profile(
             q_lengths,
             history_n_blocks,
@@ -575,10 +595,12 @@ def _critical_wave_plan(
             block_n=block_n,
             num_compute_ctas=num_compute_ctas,
             num_comm_sm=num_comm_sm,
-            chunk_sequence_splits=chunk_sequence_splits,
+            chunk_sequence_splits=effective_chunk_splits,
             history_sequence_splits=splits,
             reorder_history=(
-                reorder_split
+                False
+                if legacy_is_native and source == "legacy_dynamic"
+                else reorder_split
                 if any(value > 1 for value in splits)
                 else reorder_no_split
             ),
@@ -640,6 +662,7 @@ def _critical_wave_plan(
             block_n=block_n,
             is_causal=False,
             requested_num_splits=0,
+            max_num_splits=max_num_splits,
         )
         legacy_splits = _dynamic_sequence_splits(
             q_lengths,
@@ -658,7 +681,7 @@ def _critical_wave_plan(
         zip(q_lengths, history_n_blocks)
     ):
         if q_len <= 16 and num_n_blocks >= num_compute_ctas:
-            split_caps[index] = max(split_caps[index], 4)
+            split_caps[index] = min(max_num_splits, max(split_caps[index], 4))
 
     iterative = no_split
     while True:
@@ -1116,6 +1139,7 @@ def build_dcp_mega_metadata(
     num_comm_sm: int,
     requested_num_splits: int = 0,
     block_n_override: int | None = None,
+    max_num_splits: int = 128,
     scheduler_heuristic: bool | None = None,
     reorder_history_override: bool | None = None,
 ) -> DCPMegaMetadata:
@@ -1142,13 +1166,24 @@ def build_dcp_mega_metadata(
         scheduler_heuristic, bool
     ):
         raise ValueError("scheduler_heuristic must be a bool or None")
-    if scheduler_heuristic is None:
-        scheduler_heuristic = requested_num_splits in (0, 1)
+    if max_num_splits < 1 or max_num_splits > 128:
+        raise ValueError("max_num_splits must be in [1, 128]")
+    auto_mode = scheduler_heuristic is None and requested_num_splits == 0
+    if scheduler_heuristic is None and requested_num_splits == 1:
+        scheduler_heuristic = True
+    elif scheduler_heuristic is None and requested_num_splits > 1:
+        scheduler_heuristic = False
     if scheduler_heuristic and requested_num_splits not in (0, 1):
         raise ValueError(
             "scheduler_heuristic requires requested_num_splits in {0, 1}"
         )
-    if scheduler_heuristic:
+    if auto_mode:
+        scheduler_mode = "auto"
+    elif scheduler_heuristic:
+        scheduler_mode = "critical_wave"
+    else:
+        scheduler_mode = "fa3_native"
+    if scheduler_mode in ("auto", "critical_wave"):
         split_policy = SPLIT_POLICY_CRITICAL_WAVE
     else:
         split_policy = SPLIT_POLICY_FA3_NATIVE
@@ -1161,17 +1196,38 @@ def build_dcp_mega_metadata(
     else:
         reorder_no_split = reorder_history_override
         reorder_split = reorder_history_override
-    auto_block_n = block_n_override is None and scheduler_heuristic
+    auto_block_n = (
+        block_n_override is None
+        and scheduler_mode in ("auto", "critical_wave")
+    )
     dispatch = choose_dispatch(
         max_seqlen_q=max(q_lengths),
         max_seqlen_history=max(history_lengths),
         hq_local=hq_local,
         dcp_size=dcp_size,
         num_sms=num_sms,
-        requested_num_splits=1 if scheduler_heuristic else requested_num_splits,
+        requested_num_splits=(
+            1 if auto_mode or scheduler_heuristic else requested_num_splits
+        ),
         block_n_override=block_n_override,
+        max_num_splits=max_num_splits,
     )
-    heuristic_model_block_n = dispatch.block_n if scheduler_heuristic else None
+    critical_wave_mode = scheduler_mode in ("auto", "critical_wave")
+    native_dispatch = dispatch
+    if auto_mode:
+        native_dispatch = choose_dispatch(
+            max_seqlen_q=max(q_lengths),
+            max_seqlen_history=max(history_lengths),
+            hq_local=hq_local,
+            dcp_size=dcp_size,
+            num_sms=num_sms,
+            requested_num_splits=0,
+            block_n_override=block_n_override,
+            max_num_splits=max_num_splits,
+        )
+    heuristic_model_block_n = (
+        dispatch.block_n if critical_wave_mode else None
+    )
 
     chunk_sequence_splits = _dynamic_sequence_splits(
         q_lengths,
@@ -1191,6 +1247,15 @@ def build_dcp_mega_metadata(
         num_sms=num_sms,
         block_n=dispatch.block_n,
     )
+    native_chunk_sequence_splits = _dynamic_sequence_splits(
+        q_lengths,
+        q_lengths,
+        heads=hq_local,
+        pack_gqa=native_dispatch.pack_gqa,
+        split_upper_bound=native_dispatch.chunk_num_splits,
+        num_sms=num_sms,
+        block_n=native_dispatch.block_n,
+    )
     heuristic_split_sequence_idx = None
     heuristic_split_sequence_splits = None
     heuristic_plan_source = None
@@ -1208,7 +1273,7 @@ def build_dcp_mega_metadata(
     heuristic_baseline_makespan = None
     heuristic_selected_makespan = None
     heuristic_gain = None
-    if scheduler_heuristic:
+    if scheduler_mode in ("auto", "critical_wave"):
         baseline_plan, selected_plan = _critical_wave_plan(
             q_lengths,
             history_lengths,
@@ -1219,9 +1284,16 @@ def build_dcp_mega_metadata(
             num_comm_sm=num_comm_sm,
             chunk_sequence_splits=chunk_sequence_splits,
             include_legacy_candidate=requested_num_splits == 0,
+            max_num_splits=max_num_splits,
+            native_chunk_sequence_splits=native_chunk_sequence_splits,
+            legacy_is_native=auto_mode,
             reorder_no_split=reorder_no_split,
             reorder_split=reorder_split,
         )
+        if auto_mode and selected_plan.source == "legacy_dynamic":
+            split_policy = SPLIT_POLICY_FA3_NATIVE
+            auto_block_n = False
+            chunk_sequence_splits = native_chunk_sequence_splits
         heuristic_plan_source = selected_plan.source
         heuristic_baseline_attention_tasks = baseline_plan.attention_tasks
         heuristic_selected_attention_tasks = selected_plan.attention_tasks
@@ -1261,30 +1333,18 @@ def build_dcp_mega_metadata(
             heuristic_split_sequence_splits = history_sequence_splits[
                 heuristic_split_sequence_idx
             ]
-    if heuristic_history_sequence_splits is not None:
-        chunk_num_splits = max(chunk_sequence_splits)
-        history_num_splits = max(history_sequence_splits)
-        dispatch = DCPMegaDispatch(
-            effective_num_splits=max(chunk_num_splits, history_num_splits),
-            chunk_num_splits=chunk_num_splits,
-            history_num_splits=history_num_splits,
-            pack_gqa=dispatch.pack_gqa,
-            split=True,
-            block_n=dispatch.block_n,
-            history_copy_vectors_per_task=1,
-        )
-    if all(split == 1 for split in chunk_sequence_splits) and all(
-        split == 1 for split in history_sequence_splits
-    ):
-        dispatch = DCPMegaDispatch(
-            effective_num_splits=1,
-            chunk_num_splits=1,
-            history_num_splits=1,
-            pack_gqa=dispatch.pack_gqa,
-            split=False,
-            block_n=dispatch.block_n,
-            history_copy_vectors_per_task=1,
-        )
+    chunk_num_splits = max(chunk_sequence_splits)
+    history_num_splits = max(history_sequence_splits)
+    effective_num_splits = max(chunk_num_splits, history_num_splits)
+    dispatch = DCPMegaDispatch(
+        effective_num_splits=effective_num_splits,
+        chunk_num_splits=chunk_num_splits,
+        history_num_splits=history_num_splits,
+        pack_gqa=dispatch.pack_gqa,
+        split=effective_num_splits > 1,
+        block_n=dispatch.block_n,
+        history_copy_vectors_per_task=1,
+    )
     if auto_block_n and not dispatch.split:
         dispatch = DCPMegaDispatch(
             effective_num_splits=dispatch.effective_num_splits,
@@ -1521,6 +1581,7 @@ def build_dcp_mega_metadata(
         receive_count=num_token_subtiles * (dcp_size - 1),
         tile_ready_count=num_token_subtiles * (dcp_size - 1),
         dcp_size=dcp_size,
+        scheduler_mode=scheduler_mode,
         split_policy=split_policy,
         history_order_policy=history_order_policy,
         scheduler_policy=_combined_scheduler_policy(
@@ -1563,6 +1624,8 @@ def validate_dcp_mega_metadata(
 ) -> None:
     """Validate queue ranges, dependencies, and publication ordering."""
     cu_q = tuple(int(value) for value in cu_seqlens_q)
+    if metadata.scheduler_mode not in ("auto", "critical_wave", "fa3_native"):
+        raise AssertionError("unknown scheduler mode")
     if metadata.split_policy not in (
         SPLIT_POLICY_CRITICAL_WAVE,
         SPLIT_POLICY_FA3_NATIVE,
@@ -1577,7 +1640,10 @@ def validate_dcp_mega_metadata(
         metadata.split_policy, metadata.history_order_policy
     ):
         raise AssertionError("combined scheduler policy is inconsistent")
-    heuristic_enabled = metadata.split_policy == SPLIT_POLICY_CRITICAL_WAVE
+    # Auto keeps the critical-wave candidate diagnostics even when the final
+    # policy is native, so the selected policy can be audited without
+    # reconstructing the host-side decision.
+    heuristic_enabled = metadata.heuristic_plan_source is not None
     heuristic_split_enabled = (
         heuristic_enabled
         and metadata.heuristic_history_sequence_splits is not None

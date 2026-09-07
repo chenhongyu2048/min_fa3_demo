@@ -29,18 +29,25 @@ directly.
 - DCP=`8 / KVH`, so each DCP group is one replicated KV-head group
 - formal matrix: KVH=1/2/4, corresponding to DCP=8/4/2
 
-Backend names are `vllm-ag-rs`, `vllm-a2a`, and `mega`. All three are custom
-vLLM backends backed by this repository's `min_fa3_op`: the first two use
-`VLLMDCPAttentionRunner`/`VLLMA2ADCPAttentionRunner`, while the third uses
-`DCPMegaAttentionRunner`. This fixes the local attention implementation and
-compares orchestration/collectives. All run eager, with chunked prefill enabled
-and prefix caching disabled. FlashInfer autotuning is also disabled because
+Backend names are `vllm-ag-rs`, `vllm-a2a`, `mega-fa3-native`, and `mega`. All
+four are custom vLLM backends backed by this repository's `min_fa3_op`: the
+first two use `VLLMDCPAttentionRunner`/`VLLMA2ADCPAttentionRunner`, while both
+Mega variants use `DCPMegaAttentionRunner`. `mega` uses critical-wave automatic
+split selection when its full critical-path score wins and otherwise selects
+the FA3-native dynamic split plan for that batch. `mega-fa3-native` is the
+baseline that always uses FA3-native split selection and FIFO history order. This
+fixes the local attention implementation and compares orchestration/collectives. All run
+eager, with chunked prefill enabled and prefix caching disabled. FlashInfer
+autotuning is also disabled because
 the CUSTOM backend does not use FlashInfer; otherwise vLLM runs an unrelated
 zero-history full-prefill dummy batch during startup, which is outside this
 decode-side backend's contract. The ordinary memory-profiling pass already
-uses `skip_attn=True`. Mega defaults to FIFO history order, automatic block N,
-eight communication SMs, and at most eight splits. The integration does not
-change CUDA source and does not require a top-level
+uses `skip_attn=True`. Both Mega variants use eight communication SMs and at
+most 128 splits by default. `mega` follows the benchmark's automatic history
+order (FIFO for NoSplit/mixed plans and release-LPT for decode-only critical-wave
+split plans); `mega-fa3-native` always uses FIFO. Optimized Mega selects
+BlockN automatically; the FA3-native baseline uses the existing native default
+of BlockN 128. The integration does not change CUDA source and does not require a top-level
 `vllm-flash-attention` submodule.
 
 ## Installation
@@ -141,6 +148,11 @@ communication-SM sweep as the formal matrix. Override it with a smaller set
 for a quick check, for example `MEGA_NUM_COMM_SMS=8` or
 `MEGA_NUM_COMM_SMS=4,8`.
 
+Both wrappers preallocate capacity for 128 Mega split partials by default so
+FA3-native auto selection is not capped at eight. Set `MEGA_MAX_NUM_SPLITS` to
+a smaller value when memory is constrained; the host planner applies the same
+limit before producing per-sequence split metadata.
+
 Both the smoke and formal wrappers explicitly default and export
 `VLLM_USE_FLASHINFER_SAMPLER=0`, because the custom attention backend does not
 use FlashInfer's sampling kernel and this avoids an unrelated sampling JIT
@@ -153,11 +165,11 @@ available and that sampler path is intentionally being tested.
 The formal wrapper defaults to `KV_HEADS=1,2,4` and
 `MEGA_NUM_COMM_SMS=4,8,12,16,20`, matching the Mega comm-SM sweep used by
 `benchmark_dcp_mega_arrival_matrix.sh`. It stores each KV-head configuration
-under `benchmark_logs/vllm_dcp/kvh{1,2,4}`. Baseline services run once per
-arrival scale; Mega gets one isolated service run per communication-SM value,
-with runs recorded as `mega-comm_sm{N}-scale{S}`. Set comma- or
-space-separated subsets when needed, for example `KV_HEADS=1,4` or
-`MEGA_NUM_COMM_SMS="8 16"`.
+under `benchmark_logs/vllm_dcp/kvh{1,2,4}`. The vLLM-style baseline services
+run once per arrival scale. Both `mega-fa3-native` and optimized `mega` get
+one isolated service run per communication-SM value, with runs recorded as
+`{backend}-comm_sm{N}-scale{S}`. Set comma- or space-separated subsets when
+needed, for example `KV_HEADS=1,4` or `MEGA_NUM_COMM_SMS="8 16"`.
 
 Both wrappers default to port 8000. Set `PORT` when that endpoint is already
 used by another service; the matrix rejects any existing listener before
@@ -215,9 +227,10 @@ PYTHONPATH=infer .venv/bin/python -m vllm_bench.serve \
   --num-hidden-layers 1 --gpu-memory-utilization 0.1
 ```
 
-Replace `mega` with either repository baseline; add `--dry-run` to print the
-exact command. Each matrix cell records the service log, run manifest, raw token
-timestamps/ITLs, request CSV, and summary. SSE uses `stream_interval=1` and
+Replace `mega` with `mega-fa3-native` or either vLLM-style baseline; add
+`--dry-run` to print the exact command. Each matrix cell records the service
+log, run manifest, raw token timestamps/ITLs, request CSV, and summary. SSE uses
+`stream_interval=1` and
 `return_token_ids=true`. A delta containing multiple token IDs remains valid
 for throughput/E2E but is excluded from TBT rather than receiving fabricated
 per-token timestamps. `comparison.json`/CSV report Mega/baseline ratios;

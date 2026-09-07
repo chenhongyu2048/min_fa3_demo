@@ -15,6 +15,7 @@ from dcp_mega_metadata import (
     METADATA_HEADER_INTS,
     METADATA_VERSION,
     SCHEDULER_POLICY_CRITICAL_WAVE_FIFO,
+    SCHEDULER_POLICY_FIFO,
     SCHEDULER_POLICY_HEURISTIC,
     SCHEDULER_POLICY_NATIVE_RELEASE_LPT,
     SPLIT_POLICY_CRITICAL_WAVE,
@@ -1077,8 +1078,97 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(metadata.dispatch.chunk_num_splits, 1)
         self.assertEqual(metadata.dispatch.history_num_splits, 1)
         self.assertFalse(metadata.dispatch.split)
+
+    def test_fa3_native_auto_split_honors_runner_capacity(self):
+        args = (
+            (0, 16, 32),
+            (0, 4096, 8192),
+        )
+        kwargs = dict(
+            hq_local=4,
+            dcp_size=8,
+            num_sms=132,
+            num_comm_sm=8,
+            requested_num_splits=0,
+            scheduler_heuristic=False,
+            reorder_history_override=False,
+        )
+        uncapped = build_dcp_mega_metadata(*args, **kwargs)
+        metadata = build_dcp_mega_metadata(
+            *args,
+            **kwargs,
+            max_num_splits=8,
+        )
+
+        self.assertGreater(uncapped.dispatch.effective_num_splits, 8)
+        self.assertEqual(metadata.split_policy, SPLIT_POLICY_FA3_NATIVE)
+        self.assertEqual(metadata.history_order_policy, HISTORY_ORDER_POLICY_FIFO)
+        self.assertEqual(metadata.scheduler_policy, SCHEDULER_POLICY_FIFO)
+        self.assertLessEqual(metadata.dispatch.effective_num_splits, 8)
+        self.assertTrue(
+            all(split <= 8 for split in metadata.history_sequence_splits)
+        )
         self.assertTrue(metadata.dispatch.pack_gqa)
         self.assertEqual(metadata.dispatch.block_n, 128)
+
+    def test_auto_can_select_fa3_native_split_and_fifo_schedule(self):
+        q_lengths = (16, 1, 8, 16, 16, 8, 16, 8, 4, 4, 8, 4, 1, 8)
+        history_lengths = (
+            17580, 19852, 4944, 10291, 3365, 2545, 10948,
+            15600, 18472, 3428, 11722, 14355, 10490, 6829,
+        )
+        common = dict(
+            cu_seqlens_q=_cumulative(q_lengths),
+            cu_seqlens_history=_cumulative(history_lengths),
+            hq_local=4,
+            dcp_size=2,
+            num_sms=132,
+            num_comm_sm=8,
+            requested_num_splits=0,
+        )
+        auto = build_dcp_mega_metadata(**common)
+        native = build_dcp_mega_metadata(
+            **common,
+            scheduler_heuristic=False,
+        )
+
+        self.assertEqual(auto.scheduler_mode, "auto")
+        self.assertEqual(auto.split_policy, SPLIT_POLICY_FA3_NATIVE)
+        self.assertEqual(auto.history_order_policy, HISTORY_ORDER_POLICY_FIFO)
+        self.assertEqual(auto.scheduler_policy, SCHEDULER_POLICY_FIFO)
+        self.assertEqual(auto.heuristic_plan_source, "legacy_dynamic")
+        self.assertEqual(
+            auto.chunk_sequence_splits, native.chunk_sequence_splits
+        )
+        self.assertEqual(
+            auto.history_sequence_splits, native.history_sequence_splits
+        )
+        self.assertEqual(auto.dispatch, native.dispatch)
+
+    def test_auto_critical_wave_split_respects_workspace_capacity(self):
+        q_lengths = [16] * 30 + [4096]
+        global_history_lengths = [
+            18234, 12375, 85844, 13016, 12015, 3183, 9091, 7179,
+            1183, 13975, 13359, 19947, 18835, 7404, 25785, 5381,
+            11799, 4710, 13899, 25580, 2076, 25461, 23476, 22178,
+            8113, 1296, 14450, 943, 901, 7156, 66048,
+        ]
+        metadata = build_dcp_mega_metadata(
+            _cumulative(q_lengths),
+            _cumulative([(length + 1) // 2 for length in global_history_lengths]),
+            hq_local=4,
+            dcp_size=2,
+            num_sms=132,
+            num_comm_sm=4,
+            requested_num_splits=0,
+            max_num_splits=2,
+        )
+
+        self.assertEqual(metadata.scheduler_mode, "auto")
+        self.assertLessEqual(metadata.dispatch.effective_num_splits, 2)
+        self.assertTrue(
+            all(split <= 2 for split in metadata.history_sequence_splits)
+        )
 
     def test_block_override_controls_both_split_heuristics(self):
         for block_n in (128, 176):

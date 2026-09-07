@@ -70,10 +70,24 @@ def aggregate(result_dir: Path) -> dict[str, Any]:
             key=lambda item: (item[0] is None, item[0] or 0),
         )
         for comm_sm, mega in mega_runs:
-            for baseline in ("vllm-ag-rs", "vllm-a2a"):
-                baseline_summary = by_key.get((baseline, scale, None))
-                if baseline_summary is None:
+            for baseline in ("vllm-ag-rs", "vllm-a2a", "mega-fa3-native"):
+                baseline_runs = [
+                    (baseline_comm_sm, summary)
+                    for (
+                        backend,
+                        run_scale,
+                        baseline_comm_sm,
+                    ), summary in by_key.items()
+                    if backend == baseline
+                    and run_scale == scale
+                    and (
+                        baseline != "mega-fa3-native"
+                        or baseline_comm_sm == comm_sm
+                    )
+                ]
+                if len(baseline_runs) != 1:
                     continue
+                baseline_comm_sm, baseline_summary = baseline_runs[0]
                 ratios = {}
                 for metric in METRICS:
                     numerator = _value(mega, metric)
@@ -87,6 +101,7 @@ def aggregate(result_dir: Path) -> dict[str, Any]:
                     {
                         "arrival_time_scale": scale,
                         "mega_num_comm_sm": comm_sm,
+                        "baseline_num_comm_sm": baseline_comm_sm,
                         "comparison": f"mega/{baseline}",
                         "ratios": ratios,
                         "interpretation": {

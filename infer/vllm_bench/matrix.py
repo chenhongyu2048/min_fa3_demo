@@ -17,7 +17,12 @@ from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 from .client import _write_csv, _write_results, execute, prepare_requests, summarize
-from .serve import BACKENDS, build_serve_command, parser as serve_parser
+from .serve import (
+    BACKENDS,
+    MEGA_BACKENDS,
+    build_serve_command,
+    parser as serve_parser,
+)
 from .workload import load_manifest
 
 
@@ -212,9 +217,15 @@ def main() -> None:
         type=_parse_positive_int_list,
         default=None,
         help=(
-            "Comma- or whitespace-separated Mega communication-SM sweep; "
-            "non-Mega backends run once per load point."
+            "Comma- or whitespace-separated Mega-backend communication-SM "
+            "sweep; vLLM-style baselines run once per load point."
         ),
+    )
+    parser.add_argument(
+        "--mega-max-num-splits",
+        type=int,
+        default=128,
+        help="Preallocated Mega split-workspace capacity in [1, 128].",
     )
     parser.add_argument(
         "--gpu-memory-utilization", type=float, default=0.9,
@@ -232,8 +243,15 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--server-start-timeout", type=float, default=900)
     args = parser.parse_args()
-    if args.mega_num_comm_sms is not None and "mega" not in args.backends:
-        parser.error("--mega-num-comm-sms requires the mega backend")
+    if args.mega_num_comm_sms is not None and not any(
+        backend in MEGA_BACKENDS for backend in args.backends
+    ):
+        parser.error(
+            "--mega-num-comm-sms requires a Mega backend "
+            "(mega or mega-fa3-native)"
+        )
+    if not 1 <= args.mega_max_num_splits <= 128:
+        parser.error("--mega-max-num-splits must be in [1, 128]")
     # ``infer/`` is an archive directory; the repository root is two levels
     # above this module (``infer/vllm_bench/matrix.py``).
     root = Path(__file__).resolve().parents[2]
@@ -244,17 +262,19 @@ def main() -> None:
     summaries = []
     backend_variants: list[tuple[str, int | None]] = []
     for backend in args.backends:
-        if backend == "mega" and args.mega_num_comm_sms is not None:
+        if backend in MEGA_BACKENDS and args.mega_num_comm_sms is not None:
             backend_variants.extend(
                 (backend, comm_sm) for comm_sm in args.mega_num_comm_sms
             )
         else:
-            backend_variants.append((backend, 8 if backend == "mega" else None))
+            backend_variants.append(
+                (backend, 8 if backend in MEGA_BACKENDS else None)
+            )
     for backend, comm_sm in backend_variants:
         for scale in args.arrival_time_scales:
             run_dir_name = f"{backend}-scale{scale:g}"
-            if backend == "mega" and args.mega_num_comm_sms is not None:
-                run_dir_name = f"mega-comm_sm{comm_sm}-scale{scale:g}"
+            if backend in MEGA_BACKENDS and args.mega_num_comm_sms is not None:
+                run_dir_name = f"{backend}-comm_sm{comm_sm}-scale{scale:g}"
             run_dir = args.result_dir / run_dir_name
             run_dir.mkdir(parents=True, exist_ok=True)
             serve_args = serve_parser().parse_args(
@@ -265,6 +285,8 @@ def main() -> None:
                     str(args.kv_heads),
                     "--mega-num-comm-sm",
                     str(comm_sm or 8),
+                    "--mega-max-num-splits",
+                    str(args.mega_max_num_splits),
                     "--host",
                     args.host,
                     "--port",
@@ -293,6 +315,7 @@ def main() -> None:
                 "tp_size": 8,
                 "dcp_size": 8 // args.kv_heads,
                 "mega_num_comm_sm": comm_sm,
+                "mega_max_num_splits": args.mega_max_num_splits,
                 "num_hidden_layers": args.num_hidden_layers,
                 "gpu_memory_utilization": args.gpu_memory_utilization,
                 "kv_cache_memory_bytes": args.kv_cache_memory_bytes,

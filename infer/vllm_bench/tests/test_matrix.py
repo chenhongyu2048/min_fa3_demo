@@ -24,6 +24,8 @@ class MatrixConfigTest(unittest.TestCase):
         summaries = (
             ("vllm-ag-rs-scale1", "vllm-ag-rs", None),
             ("vllm-a2a-scale1", "vllm-a2a", None),
+            ("mega-fa3-native-comm_sm4-scale1", "mega-fa3-native", 4),
+            ("mega-fa3-native-comm_sm8-scale1", "mega-fa3-native", 8),
             ("mega-comm_sm4-scale1", "mega", 4),
             ("mega-comm_sm8-scale1", "mega", 8),
         )
@@ -44,11 +46,22 @@ class MatrixConfigTest(unittest.TestCase):
                 )
             result = aggregate(result_dir)
 
-        self.assertEqual(len(result["runs"]), 4)
-        self.assertEqual(len(result["comparisons"]), 4)
+        self.assertEqual(len(result["runs"]), 6)
+        self.assertEqual(len(result["comparisons"]), 6)
         self.assertEqual(
             [comparison["mega_num_comm_sm"] for comparison in result["comparisons"]],
-            [4, 4, 8, 8],
+            [4, 4, 4, 8, 8, 8],
+        )
+        self.assertEqual(
+            [comparison["comparison"] for comparison in result["comparisons"]],
+            [
+                "mega/vllm-ag-rs",
+                "mega/vllm-a2a",
+                "mega/mega-fa3-native",
+                "mega/vllm-ag-rs",
+                "mega/vllm-a2a",
+                "mega/mega-fa3-native",
+            ],
         )
 
 

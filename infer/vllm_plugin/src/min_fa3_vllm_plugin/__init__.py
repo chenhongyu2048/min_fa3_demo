@@ -7,6 +7,9 @@ import os
 
 BACKEND_CLASS_PATHS = {
     "mega": "min_fa3_vllm_plugin.mega_backend.MegaDCPAttentionBackend",
+    "mega-fa3-native": (
+        "min_fa3_vllm_plugin.mega_backend.MegaDCPAttentionBackend"
+    ),
     "vllm-ag-rs": (
         "min_fa3_vllm_plugin.mega_backend.VLLMAGRSDCPAttentionBackend"
     ),
