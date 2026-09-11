@@ -5,8 +5,8 @@ set -euo pipefail
 #   Internet node: third_party/install_magi_attention.sh fetch
 #   CUDA node:     third_party/install_magi_attention.sh install
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
 ACTION=${1:-}
 PYTHON=${PYTHON:-$ROOT_DIR/.venv/bin/python}
 UV=${UV:-uv}
@@ -66,8 +66,8 @@ verify_source() {
 }
 
 verify_python() {
-    if [[ ! -x "$PYTHON" ]]; then
-        echo "Python environment does not exist or is not executable: $PYTHON" >&2
+    if ! "$PYTHON" -c 'import sys; print("Python executable:", sys.executable)'; then
+        echo "Python environment cannot be started: $PYTHON" >&2
         exit 1
     fi
     "$PYTHON" - <<'PY'
@@ -77,8 +77,8 @@ print("PyTorch:", torch.__version__)
 print("PyTorch CUDA:", torch.version.cuda)
 if torch.__version__ != "2.11.0+cu128":
     raise SystemExit(f"expected PyTorch 2.11.0+cu128, got {torch.__version__}")
-if torch.version.cuda != "12.8":
-    raise SystemExit(f"expected PyTorch CUDA 12.8, got {torch.version.cuda}")
+if not (torch.version.cuda or "").startswith("12."):
+    raise SystemExit(f"expected PyTorch CUDA 12.x, got {torch.version.cuda}")
 PY
 }
 
@@ -125,7 +125,7 @@ for package in ("magi_attention", "magi-attention"):
 print("MagiAttention direct_url:", json.dumps(direct_url, sort_keys=True))
 available, reason = probe_magi_attention()
 print("MagiAttention probe:", available, reason)
-if torch.__version__ != "2.11.0+cu128" or torch.version.cuda != "12.8":
+if torch.__version__ != "2.11.0+cu128" or not (torch.version.cuda or "").startswith("12."):
     raise SystemExit("Magi installation changed the expected Torch/CUDA stack")
 if installed_version != "1.1.1.post16+g872717e1":
     raise SystemExit(f"unexpected MagiAttention version: {installed_version}")
@@ -160,9 +160,13 @@ case "$ACTION" in
         echo "  MAX_JOBS: $MAX_JOBS"
         verify_source
         verify_python
-        test -x "$CUDA_HOME/bin/nvcc" || { echo "Missing nvcc: $CUDA_HOME/bin/nvcc" >&2; exit 1; }
-        if ! command -v "$UV" >/dev/null 2>&1; then
-            echo "uv is unavailable: $UV" >&2
+        NVCC_OUTPUT=$("$CUDA_HOME/bin/nvcc" --version) || { echo "Cannot start nvcc: $CUDA_HOME/bin/nvcc" >&2; exit 1; }
+        printf '%s\n' "$NVCC_OUTPUT"
+        grep -Eq 'release 12\.[0-9]+([,.]|$)' <<<"$NVCC_OUTPUT" || {
+            echo "Expected CUDA toolkit 12.x at $CUDA_HOME" >&2; exit 1;
+        }
+        if ! "$UV" --version; then
+            echo "uv cannot be started: $UV" >&2
             exit 1
         fi
         mkdir -p "$UV_CACHE_DIR"

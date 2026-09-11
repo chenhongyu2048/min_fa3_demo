@@ -6,8 +6,9 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-cd "$SCRIPT_DIR"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+cd "$ROOT_DIR"
 
 GPU_IDS=${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-"0,1,2,3,4,5,6,7"}}
 CHECK_INTERVAL_SECONDS=${CHECK_INTERVAL_SECONDS:-300}
@@ -27,7 +28,7 @@ NUM_ITERS=${NUM_ITERS:-40}
 export MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE=${MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE:-1}
 DRY_RUN=${DRY_RUN:-0}
 TORCHRUN=${TORCHRUN:-torchrun}
-LOG_ROOT=${LOG_ROOT:-"$SCRIPT_DIR/benchmark_logs/experiment_queue"}
+LOG_ROOT=${LOG_ROOT:-"$ROOT_DIR/benchmark_logs/experiment_queue"}
 RUN_ID=${RUN_ID:-$(date +%Y%m%d-%H%M%S)}
 RUN_DIR="$LOG_ROOT/$RUN_ID"
 MASTER_LOG="$RUN_DIR/experiment_queue.log"
@@ -117,11 +118,11 @@ for gpu in "${GPU_ID_LIST[@]}"; do
     nvidia-smi --id="$gpu" --query-gpu=index --format=csv,noheader,nounits \
         >/dev/null 2>&1 || die "GPU '$gpu' is not visible to nvidia-smi"
 done
-[[ -x "$SCRIPT_DIR/benchmark_dataset.sh" ]] || die "benchmark_dataset.sh is not executable"
-[[ -x "$SCRIPT_DIR/benchmark_load_balance.sh" ]] || \
-    die "benchmark_load_balance.sh is not executable"
-[[ -x "$SCRIPT_DIR/ring_test/load_balance_bench/run.sh" ]] || \
-    die "ring_test/load_balance_bench/run.sh is not executable"
+[[ -f "$ROOT_DIR/benchmark_dataset.sh" ]] || die "benchmark_dataset.sh is missing"
+[[ -f "$SCRIPT_DIR/benchmark_load_balance.sh" ]] || \
+    die "benchmark_load_balance.sh is missing"
+[[ -f "$ROOT_DIR/ring_test/load_balance_bench/run.sh" ]] || \
+    die "ring_test/load_balance_bench/run.sh is missing"
 
 mkdir -p "$RUN_DIR"
 touch "$MASTER_LOG"
@@ -212,7 +213,7 @@ run_dataset_benchmark() {
         NUM_ITERS="$NUM_ITERS" \
         METHODS=all COLLECT_MEGA_RING_STATS=0 CHECK="$CHECK" TORCHRUN="$TORCHRUN" \
         LOG_DIR="$RUN_DIR/$label.results" LOG_FILE="$RUN_DIR/$label.results.log" \
-        "$SCRIPT_DIR/benchmark_dataset.sh"
+        bash "$ROOT_DIR/benchmark_dataset.sh"
 }
 
 log "Experiment queue created"
@@ -247,7 +248,7 @@ run_experiment tile_analysis_131072_forward env \
     CHECK="$CHECK" TORCHRUN="$TORCHRUN" \
     LOG_DIR="$RUN_DIR/tile_analysis_131072_forward.results" \
     LOG_FILE="$RUN_DIR/tile_analysis_131072_forward.results.log" \
-    "$SCRIPT_DIR/benchmark_dataset.sh"
+    bash "$ROOT_DIR/benchmark_dataset.sh"
 
 # 3b. Metadata-only theoretical load analysis for every registered baseline.
 for direction in forward backward; do
@@ -263,7 +264,7 @@ for direction in forward backward; do
         TARGET_TOKENS=131072 NUM_CASES="$NUM_CASES" MODE="$MODE" \
         METHODS=all TORCHRUN="$TORCHRUN" LOG_DIR="$RUN_DIR/$label.results" \
         LOG_FILE="$RUN_DIR/$label.results.log" \
-        "$SCRIPT_DIR/benchmark_load_balance.sh"
+        bash "$SCRIPT_DIR/benchmark_load_balance.sh"
 done
 
 # 4. Native Megatron/Zeppelin and Mega Ring with three placement algorithms.
@@ -280,14 +281,14 @@ for direction in forward backward; do
         TARGET_TOKENS=131072 NUM_CASES="$NUM_CASES" MODE="$MODE" \
         COLLECT_MEGA_RING_STATS=0 CHECK="$CHECK" TORCHRUN="$TORCHRUN" \
         LOG_DIR="$RUN_DIR/$label.results" LOG_FILE="$RUN_DIR/$label.results.log" \
-        "$SCRIPT_DIR/ring_test/load_balance_bench/run.sh"
+        bash "$ROOT_DIR/ring_test/load_balance_bench/run.sh"
 done
 
 # 5. Strict W8 six-level causal forward ablation on the ArXiv case suite.
 for target_tokens in "${ABLATION_TARGET_LIST[@]}"; do
     run_experiment "forward_ablation_arxiv_${target_tokens}_${ABLATION_NUM_CASES}cases" env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
         "$TORCHRUN" --standalone --nproc_per_node=8 \
-        "$SCRIPT_DIR/ring_test/benchmark_forward_ablation.py" \
+        "$ROOT_DIR/ring_test/benchmark_forward_ablation.py" \
         --dataset "$ABLATION_DATASET" \
         --target-tokens "$target_tokens" \
         --num-cases "$ABLATION_NUM_CASES" \

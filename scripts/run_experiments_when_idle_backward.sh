@@ -7,8 +7,9 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-cd "$SCRIPT_DIR"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+cd "$ROOT_DIR"
 
 GPU_IDS=${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-"0,1,2,3,4,5,6,7"}}
 CHECK_INTERVAL_SECONDS=${CHECK_INTERVAL_SECONDS:-300}
@@ -28,7 +29,7 @@ NUM_ITERS=${NUM_ITERS:-40}
 MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE=${MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE:-1}
 DRY_RUN=${DRY_RUN:-0}
 TORCHRUN=${TORCHRUN:-torchrun}
-LOG_ROOT=${LOG_ROOT:-"$SCRIPT_DIR/benchmark_logs/experiment_queue"}
+LOG_ROOT=${LOG_ROOT:-"$ROOT_DIR/benchmark_logs/experiment_queue"}
 RUN_ID=${RUN_ID:-backward-$(date +%Y%m%d-%H%M%S)}
 RUN_DIR="$LOG_ROOT/$RUN_ID"
 MASTER_LOG="$RUN_DIR/experiment_queue_backward.log"
@@ -94,11 +95,11 @@ for gpu in "${GPU_ID_LIST[@]}"; do
     nvidia-smi --id="$gpu" --query-gpu=index --format=csv,noheader,nounits \
         >/dev/null 2>&1 || die "GPU '$gpu' is not visible to nvidia-smi"
 done
-[[ -x "$SCRIPT_DIR/benchmark_dataset.sh" ]] || die "benchmark_dataset.sh is not executable"
-[[ -x "$SCRIPT_DIR/benchmark_load_balance.sh" ]] || \
-    die "benchmark_load_balance.sh is not executable"
-[[ -x "$SCRIPT_DIR/ring_test/load_balance_bench/run.sh" ]] || \
-    die "ring_test/load_balance_bench/run.sh is not executable"
+[[ -f "$ROOT_DIR/benchmark_dataset.sh" ]] || die "benchmark_dataset.sh is missing"
+[[ -f "$SCRIPT_DIR/benchmark_load_balance.sh" ]] || \
+    die "benchmark_load_balance.sh is missing"
+[[ -f "$ROOT_DIR/ring_test/load_balance_bench/run.sh" ]] || \
+    die "ring_test/load_balance_bench/run.sh is missing"
 
 mkdir -p "$RUN_DIR"
 touch "$MASTER_LOG"
@@ -183,7 +184,7 @@ run_dataset_backward() {
         NUM_ITERS="$NUM_ITERS" METHODS=all COLLECT_MEGA_RING_STATS=0 \
         CHECK="$CHECK" TORCHRUN="$TORCHRUN" \
         LOG_DIR="$RUN_DIR/$label.results" LOG_FILE="$RUN_DIR/$label.results.log" \
-        "$SCRIPT_DIR/benchmark_dataset.sh"
+        bash "$ROOT_DIR/benchmark_dataset.sh"
 }
 
 log "Backward experiment queue created"
@@ -213,7 +214,7 @@ run_experiment theoretical_load_131072_backward env \
     METHODS=all TORCHRUN="$TORCHRUN" \
     LOG_DIR="$RUN_DIR/theoretical_load_131072_backward.results" \
     LOG_FILE="$RUN_DIR/theoretical_load_131072_backward.results.log" \
-    "$SCRIPT_DIR/benchmark_load_balance.sh"
+    bash "$SCRIPT_DIR/benchmark_load_balance.sh"
 
 # 3. Fixed backward placement comparison: native Megatron/Zeppelin and the
 # three MegaRing hybrid placement algorithms.
@@ -228,7 +229,7 @@ run_experiment load_balance_algorithms_131072_backward env \
     TORCHRUN="$TORCHRUN" \
     LOG_DIR="$RUN_DIR/load_balance_algorithms_131072_backward.results" \
     LOG_FILE="$RUN_DIR/load_balance_algorithms_131072_backward.results.log" \
-    "$SCRIPT_DIR/ring_test/load_balance_bench/run.sh"
+    bash "$ROOT_DIR/ring_test/load_balance_bench/run.sh"
 
 if ((${#FAILED_EXPERIMENTS[@]})); then
     log "Backward experiment queue finished with ${#FAILED_EXPERIMENTS[@]} failure(s): ${FAILED_EXPERIMENTS[*]}"

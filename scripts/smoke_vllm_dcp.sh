@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 PYTHON=${PYTHON:-$ROOT_DIR/.venv/bin/python}
 export PYTHONPATH="$ROOT_DIR/infer${PYTHONPATH:+:$PYTHONPATH}"
 # FlashInfer's sampler is unrelated to this CUSTOM attention benchmark and is
@@ -17,17 +17,20 @@ case "$VLLM_USE_FLASHINFER_SAMPLER" in
 esac
 CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.8}
 if [[ "$VLLM_USE_FLASHINFER_SAMPLER" == 1 && \
-    ( ! -x "$CUDA_HOME/bin/nvcc" || ! -f "$CUDA_HOME/include/cuda_runtime.h" ) ]]; then
+    ! -f "$CUDA_HOME/include/cuda_runtime.h" ]]; then
     echo "error: CUDA_HOME='$CUDA_HOME' is not a complete CUDA toolkit; expected" \
         "'$CUDA_HOME/bin/nvcc' and '$CUDA_HOME/include/cuda_runtime.h'." >&2
     echo "Set CUDA_HOME to the CUDA toolkit used to build min-FA3, or leave" \
         "VLLM_USE_FLASHINFER_SAMPLER=0 for this CUSTOM-attention benchmark." >&2
     exit 2
 fi
-if [[ -x "$CUDA_HOME/bin/nvcc" ]]; then
+if "$CUDA_HOME/bin/nvcc" --version >/dev/null 2>&1; then
     export CUDA_HOME CUDA_PATH="$CUDA_HOME"
     export PATH="$CUDA_HOME/bin:$PATH"
     export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+elif [[ "$VLLM_USE_FLASHINFER_SAMPLER" == 1 ]]; then
+    echo "error: CUDA compiler cannot be started: $CUDA_HOME/bin/nvcc" >&2
+    exit 2
 fi
 TRACE=${TRACE:-$ROOT_DIR/dcp_test/trace/conversation_trace.jsonl}
 WORKLOAD=${WORKLOAD:-$ROOT_DIR/.cache/vllm_dcp/smoke-workload.json}

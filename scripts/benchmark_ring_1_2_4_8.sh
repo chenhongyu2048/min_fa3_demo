@@ -5,8 +5,9 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-cd "$SCRIPT_DIR"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+cd "$ROOT_DIR"
 
 GPU_COUNTS=${GPU_COUNTS:-"1 2 4 8"}
 WARMUP_ITERS=${WARMUP_ITERS:-10}

@@ -5,8 +5,9 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-cd "$SCRIPT_DIR"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+cd "$ROOT_DIR"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-8}
 export NCCL_CGA_CLUSTER_SIZE=${NCCL_CGA_CLUSTER_SIZE:-1}
@@ -14,11 +15,11 @@ export TORCH_NCCL_HIGH_PRIORITY=${TORCH_NCCL_HIGH_PRIORITY:-1}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
 
-PYTHON=${PYTHON:-"$SCRIPT_DIR/.venv/bin/python"}
-TORCHRUN=${TORCHRUN:-"$SCRIPT_DIR/.venv/bin/torchrun"}
+PYTHON=${PYTHON:-"$ROOT_DIR/.venv/bin/python"}
+TORCHRUN=${TORCHRUN:-"$ROOT_DIR/.venv/bin/torchrun"}
 TRACE_CONFIG=${TRACE_CONFIG:-dcp_test/trace/example_config.json}
 BATCH_CONFIG=${BATCH_CONFIG:-dcp_test/configs/dcp_mega_six_loads.json}
-LOG_DIR=${LOG_DIR:-"$SCRIPT_DIR/benchmark_logs/bench_dcp/$(date +%Y%m%d-%H%M%S)-arrival4-phases-graph"}
+LOG_DIR=${LOG_DIR:-"$ROOT_DIR/benchmark_logs/bench_dcp/$(date +%Y%m%d-%H%M%S)-arrival4-phases-graph"}
 RESULT_DIR=${RESULT_DIR:-"$LOG_DIR/results"}
 MASTER_LOG=${MASTER_LOG:-"$LOG_DIR/benchmark.log"}
 MEGA_NUM_COMM_SMS=${MEGA_NUM_COMM_SMS:-"4,8,12,16,20"}

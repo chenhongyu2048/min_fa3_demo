@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
 PYTHON=${PYTHON:-$ROOT_DIR/.venv/bin/python}
 CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.8}
-test -x "$PYTHON" || { echo "Missing Python: $PYTHON" >&2; exit 1; }
 SITE_PACKAGES=$(
     "$PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])'
-)
+) || { echo "Cannot start Python: $PYTHON" >&2; exit 1; }
 CUDNN_ROOT=${CUDNN_ROOT:-$SITE_PACKAGES/nvidia/cudnn}
 NVSHMEM_ROOT=${NVSHMEM_ROOT:-$SITE_PACKAGES/nvidia/nvshmem}
 NVIDIA_LIBRARY_PATH=$(
@@ -25,7 +24,11 @@ FORCE_REBUILD=${FORCE_REBUILD:-0}
 LOG_DIR=${LOG_DIR:-$ROOT_DIR/.cache/mega_cp/logs}
 LOG_FILE=${LOG_FILE:-$LOG_DIR/precompile_magi_ffa_training.log}
 
-test -x "$CUDA_HOME/bin/nvcc" || { echo "Missing nvcc: $CUDA_HOME/bin/nvcc" >&2; exit 1; }
+NVCC_OUTPUT=$("$CUDA_HOME/bin/nvcc" --version) || { echo "Cannot start nvcc: $CUDA_HOME/bin/nvcc" >&2; exit 1; }
+printf '%s\n' "$NVCC_OUTPUT"
+grep -Eq 'release 12\.[0-9]+([,.]|$)' <<<"$NVCC_OUTPUT" || {
+    echo "Expected CUDA toolkit 12.x at $CUDA_HOME" >&2; exit 1;
+}
 test -f "$NVSHMEM_ROOT/lib/libnvshmem_host.so.3" || {
     echo "Missing NVSHMEM host library under: $NVSHMEM_ROOT/lib" >&2
     exit 1
@@ -69,9 +72,9 @@ import magi_attention
 from magi_attention.common.jit import env as jit_env
 from magi_attention.functional._flex_flash_attn_jit import get_ffa_jit_spec
 
-if torch.__version__ != "2.11.0+cu128" or torch.version.cuda != "12.8":
+if torch.__version__ != "2.11.0+cu128" or not (torch.version.cuda or "").startswith("12."):
     raise RuntimeError(
-        f"expected PyTorch 2.11.0+cu128/CUDA 12.8, got "
+        f"expected PyTorch 2.11.0+cu128/CUDA 12.x, got "
         f"{torch.__version__}/{torch.version.cuda}"
     )
 

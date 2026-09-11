@@ -5,8 +5,8 @@ set -euo pipefail
 #   Internet node: third_party/install_transformer_engine.sh fetch
 #   CUDA node:     third_party/install_transformer_engine.sh install
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
 ACTION=${1:-}
 PYTHON=${PYTHON:-$ROOT_DIR/.venv/bin/python}
 UV=${UV:-uv}
@@ -75,8 +75,8 @@ verify_sources() {
 }
 
 verify_python() {
-    if [[ ! -x "$PYTHON" ]]; then
-        echo "Python environment does not exist or is not executable: $PYTHON" >&2
+    if ! "$PYTHON" -c 'import sys; print("Python executable:", sys.executable)'; then
+        echo "Python environment cannot be started: $PYTHON" >&2
         exit 1
     fi
 
@@ -87,8 +87,8 @@ print("PyTorch:", torch.__version__)
 print("PyTorch CUDA:", torch.version.cuda)
 if torch.__version__ != "2.11.0+cu128":
     raise SystemExit(f"expected PyTorch 2.11.0+cu128, got {torch.__version__}")
-if torch.version.cuda != "12.8":
-    raise SystemExit(f"expected PyTorch CUDA 12.8, got {torch.version.cuda}")
+if not (torch.version.cuda or "").startswith("12."):
+    raise SystemExit(f"expected PyTorch CUDA 12.x, got {torch.version.cuda}")
 PY
 }
 
@@ -160,7 +160,7 @@ for package in ("transformer-engine", "transformer-engine-torch", "transformer-e
 print("Transformer Engine direct_url:", json.dumps(direct_url, sort_keys=True))
 spec = get_gpt_layer_with_transformer_engine_submodules()
 print("Megatron TE spec:", type(spec).__name__)
-if torch.__version__ != "2.11.0+cu128" or torch.version.cuda != "12.8":
+if torch.__version__ != "2.11.0+cu128" or not (torch.version.cuda or "").startswith("12."):
     raise SystemExit("TE installation changed the expected Torch/CUDA stack")
 if installed_version != "2.17.1+4329ff84":
     raise SystemExit(f"unexpected Transformer Engine version: {installed_version}")
@@ -199,9 +199,13 @@ case "$ACTION" in
         echo "  MAX_JOBS: $MAX_JOBS"
         verify_sources
         verify_python
-        test -x "$CUDA_HOME/bin/nvcc" || { echo "Missing nvcc: $CUDA_HOME/bin/nvcc" >&2; exit 1; }
-        if ! command -v "$UV" >/dev/null 2>&1; then
-            echo "uv is unavailable: $UV" >&2
+        NVCC_OUTPUT=$("$CUDA_HOME/bin/nvcc" --version) || { echo "Cannot start nvcc: $CUDA_HOME/bin/nvcc" >&2; exit 1; }
+        printf '%s\n' "$NVCC_OUTPUT"
+        grep -Eq 'release 12\.[0-9]+([,.]|$)' <<<"$NVCC_OUTPUT" || {
+            echo "Expected CUDA toolkit 12.x at $CUDA_HOME" >&2; exit 1;
+        }
+        if ! "$UV" --version; then
+            echo "uv cannot be started: $UV" >&2
             exit 1
         fi
         mkdir -p "$UV_CACHE_DIR"

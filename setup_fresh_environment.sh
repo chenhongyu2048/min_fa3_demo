@@ -5,7 +5,7 @@ set -euo pipefail
 # single-layer benchmark environment. This is the single public environment
 # entry point; component-specific installers remain under third_party/.
 
-ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 THIRD_PARTY_DIR="$ROOT_DIR/third_party"
 ACTION=${1:-}
 
@@ -35,7 +35,7 @@ Actions:
   prepare  Bootstrap repository-local uv $UV_VERSION when necessary, initialize
            every recursive submodule, create .venv with Python 3.12, and
            exactly install the locked PyTorch 2.11.0+cu128 base environment.
-  install  On one visible SM90 Hopper GPU with CUDA toolkit 12.8, clean-build
+  install  On one visible SM90 Hopper GPU with CUDA toolkit 12.x, clean-build
            min-FA3, install pinned TE and MagiAttention offline, compile the
            three targeted Magi FFA kernels, and run complete verification.
   verify   Verify the completed environment without rebuilding.
@@ -52,7 +52,7 @@ Fresh-clone host prerequisites:
   prepare: Linux x86_64, git, curl, a POSIX shell/CA certificates, and Internet
            access. uv downloads its managed CPython 3.12 when it is absent.
   install: the prepared .venv and submodules, GNU make/gcc/g++, CUDA toolkit
-           12.8 at CUDA_HOME (default /usr/local/cuda-12.8), an NVIDIA driver,
+           12.x at CUDA_HOME (default /usr/local/cuda-12.8), an NVIDIA driver,
            and at least one visible SM90 Hopper GPU. Eight GPUs are not needed
            for building; they are only needed for the formal CP=8 benchmark.
 
@@ -84,7 +84,6 @@ require_command() {
 command_path() {
     local candidate=$1
     if [[ "$candidate" == */* ]]; then
-        [[ -x "$candidate" ]] || return 1
         printf '%s\n' "$candidate"
     else
         command -v "$candidate"
@@ -146,13 +145,23 @@ resolve_uv() {
 verify_checkout() {
     require_command git
     local git_root
+
     git_root=$(git -C "$ROOT_DIR" rev-parse --show-toplevel 2>/dev/null) ||
         die "$ROOT_DIR is not a Git checkout"
-    [[ "$(cd -- "$git_root" && pwd)" == "$ROOT_DIR" ]] ||
+
+    git_root=$(cd -- "$git_root" && pwd -P) ||
+        die "cannot resolve Git checkout root: $git_root"
+
+    if [[ "$git_root" != "$ROOT_DIR" ]]; then
+        printf 'Script directory: <%s>\n' "$ROOT_DIR" >&2
+        printf 'Git root:         <%s>\n' "$git_root" >&2
         die "script must reside at the root of its Git checkout"
+    fi
+
     [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] ||
         die "the locked environment supports only Linux x86_64"
 }
+
 
 run_logged() {
     local name=$1
@@ -173,11 +182,11 @@ verify_uv() {
 
 verify_cuda_host() {
     local nvcc_output
-    [[ -x "$CUDA_HOME/bin/nvcc" ]] || die "missing nvcc: $CUDA_HOME/bin/nvcc"
-    nvcc_output=$("$CUDA_HOME/bin/nvcc" --version)
+    nvcc_output=$("$CUDA_HOME/bin/nvcc" --version) ||
+        die "CUDA compiler cannot be started: $CUDA_HOME/bin/nvcc"
     printf '%s\n' "$nvcc_output"
-    if ! grep -Eq 'release 12\.8([,.]|$)' <<<"$nvcc_output"; then
-        die "expected CUDA toolkit 12.8 under CUDA_HOME=$CUDA_HOME"
+    if ! grep -Eq 'release 12\.[0-9]+([,.]|$)' <<<"$nvcc_output"; then
+        die "expected CUDA toolkit 12.x under CUDA_HOME=$CUDA_HOME"
     fi
 
     "$PYTHON" - <<'PY'
@@ -193,19 +202,16 @@ PY
 }
 
 verify_python_stack() {
-    [[ -x "$PYTHON" ]] ||
-        die "Python environment does not exist or is not executable: $PYTHON"
-    "$PYTHON" - <<'PY'
+    "$PYTHON" -c 'import sys; print("Python executable:", sys.executable)' ||
+        die "Python environment cannot be started: $PYTHON"
+    "$PYTHON" - "${1:-runtime}" <<'PY'
 import sys
 from importlib.metadata import version
-
-import torch
 
 print("Python/Torch environment")
 print("  Python:", sys.version.split()[0])
 print("  NumPy:", version("numpy"))
-print("  torch:", torch.__version__)
-print("  torch CUDA:", torch.version.cuda)
+print("  torch:", version("torch"))
 print("  Triton:", version("triton"))
 print("  cuDNN wheel:", version("nvidia-cudnn-cu12"))
 print("  NVSHMEM wheel:", version("nvidia-nvshmem-cu12"))
@@ -221,7 +227,7 @@ expected = {
 }
 actual = {
     "numpy": version("numpy"),
-    "torch": torch.__version__,
+    "torch": version("torch"),
     "triton": version("triton"),
     "nvidia-cudnn-cu12": version("nvidia-cudnn-cu12"),
     "nvidia-nvshmem-cu12": version("nvidia-nvshmem-cu12"),
@@ -237,8 +243,12 @@ for package, expected_version in expected.items():
             f"unexpected {package} version: expected {expected_version}, "
             f"got {actual[package]}"
         )
-if torch.version.cuda != "12.8":
-    raise SystemExit(f"expected PyTorch CUDA 12.8, got {torch.version.cuda}")
+if sys.argv[1] != "prepare":
+    import torch
+
+    print("  torch CUDA:", torch.version.cuda)
+    if not (torch.version.cuda or "").startswith("12."):
+        raise SystemExit(f"expected PyTorch CUDA 12.x, got {torch.version.cuda}")
 print("Locked Python/Torch environment: OK")
 PY
 }
@@ -372,7 +382,7 @@ prepare_environment() {
         --group build \
         --group transformer-layer
 
-    verify_python_stack | tee "$LOG_DIR/verify_python_stack.log"
+    verify_python_stack prepare | tee "$LOG_DIR/verify_python_stack.log"
     verify_submodules | tee "$LOG_DIR/verify_submodules.log"
     echo "Fresh base environment preparation: OK"
 }
