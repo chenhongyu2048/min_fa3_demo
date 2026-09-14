@@ -10,6 +10,7 @@ CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.8}
 MAX_JOBS=${MAX_JOBS:-8}
 NVCC_THREADS=${NVCC_THREADS:-2}
 VLLM_USE_PRECOMPILED=${VLLM_USE_PRECOMPILED:-1}
+FORCE_REBUILD=${FORCE_REBUILD:-0}
 ACTION=${1:-}
 VLLM_COMMIT=c6fe94b4d5b418fa213af0e5884eddd304333dcd
 
@@ -29,11 +30,13 @@ Usage: $0 prepare|install|verify|all
            This action does not require CUDA hardware or nvcc.
            Only file presence and package versions are checked;
            CUDA shared-library dependencies are not checked.
-  install  On a CUDA 12.x Hopper node, build min-FA3, reinstall the local
-           plugin, and run runtime verification. Run prepare first.
+  install  On a CUDA 12.x Hopper node, build min-FA3 when needed, install the
+           local plugin, and run runtime verification. Run prepare first.
   verify   Verify revisions and runtime imports without rebuilding.
            Requires the built min-FA3 extension and its runtime dependencies.
   all      Run prepare and install on one networked CUDA Hopper node.
+
+Set FORCE_REBUILD=1 to force a min-FA3 rebuild during install.
 
 On a node without CUDA, run only:
   $0 prepare
@@ -115,6 +118,21 @@ verify_core_wheel() {
 
     [[ -f "$core" ]] ||
         die "missing vLLM core extension at $core"
+}
+
+verify_prepared_vllm() {
+    verify_core_wheel
+    verify_torch_cuda12_packages
+    "$VENV_DIR/bin/python" - "$ROOT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+import vllm
+
+root = Path(sys.argv[1]).resolve()
+if not Path(vllm.__file__).resolve().is_relative_to(root / "third_party" / "vllm"):
+    raise SystemExit("vLLM is not imported from the pinned submodule")
+PY
 }
 
 pin_torch_cuda12_packages() {
@@ -253,13 +271,17 @@ prepare_runtime() {
     echo "vLLM core wheel commit:  $VLLM_PRECOMPILED_WHEEL_COMMIT"
     echo "vLLM core wheel variant: $VLLM_PRECOMPILED_WHEEL_VARIANT"
 
-    "$UV" pip install --python "$VENV_DIR/bin/python" \
-        -r "$VLLM_DIR/requirements/build/cuda.txt"
+    if verify_prepared_vllm >/dev/null 2>&1; then
+        echo "vLLM source and precompiled core are already installed; skipping source install"
+    else
+        "$UV" pip install --python "$VENV_DIR/bin/python" \
+            -r "$VLLM_DIR/requirements/build/cuda.txt"
 
-    "$UV" pip install --python "$VENV_DIR/bin/python" \
-        --no-build-isolation --editable "$VLLM_DIR"
+        "$UV" pip install --python "$VENV_DIR/bin/python" \
+            --no-build-isolation --editable "$VLLM_DIR"
 
-    pin_torch_cuda12_packages
+        pin_torch_cuda12_packages
+    fi
 
     "$UV" pip install --python "$VENV_DIR/bin/python" \
         --no-build-isolation --no-deps \
@@ -322,8 +344,15 @@ PY
     export CUDA_HOME MAX_JOBS NVCC_THREADS
     export PATH="$VENV_DIR/bin:$CUDA_HOME/bin:$PATH"
 
-    make -C "$ROOT_DIR" clean
-    make -C "$ROOT_DIR" PYTHON="$VENV_DIR/bin/python"
+    if [[ "$FORCE_REBUILD" == 1 ]]; then
+        make -C "$ROOT_DIR" clean
+        make -C "$ROOT_DIR" PYTHON="$VENV_DIR/bin/python"
+    elif PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        "$VENV_DIR/bin/python" -c 'import _min_fa3_op' >/dev/null 2>&1; then
+        echo "In-repository min-FA3 extension already imports; skipping build"
+    else
+        make -C "$ROOT_DIR" PYTHON="$VENV_DIR/bin/python"
+    fi
 
     "$UV" pip install --python "$VENV_DIR/bin/python" \
         --no-build-isolation --no-deps \

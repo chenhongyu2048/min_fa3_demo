@@ -15,6 +15,7 @@ CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.8}
 MAGI_SRC=${MAGI_SRC:-$ROOT_DIR/third_party/MagiAttention}
 MAGI_WORKSPACE=${MAGI_WORKSPACE:-$ROOT_DIR/.cache/mega_cp/magi_ffa_sm90_bf16_hd128}
 MAX_JOBS=${MAX_JOBS:-8}
+FORCE_REBUILD=${FORCE_REBUILD:-0}
 
 usage() {
     cat <<EOF
@@ -30,6 +31,7 @@ Environment overrides:
   MAGI_WORKSPACE=$MAGI_WORKSPACE
   CUDA_HOME=$CUDA_HOME
   MAX_JOBS=$MAX_JOBS
+  FORCE_REBUILD=1  rebuild even when the installed package verifies.
 EOF
 }
 
@@ -195,16 +197,26 @@ case "$ACTION" in
         export MAGI_ATTENTION_PREBUILD_FFA=0
         export MAX_JOBS
 
-        CPATH="$CUDNN_ROOT/include${CPATH:+:$CPATH}" \
-        LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LIBRARY_PATH:+:$LIBRARY_PATH}" \
-        LD_LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-        "$UV" pip install \
-            --python "$PYTHON" \
-            --offline \
-            --no-build-isolation \
-            --no-deps \
-            --reinstall \
-            "$MAGI_SRC"
+        if [[ "$FORCE_REBUILD" != 1 ]] && CPATH="$CUDNN_ROOT/include${CPATH:+:$CPATH}" \
+            LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+            LD_LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            verify_installation >/dev/null 2>&1; then
+            echo "MagiAttention is already installed and verified; skipping source build"
+        else
+            install_args=(
+                --python "$PYTHON"
+                --offline
+                --no-build-isolation
+                --no-deps
+            )
+            if [[ "$FORCE_REBUILD" == 1 ]]; then
+                install_args+=(--reinstall)
+            fi
+            CPATH="$CUDNN_ROOT/include${CPATH:+:$CPATH}" \
+            LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+            LD_LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            "$UV" pip install "${install_args[@]}" "$MAGI_SRC"
+        fi
 
         LD_LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
             verify_installation

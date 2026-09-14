@@ -18,6 +18,7 @@ CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.8}
 MAX_JOBS=${MAX_JOBS:-8}
 NVCC_THREADS=${NVCC_THREADS:-2}
 LOG_DIR=${LOG_DIR:-$ROOT_DIR/.cache/mega_cp/logs/fresh_environment}
+FORCE_REBUILD=${FORCE_REBUILD:-0}
 
 usage() {
     cat <<EOF
@@ -34,10 +35,11 @@ Starting from a fresh clone:
 Actions:
   prepare  Bootstrap repository-local uv $UV_VERSION when necessary, initialize
            every recursive submodule, create .venv with Python 3.12, and
-           exactly install the locked PyTorch 2.11.0+cu128 base environment.
-  install  On one visible SM90 Hopper GPU with CUDA toolkit 12.x, clean-build
-           min-FA3, install pinned TE and MagiAttention offline, compile the
-           three targeted Magi FFA kernels, and run complete verification.
+           synchronize the locked PyTorch 2.11.0+cu128 base environment.
+  install  On one visible SM90 Hopper GPU with CUDA toolkit 12.x, build
+           min-FA3 when needed, install pinned TE and MagiAttention offline
+           when missing, compile the three targeted Magi FFA kernels when
+           needed, and run complete verification.
   verify   Verify the completed environment without rebuilding.
   all      Run prepare and install on one machine that has both Internet access
            and a visible SM90 Hopper GPU.
@@ -62,11 +64,14 @@ Environment overrides:
   UV_INSTALL_URL=$UV_INSTALL_URL
   PYTHON, UV_CACHE_DIR, CUDA_HOME, MAX_JOBS, NVCC_THREADS, and LOG_DIR
   customize the native build and its logs.
+  FORCE_REBUILD=1  force rebuilding min-FA3 and targeted Magi FFA artifacts.
 
 Important:
-  prepare performs an exact uv sync and removes undeclared packages such as
-  previous TE/Magi/FlashAttention installations. Always run prepare before
-  install for a new checkout. After install, use verify for non-mutating checks.
+  prepare performs an exact uv sync for a fresh .venv. When .venv already
+  exists it uses --inexact so source-built TE/Magi packages are preserved.
+  Re-running install/prepare reuses verified native artifacts; set
+  FORCE_REBUILD=1 when a rebuild is intentional. After install, use verify for
+  non-mutating checks.
 EOF
 }
 
@@ -373,14 +378,22 @@ prepare_environment() {
     run_logged submodule_update git -C "$ROOT_DIR" submodule update \
         --init --checkout --recursive
     run_logged uv_lock_check "$UV" lock --directory "$ROOT_DIR" --check
-    run_logged uv_sync "$UV" sync \
-        --directory "$ROOT_DIR" \
-        --python 3.12 \
-        --frozen \
-        --no-install-project \
-        --no-default-groups \
-        --group build \
+    local -a sync_args=(
+        --directory "$ROOT_DIR"
+        --python 3.12
+        --frozen
+        --no-install-project
+        --no-default-groups
+        --group build
         --group transformer-layer
+    )
+    # Keep source-built packages (TE/Magi) when prepare is rerun on an
+    # already-completed checkout.  A fresh .venv still gets an exact sync.
+    if [[ -x "$PYTHON" ]]; then
+        sync_args+=(--inexact)
+        echo "Existing Python environment detected; preserving undeclared native packages"
+    fi
+    run_logged uv_sync "$UV" sync "${sync_args[@]}"
 
     verify_python_stack prepare | tee "$LOG_DIR/verify_python_stack.log"
     verify_submodules | tee "$LOG_DIR/verify_submodules.log"
@@ -395,25 +408,35 @@ install_native_environment() {
     verify_cuda_host
     verify_submodules
     mkdir -p "$UV_CACHE_DIR" "$LOG_DIR"
-    export UV PYTHON UV_CACHE_DIR CUDA_HOME MAX_JOBS NVCC_THREADS
+    export UV PYTHON UV_CACHE_DIR CUDA_HOME MAX_JOBS NVCC_THREADS FORCE_REBUILD
     export PATH="$(dirname -- "$PYTHON"):$CUDA_HOME/bin:$PATH"
     require_command cmake
     require_command ninja
     require_command gcc
     require_command g++
 
-    run_logged clean_min_fa3 make -C "$ROOT_DIR" clean
-    run_logged build_min_fa3 make -C "$ROOT_DIR" PYTHON="$PYTHON"
+    if [[ "$FORCE_REBUILD" == 1 ]]; then
+        run_logged clean_min_fa3 make -C "$ROOT_DIR" clean
+        run_logged build_min_fa3 make -C "$ROOT_DIR" PYTHON="$PYTHON"
+    elif verify_min_fa3 >/dev/null 2>&1; then
+        echo "In-repository min-FA3 extension already passes verification; skipping build"
+    else
+        run_logged build_min_fa3 make -C "$ROOT_DIR" PYTHON="$PYTHON"
+    fi
     run_logged install_transformer_engine \
         "$THIRD_PARTY_DIR/install_transformer_engine.sh" install
     run_logged install_magi_attention \
         "$THIRD_PARTY_DIR/install_magi_attention.sh" install
 
-    echo "[precompile_magi_ffa_training] $THIRD_PARTY_DIR/precompile_magi_ffa_training.sh"
-    LOG_DIR="$LOG_DIR" \
-    LOG_FILE="$LOG_DIR/precompile_magi_ffa_training.log" \
-    FORCE_REBUILD=1 \
-        "$THIRD_PARTY_DIR/precompile_magi_ffa_training.sh"
+    if [[ "$FORCE_REBUILD" == 1 ]] || ! verify_magi_aot >/dev/null 2>&1; then
+        echo "[precompile_magi_ffa_training] $THIRD_PARTY_DIR/precompile_magi_ffa_training.sh"
+        LOG_DIR="$LOG_DIR" \
+        LOG_FILE="$LOG_DIR/precompile_magi_ffa_training.log" \
+        FORCE_REBUILD="$FORCE_REBUILD" \
+            "$THIRD_PARTY_DIR/precompile_magi_ffa_training.sh"
+    else
+        echo "Targeted Magi FFA AOT artifacts already pass verification; skipping precompile"
+    fi
 
     verify_environment
     echo "Fresh native CUDA environment installation: OK"

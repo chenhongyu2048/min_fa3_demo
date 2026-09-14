@@ -144,6 +144,14 @@ if len(specs) != 3:
 
 aot_root = Path(magi_attention.__file__).resolve().parent / "lib"
 force_rebuild = os.environ["FORCE_REBUILD"] == "1"
+if not force_rebuild:
+    missing = [
+        uri for uri in specs
+        if not any((aot_root / uri).glob("*.so"))
+    ]
+    if not missing:
+        print("All targeted Magi FFA AOT artifacts already exist; skipping precompile")
+        raise SystemExit(0)
 if force_rebuild:
     print("Removing the three targeted JIT/AOT directories before rebuilding")
     for uri in specs:

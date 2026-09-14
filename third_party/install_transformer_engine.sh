@@ -15,6 +15,7 @@ CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.8}
 TE_SRC=${TE_SRC:-$ROOT_DIR/third_party/TransformerEngine}
 MEGATRON_SRC=${MEGATRON_SRC:-$ROOT_DIR/third_party/Megatron-LM}
 MAX_JOBS=${MAX_JOBS:-8}
+FORCE_REBUILD=${FORCE_REBUILD:-0}
 
 usage() {
     cat <<EOF
@@ -30,6 +31,7 @@ Environment overrides:
   MEGATRON_SRC=$MEGATRON_SRC
   CUDA_HOME=$CUDA_HOME
   MAX_JOBS=$MAX_JOBS
+  FORCE_REBUILD=1  rebuild even when the installed package verifies.
 EOF
 }
 
@@ -225,16 +227,26 @@ case "$ACTION" in
         export NVTE_WITH_NCCL_EP=${NVTE_WITH_NCCL_EP:-0}
         export MAX_JOBS
 
-        CPATH="$CUDNN_ROOT/include${CPATH:+:$CPATH}" \
-        LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LIBRARY_PATH:+:$LIBRARY_PATH}" \
-        LD_LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-        "$UV" pip install \
-            --python "$PYTHON" \
-            --offline \
-            --no-build-isolation \
-            --no-deps \
-            --reinstall \
-            "$TE_SRC"
+        if [[ "$FORCE_REBUILD" != 1 ]] && CPATH="$CUDNN_ROOT/include${CPATH:+:$CPATH}" \
+            LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+            LD_LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            verify_installation >/dev/null 2>&1; then
+            echo "Transformer Engine is already installed and verified; skipping source build"
+        else
+            install_args=(
+                --python "$PYTHON"
+                --offline
+                --no-build-isolation
+                --no-deps
+            )
+            if [[ "$FORCE_REBUILD" == 1 ]]; then
+                install_args+=(--reinstall)
+            fi
+            CPATH="$CUDNN_ROOT/include${CPATH:+:$CPATH}" \
+            LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+            LD_LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            "$UV" pip install "${install_args[@]}" "$TE_SRC"
+        fi
 
         LD_LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
             verify_installation

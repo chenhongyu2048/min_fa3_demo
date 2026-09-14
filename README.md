@@ -67,6 +67,11 @@ check is available as `CUDA_VISIBLE_DEVICES=0 ./setup_fresh_environment.sh
 verify`. For a machine with both network access and a visible H20, use
 `CUDA_VISIBLE_DEVICES=0 ./setup_fresh_environment.sh all`.
 
+All setup actions are safe to repeat: an existing `.venv` is synchronized with
+`--inexact`, verified min-FA3/TE/Magi artifacts are reused, and the targeted
+Magi FFA AOT kernels are not rebuilt. Set `FORCE_REBUILD=1` when a native
+rebuild is intentional.
+
 The equivalent manual core-environment and in-place extension build is:
 
 ```bash
@@ -81,7 +86,8 @@ make PYTHON=.venv/bin/python
 `--no-install-project` intentionally leaves the CUDA extension to the existing
 in-place `make` workflow. The commands above target a fresh core environment;
 when updating an existing environment that contains manually installed
-optional packages, add `--inexact` to preserve those undeclared packages. To
+optional packages, add `--inexact` to preserve those undeclared packages (the
+setup script does this automatically). To
 use the plotting and dataset-maintenance scripts, sync their optional
 dependency groups before building:
 

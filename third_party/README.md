@@ -121,9 +121,9 @@ submodule paths.
 The Magi installer disables its broad upstream FFA prebuild matrix. The next
 step compiles only the three BF16/SM90/head-dim-128 forward/backward variants
 used by this benchmark and installs them into Magi's package-local `lib/` tree.
-The fresh-environment orchestrator removes only those three matching cache/AOT
-directories before compilation, preventing reuse across an older Torch/CUDA
-environment without deleting unrelated Magi caches.
+The fresh-environment orchestrator verifies those three cache/AOT artifacts and
+reuses them on subsequent runs. Set `FORCE_REBUILD=1` to remove and rebuild the
+matching artifacts intentionally; unrelated Magi caches are never deleted.
 
 The scripts automatically discover the NVIDIA wheel library directories.
 TE 2.17.1 looks for the PyTorch CUDA runtime under the legacy package path
@@ -142,9 +142,10 @@ Magi FFA JIT/AOT output and the precompile log default to ignored paths below:
 .cache/mega_cp/logs
 ```
 
-Reinstalling MagiAttention may replace its package-local `lib/` tree. Run the
-targeted precompile script again after every Magi reinstall, but do not repeat
-it when the package and environment have not changed.
+Reinstalling MagiAttention may replace its package-local `lib/` tree, so the
+next orchestrator run will detect the missing artifacts and precompile them.
+When the package and environment have not changed, repeated runs skip both the
+source install and targeted precompile.
 
 For the complete build history, failure analysis, and exact FFA specs, see
 [`../docs/TRANSFORMER_ENGINE_MAGI_BUILD_GUIDE.md`](../docs/TRANSFORMER_ENGINE_MAGI_BUILD_GUIDE.md).
