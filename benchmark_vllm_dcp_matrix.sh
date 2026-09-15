@@ -7,12 +7,13 @@ export PYTHONPATH="$ROOT_DIR/infer${PYTHONPATH:+:$PYTHONPATH}"
 TRACE=${TRACE:-$ROOT_DIR/dcp_test/trace/conversation_trace.jsonl}
 WORKLOAD=${WORKLOAD:-$ROOT_DIR/.cache/vllm_dcp/workload-100-1000.json}
 RESULT_DIR=${RESULT_DIR:-$ROOT_DIR/benchmark_logs/vllm_dcp}
-KV_HEADS=${KV_HEADS:-1,2,4}
+KV_HEADS=${KV_HEADS:-4}
 MEGA_NUM_COMM_SMS=${MEGA_NUM_COMM_SMS:-"4,8,12,16,20"}
 MEGA_MAX_NUM_SPLITS=${MEGA_MAX_NUM_SPLITS:-128}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
-NUM_HIDDEN_LAYERS=${NUM_HIDDEN_LAYERS:-32}
+NUM_HIDDEN_LAYERS=${NUM_HIDDEN_LAYERS:-48}
 VLLM_USE_FLASHINFER_SAMPLER=${VLLM_USE_FLASHINFER_SAMPLER:-0}
+export VLLM_MOE_ROUTING_SIMULATION_STRATEGY=${VLLM_MOE_ROUTING_SIMULATION_STRATEGY-min_fa3_balanced}
 PORT=${PORT:-18000}
 
 case "$VLLM_USE_FLASHINFER_SAMPLER" in
@@ -71,12 +72,13 @@ for kv_heads in "${KV_HEAD_LIST[@]}"; do
     kv_result_dir="$RESULT_DIR/kvh$kv_heads"
     mkdir -p "$kv_result_dir"
 
-    echo "Running vLLM DCP matrix with KV_HEADS=$kv_heads MEGA_NUM_COMM_SMS=$MEGA_NUM_COMM_SMS VLLM_USE_FLASHINFER_SAMPLER=$VLLM_USE_FLASHINFER_SAMPLER; results=$kv_result_dir"
+    echo "Running Qwen3 MoE matrix with TP=8 EP=8 KV_HEADS=$kv_heads DCP=$((8 / kv_heads)) NUM_HIDDEN_LAYERS=$NUM_HIDDEN_LAYERS MEGA_NUM_COMM_SMS=$MEGA_NUM_COMM_SMS VLLM_USE_FLASHINFER_SAMPLER=$VLLM_USE_FLASHINFER_SAMPLER; results=$kv_result_dir"
     CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7} \
         "$PYTHON" -m vllm_bench.matrix \
             --workload "$WORKLOAD" \
             --result-dir "$kv_result_dir" \
             --port "$PORT" \
+            --tp-size 8 \
             --kv-heads "$kv_heads" \
             --mega-num-comm-sms "$MEGA_NUM_COMM_SMS" \
             --mega-max-num-splits "$MEGA_MAX_NUM_SPLITS" \

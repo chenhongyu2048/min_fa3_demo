@@ -1,9 +1,9 @@
 """Single-layer Megatron adapters for the existing CP attention benchmarks.
 
 The Transformer layer, norms, projections, BDA, and MLP remain Megatron-Core
-modules.  Only ``SelfAttention.core_attention`` is replaced by the dispatcher
-below.  Existing CP runners retain ownership of their communication plans and
-preallocated scratch buffers.
+modules. ``SelfAttention.core_attention`` uses the dispatcher below, and the MoE
+router uses synthetic uniform expert selection. Existing CP runners retain
+ownership of their communication plans and preallocated scratch buffers.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import sys
 from dataclasses import dataclass, replace
 from itertools import accumulate
 from pathlib import Path
+from types import MethodType
 from typing import Any, Protocol, Sequence
 
 import torch
@@ -48,6 +49,20 @@ ALL_CP_METHODS = frozenset(
         "mega_ring_all_cp",
     )
 )
+
+# Qwen/Qwen3-30B-A3B config.json. One randomly initialized layer is benchmarked.
+QWEN3_CONFIG = {
+    "hidden_size": 2048,
+    "num_attention_heads": 32,
+    "num_query_groups": 4,
+    "kv_channels": 128,
+    "ffn_hidden_size": 6144,
+    "num_moe_experts": 128,
+    "moe_router_topk": 8,
+    "moe_ffn_hidden_size": 768,
+    "qk_layernorm": True,
+    "layernorm_epsilon": 1.0e-6,
+}
 
 
 @dataclass(frozen=True)
@@ -451,8 +466,8 @@ class _MegaRingAdapter:
         self.ring_sizes_host = torch.tensor(ring_sizes, dtype=torch.int32)
         self.ring_starts_host = torch.tensor(ring_starts, dtype=torch.int32)
 
-        kv_heads = 8
-        head_dim = 128
+        kv_heads = QWEN3_CONFIG["num_query_groups"]
+        head_dim = QWEN3_CONFIG["kv_channels"]
         arena_shape = [world_size * rank_capacity, kv_heads, head_dim]
         self.remote_k = min_fa3_op.TKParallelTensor(
             arena_shape, torch.bfloat16, rank, world_size, False
@@ -587,8 +602,14 @@ class PreparedMethod:
 def _empty_qkv(
     local_tokens: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q = torch.empty((local_tokens, 32, 128), dtype=torch.bfloat16, device=device)
-    k = torch.empty((local_tokens, 8, 128), dtype=torch.bfloat16, device=device)
+    q = torch.empty(
+        (local_tokens, QWEN3_CONFIG["num_attention_heads"], QWEN3_CONFIG["kv_channels"]),
+        dtype=torch.bfloat16, device=device,
+    )
+    k = torch.empty(
+        (local_tokens, QWEN3_CONFIG["num_query_groups"], QWEN3_CONFIG["kv_channels"]),
+        dtype=torch.bfloat16, device=device,
+    )
     v = torch.empty_like(k)
     dout = torch.empty_like(q)
     return q, k, v, dout
@@ -643,9 +664,9 @@ def prepare_method(
         projected = MagiProjectedAttention(
             dist.group.WORLD,
             global_lengths,
-            32,
-            8,
-            128,
+            QWEN3_CONFIG["num_attention_heads"],
+            QWEN3_CONFIG["num_query_groups"],
+            QWEN3_CONFIG["kv_channels"],
             True,
             device,
             config=MagiAttentionConfig(
@@ -835,10 +856,38 @@ def make_packed_seq_params(
     )
 
 
+def _uniform_topk_routing(
+    router: Any,
+    logits: torch.Tensor,
+    padding_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Synthetic top-8 routing for the 128-expert attention benchmark.
+
+    Slots are spaced 16 experts apart, balancing EP4/EP8 destinations for every
+    token. Every 16 tokens cover all experts equally; a partial block differs by
+    at most one assignment per expert on each source rank. Selected-logit
+    softmax keeps the router's gradient path intact.
+    """
+    logits = logits.reshape(-1, router.config.num_moe_experts)
+    expert_stride = router.config.num_moe_experts // router.topk
+    rows = torch.arange(logits.shape[0], device=logits.device)[:, None]
+    slots = torch.arange(router.topk, device=logits.device)[None, :]
+    indices = rows.remainder(expert_stride) + slots * expert_stride
+    scores = logits.gather(1, indices)
+    weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(logits.dtype)
+    probs = torch.zeros_like(logits).scatter(1, indices, weights)
+    routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, indices, True)
+    if padding_mask is not None:
+        valid = padding_mask.reshape(-1, 1)
+        probs = probs * valid
+        routing_map = routing_map & valid
+    return probs, routing_map
+
+
 def build_megatron_layer(
     megatron_path: Path, device: torch.device, context_parallel_size: int
 ) -> Any:
-    """Build the locked Llama-3-8B-style single TE Transformer layer."""
+    """Build one Qwen3-30B-A3B-style TE layer with real routed experts."""
     if str(megatron_path) not in sys.path:
         sys.path.insert(0, str(megatron_path))
 
@@ -852,15 +901,10 @@ def build_megatron_layer(
 
     config = TransformerConfig(
         num_layers=1,
-        hidden_size=4096,
-        num_attention_heads=32,
-        num_query_groups=8,
-        kv_channels=128,
-        ffn_hidden_size=14336,
+        **QWEN3_CONFIG,
         gated_linear_unit=True,
         activation_func=functional.silu,
         normalization="RMSNorm",
-        layernorm_epsilon=1.0e-5,
         add_bias_linear=False,
         add_qkv_bias=False,
         hidden_dropout=0.0,
@@ -870,9 +914,22 @@ def build_megatron_layer(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
         context_parallel_size=context_parallel_size,
+        expert_model_parallel_size=context_parallel_size,
+        expert_tensor_parallel_size=1,
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        # Softmax over the selected logits equals Qwen's full softmax followed
+        # by top-k and renormalization. No auxiliary loss in this layer benchmark.
+        moe_router_pre_softmax=False,
+        moe_router_load_balancing_type="none",
+        moe_aux_loss_coeff=0.0,
         sequence_parallel=False,
     )
-    submodules = get_gpt_layer_with_transformer_engine_submodules()
+    submodules = get_gpt_layer_with_transformer_engine_submodules(
+        num_experts=config.num_moe_experts,
+        moe_grouped_gemm=config.moe_grouped_gemm,
+        qk_layernorm=config.qk_layernorm,
+    )
     submodules.self_attention.submodules.core_attention = CoreAttentionDispatcher
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     layer = TransformerLayer(
@@ -881,6 +938,7 @@ def build_megatron_layer(
         layer_number=1,
         pg_collection=pg_collection,
     )
+    layer.mlp.router.routing = MethodType(_uniform_topk_routing, layer.mlp.router)
     layer.to(device=device)
     layer.train()
     if not isinstance(layer.self_attention.core_attention, CoreAttentionDispatcher):

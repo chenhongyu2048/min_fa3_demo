@@ -48,6 +48,22 @@ public:
         int attention_count;
         int compute_block_offset;
         int num_compute_ctas;
+        int32_t const* dynamic_metadata = nullptr;
+
+        CUTLASS_DEVICE Params resolve() const {
+            Params result = *this;
+            if (dynamic_metadata != nullptr) {
+                using namespace min_fa3_varlen_demo::dcp_mega;
+                auto const& header = *reinterpret_cast<MetadataHeader const*>(dynamic_metadata);
+                result.descriptors = reinterpret_cast<AttentionWorkDesc const*>(
+                    dynamic_metadata + header.attention_offset);
+                result.q_dependencies = dynamic_metadata + header.q_dependencies_offset;
+                result.chunk_sequence_splits = dynamic_metadata + header.chunk_splits_offset;
+                result.history_sequence_splits = dynamic_metadata + header.history_splits_offset;
+                result.attention_count = header.attention_count;
+            }
+            return result;
+        }
     };
 
     static Params to_underlying_arguments(TileSchedulerArguments const& args) {

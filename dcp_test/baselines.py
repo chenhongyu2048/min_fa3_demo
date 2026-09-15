@@ -1043,6 +1043,56 @@ class _SequentialDCPAttentionRunnerBase(DCPAttentionRunner):
             self._enqueue_lock.release()
 
 
+    def forward_chunk_prefill_varlen_graph(
+        self, q_local, k_history_local, v_history_local, k_chunk, v_chunk,
+        cu_seqlens_q, cu_seqlens_history_local, max_seqlen_q,
+        max_seqlen_history_local, *, cu_seqlens_q_host,
+        cu_seqlens_history_local_host, return_lse=False,
+    ):
+        """Capacity-bound serving path; device offsets may change on replay.
+
+        The caller prepares/validates actual lengths outside the model graph.
+        All tensors and maximum lengths here describe fixed graph capacities.
+        """
+        capturing = torch.cuda.is_current_stream_capturing()
+        inflight_start = len(self._inflight_tensors)
+        previous_capture = self._capture_in_progress
+        self._capture_in_progress = capturing or previous_capture
+        try:
+            self._reap_inflight_tensors()
+            stream = torch.cuda.current_stream(self.device)
+            q_group = self._all_gather_q_varlen_sequential(
+                q_local, stream, timing=False
+            )
+            history_out, history_lse = min_fa3_op.forward_kvcache_varlen(
+                q_group, k_history_local, v_history_local, cu_seqlens_q,
+                cu_seqlens_history_local, max_seqlen_q, max_seqlen_history_local,
+                cu_seqlens_q_host=cu_seqlens_q_host,
+                cu_seqlens_k_host=cu_seqlens_history_local_host,
+                return_lse=True, is_causal=False, graph_capacity=True,
+            )
+            context_out, context_lse = self._combine_context_varlen_sequential(
+                history_out, history_lse, stream, timing=False
+            )
+            chunk_out, chunk_lse = min_fa3_op.forward_kvcache_varlen(
+                q_local, k_chunk, v_chunk, cu_seqlens_q, cu_seqlens_q,
+                max_seqlen_q, max_seqlen_q,
+                cu_seqlens_q_host=cu_seqlens_q_host,
+                cu_seqlens_k_host=cu_seqlens_q_host,
+                return_lse=True, is_causal=True, graph_capacity=True,
+            )
+            return self._merge_context_and_chunk_varlen_sequential(
+                context_out, context_lse, chunk_out, chunk_lse,
+                return_lse, stream, timing=False,
+            )
+        finally:
+            if capturing:
+                # These inputs are retained by _capture_tensors. Events recorded
+                # inside capture cannot be queried by later eager warmups.
+                del self._inflight_tensors[inflight_start:]
+            self._capture_in_progress = previous_capture
+
+
 class VLLMDCPAttentionRunner(_SequentialDCPAttentionRunnerBase):
     """Pinned vLLM default AG+RS orchestration using the local min FA3 op."""
 

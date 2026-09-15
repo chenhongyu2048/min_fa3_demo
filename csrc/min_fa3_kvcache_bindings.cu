@@ -462,7 +462,8 @@ py::object forward_kvcache_varlen(
     torch::Tensor cu_seqlens_k_host,
     int64_t num_splits,
     bool return_lse,
-    py::object is_causal_obj) {
+    py::object is_causal_obj,
+    bool graph_capacity) {
     check_packed_qkv(q, "q");
     check_packed_qkv(k_cache, "k_cache");
     check_packed_qkv(v_cache, "v_cache");
@@ -505,21 +506,23 @@ py::object forward_kvcache_varlen(
                 "batch size is too large for scheduler metadata");
 
     int const batch_size = static_cast<int>(cu_seqlens_q.numel() - 1);
-    int const actual_max_seqlen_q = validate_host_cu_seqlens(
-        cu_seqlens_q_host, q.size(0), "cu_seqlens_q_host");
-    int const actual_max_seqlen_k = validate_host_cu_seqlens(
-        cu_seqlens_k_host, k_cache.size(0), "cu_seqlens_k_host");
-    TORCH_CHECK(max_seqlen_q == actual_max_seqlen_q,
-                "max_seqlen_q must equal the maximum length in cu_seqlens_q_host. Got ",
-                max_seqlen_q, " vs ", actual_max_seqlen_q);
-    TORCH_CHECK(max_seqlen_k == actual_max_seqlen_k,
-                "max_seqlen_k must equal the maximum length in cu_seqlens_k_host. Got ",
-                max_seqlen_k, " vs ", actual_max_seqlen_k);
+    if (!graph_capacity) {
+        int const actual_max_seqlen_q = validate_host_cu_seqlens(
+            cu_seqlens_q_host, q.size(0), "cu_seqlens_q_host");
+        int const actual_max_seqlen_k = validate_host_cu_seqlens(
+            cu_seqlens_k_host, k_cache.size(0), "cu_seqlens_k_host");
+        TORCH_CHECK(max_seqlen_q == actual_max_seqlen_q,
+                    "max_seqlen_q must equal the maximum length in cu_seqlens_q_host. Got ",
+                    max_seqlen_q, " vs ", actual_max_seqlen_q);
+        TORCH_CHECK(max_seqlen_k == actual_max_seqlen_k,
+                    "max_seqlen_k must equal the maximum length in cu_seqlens_k_host. Got ",
+                    max_seqlen_k, " vs ", actual_max_seqlen_k);
+    }
 
     bool const is_causal = is_causal_obj.is_none()
         ? max_seqlen_q != 1
         : is_causal_obj.cast<bool>();
-    if (is_causal) {
+    if (is_causal && !graph_capacity) {
         int const* q_offsets = cu_seqlens_q_host.data_ptr<int>();
         int const* k_offsets = cu_seqlens_k_host.data_ptr<int>();
         for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
@@ -635,6 +638,7 @@ void bind_min_fa3_kvcache(py::module_& module) {
         py::arg("num_splits") = 0,
         py::arg("return_lse") = false,
         py::arg("is_causal") = py::none(),
+        py::arg("graph_capacity") = false,
         "Minimal Hopper FA3 packed-varlen read-only KV-cache decode/chunk-prefill forward. "
         "The CPU cu_seqlens mirrors are required for synchronization-free validation.");
 }

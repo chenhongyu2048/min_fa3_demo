@@ -1,8 +1,8 @@
 import os
 from pathlib import Path
 
-from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
+from setuptools import Extension, setup
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME, include_paths
 
 this_dir = Path(__file__).resolve().parent
 repo_root = this_dir
@@ -82,8 +82,16 @@ if using_cuda_stubs:
 else:
     print(f"Linking libcuda from driver library directory: {cuda_link_dir}")
 
-# Build the single PyTorch CUDA extension with the local sources, headers, and SM90 compile flags.
+# Build the CPU planner and the PyTorch CUDA extension with SM90 compile flags.
 ext_modules = [
+    # A CPU-only pybind module: no torch/CUDA linkage or device synchronization.
+    Extension(
+        name="_dcp_mega_planner",
+        sources=["csrc/dcp_mega_planner.cpp", "csrc/dcp_mega_metadata.cpp"],
+        include_dirs=include_paths()[:1],
+        language="c++",
+        extra_compile_args={"cxx": ["-O3", "-std=c++20"]},
+    ),
     CUDAExtension(
         name="_min_fa3_op",
         sources=[

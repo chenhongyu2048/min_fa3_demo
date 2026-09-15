@@ -19,10 +19,9 @@ SEED=${SEED:-0}
 TARGET_TOKENS=${TARGET_TOKENS:-131072}
 WARMUP_ITERS=${WARMUP_ITERS:-10}
 NUM_ITERS=${NUM_ITERS:-40}
-# Keep the default method set explicit so the two all-to-all baselines are part
-# of the Transformer-layer benchmark even when the parser's `all` expansion is
-# changed independently.
-METHODS=${METHODS:-"allgather_attention,llama3_allgather_attention,ulysses,usp,fa3_ring,megatron_hybrid_cp,magi_attention,zeppelin,mega_ring_all_cp,mega_ring_hybrid"}
+# Python defines the random-weight Qwen3-30B-A3B layer, uniform MoE routing,
+# and TP=1, CP=EP=WORLD_SIZE. This experiment excludes Ulysses/USP by default.
+METHODS=${METHODS:-"allgather_attention,llama3_allgather_attention,fa3_ring,megatron_hybrid_cp,magi_attention,zeppelin,mega_ring_all_cp,mega_ring_hybrid"}
 WORLD_SIZE=${WORLD_SIZE:-8}
 SM_CONFIGS=${SM_CONFIGS:-"128:4,124:8,120:12,116:16"}
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/results/transformer_layer_cp}

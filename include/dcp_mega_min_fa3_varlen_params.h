@@ -162,6 +162,7 @@ struct DCPMega_fwd_params {
 
     int32_t const* metadata = nullptr;
     MetadataHeader metadata_header{};
+    bool dynamic_metadata = false;
     int32_t* q_ready = nullptr;
     int32_t* attention_done = nullptr;
     int32_t* publish_ready = nullptr;

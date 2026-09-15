@@ -297,7 +297,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--workload", type=Path, required=True)
     result.add_argument("--server-url", default="http://127.0.0.1:8000")
-    result.add_argument("--model", default="llama-3.1-8b-dummy")
+    result.add_argument("--model", default="qwen3-30b-a3b-dummy")
     result.add_argument("--backend", required=True)
     result.add_argument("--arrival-time-scale", type=float, required=True)
     result.add_argument("--result-dir", type=Path, required=True)

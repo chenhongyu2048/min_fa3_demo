@@ -21,6 +21,7 @@ from .serve import (
     BACKENDS,
     MEGA_BACKENDS,
     build_serve_command,
+    model_dir,
     parser as serve_parser,
 )
 from .workload import load_manifest
@@ -211,7 +212,8 @@ def main() -> None:
     parser.add_argument(
         "--arrival-time-scales", nargs="+", type=float, default=[1, 2, 4]
     )
-    parser.add_argument("--kv-heads", type=int, choices=(1, 2, 4), default=1)
+    parser.add_argument("--tp-size", type=int, choices=(4, 8), default=8)
+    parser.add_argument("--kv-heads", type=int, choices=(1, 2, 4), default=4)
     parser.add_argument(
         "--mega-num-comm-sms",
         type=_parse_positive_int_list,
@@ -236,8 +238,8 @@ def main() -> None:
         help="Explicit per-GPU KV-cache size; useful with changing co-tenant usage.",
     )
     parser.add_argument(
-        "--num-hidden-layers", type=int, default=32,
-        help="Synthetic Llama layer count passed through --hf-overrides.",
+        "--num-hidden-layers", type=int, default=48,
+        help="Synthetic Qwen3 MoE layer count passed through --hf-overrides.",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -281,6 +283,8 @@ def main() -> None:
                 [
                     "--backend",
                     backend,
+                    "--tp-size",
+                    str(args.tp_size),
                     "--kv-heads",
                     str(args.kv_heads),
                     "--mega-num-comm-sm",
@@ -312,11 +316,16 @@ def main() -> None:
                 "backend": backend,
                 "arrival_time_scale": scale,
                 "kv_heads": args.kv_heads,
-                "tp_size": 8,
-                "dcp_size": 8 // args.kv_heads,
+                "tp_size": args.tp_size,
+                "ep_size": args.tp_size,
+                "attention_tp_size": args.kv_heads,
+                "cuda_visible_devices": env.get("CUDA_VISIBLE_DEVICES"),
+                "dcp_size": args.tp_size // args.kv_heads,
                 "mega_num_comm_sm": comm_sm,
                 "mega_max_num_splits": args.mega_max_num_splits,
                 "num_hidden_layers": args.num_hidden_layers,
+                "cudagraph_mode": "FULL",
+                "graph_block_n": 128 if serve_args.mega_block_n == "auto" else int(serve_args.mega_block_n),
                 "gpu_memory_utilization": args.gpu_memory_utilization,
                 "kv_cache_memory_bytes": args.kv_cache_memory_bytes,
                 "workload_sha256": workload_hash,
@@ -324,21 +333,17 @@ def main() -> None:
                 "repository_commit": _git_revision(root),
                 "vllm_commit": _git_revision(root / "third_party" / "vllm"),
                 "model_config_sha256": hashlib.sha256(
-                    (
-                        root
-                        / "infer"
-                        / "vllm_bench"
-                        / "models"
-                        / f"llama-3.1-8b-kvh{args.kv_heads}"
-                        / "config.json"
-                    ).read_bytes()
+                    (model_dir(args.kv_heads) / "config.json").read_bytes()
                 ).hexdigest(),
                 "runtime": runtime_versions,
                 "command": command,
                 "backend_env": {
                     key: value
                     for key, value in env.items()
-                    if key == "MIN_FA3_DCP_BACKEND"
+                    if key in (
+                        "MIN_FA3_DCP_BACKEND", "VLLM_MOE_SKIP_PADDING",
+                        "VLLM_MOE_ROUTING_SIMULATION_STRATEGY",
+                    )
                     or key.startswith("MEGA_DCP_")
                 },
             }

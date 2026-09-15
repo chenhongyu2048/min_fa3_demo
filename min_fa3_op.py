@@ -348,7 +348,14 @@ def forward_kvcache_varlen(
     num_splits: int = 0,
     return_lse: bool = False,
     is_causal: Optional[bool] = None,
+    graph_capacity: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Run packed KV attention; ``graph_capacity`` uses fixed capacity bounds.
+
+    In capacity mode the caller validates actual lengths before replay. Device
+    offsets may include empty padding rows and change without recapturing;
+    tensor addresses, shapes, and maximum sequence-length bounds stay fixed.
+    """
     return _forward_kvcache_varlen_cuda(
         q,
         k_cache,
@@ -362,6 +369,7 @@ def forward_kvcache_varlen(
         num_splits=int(num_splits),
         return_lse=bool(return_lse),
         is_causal=None if is_causal is None else bool(is_causal),
+        graph_capacity=bool(graph_capacity),
     )
 
 

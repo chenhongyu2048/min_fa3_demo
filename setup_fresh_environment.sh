@@ -37,7 +37,8 @@ Actions:
            every recursive submodule, create .venv with Python 3.12, and
            synchronize the locked PyTorch 2.11.0+cu128 base environment.
   install  On one visible SM90 Hopper GPU with CUDA toolkit 12.x, build
-           min-FA3 when needed, install pinned TE and MagiAttention offline
+           min-FA3 and its DCP CPU planner/queue module when needed,
+           install pinned TE and MagiAttention offline
            when missing, compile the three targeted Magi FFA kernels when
            needed, and run complete verification.
   verify   Verify the completed environment without rebuilding.
@@ -317,14 +318,19 @@ from pathlib import Path
 
 import min_fa3_op
 import _min_fa3_op
+import _dcp_mega_planner
+from _dcp_mega_planner import critical_wave_plan, build_packed_queues
 
 root = Path(sys.argv[1]).resolve()
 print("min_fa3_op:", min_fa3_op.__file__)
 print("min-FA3 extension:", _min_fa3_op.__file__)
+print("DCP CPU planner/queue extension:", _dcp_mega_planner.__file__)
 if Path(min_fa3_op.__file__).resolve().parent != root:
     raise SystemExit("min_fa3_op was not imported from this repository")
 if Path(_min_fa3_op.__file__).resolve().parent != root:
     raise SystemExit("_min_fa3_op was not built in this repository")
+if Path(_dcp_mega_planner.__file__).resolve().parent != root:
+    raise SystemExit("_dcp_mega_planner was not built in this repository")
 required = (
     "forward_varlen",
     "backward_varlen",

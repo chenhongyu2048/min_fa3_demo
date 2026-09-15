@@ -171,10 +171,31 @@ remove_incompatible_optional_cuda_packages() {
         torchcodec >/dev/null 2>&1 || true
 }
 
+verify_min_fa3_extensions() {
+    PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        "$VENV_DIR/bin/python" - "$ROOT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+import torch
+import _min_fa3_op
+import _dcp_mega_planner
+from _dcp_mega_planner import critical_wave_plan, build_packed_queues
+
+root = Path(sys.argv[1]).resolve()
+for module in (_min_fa3_op, _dcp_mega_planner):
+    path = Path(module.__file__).resolve()
+    if path.parent != root:
+        raise SystemExit(f"{module.__name__} was not built in this repository")
+    print(f"Native extension: {path}")
+PY
+}
+
 verify_runtime() {
     verify_sources
     verify_core_wheel
     verify_torch_cuda12_packages
+    verify_min_fa3_extensions
 
     PYTHONPATH="$ROOT_DIR/infer/vllm_plugin/src:$ROOT_DIR/infer:$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
         "$VENV_DIR/bin/python" \
@@ -347,9 +368,8 @@ PY
     if [[ "$FORCE_REBUILD" == 1 ]]; then
         make -C "$ROOT_DIR" clean
         make -C "$ROOT_DIR" PYTHON="$VENV_DIR/bin/python"
-    elif PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-        "$VENV_DIR/bin/python" -c 'import _min_fa3_op' >/dev/null 2>&1; then
-        echo "In-repository min-FA3 extension already imports; skipping build"
+    elif verify_min_fa3_extensions >/dev/null 2>&1; then
+        echo "In-repository CUDA and DCP CPU extensions pass verification; skipping build"
     else
         make -C "$ROOT_DIR" PYTHON="$VENV_DIR/bin/python"
     fi

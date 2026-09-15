@@ -26,6 +26,8 @@ for _path in (THIS_DIR, DEMO_DIR):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
+from transformer_layer_cp import QWEN3_CONFIG
+
 
 @dataclass(frozen=True)
 class Case:
@@ -40,9 +42,9 @@ class Timing:
     forward_cuda_critical_rank_avg_ms: float
     backward_cuda_critical_rank_avg_ms: float
     total_cuda_critical_rank_avg_ms: float
-    self_attn_forward_cuda_critical_rank_avg_ms: float
+    core_attn_forward_cuda_critical_rank_avg_ms: float
     others_forward_cuda_critical_rank_avg_ms: float
-    self_attn_backward_cuda_critical_rank_avg_ms: float
+    core_attn_backward_cuda_critical_rank_avg_ms: float
     others_backward_cuda_critical_rank_avg_ms: float
     total_wall_max_avg_ms: float
     per_rank_total_wall_avg_ms: tuple[float, ...]
@@ -53,34 +55,34 @@ class Timing:
 class CriticalRankTiming:
     forward_ms: float
     backward_ms: float
-    self_attn_forward_ms: float
-    self_attn_backward_ms: float
+    core_attn_forward_ms: float
+    core_attn_backward_ms: float
     wall_max_ms: float
     rank: int
 
 
-class SelfAttentionTimingProbe:
-    """CUDA-event instrumentation around one Megatron SelfAttention module.
+class CoreAttentionTimingProbe:
+    """CUDA events around CP core attention, excluding projections and Q/K norms.
 
-    Forward hooks delimit the complete SelfAttention call. Tensor-gradient
-    hooks delimit its backward without adding a synchronization point or
-    changing the autograd graph with a full-module backward hook.
+    Backward ends only after all Q/K/V gradients are ready. Tensor-gradient
+    hooks avoid introducing the views imposed by full-module backward hooks.
     """
 
-    def __init__(self, self_attention: torch.nn.Module) -> None:
+    def __init__(self, core_attention: torch.nn.Module) -> None:
         self._active = False
         self._backward_start_recorded = False
         self._backward_end_recorded = False
-        self._forward_pre_handle = self_attention.register_forward_pre_hook(
+        self._gradient_handles: list[Any] = []
+        self._forward_pre_handle = core_attention.register_forward_pre_hook(
             self._forward_pre_hook
         )
-        self._forward_handle = self_attention.register_forward_hook(
+        self._forward_handle = core_attention.register_forward_hook(
             self._forward_hook
         )
 
     def begin(self) -> None:
         if self._active:
-            raise RuntimeError("self-attention timing probe is already active")
+            raise RuntimeError("core-attention timing probe is already active")
         self._forward_start = torch.cuda.Event(enable_timing=True)
         self._forward_end = torch.cuda.Event(enable_timing=True)
         self._backward_start = torch.cuda.Event(enable_timing=True)
@@ -95,13 +97,16 @@ class SelfAttentionTimingProbe:
         del module
         if not self._active:
             return
-        if not inputs or not isinstance(inputs[0], torch.Tensor):
-            raise RuntimeError("SelfAttention timing requires a tensor input")
-        hidden_states = inputs[0]
-        if not hidden_states.requires_grad:
-            raise RuntimeError("SelfAttention timing input must require gradients")
+        qkv = inputs[:3]
+        if len(qkv) != 3 or any(
+            not isinstance(tensor, torch.Tensor) or not tensor.requires_grad
+            for tensor in qkv
+        ):
+            raise RuntimeError("CoreAttention timing requires Q/K/V with gradients")
         self._forward_start.record()
-        hidden_states.register_hook(self._input_gradient_hook)
+        self._gradient_handles.append(torch.autograd.graph.register_multi_grad_hook(
+            qkv, self._input_gradient_hook, mode="all"
+        ))
 
     def _forward_hook(
         self,
@@ -115,10 +120,12 @@ class SelfAttentionTimingProbe:
         self._forward_end.record()
         output_tensor = output[0] if isinstance(output, tuple) else output
         if not isinstance(output_tensor, torch.Tensor):
-            raise RuntimeError("SelfAttention timing requires a tensor output")
+            raise RuntimeError("CoreAttention timing requires a tensor output")
         if not output_tensor.requires_grad:
-            raise RuntimeError("SelfAttention timing output must require gradients")
-        output_tensor.register_hook(self._output_gradient_hook)
+            raise RuntimeError("CoreAttention timing output must require gradients")
+        self._gradient_handles.append(
+            output_tensor.register_hook(self._output_gradient_hook)
+        )
 
     def _output_gradient_hook(self, gradient: torch.Tensor) -> torch.Tensor:
         if self._active:
@@ -126,26 +133,32 @@ class SelfAttentionTimingProbe:
             self._backward_start_recorded = True
         return gradient
 
-    def _input_gradient_hook(self, gradient: torch.Tensor) -> torch.Tensor:
+    def _input_gradient_hook(self, gradients: Sequence[torch.Tensor | None]) -> None:
+        del gradients
         if self._active:
             self._backward_end.record()
             self._backward_end_recorded = True
-        return gradient
 
     def finish(self) -> tuple[float, float]:
         if not self._active:
-            raise RuntimeError("self-attention timing probe is not active")
+            raise RuntimeError("core-attention timing probe is not active")
         if not self._backward_start_recorded or not self._backward_end_recorded:
             raise RuntimeError(
-                "SelfAttention backward timing hooks did not both execute"
+                "CoreAttention backward timing hooks did not both execute"
             )
         forward_ms = self._forward_start.elapsed_time(self._forward_end)
         backward_ms = self._backward_start.elapsed_time(self._backward_end)
         self._active = False
+        for handle in self._gradient_handles:
+            handle.remove()
+        self._gradient_handles.clear()
         return forward_ms, backward_ms
 
     def close(self) -> None:
         self._active = False
+        for handle in self._gradient_handles:
+            handle.remove()
+        self._gradient_handles.clear()
         self._forward_pre_handle.remove()
         self._forward_handle.remove()
 
@@ -167,8 +180,8 @@ def _nonnegative_int(value: str) -> int:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark one Llama-3-8B-style Megatron Transformer layer forward+backward "
-            "with CP=8 and TP=PP=DP=1"
+            "Benchmark one Qwen3-30B-A3B-style Megatron Transformer layer forward+backward "
+            "with CP=EP=world size and TP=PP=DP=1"
         )
     )
     parser.add_argument(
@@ -227,8 +240,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--structure-threshold must be in [0, 1]")
     if not 1 <= args.magi_overlap_degree <= 8:
         raise SystemExit("--magi-overlap-degree must be in [1, 8]")
-    if 8 % args.allgather_heads_k_stride:
-        raise SystemExit("--allgather-heads-k-stride must divide KVH=8")
+    kv_heads = QWEN3_CONFIG["num_query_groups"]
+    if kv_heads % args.allgather_heads_k_stride:
+        raise SystemExit(f"--allgather-heads-k-stride must divide KVH={kv_heads}")
     if not args.megatron_path.is_dir() and not args.dry_run_layout:
         raise SystemExit(f"Megatron path does not exist: {args.megatron_path}")
 
@@ -437,7 +451,11 @@ def _preflight(
             get_gpt_layer_with_transformer_engine_submodules,
         )
 
-        get_gpt_layer_with_transformer_engine_submodules()
+        get_gpt_layer_with_transformer_engine_submodules(
+            num_experts=QWEN3_CONFIG["num_moe_experts"],
+            moe_grouped_gemm=True,
+            qk_layernorm=True,
+        )
         import min_fa3_op  # noqa: F401
 
         if "magi_attention" in methods:
@@ -494,7 +512,8 @@ def _initialize_megatron(args: argparse.Namespace) -> None:
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
         context_parallel_size=args.world_size,
-        expert_model_parallel_size=1,
+        expert_model_parallel_size=args.world_size,
+        expert_tensor_parallel_size=1,
         order="tp-cp-ep-dp-pp",
         create_gloo_process_groups=False,
     )
@@ -513,7 +532,7 @@ def _one_iteration(
     hidden_states: torch.Tensor,
     dout: torch.Tensor,
     packed_seq_params: Any,
-    self_attn_timing_probe: SelfAttentionTimingProbe,
+    core_attn_timing_probe: CoreAttentionTimingProbe,
 ) -> tuple[float, float, float, float, float]:
     _zero_grads(layer, hidden_states)
     torch.cuda.synchronize()
@@ -524,7 +543,7 @@ def _one_iteration(
     forward_end = torch.cuda.Event(enable_timing=True)
     backward_start = torch.cuda.Event(enable_timing=True)
     backward_end = torch.cuda.Event(enable_timing=True)
-    self_attn_timing_probe.begin()
+    core_attn_timing_probe.begin()
     wall_start = time.perf_counter()
     forward_start.record()
     output, _context = layer(
@@ -538,13 +557,13 @@ def _one_iteration(
     backward_end.record()
     torch.cuda.synchronize()
     total_ms = (time.perf_counter() - wall_start) * 1000.0
-    self_attn_forward_ms, self_attn_backward_ms = self_attn_timing_probe.finish()
+    core_attn_forward_ms, core_attn_backward_ms = core_attn_timing_probe.finish()
     return (
         forward_start.elapsed_time(forward_end),
         backward_start.elapsed_time(backward_end),
         total_ms,
-        self_attn_forward_ms,
-        self_attn_backward_ms,
+        core_attn_forward_ms,
+        core_attn_backward_ms,
     )
 
 
@@ -576,7 +595,7 @@ def select_cuda_critical_rank_timing(
     """Select all CUDA components from the rank with maximum full FWD+BWD.
 
     ``rank_samples`` has one row per rank and columns ``[forward, backward,
-    total_wall, self_attn_forward, self_attn_backward]``. Wall time is
+    total_wall, core_attn_forward, core_attn_backward]``. Wall time is
     deliberately not used to choose the CUDA critical rank; it remains an
     independent host/synchronization diagnostic.
     """
@@ -590,8 +609,8 @@ def select_cuda_critical_rank_timing(
     return CriticalRankTiming(
         forward_ms=float(rank_samples[critical_rank, 0].item()),
         backward_ms=float(rank_samples[critical_rank, 1].item()),
-        self_attn_forward_ms=float(rank_samples[critical_rank, 3].item()),
-        self_attn_backward_ms=float(rank_samples[critical_rank, 4].item()),
+        core_attn_forward_ms=float(rank_samples[critical_rank, 3].item()),
+        core_attn_backward_ms=float(rank_samples[critical_rank, 4].item()),
         wall_max_ms=float(rank_samples[:, 2].max().item()),
         rank=critical_rank,
     )
@@ -605,7 +624,7 @@ def _measure(
     warmup_iters: int,
     num_iters: int,
 ) -> Timing:
-    self_attn_timing_probe = SelfAttentionTimingProbe(layer.self_attention)
+    core_attn_timing_probe = CoreAttentionTimingProbe(layer.self_attention.core_attention)
     try:
         gradients_validated = False
         for _ in range(warmup_iters):
@@ -614,7 +633,7 @@ def _measure(
                 hidden_states,
                 dout,
                 packed_seq_params,
-                self_attn_timing_probe,
+                core_attn_timing_probe,
             )
             if not gradients_validated:
                 _validate_complete_gradients(layer, hidden_states)
@@ -628,14 +647,14 @@ def _measure(
                 forward_ms,
                 backward_ms,
                 total_ms,
-                self_attn_forward_ms,
-                self_attn_backward_ms,
+                core_attn_forward_ms,
+                core_attn_backward_ms,
             ) = _one_iteration(
                 layer,
                 hidden_states,
                 dout,
                 packed_seq_params,
-                self_attn_timing_probe,
+                core_attn_timing_probe,
             )
             local_total_samples.append(total_ms)
             if not gradients_validated:
@@ -646,8 +665,8 @@ def _measure(
                     forward_ms,
                     backward_ms,
                     total_ms,
-                    self_attn_forward_ms,
-                    self_attn_backward_ms,
+                    core_attn_forward_ms,
+                    core_attn_backward_ms,
                 ],
                 dtype=torch.float64,
                 device=hidden_states.device,
@@ -663,7 +682,7 @@ def _measure(
             critical_cuda_samples.append(critical_sample)
             critical_rank_counts[critical_sample.rank] += 1
     finally:
-        self_attn_timing_probe.close()
+        core_attn_timing_probe.close()
 
     local_avg = mean(local_total_samples)
     per_rank: list[float | None] = [None] * dist.get_world_size()
@@ -674,26 +693,26 @@ def _measure(
     measured_backward_avg_ms = mean(
         sample.backward_ms for sample in critical_cuda_samples
     )
-    self_attn_forward_avg_ms = mean(
-        sample.self_attn_forward_ms for sample in critical_cuda_samples
+    core_attn_forward_avg_ms = mean(
+        sample.core_attn_forward_ms for sample in critical_cuda_samples
     )
-    self_attn_backward_avg_ms = mean(
-        sample.self_attn_backward_ms for sample in critical_cuda_samples
+    core_attn_backward_avg_ms = mean(
+        sample.core_attn_backward_ms for sample in critical_cuda_samples
     )
-    others_forward_avg_ms = measured_forward_avg_ms - self_attn_forward_avg_ms
-    others_backward_avg_ms = measured_backward_avg_ms - self_attn_backward_avg_ms
+    others_forward_avg_ms = measured_forward_avg_ms - core_attn_forward_avg_ms
+    others_backward_avg_ms = measured_backward_avg_ms - core_attn_backward_avg_ms
     # Build the stored parent phases from their stored components. This keeps
     # the JSON arithmetic identities exact while changing the measured parent
     # averages by at most the final floating-point rounding bit.
-    forward_avg_ms = self_attn_forward_avg_ms + others_forward_avg_ms
-    backward_avg_ms = self_attn_backward_avg_ms + others_backward_avg_ms
+    forward_avg_ms = core_attn_forward_avg_ms + others_forward_avg_ms
+    backward_avg_ms = core_attn_backward_avg_ms + others_backward_avg_ms
     return Timing(
         forward_cuda_critical_rank_avg_ms=forward_avg_ms,
         backward_cuda_critical_rank_avg_ms=backward_avg_ms,
         total_cuda_critical_rank_avg_ms=forward_avg_ms + backward_avg_ms,
-        self_attn_forward_cuda_critical_rank_avg_ms=self_attn_forward_avg_ms,
+        core_attn_forward_cuda_critical_rank_avg_ms=core_attn_forward_avg_ms,
         others_forward_cuda_critical_rank_avg_ms=others_forward_avg_ms,
-        self_attn_backward_cuda_critical_rank_avg_ms=self_attn_backward_avg_ms,
+        core_attn_backward_cuda_critical_rank_avg_ms=core_attn_backward_avg_ms,
         others_backward_cuda_critical_rank_avg_ms=others_backward_avg_ms,
         total_wall_max_avg_ms=mean(
             sample.wall_max_ms for sample in critical_cuda_samples
@@ -709,7 +728,7 @@ def _make_inputs(
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
     hidden = torch.randn(
-        (local_tokens, 1, 4096),
+        (local_tokens, 1, QWEN3_CONFIG["hidden_size"]),
         dtype=torch.bfloat16,
         device=device,
         generator=generator,
@@ -735,7 +754,7 @@ def _record(
     megatron_commit: str | None,
 ) -> dict[str, Any]:
     return {
-        "schema": "min_fa3.megatron_transformer_layer_cp.v1",
+        "schema": "min_fa3.megatron_transformer_layer_cp.v2",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "dataset": args.dataset,
         "case_index": case.case_index,
@@ -746,20 +765,34 @@ def _record(
         "causal": True,
         "sm_config": None if sm_config is None else asdict(sm_config),
         "model": {
-            "profile": "llama3_8b_single_layer",
+            "profile": "qwen3_30b_a3b_single_layer",
+            "weights": "random",
             "dtype": "bfloat16",
-            "hidden_size": 4096,
-            "q_heads": 32,
-            "kv_heads": 8,
-            "head_dim": 128,
-            "ffn_hidden_size": 14336,
+            "hidden_size": QWEN3_CONFIG["hidden_size"],
+            "q_heads": QWEN3_CONFIG["num_attention_heads"],
+            "kv_heads": QWEN3_CONFIG["num_query_groups"],
+            "head_dim": QWEN3_CONFIG["kv_channels"],
+            "ffn_hidden_size": QWEN3_CONFIG["ffn_hidden_size"],
+            "num_experts": QWEN3_CONFIG["num_moe_experts"],
+            "experts_per_token": QWEN3_CONFIG["moe_router_topk"],
+            "moe_intermediate_size": QWEN3_CONFIG["moe_ffn_hidden_size"],
+            "moe_grouped_gemm": True,
+            "moe_token_dispatcher": "alltoall",
+            "moe_routing": "synthetic_uniform_topk",
+            "moe_routing_weights": "softmax_of_selected_router_logits",
+            "moe_aux_loss_coeff": 0.0,
+            "qk_layernorm": True,
+            "rms_norm_eps": QWEN3_CONFIG["layernorm_epsilon"],
             "activation": "swiglu",
             "normalization": "rmsnorm",
             "bias": False,
             "dropout": 0.0,
             "rope": False,
         },
-        "parallelism": {"cp": args.world_size, "tp": 1, "pp": 1, "dp": 1},
+        "parallelism": {
+            "cp": args.world_size, "ep": args.world_size,
+            "tp": 1, "pp": 1, "dp": 1, "expert_tp": 1,
+        },
         "formal_cp8_result": args.world_size == 8,
         "iterations": {"warmup": args.warmup_iters, "measure": args.num_iters},
         "tokens": {
@@ -815,15 +848,17 @@ def _record(
             ),
             "primary": (
                 "for each iteration, select one rank by maximum CUDA forward+backward; "
-                "average that same rank's full and self-attention components"
+                "average that same rank's full and core-attention components"
             ),
-            "self_attention": (
-                "complete Megatron SelfAttention module: QKV projection, CP core "
-                "attention, and output projection"
+            "core_attention": (
+                "SelfAttention.core_attention dispatcher: Q/K/V contiguous copies, "
+                "CP attention and its communication/workspace updates; backward "
+                "from output gradient until all Q/K/V input gradients are ready"
             ),
             "others": (
-                "algebraic full-phase remainder after subtracting self-attention: "
-                "RMSNorm, residual/BDA, pre-MLP RMSNorm, SwiGLU MLP, and MLP residual/BDA"
+                "algebraic full-phase remainder after subtracting core-attention: "
+                "QKV/output projections, Q/K RMSNorm, other norms, residual/BDA, "
+                "and routed SwiGLU MoE (router, dispatch, experts, combine)"
             ),
             "diagnostic": (
                 "total_wall_max_avg_ms independently averages each iteration's "
@@ -848,23 +883,23 @@ def _print_result(record: dict[str, Any]) -> None:
     sm_label = "-" if sm is None else f"{sm['num_comp_sm']}:{sm['num_comm_sm']}"
     forward_ms = float(timing["forward_cuda_critical_rank_avg_ms"])
     backward_ms = float(timing["backward_cuda_critical_rank_avg_ms"])
-    self_attn_forward_ms = float(
-        timing["self_attn_forward_cuda_critical_rank_avg_ms"]
+    core_attn_forward_ms = float(
+        timing["core_attn_forward_cuda_critical_rank_avg_ms"]
     )
-    self_attn_backward_ms = float(
-        timing["self_attn_backward_cuda_critical_rank_avg_ms"]
+    core_attn_backward_ms = float(
+        timing["core_attn_backward_cuda_critical_rank_avg_ms"]
     )
     # Construct displayed remainders and total from the displayed parent and
-    # self-attention components so all RESULT identities are exact at 3 decimals.
+    # core-attention components so all RESULT identities are exact at 3 decimals.
     forward_display_ms = round(forward_ms, 3)
     backward_display_ms = round(backward_ms, 3)
-    self_attn_forward_display_ms = round(self_attn_forward_ms, 3)
-    self_attn_backward_display_ms = round(self_attn_backward_ms, 3)
+    core_attn_forward_display_ms = round(core_attn_forward_ms, 3)
+    core_attn_backward_display_ms = round(core_attn_backward_ms, 3)
     others_forward_display_ms = (
-        forward_display_ms - self_attn_forward_display_ms
+        forward_display_ms - core_attn_forward_display_ms
     )
     others_backward_display_ms = (
-        backward_display_ms - self_attn_backward_display_ms
+        backward_display_ms - core_attn_backward_display_ms
     )
     total_display_ms = forward_display_ms + backward_display_ms
     critical_rank_counts = "/".join(
@@ -877,12 +912,12 @@ def _print_result(record: dict[str, Any]) -> None:
         f"forward_cuda_critical_rank_avg_ms={forward_display_ms:.3f} "
         f"backward_cuda_critical_rank_avg_ms={backward_display_ms:.3f} "
         f"total_cuda_critical_rank_avg_ms={total_display_ms:.3f} "
-        f"self_attn_forward_cuda_critical_rank_avg_ms="
-        f"{self_attn_forward_display_ms:.3f} "
+        f"core_attn_forward_cuda_critical_rank_avg_ms="
+        f"{core_attn_forward_display_ms:.3f} "
         f"others_forward_cuda_critical_rank_avg_ms="
         f"{others_forward_display_ms:.3f} "
-        f"self_attn_backward_cuda_critical_rank_avg_ms="
-        f"{self_attn_backward_display_ms:.3f} "
+        f"core_attn_backward_cuda_critical_rank_avg_ms="
+        f"{core_attn_backward_display_ms:.3f} "
         f"others_backward_cuda_critical_rank_avg_ms="
         f"{others_backward_display_ms:.3f} "
         f"cuda_critical_rank_counts={critical_rank_counts} "
@@ -955,9 +990,9 @@ def _run(args: argparse.Namespace) -> None:
                 flush=True,
             )
         print(
-            f"Single-layer benchmark: CP={world_size} TP=PP=DP=1, "
+            f"Single-layer benchmark: CP=EP={world_size} TP=PP=DP=1, "
             f"mode={'formal CP=8' if world_size == 8 else 'functional CP=4 smoke'}, "
-            "BF16 Llama-3-8B profile, "
+            "BF16 Qwen3-30B-A3B MoE profile, synthetic uniform top-k routing, "
             f"dataset={args.dataset}, cases={len(cases)}, methods={methods}, "
             f"MegaRing SM={[config.label for config in sm_configs]}, "
             f"FA3 block backend={block_backend}",

@@ -8,6 +8,7 @@ vLLM FlashAttention backend or ``vllm.vllm_flash_attn``.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -47,7 +48,7 @@ logger = init_logger(__name__)
 
 @dataclass
 class LocalDCPAttentionMetadata(AttentionMetadata):
-    """Minimal eager metadata needed by the three local DCP runners."""
+    """Packed history metadata and optional capacity-bound graph arguments."""
 
     num_actual_tokens: int
     max_query_len: int
@@ -63,6 +64,8 @@ class LocalDCPAttentionMetadata(AttentionMetadata):
     history_start_loc: torch.Tensor
     max_history_len_local: int
     local_causal_only: bool = False
+    graph_args: tuple | None = None
+    graph_capacity: bool = False
 
 
 class LocalDCPMetadataBuilder(
@@ -70,7 +73,7 @@ class LocalDCPMetadataBuilder(
 ):
     """Build packed local-history offsets without FlashAttention metadata."""
 
-    _cudagraph_support = AttentionCGSupport.NEVER
+    _cudagraph_support = AttentionCGSupport.ALWAYS
     supports_update_block_table = False
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device) -> None:
@@ -89,6 +92,16 @@ class LocalDCPMetadataBuilder(
         # real service requests.
         self._saw_zero_history_warmup = False
         self._short_history_warmup_consumed = False
+        self.full_graphs = vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        self._graph_block_table = None
+        if self.full_graphs:
+            runtime = MegaRuntimeConfig.from_env()
+            self._graph_query_cpu = torch.empty(
+                runtime.max_batch + 1, dtype=torch.int32, device="cpu"
+            )
+            self._graph_history_cpu = torch.empty_like(self._graph_query_cpu)
+            self._graph_query = torch.empty_like(self._graph_query_cpu, device=device)
+            self._graph_history = torch.empty_like(self._graph_query, device=device)
 
     def build(
         self,
@@ -97,6 +110,19 @@ class LocalDCPMetadataBuilder(
         fast_build: bool = False,
     ) -> LocalDCPAttentionMetadata:
         del fast_build
+        if self.full_graphs:
+            if common_prefix_len != 0:
+                raise ValueError("prefix caching/cascade attention must be disabled")
+            from vllm.compilation import monitor
+
+            # The GPU runner warms each capture shape through build(), before
+            # calling build_for_cudagraph_capture(). Its small synthetic batches
+            # can have history shorter than DCP. vLLM closes this startup window
+            # after capture_model(), keeping real-request validation unchanged.
+            return self._build_graph(
+                common_attn_metadata,
+                capture=monitor.cudagraph_capturing_enabled,
+            )
         if common_prefix_len != 0:
             raise ValueError(
                 "the local DCP benchmark requires prefix caching/cascade "
@@ -179,6 +205,94 @@ class LocalDCPMetadataBuilder(
             history_start_loc=history_device,
             max_history_len_local=int(local_history_lengths.max().item()),
             local_causal_only=local_causal_only,
+        )
+
+
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        return self._build_graph(common_attn_metadata, capture=True)
+
+    def _build_graph(self, common, capture=False):
+        backend = os.environ.get("MIN_FA3_DCP_BACKEND", "mega")
+        impl = {
+            "mega": MegaDCPAttentionImpl,
+            "mega-fa3-native": MegaDCPAttentionImpl,
+            "vllm-ag-rs": VLLMAGRSDCPAttentionImpl,
+            "vllm-a2a": VLLMA2ADCPAttentionImpl,
+        }[backend]
+        impl._ensure_runner(self.vllm_config)
+        runtime, runner = impl._runtime, impl._runner
+        query = common.query_start_loc_cpu[:common.num_reqs + 1]
+        lengths = query[1:] - query[:-1]
+        num_reqs = int((lengths > 0).sum())
+        query = query[:num_reqs + 1]
+        lengths = lengths[:num_reqs]
+        history = common.seq_lens_cpu_upper_bound[:num_reqs] - lengths
+        all_zero_history = bool((history == 0).all())
+        short_warmup = is_vllm_short_history_warmup(
+            lengths.tolist(), history.tolist(), self.dcp_world_size,
+            saw_zero_history_warmup=(
+                self._saw_zero_history_warmup
+                and not self._short_history_warmup_consumed
+            ),
+        )
+        if all_zero_history and bool((lengths == 2).all()):
+            self._saw_zero_history_warmup = True
+        if short_warmup:
+            self._short_history_warmup_consumed = True
+        # Synthetic capture/warmup uses block zero and one local history token.
+        # Real decode-side batches retain the positive local-history contract.
+        if capture or all_zero_history or short_warmup:
+            history = history.clamp(min=self.dcp_world_size)
+        elif bool((history < self.dcp_world_size).any()):
+            raise ValueError("every request must have local history on every DCP rank")
+        local = (history // self.dcp_world_size
+                 + (self.dcp_rank < history % self.dcp_world_size)).to(torch.int32)
+        history_cpu = torch.cat((torch.zeros(1, dtype=torch.int32, device="cpu"), local.cumsum(0).int()))
+        total_q = common.num_actual_tokens
+        if num_reqs > runtime.max_batch or total_q > runtime.max_total_q:
+            raise ValueError("local DCP batch exceeds configured graph capacity")
+        if int(history_cpu[-1]) > impl._history_k.shape[0]:
+            raise ValueError("packed local-history workspace is too small")
+        self._graph_query_cpu.fill_(int(query[-1]))
+        self._graph_query_cpu[:num_reqs + 1].copy_(query)
+        self._graph_history_cpu.fill_(int(history_cpu[-1]))
+        self._graph_history_cpu[:num_reqs + 1].copy_(history_cpu)
+        # Each copy owns its pinned source until DMA finishes. The next CPU
+        # batch may prepare these reusable mirrors before graph replay ends.
+        self._graph_query.copy_(self._graph_query_cpu.pin_memory(), non_blocking=True)
+        self._graph_history.copy_(self._graph_history_cpu.pin_memory(), non_blocking=True)
+        if self._graph_block_table is None:
+            self._graph_block_table = torch.zeros(
+                (runtime.max_batch, common.block_table_tensor.shape[1]),
+                dtype=common.block_table_tensor.dtype, device=self.device,
+            )
+        self._graph_block_table[:num_reqs].copy_(common.block_table_tensor[:num_reqs])
+        graph_args = None
+        if isinstance(runner, DCPMegaAttentionRunner):
+            graph_args = runner.prepare_graph_forward(
+                impl._q[:total_q], impl._history_k, impl._history_v,
+                impl._chunk_k[:total_q], impl._chunk_v[:total_q],
+                self._graph_query, self._graph_history,
+                cu_seqlens_q_host=query,
+                cu_seqlens_history_local_host=history_cpu,
+                scheduler_heuristic=runtime.scheduler_heuristic,
+                reorder_history_override=(None if runtime.scheduler_heuristic is None else False),
+            )
+        max_history = (self.vllm_config.model_config.max_model_len
+                       + self.dcp_world_size - 1) // self.dcp_world_size
+        if common.causal is not True:
+            raise ValueError("local DCP attention requires causal decoder attention")
+        return LocalDCPAttentionMetadata(
+            num_actual_tokens=total_q, max_query_len=total_q,
+            query_start_loc=self._graph_query, max_seq_len=common.max_seq_len,
+            seq_lens=common.seq_lens, block_table=self._graph_block_table,
+            slot_mapping=common.slot_mapping, causal=True,
+            query_start_loc_cpu=self._graph_query_cpu,
+            seq_lens_cpu_upper_bound=common.seq_lens_cpu_upper_bound,
+            history_start_loc_cpu=self._graph_history_cpu,
+            history_start_loc=self._graph_history,
+            max_history_len_local=max_history,
+            graph_args=graph_args, graph_capacity=True,
         )
 
 
@@ -315,9 +429,9 @@ class LocalDCPAttentionImpl(AttentionImpl[LocalDCPAttentionMetadata]):
             raise ValueError("local DCP attention does not support sliding windows")
         if kv_cache_dtype not in ("auto", "bfloat16"):
             raise ValueError("local DCP attention requires a BF16 KV cache")
-        if num_heads != 4 or num_kv_heads != 1 or head_size != 128:
+        if num_heads not in (4, 8) or num_kv_heads != 1 or head_size != 128:
             raise ValueError(
-                "each TP rank must use QH=4, KVH=1, and head_dim=128"
+                "each TP rank must use QH=4/8, KVH=1, and head_dim=128"
             )
         expected_scale = 1.0 / math.sqrt(head_size)
         if not math.isclose(self.scale, expected_scale, rel_tol=0.0, abs_tol=1e-7):
@@ -334,10 +448,11 @@ class LocalDCPAttentionImpl(AttentionImpl[LocalDCPAttentionMetadata]):
         runtime = MegaRuntimeConfig.from_env()
         dcp = get_dcp_group()
         tp = get_tp_group()
-        expected_dcp = 8 // vllm_config.model_config.get_total_num_kv_heads()
-        if dcp.world_size != expected_dcp or tp.world_size != 8:
+        expected_dcp = tp.world_size // vllm_config.model_config.get_total_num_kv_heads()
+        hq_local = 32 // tp.world_size
+        if dcp.world_size != expected_dcp or tp.world_size not in (4, 8):
             raise ValueError(
-                f"local DCP attention requires TP=8 and DCP={expected_dcp}"
+                f"local DCP attention requires TP=4/8 and DCP={expected_dcp}"
             )
         if get_node_count() != 1:
             raise ValueError("local DCP attention supports a single node only")
@@ -348,7 +463,7 @@ class LocalDCPAttentionImpl(AttentionImpl[LocalDCPAttentionMetadata]):
                 tp.device_group,
                 max_total_q=runtime.max_total_q,
                 max_batch=runtime.max_batch,
-                Hq_local=4,
+                Hq_local=hq_local,
                 max_num_splits=runtime.max_num_splits,
                 num_comm_sm=runtime.num_comm_sm,
                 block_n_override=runtime.block_n,
@@ -388,7 +503,7 @@ class LocalDCPAttentionImpl(AttentionImpl[LocalDCPAttentionMetadata]):
             cls._q = cls._runner.q_backing
         else:
             cls._q = torch.empty(
-                (runtime.max_total_q, 4, 128),
+                (runtime.max_total_q, hq_local, 128),
                 dtype=torch.bfloat16,
                 device=device,
             )
@@ -507,8 +622,8 @@ class LocalDCPAttentionImpl(AttentionImpl[LocalDCPAttentionMetadata]):
         key_cache, value_cache = kv_cache.transpose(1, 2).split(
             self.head_size, dim=-1
         )
-        history_k = history_k_store[:total_history]
-        history_v = history_v_store[:total_history]
+        history_k = history_k_store if attn_metadata.graph_capacity else history_k_store[:total_history]
+        history_v = history_v_store if attn_metadata.graph_capacity else history_v_store[:total_history]
         ops.cp_gather_cache(
             key_cache,
             history_k,
@@ -540,7 +655,16 @@ class LocalDCPAttentionImpl(AttentionImpl[LocalDCPAttentionMetadata]):
             "cu_seqlens_history_local_host": history_host,
             "num_splits": 0,
         }
-        if isinstance(runner, DCPMegaAttentionRunner):
+        if attn_metadata.graph_capacity:
+            if isinstance(runner, DCPMegaAttentionRunner):
+                result = runner.forward_prepared_graph(attn_metadata.graph_args)
+            else:
+                result = runner.forward_chunk_prefill_varlen_graph(
+                    *common_args,
+                    cu_seqlens_q_host=q_host,
+                    cu_seqlens_history_local_host=history_host,
+                )
+        elif isinstance(runner, DCPMegaAttentionRunner):
             result = runner.forward_chunk_prefill_varlen(
                 *common_args,
                 **common_kwargs,

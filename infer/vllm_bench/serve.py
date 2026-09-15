@@ -19,12 +19,14 @@ def model_dir(kv_heads: int) -> Path:
     if kv_heads not in (1, 2, 4):
         raise ValueError("kv_heads must be one of 1, 2, or 4")
     return repo_root() / "infer" / "vllm_bench" / "models" / (
-        f"llama-3.1-8b-kvh{kv_heads}"
+        f"qwen3-30b-a3b-kvh{kv_heads}"
     )
 
 
-def dcp_size(kv_heads: int) -> int:
-    return 8 // kv_heads
+def dcp_size(kv_heads: int, tp_size: int = 8) -> int:
+    if tp_size not in (4, 8) or kv_heads not in (1, 2, 4) or tp_size // kv_heads < 2:
+        raise ValueError("requires TP=4/8 and DCP=TP/KVH in {2, 4, 8}")
+    return tp_size // kv_heads
 
 
 def build_serve_command(args: argparse.Namespace) -> tuple[dict[str, str], list[str]]:
@@ -38,10 +40,10 @@ def build_serve_command(args: argparse.Namespace) -> tuple[dict[str, str], list[
     if not 1 <= args.mega_max_num_splits <= 128:
         raise ValueError("mega_max_num_splits must be in [1, 128]")
     # ``hf_overrides`` is intentionally used for smoke runs instead of
-    # maintaining a second, non-Llama model config.  vLLM applies this to the
-    # HuggingFace config before constructing the model, so changing the layer
+    # maintaining a second model config for each layer count. vLLM applies
+    # this to the HuggingFace config before constructing the model, so changing the layer
     # count does not affect the Q/KV head topology exercised by the benchmark.
-    num_hidden_layers = getattr(args, "num_hidden_layers", 32)
+    num_hidden_layers = getattr(args, "num_hidden_layers", 48)
     if not isinstance(num_hidden_layers, int) or num_hidden_layers <= 0:
         raise ValueError("num_hidden_layers must be a positive integer")
     kv_cache_memory_bytes = getattr(args, "kv_cache_memory_bytes", None)
@@ -77,9 +79,10 @@ def build_serve_command(args: argparse.Namespace) -> tuple[dict[str, str], list[
         "--kv-cache-dtype",
         "bfloat16",
         "--tensor-parallel-size",
-        "8",
+        str(args.tp_size),
+        "--enable-expert-parallel",
         "--decode-context-parallel-size",
-        str(dcp_size(args.kv_heads)),
+        str(dcp_size(args.kv_heads, args.tp_size)),
         "--cp-kv-cache-interleave-size",
         "1",
         "--max-model-len",
@@ -90,12 +93,18 @@ def build_serve_command(args: argparse.Namespace) -> tuple[dict[str, str], list[
         "4096",
         "--enable-chunked-prefill",
         "--no-enable-prefix-caching",
-        "--enforce-eager",
+        "--compilation-config",
+        json.dumps(
+            {"mode": 0, "cudagraph_mode": "FULL",
+             "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]},
+            separators=(",", ":"),
+        ),
         # The CUSTOM backend does not use FlashInfer.  Leaving this enabled on
         # Hopper makes vLLM execute an unrelated full-prefill dummy attention
         # batch during FlashInfer autotuning, which violates this benchmark's
         # decode-side-only history contract.
         "--no-enable-flashinfer-autotune",
+        "--cudagraph-metrics",
         "--stream-interval",
         "1",
         "--gpu-memory-utilization",
@@ -127,6 +136,11 @@ def build_serve_command(args: argparse.Namespace) -> tuple[dict[str, str], list[
         {
             "VLLM_PLUGINS": "min_fa3_dcp",
             "MIN_FA3_DCP_BACKEND": args.backend,
+            # The pinned MoE wheel predates padding-mask support in top-k.
+            "VLLM_MOE_SKIP_PADDING": "0",
+            "VLLM_MOE_ROUTING_SIMULATION_STRATEGY": env.get(
+                "VLLM_MOE_ROUTING_SIMULATION_STRATEGY", "min_fa3_balanced"
+            ),
             # The benchmark uses a CUSTOM attention backend and does not
             # measure FlashInfer's unrelated sampling kernel.  Disable its
             # optional JIT by default; callers with a complete CUDA toolkit
@@ -156,10 +170,11 @@ def build_serve_command(args: argparse.Namespace) -> tuple[dict[str, str], list[
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--backend", choices=BACKENDS, required=True)
-    result.add_argument("--kv-heads", type=int, choices=(1, 2, 4), default=1)
+    result.add_argument("--tp-size", type=int, choices=(4, 8), default=8)
+    result.add_argument("--kv-heads", type=int, choices=(1, 2, 4), default=4)
     result.add_argument("--host", default="0.0.0.0")
     result.add_argument("--port", type=int, default=8000)
-    result.add_argument("--served-model-name", default="llama-3.1-8b-dummy")
+    result.add_argument("--served-model-name", default="qwen3-30b-a3b-dummy")
     result.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     result.add_argument(
         "--kv-cache-memory-bytes",
@@ -174,7 +189,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--num-hidden-layers",
         type=int,
-        default=32,
+        default=48,
         help="Override the synthetic model layer count (use 1 for a low-memory smoke run).",
     )
     result.add_argument("--seed", type=int, default=42)
@@ -201,6 +216,7 @@ def main() -> None:
                 "VLLM_PLUGINS",
                 "MIN_FA3_DCP_BACKEND",
                 "VLLM_USE_FLASHINFER_SAMPLER",
+                "VLLM_MOE_ROUTING_SIMULATION_STRATEGY",
             )
             or key.startswith("MEGA_DCP_")
         }

@@ -35,6 +35,7 @@ from dcp_mega_metadata import (
     MEGA_COMPUTE_WARPS,
     METADATA_HEADER_INTS,
     build_dcp_mega_metadata,
+    build_packed_dcp_mega_metadata,
     pack_dcp_mega_metadata,
 )
 
@@ -2540,6 +2541,8 @@ class DCPMegaAttentionRunner:
             len(self.PHASE_TIMESTAMP_NAMES), dtype=torch.int64, **cuda
         )
         self._graph_post_phase = torch.empty(1, dtype=torch.int32, **cuda)
+        self._graph_metadata_payload: bytes | None = None
+        self._graph_metadata_host: torch.Tensor | None = None
 
         self._enqueue_lock = threading.Lock()
         self._completion_event = torch.cuda.Event()
@@ -2556,6 +2559,7 @@ class DCPMegaAttentionRunner:
         self._last_replay: _DCPMegaReplay | None = None
         self._replay_pending: _DCPMegaReplayPending | None = None
         self._active_graph: DCPMegaAttentionCUDAGraph | None = None
+        self._external_graph_mode = False
 
         # The arenas must be visibly initialized before any subgroup starts a
         # forward. This is construction-time synchronization, not hot-path work.
@@ -2672,6 +2676,8 @@ class DCPMegaAttentionRunner:
         reorder_history_override: bool | None = None,
         return_lse: bool = False,
     ) -> _DCPResult:
+        if self._external_graph_mode:
+            raise RuntimeError("use prepared forwards after entering external graph mode")
         if self._closed:
             raise RuntimeError("DCPMegaAttentionRunner is closed")
         if self._active_graph is not None:
@@ -2923,49 +2929,11 @@ class DCPMegaAttentionRunner:
                     "the installed _min_fa3_op extension does not contain the DCP mega "
                     "backend; rebuild the extension"
                 )
-            backend_args = (
-                q_local,
-                k_history_local,
-                v_history_local,
-                k_chunk,
-                v_chunk,
-                cu_seqlens_q,
-                cu_seqlens_history_local,
-                int(max_seqlen_q),
-                int(max_seqlen_history_local),
-                self._ipc_q,
-                self._ipc_history_send_o,
-                self._ipc_history_send_lse,
-                self._ipc_tile_ready,
-                self._ipc_barrier,
-                self._q_group,
-                self._chunk_o,
-                self._chunk_lse,
-                self._history_o,
-                self._history_lse,
-                self._history_receive_o,
-                self._history_receive_lse,
-                self._chunk_o_partial,
-                self._chunk_lse_partial,
-                self._history_o_partial,
-                self._history_lse_partial,
-                output,
-                output_lse,
-                metadata_host,
-                self._metadata_device,
-                metadata_used,
-                self._q_ready,
-                self._attention_done,
-                self._publish_ready,
-                self._receive_ready,
-                self._queue_state,
-                self._phase_timestamps,
-                self._graph_post_phase,
-                self.record_phase_timestamps,
-                list(self.dcp_node_ranks),
-                self.rank,
-                self.num_comm_sm,
-                bool(return_lse),
+            backend_args = self._backend_args(
+                q_local, k_history_local, v_history_local, k_chunk, v_chunk,
+                cu_seqlens_q, cu_seqlens_history_local, max_seqlen_q,
+                max_seqlen_history_local, output, output_lse, metadata_host,
+                metadata_used, return_lse,
             )
             try:
                 backend(*backend_args)
@@ -2992,6 +2960,130 @@ class DCPMegaAttentionRunner:
             self._enqueue_lock.release()
 
     forward_chunk_prefill_varlen_dcp_mega = forward_chunk_prefill_varlen
+
+    def _backend_args(
+        self, q_local, k_history_local, v_history_local, k_chunk, v_chunk,
+        cu_seqlens_q, cu_seqlens_history_local, max_seqlen_q,
+        max_seqlen_history_local, output, output_lse, metadata_host,
+        metadata_used, return_lse,
+    ):
+        return (
+            q_local,
+            k_history_local,
+            v_history_local,
+            k_chunk,
+            v_chunk,
+            cu_seqlens_q,
+            cu_seqlens_history_local,
+            int(max_seqlen_q),
+            int(max_seqlen_history_local),
+            self._ipc_q,
+            self._ipc_history_send_o,
+            self._ipc_history_send_lse,
+            self._ipc_tile_ready,
+            self._ipc_barrier,
+            self._q_group,
+            self._chunk_o,
+            self._chunk_lse,
+            self._history_o,
+            self._history_lse,
+            self._history_receive_o,
+            self._history_receive_lse,
+            self._chunk_o_partial,
+            self._chunk_lse_partial,
+            self._history_o_partial,
+            self._history_lse_partial,
+            output,
+            output_lse,
+            metadata_host,
+            self._metadata_device,
+            metadata_used,
+            self._q_ready,
+            self._attention_done,
+            self._publish_ready,
+            self._receive_ready,
+            self._queue_state,
+            self._phase_timestamps,
+            self._graph_post_phase,
+            self.record_phase_timestamps,
+            list(self.dcp_node_ranks),
+            self.rank,
+            self.num_comm_sm,
+            bool(return_lse),
+        )
+
+    def prepare_graph_forward(
+        self, q_local, k_history_local, v_history_local, k_chunk, v_chunk,
+        cu_seqlens_q, cu_seqlens_history_local, *,
+        cu_seqlens_q_host, cu_seqlens_history_local_host,
+        scheduler_heuristic=None, reorder_history_override=None,
+        return_lse=False,
+    ):
+        """Prepare a serving batch outside an externally owned CUDA Graph.
+
+        Tensor shapes describe capacities and stay fixed within each graph.
+        CPU offsets describe the actual batch. All graphs of this runner share
+        its device metadata/workspace and must execute serially on one stream.
+        Call this before each replay, then capture/run ``forward_prepared_graph``
+        with the returned arguments. BlockN is fixed (128 unless overridden);
+        per-sequence splits and task order remain dynamic.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("prepare_graph_forward must run outside capture")
+        if self._closed or self._active_graph is not None:
+            raise RuntimeError("runner is closed or owns a standalone graph")
+        if not self._external_graph_mode:
+            self._graph_post_phase.fill_(self._phase)
+            self._external_graph_mode = True
+        q_offsets = self._host_offsets(cu_seqlens_q_host, "cu_seqlens_q_host")
+        history_offsets = self._host_offsets(
+            cu_seqlens_history_local_host, "cu_seqlens_history_local_host"
+        )
+        if q_offsets[-1] > q_local.shape[0] or history_offsets[-1] > k_history_local.shape[0]:
+            raise ValueError("actual batch exceeds graph input capacity")
+        dispatch, payload = build_packed_dcp_mega_metadata(
+            q_offsets, history_offsets, hq_local=self.Hq_local,
+            dcp_size=self.world_size, num_sms=self.num_sms,
+            num_comm_sm=self.num_comm_sm, requested_num_splits=0,
+            block_n_override=self.block_n_override or 128,
+            max_num_splits=self.max_num_splits,
+            scheduler_heuristic=scheduler_heuristic,
+            reorder_history_override=reorder_history_override,
+            pre_phase=1, post_phase=2, capacity=self._metadata_capacity,
+        )
+        payload_bytes = payload.tobytes()
+        if payload_bytes != self._graph_metadata_payload:
+            # Read the packed int32 buffer directly instead of converting each
+            # Python integer. Never mutate a pinned source still used by DMA.
+            self._graph_metadata_host = torch.frombuffer(
+                payload, dtype=torch.int32
+            ).pin_memory()
+            self._graph_metadata_payload = payload_bytes
+        metadata_host = self._graph_metadata_host
+        # Equal payloads may share an immutable pinned source across replays.
+        # Changed payloads own a fresh source retained by PyTorch through DMA.
+        self._metadata_device[:len(payload)].copy_(metadata_host, non_blocking=True)
+        self._last_dispatch = dispatch
+        total_q = q_local.shape[0]
+        return self._backend_args(
+            q_local, k_history_local, v_history_local, k_chunk, v_chunk,
+            cu_seqlens_q, cu_seqlens_history_local,
+            q_local.shape[0], k_history_local.shape[0],
+            self._output[:total_q], self._output_lse[:, :total_q],
+            metadata_host, len(payload), return_lse,
+        )
+
+    def forward_prepared_graph(self, backend_args):
+        """Enqueue a prepared forward, including inside a full model capture.
+
+        Keep backend_args alive for the graph lifetime. Use this path for both
+        warmup and replay so every invocation advances the same device phase.
+        """
+        min_fa3_op.forward_chunk_prefill_varlen_dcp_mega(
+            *backend_args, True, 0, True, True, False, True, True
+        )
+        output, lse = backend_args[25:27]
+        return (output, lse) if backend_args[-1] else output
 
     def capture_last_forward(
         self,
@@ -3193,6 +3285,8 @@ class DCPMegaAttentionRunner:
             raise RuntimeError("close the active DCP mega CUDA Graph before the runner")
         if self._replay_pending is not None:
             raise RuntimeError("cannot close DCP mega runner with a pending replay")
+        if self._external_graph_mode:
+            torch.cuda.synchronize(self.device)
         if self._has_completion:
             self._completion_event.synchronize()
         for used, event in zip(self._metadata_slot_used, self._metadata_slot_events):

@@ -113,7 +113,6 @@ def validate_service_config(vllm_config: Any) -> None:
     parallel = vllm_config.parallel_config
     scheduler = vllm_config.scheduler_config
     cache = vllm_config.cache_config
-    compilation = vllm_config.compilation_config
 
     q_heads = (
         model.get_num_attention_heads(parallel) * parallel.tensor_parallel_size
@@ -132,11 +131,13 @@ def validate_service_config(vllm_config: Any) -> None:
         errors.append(f"head size must be 128, got {head_size}")
     if str(dtype) != "torch.bfloat16":
         errors.append(f"model dtype must be torch.bfloat16, got {dtype}")
-    if parallel.tensor_parallel_size != 8:
+    if parallel.tensor_parallel_size not in (4, 8):
         errors.append(
-            f"tensor parallel size must be 8, got {parallel.tensor_parallel_size}"
+            f"tensor parallel size must be 4 or 8, got {parallel.tensor_parallel_size}"
         )
-    expected_dcp = 8 // kv_heads if kv_heads in SUPPORTED_KV_HEADS else 0
+    expected_dcp = parallel.tensor_parallel_size // kv_heads if kv_heads in SUPPORTED_KV_HEADS else 0
+    if expected_dcp not in (2, 4, 8):
+        errors.append("DCP size must be 2, 4, or 8")
     if parallel.decode_context_parallel_size != expected_dcp:
         errors.append(
             "decode context parallel size must equal TP / global KV heads "
@@ -146,8 +147,8 @@ def validate_service_config(vllm_config: Any) -> None:
         errors.append("cp_kv_cache_interleave_size must be 1")
     if parallel.use_ubatching:
         errors.append("dual-batch overlap and microbatching are unsupported")
-    if model.get_num_attention_heads(parallel) != 4:
-        errors.append("each rank must own exactly 4 query heads")
+    if model.get_num_attention_heads(parallel) not in (4, 8):
+        errors.append("each rank must own 4 or 8 query heads")
     if model.get_num_kv_heads(parallel) != 1:
         errors.append("each rank must own exactly one KV head")
     if scheduler.max_num_seqs > 64:
@@ -158,8 +159,6 @@ def validate_service_config(vllm_config: Any) -> None:
         errors.append("chunked prefill must be enabled")
     if cache.enable_prefix_caching:
         errors.append("prefix caching must be disabled")
-    if compilation.cudagraph_mode.has_full_cudagraphs():
-        errors.append("Mega DCP must run in eager mode")
     if vllm_config.speculative_config is not None:
         errors.append("speculative decoding is unsupported")
     if errors:

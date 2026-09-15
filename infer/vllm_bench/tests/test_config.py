@@ -20,12 +20,13 @@ class ServiceConfigTest(unittest.TestCase):
         return Namespace(
             backend=backend,
             kv_heads=kv_heads,
+            tp_size=8,
             host="127.0.0.1",
             port=8000,
             served_model_name="dummy",
             gpu_memory_utilization=0.9,
             kv_cache_memory_bytes=None,
-            num_hidden_layers=32,
+            num_hidden_layers=48,
             seed=42,
             fill_mean=0.015,
             mega_max_total_q=4096,
@@ -35,15 +36,23 @@ class ServiceConfigTest(unittest.TestCase):
             dry_run=True,
         )
 
-    def test_model_configs_keep_llama_shape_and_change_kvh(self) -> None:
+    def test_model_configs_keep_qwen3_moe_shape_and_change_kvh(self) -> None:
         for kv_heads in (1, 2, 4):
             config = json.loads((model_dir(kv_heads) / "config.json").read_text())
-            self.assertEqual(config["hidden_size"], 4096)
-            self.assertEqual(config["num_hidden_layers"], 32)
+            self.assertEqual(config["hidden_size"], 2048)
+            self.assertEqual(config["num_hidden_layers"], 48)
             self.assertEqual(config["num_attention_heads"], 32)
             self.assertEqual(config["num_key_value_heads"], kv_heads)
             self.assertEqual(config["max_position_embeddings"], 131072)
-            self.assertEqual(4096 // 32, 128)
+            self.assertEqual(config["head_dim"], 128)
+            self.assertEqual(config["architectures"], ["Qwen3MoeForCausalLM"])
+            self.assertEqual(config["num_experts"], 128)
+            self.assertEqual(config["num_experts_per_tok"], 8)
+            self.assertEqual(config["moe_intermediate_size"], 768)
+            self.assertEqual(config["rope_scaling"], {
+                "rope_type": "yarn", "factor": 4.0,
+                "original_max_position_embeddings": 32768,
+            })
             self.assertEqual(dcp_size(kv_heads), 8 // kv_heads)
 
     def test_backend_selector_changes_only_attention_path(self) -> None:
@@ -55,15 +64,21 @@ class ServiceConfigTest(unittest.TestCase):
             )
         common_flags = [
             "--tensor-parallel-size",
+            "--enable-expert-parallel",
             "--decode-context-parallel-size",
             "--max-num-batched-tokens",
-            "--enforce-eager",
+            "--compilation-config",
+            "--cudagraph-metrics",
             "--no-enable-flashinfer-autotune",
             "--no-enable-prefix-caching",
         ]
         for flag in common_flags:
             self.assertTrue(all(flag in command for command in commands.values()))
         for backend, command in commands.items():
+            self.assertNotIn("--enforce-eager", command)
+            compilation = json.loads(command[command.index("--compilation-config") + 1])
+            self.assertEqual(compilation["cudagraph_mode"], "FULL")
+            self.assertEqual(max(compilation["cudagraph_capture_sizes"]), 4096)
             self.assertIn("CUSTOM", command)
             self.assertNotIn("FLASH_ATTN", command)
             self.assertEqual(
@@ -72,6 +87,7 @@ class ServiceConfigTest(unittest.TestCase):
             self.assertEqual(
                 environments[backend]["VLLM_USE_FLASHINFER_SAMPLER"], "0"
             )
+            self.assertEqual(environments[backend]["VLLM_MOE_SKIP_PADDING"], "0")
             self.assertEqual(
                 environments[backend]["MEGA_DCP_SCHEDULER_HEURISTIC"],
                 "0" if backend == "mega-fa3-native" else "auto",
@@ -80,11 +96,21 @@ class ServiceConfigTest(unittest.TestCase):
                 environments[backend]["MEGA_DCP_MAX_NUM_SPLITS"], "128"
             )
             self.assertIn("--hf-overrides", command)
-            self.assertIn('{"num_hidden_layers":32}', command)
+            self.assertIn('{"num_hidden_layers":48}', command)
             self.assertIn(
                 str(Path(__file__).resolve().parents[3] / "infer/vllm_plugin/src"),
                 environments[backend]["PYTHONPATH"],
             )
+
+    def test_four_gpu_smoke_topology(self) -> None:
+        args = self._args("mega")
+        args.tp_size = 4
+        _, command = build_serve_command(args)
+        self.assertEqual(command[command.index("--tensor-parallel-size") + 1], "4")
+        self.assertEqual(command[command.index("--decode-context-parallel-size") + 1], "4")
+        args.kv_heads = 4
+        with self.assertRaisesRegex(ValueError, "DCP"):
+            build_serve_command(args)
 
     def test_explicit_kv_cache_size_is_forwarded(self) -> None:
         args = self._args("mega")
@@ -105,6 +131,16 @@ class ServiceConfigTest(unittest.TestCase):
         _, command = build_serve_command(args)
         index = command.index("--port")
         self.assertEqual(command[index + 1], "18000")
+
+    def test_balanced_routing_default_and_original_routing_override(self) -> None:
+        key = "VLLM_MOE_ROUTING_SIMULATION_STRATEGY"
+        for backend in BACKENDS:
+            with patch.dict(os.environ, {}, clear=True):
+                env, _ = build_serve_command(self._args(backend))
+            self.assertEqual(env[key], "min_fa3_balanced")
+            with patch.dict(os.environ, {key: ""}):
+                env, _ = build_serve_command(self._args(backend))
+            self.assertEqual(env[key], "")
 
     def test_dry_run_does_not_print_inherited_environment(self) -> None:
         output = StringIO()
@@ -255,11 +291,15 @@ class PluginPureConfigTest(unittest.TestCase):
             cache_config=SimpleNamespace(enable_prefix_caching=False),
             compilation_config=SimpleNamespace(
                 cudagraph_mode=SimpleNamespace(
-                    has_full_cudagraphs=lambda: False
+                    has_full_cudagraphs=lambda: True
                 )
             ),
             speculative_config=None,
         )
+        validate_service_config(config)
+        parallel.tensor_parallel_size = 4
+        parallel.decode_context_parallel_size = 4
+        model.get_num_attention_heads = lambda config: 8
         validate_service_config(config)
 
 

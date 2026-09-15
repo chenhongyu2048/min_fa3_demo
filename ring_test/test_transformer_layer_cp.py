@@ -8,6 +8,7 @@ import unittest
 import weakref
 from contextlib import ExitStack
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, patch
 
 import torch
@@ -20,6 +21,8 @@ from ring_test.transformer_layer_cp import (
     SmConfig,
     _MegaRingAdapter,
     _RunnerAdapter,
+    _empty_qkv,
+    _uniform_topk_routing,
     build_physical_layout,
     explicit_cp_attention,
     parse_methods,
@@ -85,6 +88,100 @@ class _CPUMegaRingAdapter(_FakeAdapter):
 
 
 class TransformerLayerCPTest(unittest.TestCase):
+    def test_uniform_routing_balances_experts_and_ep_destinations(self) -> None:
+        router = SimpleNamespace(config=SimpleNamespace(num_moe_experts=128), topk=8)
+        for tokens in (1, 15, 16, 17, 2048):
+            with self.subTest(tokens=tokens):
+                logits = torch.randn(tokens, 1, 128)
+                probs, route = _uniform_topk_routing(router, logits)
+                self.assertTrue(torch.all(route.sum(dim=1) == 8))
+                counts = route.sum(dim=0)
+                self.assertLessEqual(int(counts.max() - counts.min()), 1)
+                for ep in (4, 8):
+                    destinations = route.reshape(tokens, ep, 128 // ep).sum(dim=2)
+                    self.assertTrue(torch.all(destinations == 8 // ep))
+                torch.testing.assert_close(probs.sum(dim=1), torch.ones(tokens))
+                self.assertTrue(torch.all(probs[~route] == 0))
+                biased_logits = logits.clone()
+                biased_logits[..., :8] += 1000
+                _, biased_route = _uniform_topk_routing(router, biased_logits)
+                self.assertTrue(torch.equal(route, biased_route))
+
+    def test_uniform_routing_preserves_selected_logits_gradients(self) -> None:
+        router = SimpleNamespace(config=SimpleNamespace(num_moe_experts=128), topk=8)
+        hidden = torch.randn(17, 12, requires_grad=True)
+        gate = torch.randn(128, 12, requires_grad=True)
+        logits = hidden @ gate.T
+        logits.retain_grad()
+        probs, route = _uniform_topk_routing(router, logits)
+        expert_outputs = torch.randn_like(probs)
+        (probs * expert_outputs).sum().backward()
+        expected = probs * (expert_outputs - (probs * expert_outputs).sum(dim=1, keepdim=True))
+        torch.testing.assert_close(logits.grad, expected)
+        self.assertTrue(torch.all(logits.grad[~route] == 0))
+        for tensor in (hidden, gate):
+            self.assertTrue(torch.isfinite(tensor.grad).all())
+            self.assertGreater(float(tensor.grad.abs().sum()), 0)
+
+    def test_core_timing_waits_for_all_qkv_gradients(self) -> None:
+        events: list[str] = []
+
+        class Event:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def record(self) -> None:
+                events.append(self.name)
+
+            def elapsed_time(self, end: Any) -> float:
+                return float(events.index(end.name) - events.index(self.name))
+
+        class Core(torch.nn.Module):
+            def forward(self, q, k, v):
+                return q.square() + k.pow(3) + v.pow(4)
+
+        core = Core()
+        q, k, v = [torch.randn(3, 2, requires_grad=True) for _ in range(3)]
+        for name, tensor in zip(("dq", "dk", "dv"), (q, k, v)):
+            tensor.register_hook(lambda grad, name=name: events.append(name))
+        probe = benchmark.CoreAttentionTimingProbe(core)
+        try:
+            # Reuse the same inputs to catch accumulated timing hooks.
+            for _ in range(2):
+                events.clear()
+                for tensor in (q, k, v):
+                    tensor.grad = None
+                with patch.object(torch.cuda, "Event", side_effect=[
+                    Event("forward_start"), Event("forward_end"),
+                    Event("backward_start"), Event("backward_end"),
+                ]):
+                    probe.begin()
+                    out = core(q, k, v)
+                    out.sum().backward()
+                    forward_ms, backward_ms = probe.finish()
+                self.assertEqual(events[:3], [
+                    "forward_start", "forward_end", "backward_start"
+                ])
+                self.assertCountEqual(events[3:-1], ["dq", "dk", "dv"])
+                self.assertEqual(events[-1], "backward_end")
+                self.assertGreater(forward_ms, 0)
+                self.assertGreater(backward_ms, 0)
+                torch.testing.assert_close(q.grad, 2 * q)
+                torch.testing.assert_close(k.grad, 3 * k.square())
+                torch.testing.assert_close(v.grad, 4 * v.pow(3))
+        finally:
+            probe.close()
+
+    def test_qwen_inputs_keep_attention_width_independent_of_hidden_size(self) -> None:
+        hidden, dout = benchmark._make_inputs(8, torch.device("cpu"), 0)
+        q, k, v, attention_dout = _empty_qkv(8, torch.device("cpu"))
+        self.assertEqual(hidden.shape, (8, 1, 2048))
+        self.assertEqual(dout.shape, hidden.shape)
+        self.assertEqual(q.shape, (8, 32, 128))
+        self.assertEqual(k.shape, (8, 4, 128))
+        self.assertEqual(v.shape, k.shape)
+        self.assertEqual(attention_dout.shape, q.shape)
+
     def test_runner_with_cached_output_views_is_released(self) -> None:
         runner = _CachedOutputRunner()
         adapter = _RunnerAdapter(runner, True)
@@ -186,8 +283,8 @@ class TransformerLayerCPTest(unittest.TestCase):
         self.assertEqual(selected.forward_ms, 10.0)
         self.assertEqual(selected.backward_ms, 8.0)
         self.assertEqual(selected.forward_ms + selected.backward_ms, 18.0)
-        self.assertEqual(selected.self_attn_forward_ms, 6.0)
-        self.assertEqual(selected.self_attn_backward_ms, 5.0)
+        self.assertEqual(selected.core_attn_forward_ms, 6.0)
+        self.assertEqual(selected.core_attn_backward_ms, 5.0)
         self.assertEqual(selected.wall_max_ms, 22.0)
 
     def test_half_selectors_become_reusable_integer_rows(self) -> None:

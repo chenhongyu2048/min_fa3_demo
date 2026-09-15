@@ -233,7 +233,7 @@ public:
 
         SharedStorage& shared_storage
             = *reinterpret_cast<SharedStorage*>(smem_buf);
-        auto const& scheduler_params = params.chunk.scheduler;
+        auto const scheduler_params = params.chunk.scheduler.resolve();
 
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();

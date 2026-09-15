@@ -41,6 +41,7 @@ KV_CACHE_MEMORY_BYTES=${KV_CACHE_MEMORY_BYTES:-1073741824}
 MEGA_NUM_COMM_SMS=${MEGA_NUM_COMM_SMS:-"4,8,12,16,20"}
 MEGA_MAX_NUM_SPLITS=${MEGA_MAX_NUM_SPLITS:-128}
 PORT=${PORT:-18000}
+TP_SIZE=${TP_SIZE:-8}
 
 mkdir -p "$(dirname -- "$WORKLOAD")" "$RESULT_DIR"
 "$PYTHON" -m vllm_bench.workload \
@@ -54,6 +55,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7} \
         --workload "$WORKLOAD" \
         --result-dir "$RESULT_DIR" \
         --port "$PORT" \
+        --tp-size "$TP_SIZE" \
         --kv-heads 1 \
         --mega-num-comm-sms "$MEGA_NUM_COMM_SMS" \
         --mega-max-num-splits "$MEGA_MAX_NUM_SPLITS" \

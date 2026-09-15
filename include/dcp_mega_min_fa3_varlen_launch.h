@@ -290,6 +290,64 @@ struct DCPMegaKernelConfig {
         int32_t* queue_state = nullptr;
         uint64_t* phase_timestamps = nullptr;
         int32_t const* graph_post_phase = nullptr;
+        // Serving graphs reuse their launch while the device task image changes.
+        int32_t const* dynamic_metadata = nullptr;
+        CUTLASS_DEVICE QTaskDesc const* get_q_tasks() const {
+            return dynamic_metadata == nullptr ? q_tasks
+                : reinterpret_cast<QTaskDesc const*>(dynamic_metadata
+                    + reinterpret_cast<MetadataHeader const*>(dynamic_metadata)->q_tasks_offset);
+        }
+        CUTLASS_DEVICE PublishWorkDesc const* get_publish() const {
+            return dynamic_metadata == nullptr ? publish
+                : reinterpret_cast<PublishWorkDesc const*>(dynamic_metadata
+                    + reinterpret_cast<MetadataHeader const*>(dynamic_metadata)->publish_offset);
+        }
+        CUTLASS_DEVICE HistoryCombineWorkDesc const* get_history_combine() const {
+            return dynamic_metadata == nullptr ? history_combine
+                : reinterpret_cast<HistoryCombineWorkDesc const*>(dynamic_metadata
+                    + reinterpret_cast<MetadataHeader const*>(dynamic_metadata)->history_combine_offset);
+        }
+        CUTLASS_DEVICE FinalWorkDesc const* get_final() const {
+            return dynamic_metadata == nullptr ? final
+                : reinterpret_cast<FinalWorkDesc const*>(dynamic_metadata
+                    + reinterpret_cast<MetadataHeader const*>(dynamic_metadata)->final_offset);
+        }
+        CUTLASS_DEVICE int32_t const* get_publish_dependencies() const {
+            return dynamic_metadata == nullptr ? publish_dependencies
+                : reinterpret_cast<int32_t const*>(dynamic_metadata
+                    + reinterpret_cast<MetadataHeader const*>(dynamic_metadata)->publish_dependencies_offset);
+        }
+        CUTLASS_DEVICE int32_t const* get_final_dependencies() const {
+            return dynamic_metadata == nullptr ? final_dependencies
+                : reinterpret_cast<int32_t const*>(dynamic_metadata
+                    + reinterpret_cast<MetadataHeader const*>(dynamic_metadata)->final_dependencies_offset);
+        }
+        CUTLASS_DEVICE int32_t const* get_chunk_sequence_splits() const {
+            return dynamic_metadata == nullptr ? chunk_sequence_splits
+                : reinterpret_cast<int32_t const*>(dynamic_metadata
+                    + reinterpret_cast<MetadataHeader const*>(dynamic_metadata)->chunk_splits_offset);
+        }
+        CUTLASS_DEVICE int get_num_q_tasks() const {
+            return dynamic_metadata == nullptr ? num_q_tasks
+                : reinterpret_cast<MetadataHeader const*>(dynamic_metadata)->q_task_count;
+        }
+        CUTLASS_DEVICE int get_history_combine_count() const {
+            return dynamic_metadata == nullptr ? history_combine_count
+                : reinterpret_cast<MetadataHeader const*>(dynamic_metadata)->history_combine_count;
+        }
+        CUTLASS_DEVICE int get_token_block_count() const {
+            return dynamic_metadata == nullptr ? token_block_count
+                : reinterpret_cast<MetadataHeader const*>(dynamic_metadata)->token_block_count;
+        }
+        CUTLASS_DEVICE int get_final_count() const {
+            return dynamic_metadata == nullptr ? final_count
+                : reinterpret_cast<MetadataHeader const*>(dynamic_metadata)->final_count;
+        }
+        CUTLASS_DEVICE int get_batch_size() const {
+            return dynamic_metadata == nullptr ? batch_size
+                : reinterpret_cast<MetadataHeader const*>(dynamic_metadata)->batch_size;
+        }
+
         int const* cu_seqlens_q = nullptr;
         int total_q = 0;
         int batch_size = 0;
@@ -359,9 +417,9 @@ CUTLASS_DEVICE void run_q_allgather(
     if (warp_id < Config::kNumCommChunks && kittens::laneid() == 0) {
         int const chunk = warp_id;
         for (int task_id = Config::kNumCommChunks * int(blockIdx.x) + chunk;
-             task_id < params.num_q_tasks;
+             task_id < params.get_num_q_tasks();
              task_id += Config::kNumCommChunks * params.num_comm_sm) {
-            QTaskDesc const task = params.q_tasks[task_id];
+            QTaskDesc const task = params.get_q_tasks()[task_id];
             kittens::wait(
                 shared.finished[chunk], kittens::get_phasebit<1>(phasebits, 0));
             kittens::update_phasebit<1>(phasebits, 0);
@@ -377,9 +435,9 @@ CUTLASS_DEVICE void run_q_allgather(
                && kittens::laneid() == 0) {
         int const chunk = warp_id - Config::kNumCommChunks;
         for (int task_id = Config::kNumCommChunks * int(blockIdx.x) + chunk;
-             task_id < params.num_q_tasks;
+             task_id < params.get_num_q_tasks();
              task_id += Config::kNumCommChunks * params.num_comm_sm) {
-            QTaskDesc const task = params.q_tasks[task_id];
+            QTaskDesc const task = params.get_q_tasks()[task_id];
             kittens::wait(
                 shared.arrived[chunk], kittens::get_phasebit<0>(phasebits, 0));
             kittens::update_phasebit<0>(phasebits, 0);
@@ -440,7 +498,7 @@ CUTLASS_DEVICE void complete_history_combine_task(
     int const lane = kittens::laneid();
     __syncwarp();
     if (lane == 0) {
-        PublishWorkDesc const publish = params.publish[work.publish_id];
+        PublishWorkDesc const publish = params.get_publish()[work.publish_id];
         int const previous = atomic_add_acq_rel_device_s32(
             params.publish_ready + work.publish_id, 1);
         if (previous == publish.combine_task_count - 1
@@ -645,20 +703,20 @@ CUTLASS_DEVICE void run_history_combine(
                 params.queue_state + kHistoryCombineCounter, 1);
         }
         ticket = __shfl_sync(0xffffffffu, ticket, 0);
-        if (ticket >= params.history_combine_count) {
+        if (ticket >= params.get_history_combine_count()) {
             break;
         }
-        HistoryCombineWorkDesc const work = params.history_combine[ticket];
+        HistoryCombineWorkDesc const work = params.get_history_combine()[ticket];
         if (lane == 0) {
             for (int dep = 0; dep < work.dependency_count; ++dep) {
-                int const completion_id = params.publish_dependencies[
+                int const completion_id = params.get_publish_dependencies()[
                     work.dependency_begin + dep];
                 min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
                     params.attention_done + completion_id, 1);
             }
         }
         __syncwarp();
-        PublishWorkDesc const publish = params.publish[work.publish_id];
+        PublishWorkDesc const publish = params.get_publish()[work.publish_id];
         if constexpr (Config::HistoryKernel::Split) {
             if (work.actual_splits > 1) {
                 int const vector = work.vector_begin;
@@ -704,7 +762,7 @@ CUTLASS_DEVICE int receive_task_id_from_pull_ordinal(
     int const source_ordinal
         = pull_ordinal - parent_ordinal * kReceiveSources;
     QTaskDesc const parent_q_task
-        = params.q_tasks[parent_ordinal * Config::kDCPSize];
+        = params.get_q_tasks()[parent_ordinal * Config::kDCPSize];
     int const parent_token_block = parent_q_task.token_begin / 16;
     return parent_token_block * kReceiveSources + source_ordinal;
 }
@@ -728,7 +786,7 @@ CUTLASS_DEVICE void run_communication_post_q(
     int const lane = kittens::laneid();
     constexpr int kReceiveSources = Config::kDCPSize - 1;
     int const total_receive_tasks
-        = params.token_block_count * kReceiveSources;
+        = params.get_token_block_count() * kReceiveSources;
     int const receive_stride = Config::kNumCommChunks * params.num_comm_sm;
     int const expected_phase = params.graph_post_phase != nullptr
         ? *params.graph_post_phase - 1 : params.tile_ready_phase;
@@ -825,9 +883,9 @@ CUTLASS_DEVICE void run_communication_post_q(
             int const source
                 = source_ordinal + (source_ordinal >= params.dcp_rank);
             int const publish_id
-                = params.dcp_rank * params.token_block_count
+                = params.dcp_rank * params.get_token_block_count()
                 + parent_token_block;
-            PublishWorkDesc const work = params.publish[publish_id];
+            PublishWorkDesc const work = params.get_publish()[publish_id];
             if (lane == 0) {
                 shared.receive_task_ids[chunk] = selected_task;
             }
@@ -875,9 +933,9 @@ CUTLASS_DEVICE void run_communication_post_q(
             int const source
                 = source_ordinal + (source_ordinal >= params.dcp_rank);
             int const publish_id
-                = params.dcp_rank * params.token_block_count
+                = params.dcp_rank * params.get_token_block_count()
                 + parent_token_block;
-            PublishWorkDesc const work = params.publish[publish_id];
+            PublishWorkDesc const work = params.get_publish()[publish_id];
             for (int vector_in_task = lane;
                  vector_in_task < work.valid_vectors;
                  vector_in_task += cutlass::NumThreadsPerWarp) {
@@ -914,7 +972,7 @@ CUTLASS_DEVICE void run_final_combine(
     typename Config::HelperSharedStorage& shared) {
     int const compute_cta_id = int(blockIdx.x) - params.num_comm_sm;
     int const num_compute_ctas = params.num_sms - params.num_comm_sm;
-    bool const static_schedule = params.final_count <= num_compute_ctas;
+    bool const static_schedule = params.get_final_count() <= num_compute_ctas;
     while (true) {
         int work_id;
         if (static_schedule) {
@@ -927,21 +985,21 @@ CUTLASS_DEVICE void run_final_combine(
             __syncthreads();
             work_id = shared.work_id;
         }
-        if (work_id >= params.final_count) {
+        if (work_id >= params.get_final_count()) {
             break;
         }
-        FinalWorkDesc const work = params.final[work_id];
+        FinalWorkDesc const work = params.get_final()[work_id];
         if (threadIdx.x == 0) {
             for (int dep = 0; dep < work.dependency_count; ++dep) {
-                int const completion_id = params.final_dependencies[
+                int const completion_id = params.get_final_dependencies()[
                     work.dependency_begin + dep];
                 min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
                     params.attention_done + completion_id, 1);
             }
             int const publish_id
-                = params.dcp_rank * params.token_block_count
+                = params.dcp_rank * params.get_token_block_count()
                 + work.parent_token_block;
-            PublishWorkDesc const publish = params.publish[publish_id];
+            PublishWorkDesc const publish = params.get_publish()[publish_id];
             min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
                 params.publish_ready + publish_id,
                 publish.combine_task_count);
@@ -971,7 +1029,7 @@ CUTLASS_DEVICE void run_final_combine(
                     int const token = vector / params.hq_local;
                     int const local_head = vector - token * params.hq_local;
                     int const batch = batch_for_token(
-                        token, params.cu_seqlens_q, params.batch_size);
+                        token, params.cu_seqlens_q, params.get_batch_size());
                     float owned_lse = -INFINITY;
                     if (lane < Config::kDCPSize) {
                         int const source = lane;
@@ -1024,7 +1082,7 @@ CUTLASS_DEVICE void run_final_combine(
                     }
 
                     int const chunk_splits = Config::ChunkKernel::Split
-                        ? params.chunk_sequence_splits[batch] : 1;
+                        ? params.get_chunk_sequence_splits()[batch] : 1;
                     for (int split = 0; split < chunk_splits; ++split) {
                         float state_lse;
                         if constexpr (Config::ChunkKernel::Split) {
@@ -1330,6 +1388,11 @@ void launch_dcp_mega_instance(
             params.num_sms,
             params.history_lse_head_stride);
 
+    if (params.dynamic_metadata) {
+        chunk_kernel_params.scheduler.dynamic_metadata = metadata;
+        history_kernel_params.scheduler.dynamic_metadata = metadata;
+    }
+
     uint64_t q_remote_ptrs[DCPSize]{};
     uint64_t history_remote_ptrs[DCPSize]{};
     #pragma unroll
@@ -1386,6 +1449,7 @@ void launch_dcp_mega_instance(
     kernel_params.queue_state = params.queue_state;
     kernel_params.phase_timestamps = params.phase_timestamps;
     kernel_params.graph_post_phase = params.graph_post_phase;
+    kernel_params.dynamic_metadata = params.dynamic_metadata ? metadata : nullptr;
     kernel_params.cu_seqlens_q = params.chunk.cu_seqlens_q;
     kernel_params.total_q = header.total_q;
     kernel_params.batch_size = header.batch_size;

@@ -35,6 +35,13 @@ def register() -> None:
         AttentionBackendEnum,
         register_backend,
     )
+    from .moe_compat import install_moe_compat
+
+    install_moe_compat()
+    if os.environ.get("VLLM_MOE_ROUTING_SIMULATION_STRATEGY") == "min_fa3_balanced":
+        from .balanced_routing import register_balanced_routing
+
+        register_balanced_routing()
 
     register_backend(
         AttentionBackendEnum.CUSTOM,

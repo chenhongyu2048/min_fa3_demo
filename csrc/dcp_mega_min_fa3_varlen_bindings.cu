@@ -373,7 +373,8 @@ double forward_chunk_prefill_varlen_dcp_mega(
     bool run_post_barrier,
     bool run_pre_barrier,
     bool measure_kernel,
-    bool graph_replay) {
+    bool graph_replay,
+    bool dynamic_metadata) {
     check_packed_bf16(q, "q");
     check_packed_bf16(k_history, "k_history");
     check_packed_bf16(v_history, "v_history");
@@ -530,15 +531,21 @@ double forward_chunk_prefill_varlen_dcp_mega(
                 "metadata_used exceeds host/device storage");
     MetadataHeader header{};
     std::memcpy(&header, metadata_host.data_ptr<int>(), sizeof(header));
+    TORCH_CHECK(!dynamic_metadata || (graph_replay && metadata_prepared),
+                "dynamic metadata requires prepared graph execution");
+    TORCH_CHECK(!dynamic_metadata
+                    || (header.total_q <= q.size(0)
+                        && header.batch_size < cu_seqlens_q.numel()),
+                "dynamic metadata exceeds captured input capacity");
     validate_metadata_header(
         header,
         metadata_used,
         std::min(metadata_host.numel(), metadata_device.numel()),
         q_ready.numel(),
         attention_done.numel(),
-        q.size(0),
-        total_vectors,
-        cu_seqlens_q.numel() - 1,
+        dynamic_metadata ? header.total_q : q.size(0),
+        dynamic_metadata ? header.total_vectors : total_vectors,
+        dynamic_metadata ? header.batch_size : cu_seqlens_q.numel() - 1,
         dcp_size);
     TORCH_CHECK(header.effective_num_splits <= chunk_o_partial.size(0)
                     && header.effective_num_splits <= history_o_partial.size(0),
@@ -550,6 +557,12 @@ double forward_chunk_prefill_varlen_dcp_mega(
     TORCH_CHECK(ipc_tile_ready.data_.numel()
                     >= int64_t(dcp_size) * header.token_block_count,
                 "tile-ready IPC arena is too small");
+
+    if (dynamic_metadata) {
+        header.split = 1;
+        header.effective_num_splits = chunk_o_partial.size(0);
+        header.history_num_splits = history_o_partial.size(0);
+    }
 
     int64_t const group_heads = dcp_size * q.size(1);
     TORCH_CHECK(q_group.size(0) == ipc_q.data_.size(0)
@@ -645,6 +658,7 @@ double forward_chunk_prefill_varlen_dcp_mega(
     params.final_lse_head_stride = final_lse.stride(0);
     params.metadata = metadata_device.data_ptr<int>();
     params.metadata_header = header;
+    params.dynamic_metadata = dynamic_metadata;
     params.q_ready = q_ready.data_ptr<int>();
     params.attention_done = attention_done.data_ptr<int>();
     params.publish_ready = publish_ready.data_ptr<int>();
@@ -699,16 +713,16 @@ double forward_chunk_prefill_varlen_dcp_mega(
     if (!metadata_prepared || graph_replay) {
         C10_CUDA_CHECK(cudaMemsetAsync(
             q_ready.data_ptr<int>(), 0,
-            header.q_ready_count * sizeof(int32_t), stream));
+            (dynamic_metadata ? q_ready.numel() : header.q_ready_count) * sizeof(int32_t), stream));
         C10_CUDA_CHECK(cudaMemsetAsync(
             attention_done.data_ptr<int>(), 0,
-            header.attention_count * sizeof(int32_t), stream));
+            (dynamic_metadata ? attention_done.numel() : header.attention_count) * sizeof(int32_t), stream));
         C10_CUDA_CHECK(cudaMemsetAsync(
             publish_ready.data_ptr<int>(), 0,
-            header.publish_count * sizeof(int32_t), stream));
+            (dynamic_metadata ? publish_ready.numel() : header.publish_count) * sizeof(int32_t), stream));
         C10_CUDA_CHECK(cudaMemsetAsync(
             receive_ready.data_ptr<int>(), 0,
-            header.receive_count * sizeof(int32_t), stream));
+            (dynamic_metadata ? receive_ready.numel() : header.receive_count) * sizeof(int32_t), stream));
         C10_CUDA_CHECK(cudaMemsetAsync(
             queue_state.data_ptr<int>(), 0, queue_state.nbytes(), stream));
         if (record_phase_timestamps) {
@@ -868,6 +882,7 @@ void bind_dcp_mega_varlen(py::module_& module) {
         py::arg("run_pre_barrier") = true,
         py::arg("measure_kernel") = false,
         py::arg("graph_replay") = false,
+        py::arg("dynamic_metadata") = false,
         "Persistent single-node SM90 BF16 D=128 batched varlen DCP mega forward.");
     module.def(
         "_dcp_mega_varlen_barrier",
