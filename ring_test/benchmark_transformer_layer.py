@@ -1029,12 +1029,15 @@ def _run(args: argparse.Namespace) -> None:
                     torch.cuda.empty_cache()
                     dist.barrier()
     finally:
-        dispatcher.set_adapter(None)
-        del layer
-        torch.cuda.empty_cache()
-        if dist.is_initialized():
-            dist.barrier()
-        _destroy_distributed_state()
+        # Let torchrun report the original failure and stop the other ranks.
+        # Cleanup collectives can mismatch operations still running on peers.
+        if sys.exc_info()[0] is None:
+            dispatcher.set_adapter(None)
+            del layer
+            torch.cuda.empty_cache()
+            if dist.is_initialized():
+                dist.barrier()
+            _destroy_distributed_state()
 
 
 def main(argv: Sequence[str] | None = None) -> None:

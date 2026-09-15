@@ -316,7 +316,8 @@ class _ExplicitCPAttention(torch.autograd.Function):
         adapter: ExplicitAttentionAdapter,
     ) -> torch.Tensor:
         ctx.adapter = adapter
-        return adapter.forward(q, k, v)
+        # Keep cached runner outputs out of the ctx -> adapter -> out -> ctx cycle.
+        return adapter.forward(q, k, v).detach()
 
     @staticmethod
     def backward(

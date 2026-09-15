@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import gc
+import sys
 import unittest
+import weakref
+from contextlib import ExitStack
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
+from ring_test import benchmark_transformer_layer as benchmark
 from ring_test.benchmark_transformer_layer import select_cuda_critical_rank_timing
 from ring_test.ring_common import get_half_index, selector_to_row_indices
 from ring_test.transformer_layer_cp import (
     METHOD_ORDER,
+    SmConfig,
+    _MegaRingAdapter,
+    _RunnerAdapter,
     build_physical_layout,
     explicit_cp_attention,
     parse_methods,
@@ -37,7 +47,129 @@ class _FakeAdapter:
         return 2 * dout, 3 * dout, 4 * dout
 
 
+class _CachedOutputRunner(_FakeAdapter):
+    def __init__(self) -> None:
+        self.out = torch.zeros(3, 2)
+        # Llama3 retains slices of its output in forward_out.
+        self.forward_out = [self.out[:1], self.out[1:]]
+
+    def bind_inputs(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
+        pass
+
+    def forward(self) -> torch.Tensor:
+        return self.out
+
+
+class _CPUMegaRingAdapter(_FakeAdapter):
+    """Exercise the real MegaRing forward wrapper with a CPU kernel stub."""
+
+    forward = _MegaRingAdapter.forward
+
+    def __init__(self) -> None:
+        self.out = torch.zeros(3, 2)
+        self.lse = torch.empty(0)
+        self.remote_k = SimpleNamespace(data_=None)
+        self.remote_v = SimpleNamespace(data_=None)
+        self.cu = self.cu_host = None
+        self.global_host = self.ring_sizes_host = self.ring_starts_host = None
+        self.max_local_len = 3
+        self.sm_config = SmConfig(1, 1)
+        self.op = SimpleNamespace(
+            forward_varlen_mega_ring=lambda *args, **kwargs: (
+                kwargs["out"], kwargs["lse"]
+            )
+        )
+
+    def _populate_kv(self, k: torch.Tensor, v: torch.Tensor) -> None:
+        pass
+
+
 class TransformerLayerCPTest(unittest.TestCase):
+    def test_runner_with_cached_output_views_is_released(self) -> None:
+        runner = _CachedOutputRunner()
+        adapter = _RunnerAdapter(runner, True)
+        runner_ref, adapter_ref = weakref.ref(runner), weakref.ref(adapter)
+        for _ in range(2):
+            q, k, v = [torch.randn(3, 2, requires_grad=True) for _ in range(3)]
+            out = explicit_cp_attention(q, k, v, adapter)
+            self.assertEqual(out.data_ptr(), runner.out.data_ptr())
+            out.backward(torch.ones_like(out))
+            torch.testing.assert_close(q.grad, torch.full_like(q, 2.0))
+            torch.testing.assert_close(k.grad, torch.full_like(k, 3.0))
+            torch.testing.assert_close(v.grad, torch.full_like(v, 4.0))
+            del out, q, k, v
+        del adapter, runner
+        self.assertIsNone(adapter_ref())
+        self.assertIsNone(runner_ref())
+
+    def test_run_preserves_error_without_cleanup_collectives(self) -> None:
+        args = benchmark.parse_args([
+            "--dataset", "arxiv", "--output-jsonl", "unused.jsonl",
+            "--methods", "llama3_allgather_attention",
+        ])
+        cp = SimpleNamespace(
+            MEGA_RING_METHODS=frozenset(),
+            build_megatron_layer=Mock(),
+            build_physical_layout=Mock(),
+            make_packed_seq_params=Mock(),
+            parse_methods=lambda spec: spec.split(","),
+            prepare_method=Mock(side_effect=ValueError("original failure")),
+        )
+        modules = {
+            "transformer_layer_cp": cp,
+            "baseline.megatron_hybrid_cp": SimpleNamespace(
+                create_hybrid_cp_process_groups=Mock()
+            ),
+            "megatron.core": SimpleNamespace(parallel_state=Mock()),
+        }
+        setup_results = {
+            "_init_distributed": (1, 8, torch.device("cpu")),
+            "_collect_device_inventory": [],
+            "_resolve_sm_configs_collectively": [],
+            "_preflight": ("min_fa3", {}),
+            "_initialize_megatron": None,
+            "_all_rank_preflight": None,
+            "_broadcast_cases": [benchmark.Case(0, (2048,), (8,), (0,))],
+        }
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(sys.modules, modules))
+            stack.enter_context(patch.dict("os.environ", {"LOCAL_RANK": "1"}))
+            for name, result in setup_results.items():
+                stack.enter_context(patch.object(benchmark, name, return_value=result))
+            stack.enter_context(patch.object(benchmark.dist, "broadcast_object_list"))
+            stack.enter_context(patch.object(benchmark.dist, "is_initialized", return_value=True))
+            barrier = stack.enter_context(patch.object(
+                benchmark.dist, "barrier", side_effect=RuntimeError("cleanup barrier")
+            ))
+            empty_cache = stack.enter_context(patch.object(torch.cuda, "empty_cache"))
+            destroy = stack.enter_context(patch.object(benchmark, "_destroy_distributed_state"))
+            with self.assertRaisesRegex(ValueError, "original failure"):
+                benchmark._run(args)
+            barrier.assert_not_called()
+            empty_cache.assert_not_called()
+            destroy.assert_not_called()
+
+    def test_mega_ring_output_reuse_releases_adapter_without_gc(self) -> None:
+        gc_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            adapter = _CPUMegaRingAdapter()
+            adapter_ref = weakref.ref(adapter)
+            for _ in range(2):
+                q, k, v = [torch.randn(3, 2, requires_grad=True) for _ in range(3)]
+                out = explicit_cp_attention(q, k, v, adapter)
+                self.assertEqual(out.data_ptr(), adapter.out.data_ptr())
+                out.backward(torch.ones_like(out))
+                torch.testing.assert_close(q.grad, torch.full_like(q, 2.0))
+                torch.testing.assert_close(k.grad, torch.full_like(k, 3.0))
+                torch.testing.assert_close(v.grad, torch.full_like(v, 4.0))
+                del out, q, k, v
+            del adapter
+            self.assertIsNone(adapter_ref())
+        finally:
+            if gc_enabled:
+                gc.enable()
+
     def test_cuda_timing_uses_one_critical_rank(self) -> None:
         # Independent FWD/BWD maxima are rank 0/rank 1, but rank 1 has the
         # maximum total CUDA path. Both reported components must come from it.
