@@ -1,4 +1,4 @@
-// Public declaration for the causal W8 forward ablation launcher. Kernel
+// Public declaration for the causal CP4/CP8 forward ablation launcher. Kernel
 // definitions remain private to csrc/mega_ring_forward_ablation.cu.
 
 #pragma once
@@ -30,7 +30,8 @@ void run(
     Profile profile,
     int completed_storage_size,
     cudaStream_t stream,
-    bool prepare_only);
+    bool prepare_only,
+    bool compute_only);
 
 }  // namespace forward_ablation
 }  // namespace min_fa3_varlen_demo

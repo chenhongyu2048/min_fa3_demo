@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import threading
 from contextlib import nullcontext
+from functools import partial
 from dataclasses import asdict, dataclass
 from typing import Callable, Iterable, Optional, Protocol, Sequence, Tuple, Union
 
@@ -2281,6 +2282,7 @@ class DCPMegaAttentionRunner:
         num_comm_sm: int = 8,
         block_n_override: Optional[int] = None,
         record_phase_timestamps: bool = False,
+        record_cta_trace: bool = False,
     ) -> None:
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError(
@@ -2370,6 +2372,7 @@ class DCPMegaAttentionRunner:
         self.num_comm_sm = num_comm_sm
         self.block_n_override = block_n_override
         self.record_phase_timestamps = bool(record_phase_timestamps)
+        self.record_cta_trace = bool(record_cta_trace)
         self.num_sms = props.multi_processor_count
         self._padded_total_q = ((max_total_q + 15) // 16) * 16
         self._max_token_blocks = self._padded_total_q // 16
@@ -2541,6 +2544,10 @@ class DCPMegaAttentionRunner:
             len(self.PHASE_TIMESTAMP_NAMES), dtype=torch.int64, **cuda
         )
         self._graph_post_phase = torch.empty(1, dtype=torch.int32, **cuda)
+        self._cta_trace = (
+            torch.zeros((self.num_sms * 5, 5), dtype=torch.int64, device=self.device)
+            if self.record_cta_trace else None
+        )
         self._graph_metadata_payload: bytes | None = None
         self._graph_metadata_host: torch.Tensor | None = None
 
@@ -2929,6 +2936,8 @@ class DCPMegaAttentionRunner:
                     "the installed _min_fa3_op extension does not contain the DCP mega "
                     "backend; rebuild the extension"
                 )
+            if self.record_cta_trace:
+                backend = partial(backend, cta_trace=self._cta_trace)
             backend_args = self._backend_args(
                 q_local, k_history_local, v_history_local, k_chunk, v_chunk,
                 cu_seqlens_q, cu_seqlens_history_local, max_seqlen_q,
@@ -2960,6 +2969,15 @@ class DCPMegaAttentionRunner:
             self._enqueue_lock.release()
 
     forward_chunk_prefill_varlen_dcp_mega = forward_chunk_prefill_varlen
+
+    def copy_last_cta_trace(self, destination: torch.Tensor) -> None:
+        """Copy the last replay's thread-zero phase intervals on the current stream."""
+        if self._cta_trace is None:
+            raise RuntimeError("CTA trace recording is disabled")
+        if (destination.shape != self._cta_trace.shape or destination.dtype != torch.int64
+                or destination.device != self.device):
+            raise ValueError("destination must match the runner CTA trace buffer")
+        destination.copy_(self._cta_trace)
 
     def _backend_args(
         self, q_local, k_history_local, v_history_local, k_chunk, v_chunk,
@@ -3080,7 +3098,8 @@ class DCPMegaAttentionRunner:
         warmup and replay so every invocation advances the same device phase.
         """
         min_fa3_op.forward_chunk_prefill_varlen_dcp_mega(
-            *backend_args, True, 0, True, True, False, True, True
+            *backend_args, True, 0, True, True, False, True, True,
+            **({"cta_trace": self._cta_trace} if self.record_cta_trace else {}),
         )
         output, lse = backend_args[25:27]
         return (output, lse) if backend_args[-1] else output

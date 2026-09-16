@@ -1,4 +1,4 @@
-// Causal W8 forward ablation launcher copied and trimmed from
+// Causal forward ablation launcher copied and trimmed from
 // csrc/mega_ring_min_fa3_varlen_ring_launch.cu.
 
 #include "mega_ring_forward_ablation.h"
@@ -6,7 +6,8 @@
 namespace min_fa3_varlen_demo {
 namespace forward_ablation {
 
-void run(
+template <int WorldSize>
+void run_profile(
     Ring_fwd_params& params,
     kittens::py::TKParallelTensor& remote_k,
     kittens::py::TKParallelTensor& remote_v,
@@ -15,18 +16,19 @@ void run(
     Profile profile,
     int completed_storage_size,
     cudaStream_t stream,
-    bool prepare_only) {
+    bool prepare_only,
+    bool compute_only) {
     TORCH_CHECK(params.is_causal, "forward ablation supports causal mode only");
-    TORCH_CHECK(params.ring_world_size == 8,
-                "forward ablation requires exactly 8 GPUs");
+    TORCH_CHECK(params.ring_world_size == WorldSize,
+                "forward ablation world-size dispatch mismatch");
     TORCH_CHECK(params.num_comp_sm > 0,
                 "forward ablation requires num_comp_sm > 0");
     TORCH_CHECK(params.num_comm_sm >= 0,
                 "forward ablation requires num_comm_sm >= 0");
-    TORCH_CHECK(params.num_comm_sm > 0
+    TORCH_CHECK(compute_only || params.num_comm_sm > 0
                     || params.mega_ring_hierarchy.reduction_tiles == 0,
                 "num_comm_sm must be positive when this rank has "
-                "G8/G4/G2 replay work");
+                "hierarchical CP replay work");
     TORCH_CHECK(params.h_k * params.d == 1024,
                 "forward ablation requires KVH * D == 1024");
     TORCH_CHECK(params.d == 128 && params.dv == 128,
@@ -51,6 +53,14 @@ void run(
     CHECK_CUDA(cudaMemsetAsync(
         params.mega_ring_kv_ready_counts, 0,
         kMegaRingNumKvReadySections * sizeof(int), stream));
+    if (compute_only) {
+        // MOTIVATION_T2: K/V were materialized in every local IPC arena before
+        // timing. A large ready value lets the unchanged copied mainloop
+        // consume those rows without launching communication CTAs.
+        CHECK_CUDA(cudaMemsetAsync(
+            params.mega_ring_kv_ready_counts, 0x7f,
+            kMegaRingNumKvReadySections * sizeof(int), stream));
+    }
     CHECK_CUDA(cudaMemsetAsync(
         params.mega_ring_step_ready, 0,
         size_t(params.mega_ring_hierarchy.reduction_tiles) * sizeof(int), stream));
@@ -69,34 +79,34 @@ void run(
     switch (profile) {
         case Profile::StepExternalReduce:
             if (collect_stats) {
-                run_steps<false, true>(
+                run_steps<WorldSize, false, true>(
                     params, remote_k, remote_v, scratch_o, scratch_lse, stream);
             } else {
-                run_steps<false, false>(
+                run_steps<WorldSize, false, false>(
                     params, remote_k, remote_v, scratch_o, scratch_lse, stream);
             }
             break;
         case Profile::StepFusedReduce:
             if (collect_stats) {
-                run_steps<true, true>(
+                run_steps<WorldSize, true, true>(
                     params, remote_k, remote_v, scratch_o, scratch_lse, stream);
             } else {
-                run_steps<true, false>(
+                run_steps<WorldSize, true, false>(
                     params, remote_k, remote_v, scratch_o, scratch_lse, stream);
             }
             break;
         case Profile::LinearQueueNoRecycle:
             if (collect_stats) {
-                run_linear<false, true>(params, remote_k, remote_v, stream);
+                run_linear<WorldSize, false, true>(params, remote_k, remote_v, stream);
             } else {
-                run_linear<false, false>(params, remote_k, remote_v, stream);
+                run_linear<WorldSize, false, false>(params, remote_k, remote_v, stream);
             }
             break;
         case Profile::LinearQueueRecycle:
             if (collect_stats) {
-                run_linear<true, true>(params, remote_k, remote_v, stream);
+                run_linear<WorldSize, true, true>(params, remote_k, remote_v, stream);
             } else {
-                run_linear<true, false>(params, remote_k, remote_v, stream);
+                run_linear<WorldSize, true, false>(params, remote_k, remote_v, stream);
             }
             break;
         case Profile::DynamicSegmentRecycle:
@@ -107,6 +117,24 @@ void run(
             break;
         default:
             TORCH_CHECK(false, "unknown forward ablation profile");
+    }
+}
+
+void run(
+    Ring_fwd_params& params,
+    kittens::py::TKParallelTensor& remote_k,
+    kittens::py::TKParallelTensor& remote_v,
+    torch::Tensor& scratch_o,
+    torch::Tensor& scratch_lse,
+    Profile profile,
+    int completed_storage_size,
+    cudaStream_t stream,
+    bool prepare_only,
+    bool compute_only) {
+    switch (params.ring_world_size) {
+        case 4: run_profile<4>(params, remote_k, remote_v, scratch_o, scratch_lse, profile, completed_storage_size, stream, prepare_only, compute_only); break;
+        case 8: run_profile<8>(params, remote_k, remote_v, scratch_o, scratch_lse, profile, completed_storage_size, stream, prepare_only, compute_only); break;
+        default: TORCH_CHECK(false, "forward ablation requires CP world size 4 or 8");
     }
 }
 

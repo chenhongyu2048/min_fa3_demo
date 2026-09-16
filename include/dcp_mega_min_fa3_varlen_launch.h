@@ -290,6 +290,7 @@ struct DCPMegaKernelConfig {
         int32_t* queue_state = nullptr;
         uint64_t* phase_timestamps = nullptr;
         int32_t const* graph_post_phase = nullptr;
+        int64_t* cta_trace = nullptr;
         // Serving graphs reuse their launch while the device task image changes.
         int32_t const* dynamic_metadata = nullptr;
         CUTLASS_DEVICE QTaskDesc const* get_q_tasks() const {
@@ -1155,12 +1156,41 @@ CUTLASS_DEVICE void run_final_combine(
     }
 }
 
-template <typename Config>
+// MOTIVATION_D1: thread-zero phase checkpoints, not useful-work timestamps.
+// CTA roles are fixed for the runner lifetime. Each used slot is overwritten
+// on every replay; unused slots stay zero after construction, so no replay
+// memset or atomics are needed. Trace=false removes all additional sampling.
+template <bool Trace>
+CUTLASS_DEVICE uint64_t cta_trace_clock() {
+    if constexpr (Trace) {
+        if (threadIdx.x == 0) { return read_globaltimer(); }
+    }
+    return 0;
+}
+
+template <bool Trace, typename Params>
+CUTLASS_DEVICE void cta_trace_phase(Params const& params, int phase, uint64_t start) {
+    if constexpr (Trace) {
+        if (threadIdx.x == 0) {
+            int smid;
+            asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+            int64_t* row = params.cta_trace + (int(blockIdx.x) * 5 + phase) * 5;
+            row[0] = static_cast<int64_t>(start);
+            row[1] = static_cast<int64_t>(read_globaltimer());
+            row[2] = int(blockIdx.x);
+            row[3] = smid;
+            row[4] = phase;
+        }
+    }
+}
+
+template <typename Config, bool Trace = false>
 CUTLASS_GLOBAL
 __launch_bounds__(Config::MaxThreadsPerBlock, 1)
 void dcp_mega_varlen_kernel(
     CUTLASS_GRID_CONSTANT typename Config::KernelParams const params) {
     extern __shared__ char smem_buf[];
+    uint64_t trace_start = cta_trace_clock<Trace>();
     // DCP_MEGA: communication/reduction phases reuse the copied FA dynamic
     // shared region only while the FA pipeline is inactive.
     typename Config::HelperSharedStorage& helper_shared
@@ -1172,11 +1202,14 @@ void dcp_mega_varlen_kernel(
     bool const communication_cta = int(blockIdx.x) < params.num_comm_sm;
     if (communication_cta) {
         run_q_allgather<Config>(params, helper_shared);
+        cta_trace_phase<Trace>(params, 0, trace_start);
+        trace_start = cta_trace_clock<Trace>();
         record_phase_completion(
             params.queue_state, params.phase_timestamps,
             kQAllGatherPhaseCounter, kQAllGatherDoneTimestamp,
             params.num_comm_sm);
         run_communication_post_q<Config>(params, helper_shared);
+        cta_trace_phase<Trace>(params, 3, trace_start);
         record_phase_completion(
             params.queue_state, params.phase_timestamps,
             kKernelPhaseCounter, kKernelDoneTimestamp,
@@ -1188,12 +1221,16 @@ void dcp_mega_varlen_kernel(
     // threads rendezvous before the shared region is reused by local combines.
     typename Config::AttentionKernel attention_kernel;
     attention_kernel(params, smem_buf);
+    cta_trace_phase<Trace>(params, 1, trace_start);
+    trace_start = cta_trace_clock<Trace>();
     __syncthreads();
     record_phase_completion(
         params.queue_state, params.phase_timestamps,
         kAttentionPhaseCounter, kAttentionDoneTimestamp,
         params.num_sms - params.num_comm_sm);
     run_history_combine<Config>(params, helper_shared);
+    cta_trace_phase<Trace>(params, 2, trace_start);
+    trace_start = cta_trace_clock<Trace>();
     // History combine uses independent per-warp queues. This is the only CTA
     // convergence point before the existing CTA-oriented final combine.
     __syncthreads();
@@ -1201,6 +1238,7 @@ void dcp_mega_varlen_kernel(
         params.queue_state, params.phase_timestamps,
         params.num_sms - params.num_comm_sm);
     run_final_combine<Config>(params, helper_shared);
+    cta_trace_phase<Trace>(params, 4, trace_start);
     record_phase_completion(
         params.queue_state, params.phase_timestamps,
         kFinalCombinePhaseCounter, kFinalCombineDoneTimestamp,
@@ -1449,6 +1487,7 @@ void launch_dcp_mega_instance(
     kernel_params.queue_state = params.queue_state;
     kernel_params.phase_timestamps = params.phase_timestamps;
     kernel_params.graph_post_phase = params.graph_post_phase;
+    kernel_params.cta_trace = params.cta_trace;
     kernel_params.dynamic_metadata = params.dynamic_metadata ? metadata : nullptr;
     kernel_params.cu_seqlens_q = params.chunk.cu_seqlens_q;
     kernel_params.total_q = header.total_q;
@@ -1474,14 +1513,16 @@ void launch_dcp_mega_instance(
         = params.ipc_history_send_lse_ptrs[params.dcp_rank];
     kernel_params.token_block_capacity = params.ipc_token_block_capacity;
 
-    auto kernel = dcp_mega_varlen_kernel<Config>;
+    bool const tracing = params.cta_trace != nullptr;
+    auto kernel = tracing ? dcp_mega_varlen_kernel<Config, true>
+                          : dcp_mega_varlen_kernel<Config, false>;
     int const smem_size = Config::SharedStorageSize;
     if (smem_size >= 48 * 1024) {
         constexpr int kMaxCachedCUDADevices = 64;
         TORCH_CHECK(params.device >= 0 && params.device < kMaxCachedCUDADevices,
                     "DCP mega CUDA device index exceeds launch cache capacity");
-        static std::once_flag configured[kMaxCachedCUDADevices];
-        std::call_once(configured[params.device], [=] {
+        static std::once_flag configured[kMaxCachedCUDADevices][2];
+        std::call_once(configured[params.device][tracing], [=] {
             CHECK_CUDA(cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         });

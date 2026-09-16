@@ -374,7 +374,8 @@ double forward_chunk_prefill_varlen_dcp_mega(
     bool run_pre_barrier,
     bool measure_kernel,
     bool graph_replay,
-    bool dynamic_metadata) {
+    bool dynamic_metadata,
+    py::object cta_trace_obj) {
     check_packed_bf16(q, "q");
     check_packed_bf16(k_history, "k_history");
     check_packed_bf16(v_history, "v_history");
@@ -677,6 +678,15 @@ double forward_chunk_prefill_varlen_dcp_mega(
     params.ipc_token_block_capacity = token_block_capacity;
     params.device = q.get_device();
     params.num_sms = properties->multiProcessorCount;
+    if (!cta_trace_obj.is_none()) {
+        auto trace = cta_trace_obj.cast<torch::Tensor>();
+        TORCH_CHECK(trace.is_cuda() && trace.device() == q.device()
+                        && trace.scalar_type() == torch::kInt64 && trace.is_contiguous()
+                        && trace.dim() == 2 && trace.size(0) == params.num_sms * 5
+                        && trace.size(1) == 5,
+                    "cta_trace must be same-device contiguous int64 [num_sms * 5, 5]");
+        params.cta_trace = trace.data_ptr<int64_t>();
+    }
     params.num_comm_sm = num_comm_sm;
     params.return_lse = return_lse;
     for (int rank = 0; rank < dcp_size; ++rank) {
@@ -883,6 +893,7 @@ void bind_dcp_mega_varlen(py::module_& module) {
         py::arg("measure_kernel") = false,
         py::arg("graph_replay") = false,
         py::arg("dynamic_metadata") = false,
+        py::arg("cta_trace") = py::none(),
         "Persistent single-node SM90 BF16 D=128 batched varlen DCP mega forward.");
     module.def(
         "_dcp_mega_varlen_barrier",

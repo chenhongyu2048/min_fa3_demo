@@ -620,7 +620,8 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
 }
 
 min_fa3_varlen_demo::MegaRingHierarchyDesc parse_ablation_hierarchy(
-    const torch::Tensor& hierarchy_host) {
+    const torch::Tensor& hierarchy_host,
+    int world_size) {
     TORCH_CHECK(!hierarchy_host.is_cuda(), "hierarchy_host must be a CPU tensor");
     TORCH_CHECK(hierarchy_host.scalar_type() == torch::kInt32,
                 "hierarchy_host must have dtype torch.int32");
@@ -649,8 +650,9 @@ min_fa3_varlen_demo::MegaRingHierarchyDesc parse_ablation_hierarchy(
         level.half_tiles = values[cursor++];
         level.reduction_base = values[cursor++];
         level.kv_ready_base = values[cursor++];
+        int const expected_ring_size = std::max(world_size >> level_idx, 1);
         TORCH_CHECK(
-            level.ring_size == min_fa3_varlen_demo::mega_ring_size_for_level(level_idx),
+            level.ring_size == expected_ring_size,
             "invalid hierarchy ring size at level ", level_idx);
     }
     hierarchy.base_work_tiles = values[cursor++];
@@ -706,7 +708,8 @@ py::tuple forward_varlen_mega_ring_ablation(
     torch::Tensor scratch_lse,
     bool scheduler_prepared,
     bool prepare_only,
-    py::object stats_obj) {
+    py::object stats_obj,
+    bool compute_only) {
     check_varlen_qkv(q, "q");
     check_varlen_qkv(k, "k");
     check_varlen_qkv(v, "v");
@@ -724,9 +727,10 @@ py::tuple forward_varlen_mega_ring_ablation(
     TORCH_CHECK(remote_k.data_.data_ptr() == k.data_ptr()
                     && remote_v.data_.data_ptr() == v.data_ptr(),
                 "k/v must be owned by remote_k/remote_v");
-    TORCH_CHECK(remote_k.local_world_size_ == 8
-                    && remote_v.local_world_size_ == 8,
-                "forward ablation requires exactly 8 local GPUs");
+    TORCH_CHECK((remote_k.local_world_size_ == 4
+                    || remote_k.local_world_size_ == 8)
+                    && remote_v.local_world_size_ == remote_k.local_world_size_,
+                "forward ablation requires CP world size 4 or 8");
     TORCH_CHECK(remote_k.local_rank_ == q.get_device()
                     && remote_v.local_rank_ == q.get_device(),
                 "remote tensor ranks must match q.device");
@@ -754,15 +758,16 @@ py::tuple forward_varlen_mega_ring_ablation(
                 "q/k token and head counts must fit in int32");
 
     int const batch_size = cu_seqlens_q.numel() - 1;
-    auto hierarchy = parse_ablation_hierarchy(hierarchy_host);
+    int const world_size = remote_k.local_world_size_;
+    auto hierarchy = parse_ablation_hierarchy(hierarchy_host, world_size);
     TORCH_CHECK(hierarchy.base_work_tiles <= std::numeric_limits<int>::max()
                     && hierarchy.total_work_tiles <= std::numeric_limits<int>::max()
                     && hierarchy.reduction_tiles <= std::numeric_limits<int>::max()
                     && hierarchy.remote_tiles <= std::numeric_limits<int>::max(),
                 "hierarchy totals must fit in int32");
-    TORCH_CHECK(num_comm_sm > 0 || hierarchy.reduction_tiles == 0,
+    TORCH_CHECK(compute_only || num_comm_sm > 0 || hierarchy.reduction_tiles == 0,
                 "num_comm_sm must be positive when this rank has "
-                "G8/G4/G2 replay work");
+                "hierarchical CP replay work");
     check_ablation_int_cuda(ring_sizes, q, batch_size, "ring_sizes");
     check_ablation_int_cuda(
         half_cu_seqlens, q, batch_size + 1, "half_cu_seqlens");
@@ -793,9 +798,9 @@ py::tuple forward_varlen_mega_ring_ablation(
                 "num_comp_sm + num_comm_sm must not exceed the device SM count (",
                 props->multiProcessorCount, "). Got ",
                 num_comp_sm + num_comm_sm);
-    TORCH_CHECK(k.size(0) == v.size(0) && k.size(0) % 8 == 0,
-                "K/V arena rows must match and be divisible by 8");
-    int64_t const rank_capacity_i64 = k.size(0) / 8;
+    TORCH_CHECK(k.size(0) == v.size(0) && k.size(0) % world_size == 0,
+                "K/V arena rows must match and be divisible by CP world size");
+    int64_t const rank_capacity_i64 = k.size(0) / world_size;
     TORCH_CHECK(rank_capacity_i64 > 0
                     && rank_capacity_i64 <= std::numeric_limits<int>::max()
                     && rank_capacity_i64 % 128 == 0,
@@ -824,7 +829,7 @@ py::tuple forward_varlen_mega_ring_ablation(
     min_fa3_varlen_demo::forward_ablation::run(
         params, remote_k, remote_v, scratch_out, scratch_lse,
         static_cast<min_fa3_varlen_demo::forward_ablation::Profile>(profile_id),
-        completed_tiles.numel(), stream, prepare_only);
+        completed_tiles.numel(), stream, prepare_only, compute_only);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return py::make_tuple(out, lse);
 }
@@ -862,7 +867,8 @@ void bind_varlen_mega_ring(py::module_& m) {
         py::arg("scheduler_prepared"),
         py::arg("prepare_only"),
         py::arg("stats") = py::none(),
-        "Preallocated causal W8 forward-ablation runner.");
+        py::arg("compute_only") = false,
+        "Preallocated causal CP4/CP8 forward-ablation runner.");
     m.def(
         "forward_varlen_mega_ring",
         &forward_varlen_mega_ring,
