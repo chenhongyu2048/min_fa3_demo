@@ -102,11 +102,21 @@ def main():
                         graph.replay()
                         copied = torch.empty_like(runner._cta_trace)
                         runner.copy_last_cta_trace(copied)
-                        rows = [row for row in copied.cpu().tolist() if row[1] > 0]
+                        previous = copied.cpu()
+                        graph.replay()
+                        runner.copy_last_cta_trace(copied)
+                        current = copied.cpu()
+                        active = current[:, 1] > 0
+                        if not torch.equal(previous[:, 1] > 0, active):
+                            raise RuntimeError("CTA trace slot coverage changed between fixed-shape replays")
+                        if not torch.all(current[active, 0] > previous[active, 1]).item():
+                            raise RuntimeError("CTA trace contains stale intervals after replay")
+                        rows = current[active].tolist()
                         gathered = [None] * world
                         dist.all_gather_object(gathered, rows)
                         result.update(trace_by_rank={str(i): rows for i, rows in enumerate(gathered)},
                                       trace_schema=["start_ns", "end_ns", "cta_id", "sm_id", "phase_id"],
+                                      trace_replay_validation="stable active slots; all intervals advance on the next replay",
                                       trace_semantics="thread-zero phase checkpoints; may include wait/synchronization; no useful-work counts")
                     return result
                 finally:

@@ -107,7 +107,8 @@ CTA trace 每个 block 固定五个阶段槽位，每行
 `[start_ns, end_ns, cta_id, sm_id, phase_id]`。仅 thread 0 读 timer、写记录；
 关闭 trace 使用独立的编译期特化，不执行新增采样。通信 CTA 每次覆盖阶段 0/3，
 计算 CTA 每次覆盖 1/2/4，角色由 runner 固定。buffer 构造时置零，未用槽保持零，
-有效槽以 `end_ns > 0` 判断，因此 replay 不清零。不能复用到改变角色的 launch。
+有效槽以 `end_ns > 0` 判断，因此 replay 不清零。诊断阶段复制连续两次 replay 的
+记录，检查有效槽位集合不变、时间戳全部向前推进。不能复用到改变角色的 launch。
 记录是 thread-0 的 CTA **阶段检查点区间**，包含等待和同步，不是每个 CTA 的
 有效工作结束时间或有效工作量；图中不填入全局任务数。不同 rank 的时间轴独立。
 尚未给出 trace 开销下降比例或目标，需后续 GPU 实测关闭/开启路径。
