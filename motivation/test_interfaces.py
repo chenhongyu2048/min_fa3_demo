@@ -54,7 +54,9 @@ class LayoutTests(unittest.TestCase):
     def test_static_and_execution_layout_identity(self):
         from .placements import build_placements, describe_placement
         from ring_test.transformer_layer_cp import build_physical_layout
-        raw = (16385, 9216, 4097, 2048, 513)
+        # Raw manifests have already passed the public sampler's alignment.
+        # Keep non-2048 multiples to exercise additional placement padding.
+        raw = (18432, 10240, 5120, 2048, 768)
         for world in (4, 8):
             plans = build_placements(raw, world)
             self.assertEqual(tuple(plans), STRATEGIES)
