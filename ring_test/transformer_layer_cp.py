@@ -511,14 +511,14 @@ class _MegaRingAdapter:
     def _populate_kv(self, k: torch.Tensor, v: torch.Tensor) -> None:
         if k.size(0) != self.local_tokens or v.size(0) != self.local_tokens:
             raise ValueError("MegaRing projected K/V do not match the physical layout")
-        owner_begin = self.rank * self.rank_capacity
-        owner_end = owner_begin + self.rank_capacity
-        self.remote_k.data_[owner_begin:owner_end].fill_(-123.0)
-        self.remote_v.data_[owner_begin:owner_end].fill_(-123.0)
-        self.remote_k.data_[owner_begin : owner_begin + k.size(0)].copy_(k)
-        self.remote_v.data_[owner_begin : owner_begin + v.size(0)].copy_(v)
-        torch.cuda.synchronize()
-        dist.barrier()
+        # owner_begin = self.rank * self.rank_capacity
+        # owner_end = owner_begin + self.rank_capacity
+        # self.remote_k.data_[owner_begin:owner_end].fill_(-123.0)
+        # self.remote_v.data_[owner_begin:owner_end].fill_(-123.0)
+        # self.remote_k.data_[owner_begin : owner_begin + k.size(0)].copy_(k)
+        # self.remote_v.data_[owner_begin : owner_begin + v.size(0)].copy_(v)
+        # torch.cuda.synchronize()
+        # dist.barrier()
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor

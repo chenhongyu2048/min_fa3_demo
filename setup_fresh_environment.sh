@@ -383,7 +383,7 @@ prepare_environment() {
     run_logged submodule_sync git -C "$ROOT_DIR" submodule sync --recursive
     run_logged submodule_update git -C "$ROOT_DIR" submodule update \
         --init --checkout --recursive
-    run_logged uv_lock_check "$UV" lock --directory "$ROOT_DIR" --check
+    run_logged uv_lock_check "$UV" lock --directory "$ROOT_DIR" --check -v
     local -a sync_args=(
         --directory "$ROOT_DIR"
         --python 3.12
@@ -489,6 +489,8 @@ esac
 echo "Repository: $ROOT_DIR"
 echo "uv:         $RESOLVED_UV ($UV_VERSION)"
 echo "Action:     $ACTION"
+echo "uv cache:   $UV_CACHE_DIR"
+echo "uv links:   $UV_LINK_MODE"
 
 UV=$RESOLVED_UV
 
