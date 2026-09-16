@@ -42,6 +42,50 @@ freelaw、prolong 各 20 cases。131072 是公共 sampler 的目标预算：采�
 D1 前 N 个候选；`--warmup`、`--iters` 显式缩短次数。这些参数不缩短输入。
 GPU 数本身不会减少 case 数或迭代数。
 
+## 八卡完整实验脚本
+
+完成项目环境安装和 CUDA extension 构建后，在分配了八张完整 SM90 GPU 的
+CUDA 节点上执行。脚本默认使用仓库 `.venv/bin/python`，继承当前
+`CUDA_VISIBLE_DEVICES`；可用 `PYTHON=python` 指定已经激活的项目环境。
+
+```bash
+# 只查看完整流程，不加载 CUDA、不创建结果目录。
+bash motivation/run_full_8gpu.sh --dry-run
+
+# 正式运行：保留调度系统分配的 CUDA_VISIBLE_DEVICES。
+bash motivation/run_full_8gpu.sh
+
+# 也可以指定一个尚不存在的结果目录。
+bash motivation/run_full_8gpu.sh --output-dir benchmark_logs/motivation_v2/formal_8gpu
+```
+
+如需手动选卡，在命令前设置 `CUDA_VISIBLE_DEVICES` 为本次分配的八张完整
+GPU 的编号或 UUID。脚本不改写这个变量，也不负责申请节点或安装环境。
+长任务建议在 CUDA 节点的 tmux 会话中运行。
+
+脚本依次完成：
+
+1. **T1/T2**：全部五档 batch、128K tokens，warmup 40、测量 60。
+2. **T3**：五数据集各 20 cases、四种 placement，共 400 个整层 FWD/BWD
+   组合，附带同布局静态指标；warmup 10、测量 40。
+3. **D1 候选**：默认 10 cases、三种 Graph 方案，三个独立进程运行；
+   全部关闭 trace，warmup 20、测量 30。
+4. 分别生成上述各次运行的 `summary.csv` 和 `figures/`。
+5. 使用三次候选结果选择 decode-only 两个、mixed 两个稳定获益案例。
+6. 对选中四个案例重新进行无 trace 计时，再额外采集 trace 诊断，
+   单独生成这次运行的汇总和图。
+
+脚本不使用 `--case-limit`，不缩短 token 或采样次数。默认创建
+`benchmark_logs/motivation_v2/full_8gpu_<UTC timestamp>/`，其中包含
+`run.log`、`training/`、`d1_run_0/`、`d1_run_1/`、`d1_run_2/`、
+`d1_selected.json` 和 `d1_selected_trace/`。每个运行子目录独立保存
+配置、原始数据、汇总和图，不把候选三次测量及选例后的重测混在一起。
+
+任一步骤失败时脚本立即以非零状态退出，已写入的数据保留。特别是某类不足
+两个稳定获益候选时，D1 选择器会停止流程，不生成选例或继续 trace；
+此时完整候选结果及其汇总、图仍然可用，需要先根据结果决定是否扩充候选。
+脚本不自动续跑；不要把完整脚本重新指向已有目录。
+
 ## 实验口径
 
 - **T1**：Ring、AllGather 各有 comm-only、compute-only、serial、overlap。

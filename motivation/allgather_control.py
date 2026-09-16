@@ -133,4 +133,3 @@ class AllGatherControl(BaseAllGather):
 
         self._forward_ready = True
         return self.out
-

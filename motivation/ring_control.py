@@ -110,4 +110,3 @@ def zigzag_control(
     if return_lse:
         return output, lse.squeeze(-1).transpose(0, 1).contiguous()
     return output
-
