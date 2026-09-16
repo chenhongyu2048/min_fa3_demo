@@ -151,8 +151,9 @@ git diff --check
 对比；实际布局和 T2 hierarchy 检查需要 torch，缺失会明确 skip，不替换成 mock。
 源码 ABI 检查不代表 CUDA extension 已编译。
 
-本轮只做本地实现和静态检查，记录见 `LOCAL_VALIDATION.md`。未连接 SSH。
-后续用户授权节点后，沿用 `setup_fresh_environment.sh` 与 Makefile 构建，先执行：
+初始本地实现和静态检查记录见 `LOCAL_VALIDATION.md`。后续经用户 SSH 授权完成的
+H20 四卡共享 GPU 功能验证见 `REMOTE_VALIDATION.md`；这些 smoke 延迟不用于性能结论。
+在可用 CUDA 节点沿用 `setup_fresh_environment.sh` 与 Makefile 构建后，可先执行：
 
 ```bash
 python -m motivation.run --gpus 4 --case-limit 1 --warmup 1 --iters 2 --d1-trace
