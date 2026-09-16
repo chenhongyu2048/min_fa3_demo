@@ -151,8 +151,8 @@ def validate_service_config(vllm_config: Any) -> None:
         errors.append("each rank must own 4 or 8 query heads")
     if model.get_num_kv_heads(parallel) != 1:
         errors.append("each rank must own exactly one KV head")
-    if scheduler.max_num_seqs > 64:
-        errors.append("max_num_seqs cannot exceed 64")
+    if scheduler.max_num_seqs > MegaRuntimeConfig.from_env().max_batch:
+        errors.append("max_num_seqs cannot exceed MEGA_DCP_MAX_BATCH")
     if scheduler.max_num_batched_tokens > 4096:
         errors.append("max_num_batched_tokens cannot exceed 4096")
     if not scheduler.enable_chunked_prefill:

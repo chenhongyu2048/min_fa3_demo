@@ -39,6 +39,8 @@ def build_serve_command(args: argparse.Namespace) -> tuple[dict[str, str], list[
         raise ValueError("gpu_memory_utilization must be in (0, 1]")
     if not 1 <= args.mega_max_num_splits <= 128:
         raise ValueError("mega_max_num_splits must be in [1, 128]")
+    if not 1 <= args.max_num_seqs <= min(4096, args.mega_max_total_q):
+        raise ValueError("max_num_seqs must be positive and cannot exceed 4096 or mega_max_total_q")
     # ``hf_overrides`` is intentionally used for smoke runs instead of
     # maintaining a second model config for each layer count. vLLM applies
     # this to the HuggingFace config before constructing the model, so changing the layer
@@ -88,7 +90,7 @@ def build_serve_command(args: argparse.Namespace) -> tuple[dict[str, str], list[
         "--max-model-len",
         "131072",
         "--max-num-seqs",
-        "64",
+        str(args.max_num_seqs),
         "--max-num-batched-tokens",
         "4096",
         "--enable-chunked-prefill",
@@ -119,6 +121,7 @@ def build_serve_command(args: argparse.Namespace) -> tuple[dict[str, str], list[
                 "kv_connector_extra_config": {
                     "fill_mean": args.fill_mean,
                     "fill_std": 0.0,
+                    "history_kv_mode": args.history_kv_mode,
                 },
             },
             separators=(",", ":"),
@@ -155,7 +158,7 @@ def build_serve_command(args: argparse.Namespace) -> tuple[dict[str, str], list[
             # pre-migration top-level vllm_plugin/src directory.
             "PYTHONPATH": os.pathsep.join(pythonpath),
             "MEGA_DCP_MAX_TOTAL_Q": str(args.mega_max_total_q),
-            "MEGA_DCP_MAX_BATCH": "64",
+            "MEGA_DCP_MAX_BATCH": str(args.max_num_seqs),
             "MEGA_DCP_MAX_NUM_SPLITS": str(args.mega_max_num_splits),
             "MEGA_DCP_NUM_COMM_SM": str(args.mega_num_comm_sm),
             "MEGA_DCP_BLOCK_N": args.mega_block_n,
@@ -177,6 +180,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--served-model-name", default="qwen3-30b-a3b-dummy")
     result.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     result.add_argument(
+        "--max-num-seqs", type=int, default=64,
+        help="Maximum requests per iteration and attention-plugin batch capacity.",
+    )
+    result.add_argument(
         "--kv-cache-memory-bytes",
         type=int,
         default=None,
@@ -194,6 +201,10 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--seed", type=int, default=42)
     result.add_argument("--fill-mean", type=float, default=0.015)
+    result.add_argument(
+        "--history-kv-mode", choices=("synthetic", "paged"), default="synthetic",
+        help="Use fixed contiguous synthetic history, or gather actual paged KV each layer.",
+    )
     result.add_argument("--mega-max-total-q", type=int, default=4096)
     result.add_argument("--mega-max-num-splits", type=int, default=128)
     result.add_argument("--mega-num-comm-sm", type=int, default=8)

@@ -12,9 +12,15 @@ MEGA_NUM_COMM_SMS=${MEGA_NUM_COMM_SMS:-"4,8,12,16,20"}
 MEGA_MAX_NUM_SPLITS=${MEGA_MAX_NUM_SPLITS:-128}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
 NUM_HIDDEN_LAYERS=${NUM_HIDDEN_LAYERS:-48}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-64}
+HISTORY_KV_MODE=${HISTORY_KV_MODE:-synthetic}
+ARRIVAL_TIME_SCALES=${ARRIVAL_TIME_SCALES:-1}
 VLLM_USE_FLASHINFER_SAMPLER=${VLLM_USE_FLASHINFER_SAMPLER:-0}
 export VLLM_MOE_ROUTING_SIMULATION_STRATEGY=${VLLM_MOE_ROUTING_SIMULATION_STRATEGY-min_fa3_balanced}
 PORT=${PORT:-18000}
+
+arrival_time_scales_spec=${ARRIVAL_TIME_SCALES//,/ }
+read -r -a ARRIVAL_TIME_SCALE_LIST <<< "$arrival_time_scales_spec"
 
 case "$VLLM_USE_FLASHINFER_SAMPLER" in
     0|1) export VLLM_USE_FLASHINFER_SAMPLER ;;
@@ -72,7 +78,7 @@ for kv_heads in "${KV_HEAD_LIST[@]}"; do
     kv_result_dir="$RESULT_DIR/kvh$kv_heads"
     mkdir -p "$kv_result_dir"
 
-    echo "Running Qwen3 MoE matrix with TP=8 EP=8 KV_HEADS=$kv_heads DCP=$((8 / kv_heads)) NUM_HIDDEN_LAYERS=$NUM_HIDDEN_LAYERS MEGA_NUM_COMM_SMS=$MEGA_NUM_COMM_SMS VLLM_USE_FLASHINFER_SAMPLER=$VLLM_USE_FLASHINFER_SAMPLER; results=$kv_result_dir"
+    echo "Running Qwen3 MoE matrix with TP=8 EP=8 KV_HEADS=$kv_heads DCP=$((8 / kv_heads)) NUM_HIDDEN_LAYERS=$NUM_HIDDEN_LAYERS MAX_NUM_SEQS=$MAX_NUM_SEQS HISTORY_KV_MODE=$HISTORY_KV_MODE ARRIVAL_TIME_SCALES=$ARRIVAL_TIME_SCALES MEGA_NUM_COMM_SMS=$MEGA_NUM_COMM_SMS VLLM_USE_FLASHINFER_SAMPLER=$VLLM_USE_FLASHINFER_SAMPLER; results=$kv_result_dir"
     CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7} \
         "$PYTHON" -m vllm_bench.matrix \
             --workload "$WORKLOAD" \
@@ -84,7 +90,9 @@ for kv_heads in "${KV_HEAD_LIST[@]}"; do
             --mega-max-num-splits "$MEGA_MAX_NUM_SPLITS" \
             --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
             --num-hidden-layers "$NUM_HIDDEN_LAYERS" \
-            --arrival-time-scales 1 2 4 \
+            --max-num-seqs "$MAX_NUM_SEQS" \
+            --history-kv-mode "$HISTORY_KV_MODE" \
+            --arrival-time-scales "${ARRIVAL_TIME_SCALE_LIST[@]}" \
             --backends vllm-ag-rs vllm-a2a mega-fa3-native mega
 
     "$PYTHON" -m vllm_bench.summarize --result-dir "$kv_result_dir"

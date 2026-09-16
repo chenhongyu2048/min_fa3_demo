@@ -366,7 +366,7 @@ class LocalDCPAttentionBackend(AttentionBackend):
 
 
 class LocalDCPAttentionImpl(AttentionImpl[LocalDCPAttentionMetadata]):
-    """Adapt vLLM's paged cache to one in-repository packed DCP runner."""
+    """Supply packed history, either synthetic or gathered from vLLM's cache."""
 
     runner_kind: ClassVar[str]
     # The runner performs the cross-DCP LSE reduction internally before it
@@ -386,6 +386,7 @@ class LocalDCPAttentionImpl(AttentionImpl[LocalDCPAttentionMetadata]):
     _runtime: ClassVar[MegaRuntimeConfig | None] = None
     _history_k: ClassVar[torch.Tensor | None] = None
     _history_v: ClassVar[torch.Tensor | None] = None
+    _synthetic_history: ClassVar[bool] = False
     _q: ClassVar[torch.Tensor | None] = None
     _chunk_k: ClassVar[torch.Tensor | None] = None
     _chunk_v: ClassVar[torch.Tensor | None] = None
@@ -499,6 +500,21 @@ class LocalDCPAttentionImpl(AttentionImpl[LocalDCPAttentionMetadata]):
             (max_history, 1, 128), dtype=torch.bfloat16, device=device
         )
         cls._history_v = torch.empty_like(cls._history_k)
+        transfer = vllm_config.kv_transfer_config
+        cls._synthetic_history = transfer.get_from_extra_config(
+            "history_kv_mode", "paged"
+        ) == "synthetic"
+        if cls._synthetic_history:
+            # Benchmark-only, immutable history shared by all layers. Lengths
+            # and DCP shards still come from the real scheduled batch.
+            fill_mean = transfer.get_from_extra_config("fill_mean", 0.015)
+            cls._history_k.fill_(fill_mean)
+            cls._history_v.fill_(fill_mean)
+            logger.info_once(
+                "Using fixed synthetic contiguous history KV (fill=%s); "
+                "paged cache fill, updates, and gather are disabled",
+                fill_mean,
+            )
         if isinstance(cls._runner, DCPMegaAttentionRunner):
             cls._q = cls._runner.q_backing
         else:
@@ -521,7 +537,7 @@ class LocalDCPAttentionImpl(AttentionImpl[LocalDCPAttentionMetadata]):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        if kv_cache.numel() == 0:
+        if self._synthetic_history or kv_cache.numel() == 0:
             return
         key_cache, value_cache = kv_cache.transpose(1, 2).split(
             self.head_size, dim=-1
@@ -619,25 +635,26 @@ class LocalDCPAttentionImpl(AttentionImpl[LocalDCPAttentionMetadata]):
             output[:num_tokens].copy_(result)
             return output
 
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(
-            self.head_size, dim=-1
-        )
         history_k = history_k_store if attn_metadata.graph_capacity else history_k_store[:total_history]
         history_v = history_v_store if attn_metadata.graph_capacity else history_v_store[:total_history]
-        ops.cp_gather_cache(
-            key_cache,
-            history_k,
-            attn_metadata.block_table[:num_reqs],
-            history_device,
-            num_reqs,
-        )
-        ops.cp_gather_cache(
-            value_cache,
-            history_v,
-            attn_metadata.block_table[:num_reqs],
-            history_device,
-            num_reqs,
-        )
+        if not self._synthetic_history:
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
+                self.head_size, dim=-1
+            )
+            ops.cp_gather_cache(
+                key_cache,
+                history_k,
+                attn_metadata.block_table[:num_reqs],
+                history_device,
+                num_reqs,
+            )
+            ops.cp_gather_cache(
+                value_cache,
+                history_v,
+                attn_metadata.block_table[:num_reqs],
+                history_device,
+                num_reqs,
+            )
 
         common_args = (
             q_local,

@@ -27,8 +27,10 @@ class ServiceConfigTest(unittest.TestCase):
             gpu_memory_utilization=0.9,
             kv_cache_memory_bytes=None,
             num_hidden_layers=48,
+            max_num_seqs=64,
             seed=42,
             fill_mean=0.015,
+            history_kv_mode="synthetic",
             mega_max_total_q=4096,
             mega_max_num_splits=128,
             mega_num_comm_sm=8,
@@ -111,6 +113,43 @@ class ServiceConfigTest(unittest.TestCase):
         args.kv_heads = 4
         with self.assertRaisesRegex(ValueError, "DCP"):
             build_serve_command(args)
+
+    def test_batch_limit_matches_plugin_capacity(self) -> None:
+        from vllm_bench.serve import parser
+
+        for backend in BACKENDS:
+            for limit in (64, 128):
+                with self.subTest(backend=backend, limit=limit):
+                    argv = ["--backend", backend]
+                    if limit != 64:
+                        argv.extend(["--max-num-seqs", str(limit)])
+                    with patch.dict(os.environ, {"MEGA_DCP_MAX_BATCH": "32"}):
+                        env, command = build_serve_command(parser().parse_args(argv))
+                    self.assertEqual(command[command.index("--max-num-seqs") + 1], str(limit))
+                    self.assertEqual(env["MEGA_DCP_MAX_BATCH"], str(limit))
+
+    def test_batch_limit_fits_token_capacity(self) -> None:
+        args = self._args("mega")
+        for limit in (0, -1, 4097):
+            args.max_num_seqs = limit
+            with self.assertRaisesRegex(ValueError, "max_num_seqs"):
+                build_serve_command(args)
+        args.max_num_seqs = 128
+        args.mega_max_total_q = 64
+        with self.assertRaisesRegex(ValueError, "max_num_seqs"):
+            build_serve_command(args)
+
+    def test_history_kv_mode_reaches_connector_for_all_backends(self) -> None:
+        from vllm_bench.serve import parser
+
+        for backend in BACKENDS:
+            for mode in ("synthetic", "paged"):
+                argv = ["--backend", backend]
+                if mode == "paged":
+                    argv.extend(["--history-kv-mode", mode])
+                _, command = build_serve_command(parser().parse_args(argv))
+                transfer = json.loads(command[command.index("--kv-transfer-config") + 1])
+                self.assertEqual(transfer["kv_connector_extra_config"]["history_kv_mode"], mode)
 
     def test_explicit_kv_cache_size_is_forwarded(self) -> None:
         args = self._args("mega")
@@ -263,8 +302,6 @@ class PluginPureConfigTest(unittest.TestCase):
         self.assertNotIn("scheduler_heuristic=True", backend)
 
     def test_supported_service_config_uses_pinned_vllm_model_api(self) -> None:
-        import torch
-
         from min_fa3_vllm_plugin.config import validate_service_config
 
         parallel = SimpleNamespace(
@@ -278,7 +315,7 @@ class PluginPureConfigTest(unittest.TestCase):
             get_total_num_kv_heads=lambda: 1,
             get_head_size=lambda: 128,
             get_num_kv_heads=lambda config: 1,
-            dtype=torch.bfloat16,
+            dtype="torch.bfloat16",
         )
         config = SimpleNamespace(
             model_config=model,
@@ -301,6 +338,12 @@ class PluginPureConfigTest(unittest.TestCase):
         parallel.decode_context_parallel_size = 4
         model.get_num_attention_heads = lambda config: 8
         validate_service_config(config)
+        config.scheduler_config.max_num_seqs = 128
+        with patch.dict(os.environ, {"MEGA_DCP_MAX_BATCH": "128"}):
+            validate_service_config(config)
+        with patch.dict(os.environ, {"MEGA_DCP_MAX_BATCH": "64"}):
+            with self.assertRaisesRegex(ValueError, "MEGA_DCP_MAX_BATCH"):
+                validate_service_config(config)
 
 
 if __name__ == "__main__":

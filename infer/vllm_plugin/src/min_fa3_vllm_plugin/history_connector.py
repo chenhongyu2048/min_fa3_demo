@@ -41,7 +41,16 @@ class HistoryDecodeBenchConnector(DecodeBenchConnector):
 
     def __init__(self, vllm_config: "VllmConfig", role, kv_cache_config):
         super().__init__(vllm_config, role, kv_cache_config)
+        self._synthetic_history = vllm_config.kv_transfer_config.get_from_extra_config(
+            "history_kv_mode", "paged"
+        ) == "synthetic"
         if self.connector_scheduler is not None:
             self.connector_scheduler = HistoryDecodeBenchConnectorScheduler(
                 vllm_config
             )
+
+    def start_load_kv(self, forward_context, **kwargs) -> None:
+        # Synthetic history is initialized once in the attention runner.
+        # Keep scheduler prefix matching/accounting, but do not fill paged KV.
+        if not self._synthetic_history:
+            super().start_load_kv(forward_context, **kwargs)

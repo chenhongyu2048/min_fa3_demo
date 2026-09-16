@@ -210,10 +210,18 @@ def main() -> None:
         "--backends", nargs="+", choices=BACKENDS, default=list(BACKENDS)
     )
     parser.add_argument(
-        "--arrival-time-scales", nargs="+", type=float, default=[1, 2, 4]
+        "--arrival-time-scales", nargs="+", type=float, default=[1]
     )
     parser.add_argument("--tp-size", type=int, choices=(4, 8), default=8)
     parser.add_argument("--kv-heads", type=int, choices=(1, 2, 4), default=4)
+    parser.add_argument(
+        "--history-kv-mode", choices=("synthetic", "paged"), default="synthetic",
+        help="History KV storage used by every backend in the matrix.",
+    )
+    parser.add_argument(
+        "--max-num-seqs", type=int, default=64,
+        help="Maximum requests per iteration and attention-plugin batch capacity.",
+    )
     parser.add_argument(
         "--mega-num-comm-sms",
         type=_parse_positive_int_list,
@@ -254,6 +262,8 @@ def main() -> None:
         )
     if not 1 <= args.mega_max_num_splits <= 128:
         parser.error("--mega-max-num-splits must be in [1, 128]")
+    if not 1 <= args.max_num_seqs <= 4096:
+        parser.error("--max-num-seqs must be in [1, 4096]")
     # ``infer/`` is an archive directory; the repository root is two levels
     # above this module (``infer/vllm_bench/matrix.py``).
     root = Path(__file__).resolve().parents[2]
@@ -287,6 +297,10 @@ def main() -> None:
                     str(args.tp_size),
                     "--kv-heads",
                     str(args.kv_heads),
+                    "--max-num-seqs",
+                    str(args.max_num_seqs),
+                    "--history-kv-mode",
+                    args.history_kv_mode,
                     "--mega-num-comm-sm",
                     str(comm_sm or 8),
                     "--mega-max-num-splits",
@@ -324,6 +338,8 @@ def main() -> None:
                 "mega_num_comm_sm": comm_sm,
                 "mega_max_num_splits": args.mega_max_num_splits,
                 "num_hidden_layers": args.num_hidden_layers,
+                "max_num_seqs": args.max_num_seqs,
+                "history_kv_mode": args.history_kv_mode,
                 "cudagraph_mode": "FULL",
                 "graph_block_n": 128 if serve_args.mega_block_n == "auto" else int(serve_args.mega_block_n),
                 "gpu_memory_utilization": args.gpu_memory_utilization,
@@ -377,6 +393,7 @@ def main() -> None:
                     )
                     summary["workload_sha256"] = workload_hash
                     summary["mega_num_comm_sm"] = comm_sm
+                    summary["history_kv_mode"] = args.history_kv_mode
                     (run_dir / "summary.json").write_text(
                         json.dumps(summary, indent=2) + "\n", encoding="utf-8"
                     )

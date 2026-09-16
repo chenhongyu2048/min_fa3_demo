@@ -7,9 +7,10 @@ commands from the repository root. The companion plugin source is under
 This directory integrates the existing Mega DCP kernel with the pinned vLLM
 submodule and compares it with this repository's vLLM-style AG+RS and A2A DCP
 runners. It is a decode-side benchmark for disaggregated prefill/decode:
-history KV is filled by a benchmark connector, a conversation's new suffix
-executes as real chunk prefill, and subsequent tokens use the same backend with
-`q_len=1`.
+history KV defaults to fixed synthetic contiguous buffers, a conversation's
+new suffix executes as real chunk prefill, and subsequent tokens use the same
+backend with `q_len=1`. The connector reports external-history lengths to
+skip historical prefill.
 
 The benchmark uses local Qwen3-30B-A3B MoE configurations and vLLM's dummy loader.
 The dummy loader does not download or read a checkpoint: it constructs the
@@ -99,7 +100,7 @@ fixes the local attention implementation and compares orchestration/collectives.
 with `cudagraph_mode=FULL`, chunked prefill enabled, and prefix caching disabled.
 Capture sizes span 1 through 4096 tokens, including the maximum scheduled batch.
 Torch compilation is disabled (`mode=0`) for all methods; CUDA Graphs include
-attention, KV-cache gathering, and the DCP collectives. FlashInfer
+attention and the DCP collectives (plus KV-cache gathering in `paged` mode). FlashInfer
 autotuning is also disabled because
 the CUSTOM backend does not use FlashInfer; otherwise vLLM runs an unrelated
 zero-history full-prefill dummy batch during startup, which is outside this
@@ -226,8 +227,9 @@ as chunk prefill. Unmatched first turns use
 The 118 rows whose entire prompt hash sequence already appeared are ambiguous
 no-growth turns and are dropped from the fixed manifest.
 
-Arrival scaling divides original relative timestamps. Scales 1, 2, and 4 keep
-request order/content fixed while increasing offered load.
+Arrival scaling divides original relative timestamps. The formal wrapper and
+direct matrix command default to scale 1 only. Larger scales increase offered
+load while keeping request order/content fixed; scales below 1 reduce the load.
 
 Input and output lengths remain variable and come from each selected trace
 row. Every request sets `min_tokens=max_tokens=output_length` and
@@ -237,12 +239,74 @@ with a different token count as a failed request.
 
 ## Running and results
 
+### History KV storage
+
+All four backends default to `--history-kv-mode synthetic`. Each rank initializes
+the existing contiguous K/V history buffers once with `--fill-mean` (default
+`0.015`), before CUDA Graph capture. All layers read these immutable buffers
+directly, using the scheduled batch's actual packed history lengths and DCP
+partitioning. This removes per-layer `cp_gather_cache`, paged-cache updates,
+and the connector's paged-cache filling. Current query/chunk K/V computation
+and attention still execute; generated KV is not retained as future history.
+This mode measures synthetic performance, not autoregressive KV correctness.
+
+The two buffers are shared across layers and keep stable addresses for graph
+replay. Their combined capacity is
+`max_num_seqs * ceil(max_model_len / DCP) * 2 * 128 * 2` bytes per GPU:
+2 GiB for batch 64, DCP=2, and max length 131072. They replace the use of the
+existing gather scratch buffers, so no additional history allocation is needed.
+Sharing history across layers can also change L2-cache reuse versus per-layer KV.
+vLLM still allocates and accounts for its paged cache for scheduler admission;
+this change does not remove its memory-capacity limits or block bookkeeping.
+
+For comparison with the previous cache path, select `paged`:
+
+```bash
+HISTORY_KV_MODE=paged ./benchmark_vllm_dcp_matrix.sh
+```
+
+The wrapper defaults to `HISTORY_KV_MODE=synthetic`; direct matrix/serve commands
+accept `--history-kv-mode synthetic|paged`. The mode is recorded in each matrix
+run's `manifest.json` and `summary.json`. Use separate result directories for
+the two modes; previous results include gather and are not the same workload.
+
+### Launching the matrix
+
 Run short smoke tests, then the formal 100-warmup/1000-measured Qwen3 MoE matrix:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./scripts/smoke_vllm_dcp.sh
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./benchmark_vllm_dcp_matrix.sh
 ```
+
+Set `ARRIVAL_TIME_SCALES` to select the formal matrix's load points. It accepts
+comma- or space-separated values; the default is `1`:
+
+```bash
+ARRIVAL_TIME_SCALES=0.5 ./benchmark_vllm_dcp_matrix.sh
+ARRIVAL_TIME_SCALES=1,2,4 ./benchmark_vllm_dcp_matrix.sh
+# Equivalent: ARRIVAL_TIME_SCALES="1 2 4"
+```
+
+Direct matrix invocations accept `--arrival-time-scales 1 2 4`. With the
+default five communication-SM values, scale 1 produces 12 service runs
+(one each for AG+RS/A2A, five each for Mega FA-native/auto). The short smoke
+wrapper retains its explicit scale 4.
+
+The formal wrapper accepts `MAX_NUM_SEQS` (default `64`) to set the batch
+request limit for all four backends:
+
+```bash
+MAX_NUM_SEQS=128 ./benchmark_vllm_dcp_matrix.sh
+```
+
+Direct matrix/serve invocations accept `--max-num-seqs 128`. This single value
+sets both vLLM's `--max-num-seqs` and the attention plugin's
+`MEGA_DCP_MAX_BATCH`, and is recorded in each run's `manifest.json`.
+The per-iteration token budget remains 4096, as do the CUDA Graph capture
+sizes. The request limit must be in `[1, 4096]` and fit `--mega-max-total-q`
+when that serve option is overridden. Increasing the limit also increases
+preallocated attention workspace memory.
 
 The smoke wrapper uses the same default `MEGA_NUM_COMM_SMS=4,8,12,16,20`
 communication-SM sweep as the formal matrix. Override it with a smaller set
