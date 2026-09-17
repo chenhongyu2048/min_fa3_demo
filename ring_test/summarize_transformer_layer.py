@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Print Transformer-layer JSONL cases and per-dataset attention throughput.
+"""Print Transformer-layer JSONL cases and final per-dataset timing/throughput summaries.
 
 Usage (one benchmark run, all datasets):
     python3 ring_test/summarize_transformer_layer.py results/transformer_layer_cp/RUN_ID-*.jsonl
+    python3 ring_test/summarize_transformer_layer.py arxiv.jsonl github.jsonl pile.jsonl
 
 Only the standard library is required. FLOPs follow the dataset benchmarks:
 4 * visible_scores * QH * D for forward, 10 * visible_scores * QH * D for
 backward (including attention recomputation). Padding work is not credited.
 Each case contributes its recorded mean latency once, irrespective of the
 number of measurement iterations. SM configurations are summarized separately.
+Timing summaries use equal-case geometric and arithmetic means.
 """
 
 from __future__ import annotations
@@ -18,7 +20,20 @@ import json
 import math
 from collections import defaultdict
 from pathlib import Path
+from statistics import geometric_mean, mean
 from typing import Any, Sequence
+
+
+TIMING_COLUMNS = (
+    ("CoreF", "core_attn_forward_cuda_critical_rank_avg_ms"),
+    ("CoreB", "core_attn_backward_cuda_critical_rank_avg_ms"),
+    ("OthersF", "others_forward_cuda_critical_rank_avg_ms"),
+    ("OthersB", "others_backward_cuda_critical_rank_avg_ms"),
+    ("LayerF", "forward_cuda_critical_rank_avg_ms"),
+    ("LayerB", "backward_cuda_critical_rank_avg_ms"),
+    ("LayerFB", "total_cuda_critical_rank_avg_ms"),
+    ("WallFB", "total_wall_max_avg_ms"),
+)
 
 
 def sm_label(record: dict[str, Any]) -> str:
@@ -126,7 +141,6 @@ def print_report(records: Sequence[dict[str, Any]]) -> None:
               f"routing={model.get('moe_routing', 'model_default')} | seed={first['seed']}")
         print("CASES (times in ms; F/B/FB TFLOPS below are per GPU)")
         rows = []
-        grouped = defaultdict(list)
         for record in sorted(dataset_records, key=lambda r: (
             r["case_index"], r["method"], sm_label(r)
         )):
@@ -143,11 +157,20 @@ def print_report(records: Sequence[dict[str, Any]]) -> None:
                 f"{timing['backward_cuda_critical_rank_avg_ms']:.3f}",
                 *(f"{rate / world:.3f}" for rate in rates),
             ])
-            grouped[(record["method"], sm_label(record))].append(record)
         print_table([
             "Case", "Method", "SM", "Tokens", "ExecTokens", "CoreF", "CoreB",
             "LayerF", "LayerB", "F_TF/GPU", "B_TF/GPU", "FB_TF/GPU",
         ], rows)
+
+    print("\nSUMMARIES BY DATASET")
+    print("Times in ms: GeoMean and ArithMean give each recorded case equal weight.")
+    print("Measurement iteration counts do not affect timing means.")
+    for dataset, dataset_records in sorted(by_dataset.items()):
+        first = dataset_records[0]
+        world = gpu_count(first)
+        grouped = defaultdict(list)
+        for record in dataset_records:
+            grouped[(record["method"], sm_label(record))].append(record)
         print(f"\nSUMMARY {dataset} (time-weighted TFLOPS across recorded cases)")
         rows = []
         for (method, sm), cases in sorted(grouped.items()):
@@ -160,6 +183,21 @@ def print_report(records: Sequence[dict[str, Any]]) -> None:
         print_table([
             "Method", "SM", "Cases", "F_TF", "B_TF", "FB_TF",
             "F_TF/GPU", "B_TF/GPU", "FB_TF/GPU",
+        ], rows)
+        print(f"\nTIMING SUMMARY {dataset} (equal-case means, ms)")
+        rows = []
+        for (method, sm), cases in sorted(grouped.items()):
+            components = [
+                [float(record["timing"][key]) for record in cases]
+                for _, key in TIMING_COLUMNS
+            ]
+            for label, average in (("GeoMean", geometric_mean), ("ArithMean", mean)):
+                rows.append([
+                    method, sm, f"{len(cases)}/{first['num_cases']}", label,
+                    *(f"{average(values):.3f}" for values in components),
+                ])
+        print_table([
+            "Method", "SM", "Cases", "Mean", *(label for label, _ in TIMING_COLUMNS),
         ], rows)
         for (method, sm), cases in sorted(grouped.items()):
             present = {r["case_index"] for r in cases}
