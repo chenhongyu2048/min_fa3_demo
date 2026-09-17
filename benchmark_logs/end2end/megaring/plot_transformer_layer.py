@@ -4,6 +4,7 @@
 Use ArithMean so the four stacked components sum to mean layer latency.
 Select each Mega-Ring variant's SM configuration by minimum LayerFB.
 Hybrid speedup compares LayerFB against the fastest non-Mega-Ring baseline.
+Reuse transformer_layer_selected.csv in the output directory when it exists.
 """
 
 from __future__ import annotations
@@ -77,6 +78,19 @@ def load_summary(path: Path) -> dict[str, list[dict]]:
                 row[key] = float(row[key])
             grouped[dataset].append(row)
     return grouped
+
+
+def load_selected_csv(path: Path) -> dict[str, list[dict]]:
+    selected = {}
+    with path.open(newline="", encoding="utf-8") as source:
+        for row in csv.DictReader(source):
+            selected.setdefault(row["dataset"], []).append({
+                "Method": row["method"], "SM": row["sm_config"], "Cases": row["cases"],
+                "OthersB": float(row["otherB_ms"]), "OthersF": float(row["otherF_ms"]),
+                "CoreB": float(row["coreB_ms"]), "CoreF": float(row["coreF_ms"]),
+                "LayerFB": float(row["layerFB_ms"]),
+            })
+    return selected
 
 
 def select_results(grouped: dict[str, list[dict]]) -> dict[str, list[dict]]:
@@ -163,7 +177,13 @@ def main() -> None:
     parser.add_argument("input", nargs="?", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output-dir", type=Path, default=SCRIPT_DIR)
     args = parser.parse_args()
-    selected = select_results(load_summary(args.input))
+    csv_path = args.output_dir / "transformer_layer_selected.csv"
+    reuse_csv = csv_path.exists()
+    if reuse_csv:
+        selected = load_selected_csv(csv_path)
+        print(f"Reading {csv_path}")
+    else:
+        selected = select_results(load_summary(args.input))
     args.output_dir.mkdir(parents=True, exist_ok=True)
     figure = make_figure(selected)
     for extension in ("png", "pdf"):
@@ -171,7 +191,9 @@ def main() -> None:
         figure.savefig(output, dpi=600, facecolor="white")
         print(output)
     plt.close(figure)
-    output = args.output_dir / "transformer_layer_selected.csv"
+    if reuse_csv:
+        return
+    output = csv_path
     with output.open("w", newline="", encoding="utf-8") as target:
         writer = csv.writer(target)
         writer.writerow(["dataset", "method", "sm_config", "cases", "otherB_ms", "otherF_ms",
