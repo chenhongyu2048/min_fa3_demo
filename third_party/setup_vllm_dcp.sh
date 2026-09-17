@@ -122,7 +122,7 @@ verify_core_wheel() {
 
 verify_prepared_vllm() {
     verify_core_wheel
-    verify_torch_cuda12_packages
+    verify_torch_cuda12_packages || return 1
     "$VENV_DIR/bin/python" - "$ROOT_DIR" <<'PY'
 import sys
 from pathlib import Path
@@ -292,7 +292,8 @@ prepare_runtime() {
     echo "vLLM core wheel commit:  $VLLM_PRECOMPILED_WHEEL_COMMIT"
     echo "vLLM core wheel variant: $VLLM_PRECOMPILED_WHEEL_VARIANT"
 
-    if verify_prepared_vllm >/dev/null 2>&1; then
+    # Keep fatal verification exits inside the probe so prepare can install.
+    if (verify_prepared_vllm) >/dev/null 2>&1; then
         echo "vLLM source and precompiled core are already installed; skipping source install"
     else
         "$UV" pip install --python "$VENV_DIR/bin/python" \
