@@ -13,6 +13,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -374,7 +375,15 @@ double forward_chunk_prefill_varlen_dcp_mega(
     bool run_pre_barrier,
     bool measure_kernel,
     bool graph_replay,
-    bool dynamic_metadata) {
+    bool dynamic_metadata,
+    std::string execution_mode,
+    py::object sm_trace_obj) {
+    TORCH_CHECK(execution_mode == "mixed" || execution_mode == "phased",
+                "execution_mode must be mixed or phased");
+    bool const phased = execution_mode == "phased";
+    TORCH_CHECK(!phased || (!dynamic_metadata && !record_phase_timestamps),
+                "phased execution uses fixed metadata and sm_trace, not phase_timestamps");
+    TORCH_CHECK(phased || sm_trace_obj.is_none(), "sm_trace requires phased execution");
     check_packed_bf16(q, "q");
     check_packed_bf16(k_history, "k_history");
     check_packed_bf16(v_history, "v_history");
@@ -679,6 +688,18 @@ double forward_chunk_prefill_varlen_dcp_mega(
     params.num_sms = properties->multiProcessorCount;
     params.num_comm_sm = num_comm_sm;
     params.return_lse = return_lse;
+    params.phased_execution = phased;
+    TORCH_CHECK(!phased || ipc_barrier.data_.numel() >= 3,
+                "phased execution requires three IPC barrier slots");
+    if (!sm_trace_obj.is_none()) {
+        auto trace = sm_trace_obj.cast<torch::Tensor>();
+        TORCH_CHECK(trace.is_cuda() && trace.device() == q.device()
+                        && trace.scalar_type() == torch::kInt64 && trace.is_contiguous()
+                        && trace.dim() == 3 && trace.size(0) == 6
+                        && trace.size(1) == params.num_sms && trace.size(2) == 7,
+                    "sm_trace must be same-device contiguous int64 [6, num_sms, 7]");
+        params.sm_trace = trace.data_ptr<int64_t>();
+    }
     for (int rank = 0; rank < dcp_size; ++rank) {
         int const node_rank = dcp_node_ranks[rank];
         params.ipc_q_ptrs[rank] = ipc_q.raw_ptrs_[node_rank];
@@ -883,6 +904,8 @@ void bind_dcp_mega_varlen(py::module_& module) {
         py::arg("measure_kernel") = false,
         py::arg("graph_replay") = false,
         py::arg("dynamic_metadata") = false,
+        py::arg("execution_mode") = "mixed",
+        py::arg("sm_trace") = py::none(),
         "Persistent single-node SM90 BF16 D=128 batched varlen DCP mega forward.");
     module.def(
         "_dcp_mega_varlen_barrier",

@@ -6,6 +6,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -290,6 +291,9 @@ struct DCPMegaKernelConfig {
         int32_t* queue_state = nullptr;
         uint64_t* phase_timestamps = nullptr;
         int32_t const* graph_post_phase = nullptr;
+        int32_t* phase_barrier_remote[DCPSize]{};
+        int64_t* sm_trace = nullptr;
+        int chunk_attention_count = 0;
         // Serving graphs reuse their launch while the device task image changes.
         int32_t const* dynamic_metadata = nullptr;
         CUTLASS_DEVICE QTaskDesc const* get_q_tasks() const {
@@ -397,7 +401,7 @@ struct DCPMegaKernelConfig {
     static_assert(offsetof(KernelParams, history_receive_local) % 64 == 0);
 };
 
-template <typename Config>
+template <typename Config, bool AllCTAs = false>
 CUTLASS_DEVICE void run_q_allgather(
     typename Config::KernelParams const& params,
     typename Config::HelperSharedStorage& shared) {
@@ -418,7 +422,8 @@ CUTLASS_DEVICE void run_q_allgather(
         int const chunk = warp_id;
         for (int task_id = Config::kNumCommChunks * int(blockIdx.x) + chunk;
              task_id < params.get_num_q_tasks();
-             task_id += Config::kNumCommChunks * params.num_comm_sm) {
+             task_id += Config::kNumCommChunks
+                 * (AllCTAs ? params.num_sms : params.num_comm_sm)) {
             QTaskDesc const task = params.get_q_tasks()[task_id];
             kittens::wait(
                 shared.finished[chunk], kittens::get_phasebit<1>(phasebits, 0));
@@ -436,7 +441,8 @@ CUTLASS_DEVICE void run_q_allgather(
         int const chunk = warp_id - Config::kNumCommChunks;
         for (int task_id = Config::kNumCommChunks * int(blockIdx.x) + chunk;
              task_id < params.get_num_q_tasks();
-             task_id += Config::kNumCommChunks * params.num_comm_sm) {
+             task_id += Config::kNumCommChunks
+                 * (AllCTAs ? params.num_sms : params.num_comm_sm)) {
             QTaskDesc const task = params.get_q_tasks()[task_id];
             kittens::wait(
                 shared.arrived[chunk], kittens::get_phasebit<0>(phasebits, 0));
@@ -767,7 +773,7 @@ CUTLASS_DEVICE int receive_task_id_from_pull_ordinal(
     return parent_token_block * kReceiveSources + source_ordinal;
 }
 
-template <typename Config>
+template <typename Config, bool AllCTAs = false>
 CUTLASS_DEVICE void run_communication_post_q(
     typename Config::KernelParams const& params,
     typename Config::HelperSharedStorage& shared) {
@@ -787,7 +793,8 @@ CUTLASS_DEVICE void run_communication_post_q(
     constexpr int kReceiveSources = Config::kDCPSize - 1;
     int const total_receive_tasks
         = params.get_token_block_count() * kReceiveSources;
-    int const receive_stride = Config::kNumCommChunks * params.num_comm_sm;
+    int const receive_stride = Config::kNumCommChunks
+        * (AllCTAs ? params.num_sms : params.num_comm_sm);
     int const expected_phase = params.graph_post_phase != nullptr
         ? *params.graph_post_phase - 1 : params.tile_ready_phase;
     int const chunk = warp_id < Config::kNumCommChunks
@@ -963,15 +970,15 @@ CUTLASS_DEVICE void run_communication_post_q(
     record_phase_completion(
         params.queue_state, params.phase_timestamps,
         kReceivePhaseCounter, kReceiveDoneTimestamp,
-        params.num_comm_sm);
+        AllCTAs ? params.num_sms : params.num_comm_sm);
 }
 
-template <typename Config>
+template <typename Config, bool AllCTAs = false>
 CUTLASS_DEVICE void run_final_combine(
     typename Config::KernelParams const& params,
     typename Config::HelperSharedStorage& shared) {
-    int const compute_cta_id = int(blockIdx.x) - params.num_comm_sm;
-    int const num_compute_ctas = params.num_sms - params.num_comm_sm;
+    int const compute_cta_id = int(blockIdx.x) - (AllCTAs ? 0 : params.num_comm_sm);
+    int const num_compute_ctas = AllCTAs ? params.num_sms : params.num_sms - params.num_comm_sm;
     bool const static_schedule = params.get_final_count() <= num_compute_ctas;
     while (true) {
         int work_id;
@@ -1211,6 +1218,8 @@ void dcp_mega_varlen_kernel(
         params.num_sms);
 }
 
+#include "dcp_mega_phased.h"
+
 template <typename Kernel, typename Mainloop, typename Epilogue>
 typename Kernel::Params make_attention_kernel_params(
     Flash_fwd_params const& params,
@@ -1350,7 +1359,8 @@ void launch_dcp_mega_instance(
             header.history_num_splits == 1,
             "DCP mega nonsplit kernel requires one history split");
     }
-    int const num_compute_ctas = params.num_sms - params.num_comm_sm;
+    int const compute_offset = params.phased_execution ? 0 : params.num_comm_sm;
+    int const num_compute_ctas = params.num_sms - compute_offset;
     int32_t* attention_dynamic_counter
         = params.queue_state + kAttentionDynamicCounter;
     int32_t const* chunk_sequence_splits
@@ -1368,7 +1378,7 @@ void launch_dcp_mega_instance(
             params.q_ready,
             params.attention_done,
             num_compute_ctas,
-            params.num_comm_sm,
+            compute_offset,
             params.device,
             params.num_sms,
             params.chunk_lse_head_stride);
@@ -1383,7 +1393,7 @@ void launch_dcp_mega_instance(
             params.q_ready,
             params.attention_done,
             num_compute_ctas,
-            params.num_comm_sm,
+            compute_offset,
             params.device,
             params.num_sms,
             params.history_lse_head_stride);
@@ -1449,6 +1459,11 @@ void launch_dcp_mega_instance(
     kernel_params.queue_state = params.queue_state;
     kernel_params.phase_timestamps = params.phase_timestamps;
     kernel_params.graph_post_phase = params.graph_post_phase;
+    kernel_params.sm_trace = params.sm_trace;
+    kernel_params.chunk_attention_count = header.chunk_attention_count;
+    for (int rank = 0; rank < DCPSize; ++rank) {
+        kernel_params.phase_barrier_remote[rank] = params.ipc_barrier_ptrs[rank];
+    }
     kernel_params.dynamic_metadata = params.dynamic_metadata ? metadata : nullptr;
     kernel_params.cu_seqlens_q = params.chunk.cu_seqlens_q;
     kernel_params.total_q = header.total_q;
@@ -1474,6 +1489,20 @@ void launch_dcp_mega_instance(
         = params.ipc_history_send_lse_ptrs[params.dcp_rank];
     kernel_params.token_block_capacity = params.ipc_token_block_capacity;
 
+    if (params.phased_execution) {
+        // D1 fixes DCP=2 and Hq_local=4. Avoid compiling extra diagnostic
+        // copies of the unrelated serving/topology specializations.
+        if constexpr (DCPSize == 2 && CommHeads == 4) {
+            if (params.sm_trace != nullptr) {
+                launch_dcp_mega_phased<Config, true>(params, kernel_params, stream);
+            } else {
+                launch_dcp_mega_phased<Config, false>(params, kernel_params, stream);
+            }
+        } else {
+            TORCH_CHECK(false, "phased D1 requires DCP=2 and Hq_local=4");
+        }
+        return;
+    }
     auto kernel = dcp_mega_varlen_kernel<Config>;
     int const smem_size = Config::SharedStorageSize;
     if (smem_size >= 48 * 1024) {
