@@ -176,6 +176,54 @@ vLLM event statistics, trace overhead in milliseconds/percent, and PNG/PDF
 SM timelines for both cases. Matplotlib comes from the existing environment.
 Use `--no-plots` for dependency-free table export.
 
+### Compact plotting log
+
+After measurement, export a single portable log using only the Python standard
+library; CUDA, PyTorch and matplotlib are not needed:
+
+```bash
+python3 -m motivation.export_plot_data --input-dir benchmark_logs/motivation_v3 \
+  --output benchmark_logs/motivation_v3/plot_data.log
+```
+
+Direct execution is also supported: `python3 motivation/export_plot_data.py ...`
+from the repository root, or `python3 export_plot_data.py ...` from `motivation/`.
+Input/output paths are relative to the current working directory. `--output-dir`
+is accepted as an alias for `--output`; both take the full output **file** path.
+
+The `.log` uses JSON Lines: parse each line with `json.loads(line)`. It supports
+directories containing T1, D1, or both. Metadata lines retain the configuration,
+GPU environment and timing convention. Data lines contain:
+
+- `t1_timing`: each batch/method/mode, per-sample `rank_max_ms`, and p50/p90 in
+  milliseconds. Rank reduction happens before percentiles. The measured serial
+  configuration is retained independently of comm-only and comp-only.
+- `d1_timeline`: one complete `phased_trace_on` timeline per case. First choose
+  the sample nearest trace-on rank-max p50, then the rank with the largest CUDA
+  event duration in that sample. Ties choose the lowest sample/rank index.
+  `sample_index` is zero-based; `rank` is the logical distributed rank.
+  `selected_graph_ms` and five-configuration p50/p90 summaries retain timing
+  context, including the trace-on/off comparison.
+
+D1 stores physical SM IDs once in `sm_ids_by_cta`. `phase_times_ns` is indexed
+by `[phase][CTA][field]`, with phases and the four time fields defined in the
+`d1_metadata` line. Each row retains entry, work start, work end and exit-sync
+completion. `rank_sync_ns` rows contain `[phase_index, enter_ns, exit_ns]` for
+CTA0 at Q allgather and A2A entry; CTA0's physical SM is `sm_ids_by_cta[0]`.
+All timestamps are integer nanoseconds relative to the selected rank's earliest
+phase entry; subtraction occurs before any floating-point conversion. Divide
+by 1000 for a microsecond axis. Entry wait, work and exit wait can be drawn
+directly from adjacent boundaries. Within each phase, `max(work_end) - work_end`
+gives each SM's tail idle duration.
+
+Only the selected rank's JSON file is read for each D1 case. Full task tables,
+other ranks/replays and vLLM diagnostic events are omitted. The exported log is
+sufficient for T1 time-comparison plots and one representative per-SM timeline
+per D1 case; it cannot reconstruct all-rank imbalance or trace distributions.
+Each timeline preserves one actual execution, without mixing per-SM maxima
+across ranks or aligning independent GPU clocks. `motivation.analyze` continues
+to read the original JSON directory, not this compact log.
+
 For a four-GPU smoke test, select four non-MIG devices using
 `CUDA_VISIBLE_DEVICES` and use `--nproc_per_node=4`. T1 retains 131072 global
 tokens; D1 additionally requires `--smoke`, which uses TP=4, DCP=2, QH=16 and
