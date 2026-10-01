@@ -22,7 +22,7 @@ from matplotlib.patches import Patch
 PHASES = ["q_allgather", "chunk_attention", "history_attention",
           "history_combine_publish", "a2a_pull", "final_combine"]
 PHASE_LABELS = ["Q allgather", "Chunk attention", "History attention",
-                "History publish", "A2A pull", "Final combine"]
+                "History reduction", "A2A pull", "Final reduction"]
 # Reuse end2end/megaring/plot_transformer_layer.py's palette and typography.
 METHOD_COLORS = {"allgather_attention": "#4C78A8", "fa3_ring": "#9C755F",
                  "megatron_hybrid_cp": "#F28E2B", "magi_attention": "#17A2B8",
