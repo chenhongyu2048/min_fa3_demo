@@ -706,6 +706,15 @@ phases. `--interleave-comm-windows` (default) uses round robin windows within ea
 phase; `--no-interleave-comm-windows` concatenates sequences within each phase.
 Both options are available in the normal topology/dataset and ablation drivers.
 
+Normal MegaRing benchmarks preallocate `out/lse`, the packed state workspace,
+and the static communication windows/map offsets before timing. Each invocation
+still resets the dynamic suffix with one memset and runs the normal scheduler
+preparation. Ablation prepares its scheduler once in the constructor; each run
+resets the same dynamic suffix, including the map and phase barrier. Optional
+stats retain their separate reset. Python callers can pass a workspace returned
+by `_prepare_mega_ring_forward_call_workspace(...)` as `workspace=` to
+`forward_varlen_mega_ring`; it binds device, shapes, topology, rank, causal mode,
+and window order, and supports serial reuse.
 Stats probes are outside the timed region. `--b --seqlen ...` remains available as an explicit one-case
 debugging override.
 
@@ -1088,6 +1097,14 @@ across the full Cartesian product. The ordinary ring benchmarks consume per-rank
 local lengths.
 `--allgather-overlapping-heads-k-stride` is shared by the per-sequence and
 Llama3 all-gather baselines and must divide `--kvhead`.
+
+For `mega_ring_all_cp` and `mega_ring_hybrid`, output-buffer reuse is enabled
+in both the topology and dataset-shaped forward
+frontends: `out` and `lse` are allocated before timing and reused on every call.
+The binding does not pre-clear supplied outputs; each output tile is initialized
+by its first task in the attention kernel. Output allocation and separate
+zero/fill operations are therefore excluded from timing, while scheduler state
+resets, metadata preparation, and attention output writes remain included.
 
 For `mega_ring_all_cp` and `mega_ring_hybrid`, add
 `--collect-mega-ring-stats` to either the topology or dataset-shaped forward

@@ -11,6 +11,7 @@
 #include <cmath>
 #include <limits>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 // MEGA_RING: use the fused multi-step mega-ring launch instead of the
@@ -28,6 +29,46 @@ using VarlenParams = min_fa3_varlen_demo::Flash_fwd_params;
 
 int round_multiple(int x, int m) {
     return (x + m - 1) / m * m;
+}
+
+// The scheduler's final metadata word is the task ticket. Keep it at the start
+// of the dynamic suffix so one memset resets every internal counter and lock.
+auto prepare_mega_ring_forward_workspace(
+    torch::Tensor const& q, int batch_size, int64_t reduction_tiles,
+    bool is_causal, bool tile_ready, bool collect_stats, int64_t num_remote_tiles = 0) {
+    int const metadata_size = 1 + round_multiple(batch_size, 4) * (is_causal ? 4 : 3);
+    int64_t const state_tiles = std::max<int64_t>(reduction_tiles, 1);
+    int64_t const counts_size = tile_ready ? 0 : min_fa3_varlen_demo::kMegaRingNumKvReadySections;
+    int64_t const step_size = tile_ready ? 0 : state_tiles;
+    int64_t const prefix_size = tile_ready ? batch_size : 0;
+    int64_t const q_state_stride = tile_ready ? state_tiles : 0;
+    int64_t const completed_size = collect_stats ? 4 : 1;
+    int64_t const map_size = tile_ready ? num_remote_tiles : 0;
+    int64_t const barrier_size = tile_ready ? 1 : 0;
+    int64_t const dynamic_size = 1 + counts_size + step_size + prefix_size
+        + 3 * q_state_stride + 1 + completed_size + map_size + barrier_size;
+
+    auto storage = torch::empty(
+        {metadata_size - 1 + dynamic_size}, q.options().dtype(torch::kInt32));
+    auto scheduler_metadata = storage.narrow(0, 0, metadata_size);
+    auto dynamic_state = storage.narrow(0, metadata_size - 1, dynamic_size);
+    int64_t offset = metadata_size;
+    auto take = [&](int64_t size) {
+        auto view = storage.narrow(0, offset, size);
+        offset += size;
+        return view;
+    };
+    auto kv_ready_counts = take(counts_size);
+    auto step_ready = take(step_size);
+    auto ready_prefix = take(prefix_size);
+    auto q_state = take(3 * q_state_stride).view({3, q_state_stride});
+    auto scan_cursor = take(1);
+    auto completed_tiles = take(completed_size);
+    auto kv_map = take(map_size);
+    auto comm_phase_barrier = take(barrier_size);
+    return std::make_tuple(storage, scheduler_metadata, dynamic_state,
+        kv_ready_counts, step_ready, ready_prefix, q_state, scan_cursor, completed_tiles,
+        kv_map, comm_phase_barrier);
 }
 
 // Shared by normal forward and the reusable ablation runner. Windows are immutable.
@@ -383,6 +424,42 @@ int64_t compute_tiles_for_batch_range(const int* cu_seqlens_q_host,
     return tiles;
 }
 
+using MegaRingStateViews = decltype(prepare_mega_ring_forward_workspace(
+    std::declval<torch::Tensor const&>(), 0, 0, false, false, false));
+using MegaRingCallWorkspace = std::tuple<MegaRingStateViews, torch::Tensor, torch::Tensor, int>;
+
+MegaRingCallWorkspace prepare_mega_ring_forward_call_workspace(
+    torch::Tensor const& q, torch::Tensor const& cu_seqlens_q_host,
+    torch::Tensor const& cu_seqlens_k_host, torch::Tensor const& ring_sizes_host,
+    int rank, bool is_causal, bool interleave_comm_windows = true,
+    bool reserve_stats = false) {
+    c10::cuda::CUDAGuard device_guard(q.device());
+    int const batch = ring_sizes_host.numel();
+    auto const* sizes = ring_sizes_host.data_ptr<int>();
+    auto const* cu_q = cu_seqlens_q_host.data_ptr<int>();
+    int64_t reduction_tiles = 0;
+    for (int b = 0; b < batch; ++b) {
+        if (sizes[b] > 1) {
+            reduction_tiles += compute_tiles_for_batch_range(cu_q, b, b + 1, q.size(1));
+        }
+    }
+    auto windows = torch::empty({0, 4}, q.options().dtype(torch::kInt32));
+    auto offsets = torch::empty({0}, q.options().dtype(torch::kInt32));
+    int num_a_windows = 0;
+    int num_remote_tiles = 0;
+    if (is_causal) {
+        auto [windows_cpu, offsets_cpu, num_a] = prepare_mega_ring_causal_comm_windows(
+            cu_seqlens_k_host, ring_sizes_host, rank, interleave_comm_windows);
+        num_remote_tiles = offsets_cpu.data_ptr<int>()[batch];
+        windows = windows_cpu.to(q.device());
+        offsets = offsets_cpu.to(q.device());
+        num_a_windows = num_a;
+    }
+    auto states = prepare_mega_ring_forward_workspace(q, batch, reduction_tiles,
+        is_causal, is_causal, reserve_stats, num_remote_tiles);
+    return {states, windows, offsets, num_a_windows};
+}
+
 // MEGA_RING: public binding launches all ring steps in one CUDA kernel. The
 // caller provides full [world_size * local_total_k, KVH, D] K/V buffers instead
 // of src_rank/ring_step plus temporary prefetch buffers.
@@ -407,7 +484,8 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
                                     py::object lse_obj,
                                     bool return_lse,
                                     py::object stats_obj,
-                                    bool interleave_comm_windows) {
+                                    bool interleave_comm_windows,
+                                    py::object workspace_obj) {
     check_varlen_qkv(q, "q");
     check_varlen_qkv(k, "k");
     check_varlen_qkv(v, "v");
@@ -632,41 +710,33 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
 
     auto out = resolve_out(out_obj, q);
     auto lse = resolve_lse(lse_obj, q);
-    // The reduction epilogue treats O/LSE as running state starting at
-    // (zero, -inf), including step 0 and caller-provided output buffers.
-    out.zero_();
-    lse.fill_(-std::numeric_limits<float>::infinity());
+    // Each output tile is initialized by its first completed causal task or
+    // legacy step 0. Caller-provided buffers do not need to be cleared.
 
-    int b_rounded = round_multiple(batch_size, 4);
-    bool varlen_sort_batches = true;
-    bool head_swizzle = is_causal;
-    int num_prepare_batch_vectors = 2 + (varlen_sort_batches ? 1 : 0) + (head_swizzle ? 1 : 0);
-    int metadata_size = 1 + b_rounded * num_prepare_batch_vectors;
-    auto scheduler_metadata = torch::empty({metadata_size}, q.options().dtype(torch::kInt32));
-
-    auto kv_ready_counts = torch::zeros({11}, q.options().dtype(torch::kInt32));
-    auto step_ready = torch::zeros({std::max<int64_t>(reduction_tiles, 1)}, q.options().dtype(torch::kInt32));
-    auto scan_cursor = torch::zeros({1}, q.options().dtype(torch::kInt32));
-    auto completed_tiles = torch::zeros(
-        {stats.defined() ? 4 : 1}, q.options().dtype(torch::kInt32));
-
-    auto ready_prefix = torch::zeros({is_causal ? batch_size : 0}, q.options().dtype(torch::kInt32));
-    auto q_state = torch::zeros({3, is_causal ? std::max<int64_t>(reduction_tiles, 1) : 0},
-                               q.options().dtype(torch::kInt32));
-    auto comm_windows = torch::empty({0, 4}, q.options().dtype(torch::kInt32));
-    auto kv_map_offsets = torch::empty({0}, q.options().dtype(torch::kInt32));
-    int num_a_windows = 0;
-    int num_remote_tiles = 0;
+    auto workspace = workspace_obj.is_none()
+        ? prepare_mega_ring_forward_call_workspace(q, cu_seqlens_q_host, cu_seqlens_k_host,
+            ring_sizes_host, ring_rank, is_causal, interleave_comm_windows, stats.defined())
+        : workspace_obj.cast<MegaRingCallWorkspace>();
+    auto& [state_views, comm_windows, kv_map_offsets, num_a_windows] = workspace;
+    auto& [state_storage, scheduler_metadata, dynamic_state, kv_ready_counts,
+           step_ready, ready_prefix, q_state, scan_cursor, completed_tiles,
+           kv_map, comm_phase_barrier] = state_views;
+    TORCH_CHECK(state_storage.device() == q.device(), "workspace must be on the same device as q");
+    TORCH_CHECK(scheduler_metadata.numel() >= 1 + round_multiple(batch_size, 4) * (is_causal ? 4 : 3),
+                "workspace scheduler metadata is too small");
+    TORCH_CHECK(completed_tiles.numel() >= (stats.defined() ? 4 : 1),
+                "workspace must reserve four completed slots for statistics");
     if (is_causal) {
-        auto [windows_cpu, offsets_cpu, num_a] = prepare_mega_ring_causal_comm_windows(
-            cu_seqlens_k_host, ring_sizes_host, ring_rank, interleave_comm_windows);
-        comm_windows = windows_cpu.to(q.device());
-        kv_map_offsets = offsets_cpu.to(q.device());
-        num_a_windows = num_a;
-        num_remote_tiles = offsets_cpu.data_ptr<int>()[batch_size];
+        TORCH_CHECK(ready_prefix.numel() >= batch_size
+                        && q_state.size(1) >= std::max<int64_t>(reduction_tiles, 1)
+                        && kv_map_offsets.numel() >= batch_size + 1
+                        && kv_map.numel() >= total_comm_tasks / 2
+                        && comm_phase_barrier.numel() >= 1,
+                    "causal workspace is too small");
+    } else {
+        TORCH_CHECK(step_ready.numel() >= std::max<int64_t>(reduction_tiles, 1),
+                    "legacy workspace is too small");
     }
-    auto kv_map = torch::zeros({num_remote_tiles}, q.options().dtype(torch::kInt32));
-    auto comm_phase_barrier = torch::zeros({is_causal ? 1 : 0}, q.options().dtype(torch::kInt32));
     torch::Tensor q_descriptor = q;
     torch::Tensor out_descriptor = out;
     torch::Tensor lse_descriptor = lse;
@@ -676,6 +746,8 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
         lse_descriptor = torch::empty({q.size(1), 1}, q.options().dtype(torch::kFloat));
     }
     auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+    C10_CUDA_CHECK(cudaMemsetAsync(
+        dynamic_state.data_ptr<int>(), 0, size_t(dynamic_state.numel()) * sizeof(int), stream));
     if (stats.defined()) {
         C10_CUDA_CHECK(cudaMemsetAsync(
             stats.data_ptr<int64_t>(), 0, 2 * sizeof(int64_t), stream));
@@ -804,6 +876,7 @@ py::tuple forward_varlen_mega_ring_ablation(
     torch::Tensor half_cu_seqlens,
     torch::Tensor hierarchy_host,
     torch::Tensor scheduler_metadata,
+    torch::Tensor dynamic_state,
     torch::Tensor kv_ready_counts,
     torch::Tensor step_ready,
     torch::Tensor ready_prefix,
@@ -886,6 +959,7 @@ py::tuple forward_varlen_mega_ring_ablation(
     int const metadata_size = 1 + round_multiple(batch_size, 4) * 4;
     check_ablation_int_cuda(
         scheduler_metadata, q, metadata_size, "scheduler_metadata");
+    check_ablation_int_cuda(dynamic_state, q, 1, "dynamic_state");
     if (profile_id >= 5) {
         check_ablation_int_cuda(ready_prefix, q, batch_size, "ready_prefix");
         TORCH_CHECK(q_state.dim() == 2 && q_state.size(0) == 3
@@ -956,7 +1030,7 @@ py::tuple forward_varlen_mega_ring_ablation(
     min_fa3_varlen_demo::forward_ablation::run(
         params, remote_k, remote_v, scratch_out, scratch_lse,
         static_cast<min_fa3_varlen_demo::forward_ablation::Profile>(profile_id),
-        completed_tiles.numel(), kv_map.numel(), stream, prepare_only);
+        completed_tiles.numel(), dynamic_state, stream, prepare_only);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return py::make_tuple(out, lse);
 }
@@ -964,9 +1038,17 @@ py::tuple forward_varlen_mega_ring_ablation(
 }  // namespace
 
 void bind_varlen_mega_ring(py::module_& m) {
+    m.def("_prepare_mega_ring_forward_workspace", &prepare_mega_ring_forward_workspace,
+          py::arg("q"), py::arg("batch_size"), py::arg("reduction_tiles"),
+          py::arg("is_causal"), py::arg("tile_ready"), py::arg("collect_stats"),
+          py::arg("num_remote_tiles") = 0);
     m.def("_prepare_mega_ring_causal_comm_windows", &prepare_mega_ring_causal_comm_windows,
           py::arg("cu_seqlens_k_host"), py::arg("ring_sizes_host"), py::arg("rank"),
           py::arg("interleave_comm_windows") = true);
+    m.def("_prepare_mega_ring_forward_call_workspace", &prepare_mega_ring_forward_call_workspace,
+          py::arg("q"), py::arg("cu_seqlens_q_host"), py::arg("cu_seqlens_k_host"),
+          py::arg("ring_sizes_host"), py::arg("rank"), py::arg("is_causal"),
+          py::arg("interleave_comm_windows") = true, py::arg("reserve_stats") = false);
     m.def(
         "forward_varlen_mega_ring_ablation",
         &forward_varlen_mega_ring_ablation,
@@ -986,6 +1068,7 @@ void bind_varlen_mega_ring(py::module_& m) {
         py::arg("half_cu_seqlens"),
         py::arg("hierarchy_host"),
         py::arg("scheduler_metadata"),
+        py::arg("dynamic_state"),
         py::arg("kv_ready_counts"),
         py::arg("step_ready"),
         py::arg("ready_prefix"),
@@ -1030,6 +1113,7 @@ void bind_varlen_mega_ring(py::module_& m) {
         py::arg("return_lse") = false,
         py::arg("stats") = py::none(),
         py::arg("interleave_comm_windows") = true,
+        py::arg("workspace") = py::none(),
         "MEGA_RING: hierarchical fused Hopper varlen ring-attention forward.\n\n"
         "K/V must be contiguous [world_size * rank_kv_capacity, 8, 128] arenas. "
         "The kernel performs persistent compute and remote K/V TMA loads in one launch.");

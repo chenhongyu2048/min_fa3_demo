@@ -413,31 +413,27 @@ class ForwardAblationPlan:
         else:
             self.comm_windows = torch.empty((0, 4), device=q.device, dtype=torch.int32)
             self.kv_map_offsets = torch.empty(0, device=q.device, dtype=torch.int32)
-        b_rounded = (len(global_lengths) + 3) // 4 * 4
-        self.scheduler_metadata = torch.empty(
-            1 + 4 * b_rounded, device=q.device, dtype=torch.int32
+        (
+            self.state_storage,
+            self.scheduler_metadata,
+            self.dynamic_state,
+            self.kv_ready_counts,
+            self.step_ready,
+            self.ready_prefix,
+            self.q_state,
+            self.scan_cursor,
+            self.completed_tiles,
+            self.kv_map,
+            self.comm_phase_barrier,
+        ) = min_fa3_op._prepare_mega_ring_forward_workspace(
+            q,
+            len(global_lengths),
+            hierarchy["reduction_tiles"],
+            True,
+            dynamic,
+            collect_stats,
+            num_remote_tiles,
         )
-        self.kv_ready_counts = torch.empty(
-            11, device=q.device, dtype=torch.int32
-        )
-        self.step_ready = torch.empty(
-            max(hierarchy["reduction_tiles"], 1),
-            device=q.device,
-            dtype=torch.int32,
-        )
-        self.scan_cursor = torch.empty(1, device=q.device, dtype=torch.int32)
-        self.completed_tiles = torch.empty(
-            4 if collect_stats else 1, device=q.device, dtype=torch.int32
-        )
-        self.ready_prefix = torch.empty(
-            len(global_lengths) if dynamic else 0, device=q.device, dtype=torch.int32
-        )
-        self.q_state = torch.empty(
-            (3, max(hierarchy["reduction_tiles"], 1) if dynamic else 0),
-            device=q.device, dtype=torch.int32,
-        )
-        self.kv_map = torch.empty(num_remote_tiles, device=q.device, dtype=torch.int32)
-        self.comm_phase_barrier = torch.empty(1 if dynamic else 0, device=q.device, dtype=torch.int32)
         self.out = torch.empty_like(q)
         self.lse = torch.empty(
             (q.size(1), q.size(0)), device=q.device, dtype=torch.float32
@@ -473,6 +469,7 @@ class ForwardAblationPlan:
             self.half_cu_seqlens,
             self.hierarchy_host,
             self.scheduler_metadata,
+            self.dynamic_state,
             self.kv_ready_counts,
             self.step_ready,
             self.ready_prefix,

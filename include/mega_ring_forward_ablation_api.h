@@ -29,7 +29,7 @@ void run(
     torch::Tensor& scratch_lse,
     Profile profile,
     int completed_storage_size,
-    int map_storage_size,
+    torch::Tensor const& dynamic_state,
     cudaStream_t stream,
     bool prepare_only);
 

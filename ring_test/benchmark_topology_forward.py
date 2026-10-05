@@ -1392,6 +1392,21 @@ def _main_single(
                             expected_mega_ring_all_cp_lse,
                         ) = mega_ring_all_cp_run_data
 
+                        # Reuse this method's output buffers outside the timed launch.
+                        mega_ring_all_cp_out = torch.empty_like(mega_ring_all_cp_q)
+                        mega_ring_all_cp_lse = torch.empty(
+                            (mega_ring_all_cp_q.size(1), mega_ring_all_cp_q.size(0)),
+                            device=mega_ring_all_cp_q.device,
+                            dtype=torch.float32,
+                        )
+
+                        mega_ring_all_cp_workspace = min_fa3_op._prepare_mega_ring_forward_call_workspace(
+                            mega_ring_all_cp_q, mega_ring_all_cp_cu_host, mega_ring_all_cp_cu_host,
+                            mega_ring_all_cp_ring_sizes_host, rank, is_causal,
+                            interleave_comm_windows=args.interleave_comm_windows,
+                            reserve_stats=args.collect_mega_ring_stats,
+                        )
+
                         def launch_all_cp_mega(
                             stats: torch.Tensor | None = None,
                         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1413,9 +1428,12 @@ def _main_single(
                                 global_seqlens_host=mega_ring_all_cp_global_host,
                                 ring_sizes_host=mega_ring_all_cp_ring_sizes_host,
                                 ring_starts_host=mega_ring_all_cp_ring_starts_host,
+                                out=mega_ring_all_cp_out,
+                                lse=mega_ring_all_cp_lse,
                                 return_lse=True,
                                 stats=stats,
                                 interleave_comm_windows=args.interleave_comm_windows,
+                                workspace=mega_ring_all_cp_workspace,
                             )
 
                         runs.append(
@@ -1444,6 +1462,21 @@ def _main_single(
                             expected_hybrid_lse,
                         ) = hybrid_run_data
 
+                        # Empty ranks retain zero-row output buffers with the same layout.
+                        hybrid_out = torch.empty_like(hybrid_q)
+                        hybrid_lse = torch.empty(
+                            (hybrid_q.size(1), hybrid_q.size(0)),
+                            device=hybrid_q.device,
+                            dtype=torch.float32,
+                        )
+
+                        hybrid_workspace = min_fa3_op._prepare_mega_ring_forward_call_workspace(
+                            hybrid_q, hybrid_cu_host, hybrid_cu_host,
+                            hybrid_ring_sizes_host, rank, is_causal,
+                            interleave_comm_windows=args.interleave_comm_windows,
+                            reserve_stats=args.collect_mega_ring_stats,
+                        )
+
                         def launch_hybrid_mega(
                             stats: torch.Tensor | None = None,
                         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1465,9 +1498,12 @@ def _main_single(
                                 global_seqlens_host=hybrid_global_host,
                                 ring_sizes_host=hybrid_ring_sizes_host,
                                 ring_starts_host=hybrid_ring_starts_host,
+                                out=hybrid_out,
+                                lse=hybrid_lse,
                                 return_lse=True,
                                 stats=stats,
                                 interleave_comm_windows=args.interleave_comm_windows,
+                                workspace=hybrid_workspace,
                             )
 
                         runs.append(

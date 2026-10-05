@@ -24,6 +24,8 @@ from _min_fa3_op import (
     forward_varlen_mega_ring as _forward_varlen_mega_ring_cuda,
     forward_varlen_mega_ring_ablation as _forward_varlen_mega_ring_ablation_cuda,
     _prepare_mega_ring_causal_comm_windows,
+    _prepare_mega_ring_forward_workspace,
+    _prepare_mega_ring_forward_call_workspace,
     forward_varlen_ring as _forward_varlen_ring_cuda,
     parallel_remote_load as _parallel_remote_load_cuda,
     parallel_remote_load_vec as _parallel_remote_load_vec_cuda,
@@ -450,8 +452,11 @@ def forward_varlen_mega_ring(
     return_lse: bool = False,
     stats: Optional[torch.Tensor] = None,
     interleave_comm_windows: bool = True,
+    workspace=None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     # K/V are rank-major [world_size * rank_kv_capacity, KVH, 128] IPC arenas.
+    # A prepared workspace binds device, shapes, topology, rank and causal mode.
+    # Reuse it serially; its window ordering takes precedence over the flag below.
     return _forward_varlen_mega_ring_cuda(
         q,
         k,
@@ -475,6 +480,7 @@ def forward_varlen_mega_ring(
         bool(return_lse),
         stats,
         bool(interleave_comm_windows),
+        workspace,
     )
 
 

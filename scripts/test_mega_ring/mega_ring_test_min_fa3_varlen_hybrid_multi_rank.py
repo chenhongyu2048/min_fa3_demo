@@ -308,11 +308,15 @@ def run_case(args: argparse.Namespace, rank: int, world_size: int, is_causal: bo
     for _ in range(args.repeat):
         out, lse = launch()
 
-    caller_out = torch.full_like(q, SENTINEL)
-    caller_lse = torch.full(
-        (q.size(1), q.size(0)), SENTINEL, device=device, dtype=torch.float32
+    caller_out = torch.empty_like(q)
+    caller_lse = torch.empty(
+        (q.size(1), q.size(0)), device=device, dtype=torch.float32
     )
-    caller_out_result, caller_lse_result = launch(caller_out, caller_lse)
+    for _ in range(args.repeat):
+        # Reused output buffers must be overwritten without a binding-side clear.
+        caller_out.fill_(float("nan"))
+        caller_lse.fill_(float("nan"))
+        caller_out_result, caller_lse_result = launch(caller_out, caller_lse)
     torch.cuda.synchronize()
     dist.barrier()
 
