@@ -1,6 +1,6 @@
 // Forward-ablation schedulers copied and trimmed from
 // include/mega_ring_min_fa3_varlen_scheduler.h. The linear and step variants
-// are intentionally causal W8-only and do not replace the production dynamic
+// are intentionally causal all-CP-only and do not replace the production dynamic
 // scheduler.
 
 #pragma once
@@ -68,12 +68,12 @@ private:
 
     template<bool HalfMBlocks=false>
     CUTLASS_DEVICE typename Base::WorkTileInfo
-    tile_idx_to_w8_work(Params const& params, int tile_idx) const {
+    tile_idx_to_allcp_work(Params const& params, int tile_idx) const {
         int group_start_tile = 0;
         for (int bidb = 0; bidb < params.num_batch; ++bidb) {
             int num_m_blocks = params.num_m_blocks_ptr[bidb];
             if constexpr (HalfMBlocks) { num_m_blocks /= 2; }
-            if (batch_ring_size(params, bidb) != 8) { num_m_blocks = 0; }
+            if (batch_ring_size(params, bidb) != params.mega_ring_world_size) { num_m_blocks = 0; }
             int const batch_tiles = num_m_blocks * params.num_head;
             if (num_m_blocks > 0 && tile_idx < group_start_tile + batch_tiles) {
                 int const mh_block = tile_idx - group_start_tile;
@@ -99,12 +99,13 @@ private:
         Params const& params,
         typename Base::WorkTileInfo const& work,
         bool q_use_half) const {
-        if (work.bidb >= params.num_batch || batch_ring_size(params, work.bidb) != 8) {
+        if (work.bidb >= params.num_batch
+            || batch_ring_size(params, work.bidb) != params.mega_ring_world_size) {
             return 0;
         }
         int group_start_tile = 0;
         for (int bidb = 0; bidb < work.bidb; ++bidb) {
-            if (batch_ring_size(params, bidb) == 8) {
+            if (batch_ring_size(params, bidb) == params.mega_ring_world_size) {
                 group_start_tile += params.num_m_blocks_ptr[bidb] * params.num_head;
             }
         }
@@ -124,22 +125,24 @@ private:
 
     CUTLASS_DEVICE WorkTileInfo invalid_work(Params const& params, int ticket) const {
         return {ticket, 0, 0, params.num_batch,
-                min_fa3_varlen_demo::mega_ring::pack_segment_meta(8, 8, false), 0};
+                min_fa3_varlen_demo::mega_ring::pack_segment_meta(
+                    params.mega_ring_world_size, params.mega_ring_world_size, false), 0};
     }
 
     CUTLASS_DEVICE WorkTileInfo decode_step_ticket(
         Params const& params, int ticket) const {
         int const step = params.mega_ring_ablation_step;
-        auto const& level = params.mega_ring_hierarchy.levels[0];
+        auto const& level = params.mega_ring_hierarchy.levels[
+            min_fa3_varlen_demo::mega_ring_level_for_size(params.mega_ring_world_size)];
         int const ring_local_rank = params.mega_ring_rank;
         bool const q_use_half = step > ring_local_rank;
         int const step_tiles = q_use_half ? level.half_tiles : level.full_tiles;
-        if (step < 0 || step >= 8 || ticket >= step_tiles) {
+        if (step < 0 || step >= params.mega_ring_world_size || ticket >= step_tiles) {
             return invalid_work(params, ticket);
         }
         typename Base::WorkTileInfo work = q_use_half
-            ? tile_idx_to_w8_work<true>(params, ticket)
-            : tile_idx_to_w8_work<false>(params, ticket);
+            ? tile_idx_to_allcp_work<true>(params, ticket)
+            : tile_idx_to_allcp_work<false>(params, ticket);
         int const reduction_idx = level.reduction_base
             + full_tile_idx(params, work, q_use_half);
         return {work.tile_idx, work.block, work.bidh, work.bidb,
@@ -149,7 +152,8 @@ private:
 
     CUTLASS_DEVICE WorkTileInfo decode_linear_ticket(
         Params const& params, int ticket) const {
-        auto const& level = params.mega_ring_hierarchy.levels[0];
+        auto const& level = params.mega_ring_hierarchy.levels[
+            min_fa3_varlen_demo::mega_ring_level_for_size(params.mega_ring_world_size)];
         if (ticket >= params.mega_ring_hierarchy.total_work_tiles) {
             return invalid_work(params, ticket);
         }
@@ -172,8 +176,8 @@ private:
             }
         }
         typename Base::WorkTileInfo work = q_use_half
-            ? tile_idx_to_w8_work<true>(params, step_tile_idx)
-            : tile_idx_to_w8_work<false>(params, step_tile_idx);
+            ? tile_idx_to_allcp_work<true>(params, step_tile_idx)
+            : tile_idx_to_allcp_work<false>(params, step_tile_idx);
         int const reduction_idx = level.reduction_base
             + full_tile_idx(params, work, q_use_half);
         return {work.tile_idx, work.block, work.bidh, work.bidb,

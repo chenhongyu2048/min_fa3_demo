@@ -1,4 +1,4 @@
-"""Strict six-level causal W8 Mega Ring forward ablation on eight H100s."""
+"""Six-level causal Mega Ring ablation on 2/4/8 GPUs."""
 
 from __future__ import annotations
 
@@ -22,12 +22,13 @@ import balancer
 import min_fa3_op
 from ring_test.forward_ablation import (
     ForwardAblationPlan,
-    PROFILES,
+    canonicalize_lengths,
     local_lengths_for_rank,
     make_cu_seqlens,
+    profiles_for_world_size,
 )
 from ring_test.load_balance_bench.topology import PlannerControls, make_br_pbs_topology
-from ring_test.utils import aligned_length_note, align_mega_ring_all_cp_lengths
+from ring_test.utils import aligned_length_note
 from scripts.test_mega_ring.mega_ring_test_min_fa3_varlen_hybrid_multi_rank import (
     hierarchical_reference,
 )
@@ -129,6 +130,9 @@ def parse_sm_configs(spec: str) -> tuple[SmConfig, ...]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--interleave-comm-windows", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
         "--dataset", choices=(DEFAULT_DATASET,), default=DEFAULT_DATASET
     )
     parser.add_argument(
@@ -218,11 +222,11 @@ def init_distributed() -> tuple[int, int, torch.device]:
     import os
 
     if "LOCAL_RANK" not in os.environ or "LOCAL_WORLD_SIZE" not in os.environ:
-        raise SystemExit("run with torchrun --nproc_per_node=8")
+        raise SystemExit("run with torchrun --nproc_per_node=2, 4, or 8")
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["LOCAL_WORLD_SIZE"])
-    if world_size != 8:
-        raise SystemExit(f"strict forward ablation requires 8 ranks, got {world_size}")
+    if world_size not in (2, 4, 8):
+        raise SystemExit(f"forward ablation requires 2, 4, or 8 ranks, got {world_size}")
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     if torch.cuda.get_device_capability(device) != (9, 0):
@@ -319,9 +323,10 @@ def make_inputs(
     kv_heads: int,
     head_dim: int,
 ) -> DistributedInputs:
+    world_size = dist.get_world_size()
     rank_lengths = tuple(
         local_lengths_for_rank(global_lengths, ring_sizes, ring_starts, source_rank)
-        for source_rank in range(8)
+        for source_rank in range(world_size)
     )
     local_lengths = rank_lengths[rank]
     q, local_k, local_v = make_global_consistent_local_qkv(
@@ -341,12 +346,12 @@ def make_inputs(
     cu, cu_host = make_cu_seqlens(local_lengths, device)
     rank_capacity = max(sum(lengths) for lengths in rank_lengths)
     rank_capacity = (rank_capacity + 127) // 128 * 128
-    arena_shape = (8 * rank_capacity, kv_heads, head_dim)
+    arena_shape = (world_size * rank_capacity, kv_heads, head_dim)
     remote_k = min_fa3_op.TKParallelTensor(
-        arena_shape, torch.bfloat16, rank, 8, False
+        arena_shape, torch.bfloat16, rank, world_size, False
     )
     remote_v = min_fa3_op.TKParallelTensor(
-        arena_shape, torch.bfloat16, rank, 8, False
+        arena_shape, torch.bfloat16, rank, world_size, False
     )
     remote_k.data_.zero_()
     remote_v.data_.zero_()
@@ -377,6 +382,7 @@ def make_plan(
     sm_config: SmConfig,
     *,
     collect_stats: bool = False,
+    interleave_comm_windows: bool = True,
 ) -> ForwardAblationPlan:
     return ForwardAblationPlan(
         inputs.q,
@@ -392,6 +398,8 @@ def make_plan(
         num_comp_sm=sm_config.num_comp_sm,
         num_comm_sm=sm_config.num_comm_sm,
         collect_stats=collect_stats,
+        world_size=dist.get_world_size(),
+        interleave_comm_windows=interleave_comm_windows,
     )
 
 
@@ -403,7 +411,7 @@ def gather_local_kv(inputs: DistributedInputs) -> tuple[torch.Tensor, torch.Tens
             dtype=tensor.dtype,
         )
         padded[: tensor.size(0)].copy_(tensor)
-        parts = [torch.empty_like(padded) for _ in range(8)]
+        parts = [torch.empty_like(padded) for _ in range(dist.get_world_size())]
         dist.all_gather(parts, padded)
         return torch.stack(parts)
 
@@ -439,7 +447,7 @@ def reference(inputs: DistributedInputs, rank: int) -> tuple[torch.Tensor, torch
                 source_rank,
             )
         )
-        for source_rank in range(8)
+        for source_rank in range(dist.get_world_size())
     ]
     return hierarchical_reference(
         inputs.q,
@@ -455,6 +463,75 @@ def reference(inputs: DistributedInputs, rank: int) -> tuple[torch.Tensor, torch
     )
 
 
+def check_ready_state(plan: ForwardAblationPlan, inputs: DistributedInputs, rank: int) -> None:
+    """One final snapshot in --check mode, using the prepared Q ordering."""
+    batch = len(inputs.ring_sizes)
+    rounded = (batch + 3) // 4 * 4
+    metadata = plan.scheduler_metadata.cpu().tolist()
+    local_lengths = [int(inputs.cu_host[b + 1] - inputs.cu_host[b]) for b in range(batch)]
+    ready = [
+        (rank % g + 2 * (g - 1 - rank % g)) * (length // 256)
+        if g > 1 and length else 0
+        for g, length in zip(inputs.ring_sizes, local_lengths)
+    ]
+    totals: list[int] = []
+    for g in (8, 4, 2):
+        for virtual_b in range(batch):
+            b = metadata[2 * rounded + virtual_b]
+            if inputs.ring_sizes[b] != g or not local_lengths[b]:
+                continue
+            blocks = metadata[rounded + virtual_b]
+            heads_in_l2 = metadata[3 * rounded + virtual_b]
+            h = blocks // 2
+            for first_head in range(0, inputs.q.size(1), heads_in_l2):
+                heads = min(heads_in_l2, inputs.q.size(1) - first_head)
+                for m in range(blocks - 1, -1, -1):
+                    remote = (rank % g) * h if m < h else ready[b]
+                    totals.extend([m + 1 + remote] * heads)
+    count = plan.hierarchy["reduction_tiles"]
+    assert len(totals) == count
+    actual = torch.cat((plan.ready_prefix, plan.q_state[:, :count].reshape(-1), plan.completed_tiles[:1]))
+    expected = torch.tensor(ready + totals + totals + [2] * count + [count],
+                            device=actual.device, dtype=torch.int32)
+    assert_distributed_close("final R/A/C/output_state/completed", actual, expected, 0, 0)
+    mapping = plan.kv_map.cpu().tolist()
+    offsets = plan.kv_map_offsets.cpu().tolist()
+    sorted_actual: list[int] = []
+    sorted_expected: list[int] = []
+    for b, (g, length) in enumerate(zip(inputs.ring_sizes, local_lengths)):
+        if g == 1 or length == 0:
+            continue
+        h, r = length // 256, rank % g
+        expected_a: list[int] = []
+        expected_b: list[int] = []
+        for step in range(1, g):
+            source_rank = rank - r + (r - step + g) % g
+            base = (source_rank * inputs.rank_capacity + int(inputs.cu_host[b])) // 128
+            target = expected_a if step <= r else expected_b
+            target.extend(range(base, base + (h if step <= r else 2 * h)))
+        begin, end = offsets[b], offsets[b + 1]
+        split = begin + r * h
+        sorted_actual.extend(sorted(value - 1 for value in mapping[begin:split]))
+        sorted_actual.extend(sorted(value - 1 for value in mapping[split:end]))
+        sorted_expected.extend(sorted(expected_a))
+        sorted_expected.extend(sorted(expected_b))
+    assert_distributed_close(
+        "final map A/B physical tile sets",
+        torch.tensor(sorted_actual, device=actual.device, dtype=torch.int32),
+        torch.tensor(sorted_expected, device=actual.device, dtype=torch.int32), 0, 0,
+    )
+
+
+def clear_remote_kv(inputs: DistributedInputs, rank: int) -> None:
+    """Clear cached remote shards in this rank's arena, preserving its source shard."""
+    owner_begin = rank * inputs.rank_capacity
+    owner_end = owner_begin + inputs.rank_capacity
+    for arena in (inputs.remote_k.data_, inputs.remote_v.data_):
+        arena[:owner_begin].zero_()
+        arena[owner_end:].zero_()
+    cuda_barrier()
+
+
 def correctness(
     rank: int,
     device: torch.device,
@@ -465,11 +542,14 @@ def correctness(
     q_heads: int,
     kv_heads: int,
     head_dim: int,
+    interleave_comm_windows: bool = True,
 ) -> None:
+    world_size = dist.get_world_size()
+    profiles = profiles_for_world_size(world_size)
     all_cp_lengths = (8192, 4096)
     all_cp = make_inputs(
         all_cp_lengths,
-        (8, 8),
+        (world_size, world_size),
         (0, 0),
         (0, 1),
         rank,
@@ -480,11 +560,12 @@ def correctness(
         head_dim,
     )
     expected_o, expected_lse = reference(all_cp, rank)
+    mixed_rings = tuple(g for g in (8, 4, 2, 1) if g <= world_size)
     mixed = make_inputs(
-        (2048, 1024, 512, 256),
-        (8, 4, 2, 1),
-        (0, 0, 0, 0),
-        (0, 1, 2, 3),
+        tuple(256 * g for g in mixed_rings),
+        mixed_rings,
+        (0,) * len(mixed_rings),
+        tuple(range(len(mixed_rings))),
         rank,
         device,
         seed + 17,
@@ -494,47 +575,107 @@ def correctness(
     )
     mixed_expected_o, mixed_expected_lse = reference(mixed, rank)
     for sm_config in sm_configs:
-        for profile in PROFILES[:5]:
-            plan = make_plan(all_cp, profile.name, sm_config)
-            out, lse = plan.run()
+        for profile in profiles[:-1]:
+            plan = make_plan(all_cp, profile.name, sm_config,
+                             interleave_comm_windows=interleave_comm_windows)
+            clear_remote_kv(all_cp, rank)
+            for _ in range(3 if plan.profile.dynamic_segments else 1):
+                if plan.profile.dynamic_segments:
+                    plan.out.fill_(float("nan"))
+                    plan.lse.fill_(float("nan"))
+                out, lse = plan.run()
+                torch.cuda.synchronize(device)
+                assert_distributed_close(
+                    f"{profile.name} SM {sm_config.label} O",
+                    out.float(),
+                    expected_o.float(),
+                    atol,
+                    rtol,
+                )
+                assert_distributed_close(
+                    f"{profile.name} SM {sm_config.label} LSE",
+                    lse,
+                    expected_lse,
+                    atol,
+                    rtol,
+                )
+            if plan.profile.dynamic_segments:
+                check_ready_state(plan, all_cp, rank)
+
+        mixed_plan = make_plan(mixed, "hybrid_br_pbs", sm_config,
+                               interleave_comm_windows=interleave_comm_windows)
+        clear_remote_kv(mixed, rank)
+        for _ in range(3):
+            mixed_plan.out.fill_(float("nan"))
+            mixed_plan.lse.fill_(float("nan"))
+            mixed_o, mixed_lse = mixed_plan.run()
             torch.cuda.synchronize(device)
             assert_distributed_close(
-                f"{profile.name} SM {sm_config.label} O",
-                out.float(),
-                expected_o.float(),
+                f"L6 mixed SM {sm_config.label} O",
+                mixed_o.float(),
+                mixed_expected_o.float(),
                 atol,
                 rtol,
             )
             assert_distributed_close(
-                f"{profile.name} SM {sm_config.label} LSE",
-                lse,
-                expected_lse,
+                f"L6 mixed SM {sm_config.label} LSE",
+                mixed_lse,
+                mixed_expected_lse,
                 atol,
                 rtol,
             )
-
-        mixed_plan = make_plan(mixed, "hybrid_br_pbs", sm_config)
-        mixed_o, mixed_lse = mixed_plan.run()
-        torch.cuda.synchronize(device)
-        assert_distributed_close(
-            f"L6 mixed SM {sm_config.label} O",
-            mixed_o.float(),
-            mixed_expected_o.float(),
-            atol,
-            rtol,
-        )
-        assert_distributed_close(
-            f"L6 mixed SM {sm_config.label} LSE",
-            mixed_lse,
-            mixed_expected_lse,
-            atol,
-            rtol,
-        )
+        check_ready_state(mixed_plan, mixed, rank)
+        for profile in profiles:
+            inputs = mixed if profile.id == 6 else all_cp
+            expected_out = mixed_expected_o if profile.id == 6 else expected_o
+            expected_lse_value = mixed_expected_lse if profile.id == 6 else expected_lse
+            stats_plan = make_plan(inputs, profile.name, sm_config, collect_stats=True,
+                                   interleave_comm_windows=interleave_comm_windows)
+            clear_remote_kv(inputs, rank)
+            stats_plan.out.fill_(float("nan"))
+            stats_plan.lse.fill_(float("nan"))
+            probe = stats_plan.probe()
+            assert_distributed_close(
+                f"{profile.name} stats O", stats_plan.out.float(), expected_out.float(),
+                atol, rtol,
+            )
+            assert_distributed_close(
+                f"{profile.name} stats LSE", stats_plan.lse, expected_lse_value, atol, rtol,
+            )
+            blocks = [
+                (g, int(inputs.cu_host[b + 1] - inputs.cu_host[b]) // 128)
+                for b, g in enumerate(inputs.ring_sizes)
+            ]
+            # Local triangular work plus both halves' remote work, per Q head.
+            cp_reads = sum(n * (g * n + 1) // 2 for g, n in blocks if g > 1) * q_heads
+            local_blocks = [n for g, n in blocks if g == 1]
+            local_visits = sum(local_blocks) * q_heads
+            local_reads = sum(n * (n + 1) // 2 for n in local_blocks) * q_heads
+            if profile.dynamic_segments:
+                check_ready_state(stats_plan, inputs, rank)
+                expected_span = cp_reads
+                expected_visits = probe["segment_claims"] + local_visits
+            else:
+                expected_span = stats_plan.hierarchy["total_work_tiles"]
+                expected_visits = expected_span
+            actual_stats = torch.tensor(
+                [probe["segment_span_sum"], probe["qo_visits"], probe["kv_tile_reads"]],
+                device=device, dtype=torch.int64,
+            )
+            expected_stats = torch.tensor(
+                [expected_span, expected_visits, cp_reads + local_reads],
+                device=device, dtype=torch.int64,
+            )
+            assert_distributed_close(
+                f"{profile.name} stats tile counts", actual_stats, expected_stats, 0, 0,
+            )
         cuda_barrier()
         if rank == 0:
             print(
                 "correctness: PASS "
-                f"(SM={sm_config.label}, L1-L5 all-CP and L6 mixed hierarchy)"
+                f"(W={world_size}, SM={sm_config.label}, "
+                "L1-L5 all-CP and L6 mixed hierarchy, "
+                "including stats probes)"
             )
 
 
@@ -575,7 +716,7 @@ def measure_distributed_ms(
     local_avg = sum(local_samples) / len(local_samples)
     max_avg = sum(max_samples) / len(max_samples)
     local_tensor = torch.tensor([local_avg], device="cuda", dtype=torch.float64)
-    gathered = [torch.empty_like(local_tensor) for _ in range(8)]
+    gathered = [torch.empty_like(local_tensor) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, local_tensor)
     rank_times = (
         tuple(float(value.item()) for value in gathered) if rank == 0 else None
@@ -590,19 +731,20 @@ def performance_case(
     case_index: int,
     raw_lengths: tuple[int, ...],
 ) -> list[AblationSummarySample]:
+    world_size = dist.get_world_size()
+    profiles = profiles_for_world_size(world_size)
     controls = PlannerControls(
         token_balance_tolerance=args.token_balance_tolerance
     )
-    br_pbs = make_br_pbs_topology(raw_lengths, 8, True, controls)
+    br_pbs = make_br_pbs_topology(raw_lengths, world_size, True, controls)
     if tuple(sorted(br_pbs.sample_ids)) != tuple(range(len(raw_lengths))):
         raise RuntimeError("BR-PBS did not preserve every sampled ArXiv sequence")
     workload_lengths = br_pbs.global_lengths
-    all_cp_lengths = tuple(
-        align_mega_ring_all_cp_lengths(list(workload_lengths))
-    )
+    all_cp_alignment = 256 * world_size
+    all_cp_lengths = canonicalize_lengths(workload_lengths, all_cp_alignment)
     all_cp = make_inputs(
         all_cp_lengths,
-        (8,) * len(all_cp_lengths),
+        (world_size,) * len(all_cp_lengths),
         (0,) * len(all_cp_lengths),
         br_pbs.sample_ids,
         rank,
@@ -641,7 +783,7 @@ def performance_case(
         )
         print(
             "All-CP L1-L5: "
-            f"alignment=2048, execution_tokens={sum(all_cp_lengths)}, "
+            f"alignment={all_cp_alignment}, execution_tokens={sum(all_cp_lengths)}, "
             f"global_seqlens={all_cp_lengths}"
         )
 
@@ -651,15 +793,16 @@ def performance_case(
                 hybrid if profile.id == 6 else all_cp,
                 profile.name,
                 sm_config,
+                interleave_comm_windows=args.interleave_comm_windows,
             )
-            for profile in PROFILES
+            for profile in profiles
         }
         if rank == 0:
             print(
                 "level\tprofile\tsm_config\tmean_ms\tagg_tflops"
                 "\tavg_gpu_tflops\tcheck\tkernels\tnote"
             )
-        for profile in PROFILES:
+        for profile in profiles:
             timing = measure_distributed_ms(
                 plans[profile.name],
                 args.warmup_iters,
@@ -676,16 +819,16 @@ def performance_case(
                         all_cp_lengths, args.qhead, args.headdim, timing.max_ms
                     )
                     note = (
-                        f"all-CP G8; "
+                        f"all-CP G{world_size}; "
                         f"{aligned_length_note(workload_lengths, all_cp_lengths)}; "
                         f"aligned-length Agg TFLOPS={aligned_tflops:.3f}, "
-                        f"Avg/GPU={aligned_tflops / 8:.3f}"
+                        f"Avg/GPU={aligned_tflops / world_size:.3f}"
                     )
                 check_status = "ok" if args.check else "skip"
                 print(
                     f"L{profile.id}\t{profile.name}\t{sm_config.label}\t"
                     f"{timing.max_ms:.6f}\t{aggregate_tflops:.3f}\t"
-                    f"{aggregate_tflops / 8:.3f}\t{check_status}\t"
+                    f"{aggregate_tflops / world_size:.3f}\t{check_status}\t"
                     f"{profile.kernel_launches}\t{note}"
                 )
                 summary_samples.append(
@@ -713,6 +856,7 @@ def print_performance_summary(
     samples: Sequence[AblationSummarySample],
     total_cases: int,
     sm_configs: Sequence[SmConfig],
+    world_size: int = 8,
 ) -> None:
     grouped: dict[tuple[str, SmConfig], list[AblationSummarySample]] = defaultdict(list)
     for sample in samples:
@@ -720,7 +864,7 @@ def print_performance_summary(
 
     print("\nCross-case forward ablation summary")
     print(
-        "Agg TFLOPS uses the original BR-PBS workload lengths; all-CP 2K "
+        "Agg TFLOPS uses the original BR-PBS workload lengths; all-CP "
         "aligned-length TFLOPS are reported in each case Note."
     )
     print(
@@ -728,7 +872,7 @@ def print_performance_summary(
         f"{'Min ms':>10} {'Mean ms':>10} {'P50 ms':>10} {'Max ms':>10} "
         f"{'Mean TFLOPS':>14} {'Weighted TFLOPS':>18} {'Weighted/GPU':>14}"
     )
-    for profile in PROFILES:
+    for profile in profiles_for_world_size(world_size):
         for sm_config in sm_configs:
             records = grouped[(profile.name, sm_config)]
             if not records:
@@ -746,7 +890,7 @@ def print_performance_summary(
                 f"{min(times):>10.3f} {sum(times) / len(times):>10.3f} "
                 f"{median(times):>10.3f} {max(times):>10.3f} "
                 f"{mean_tflops:>14.1f} {weighted_tflops:>18.1f} "
-                f"{weighted_tflops / 8:>14.1f}"
+                f"{weighted_tflops / world_size:>14.1f}"
             )
 
 
@@ -758,6 +902,7 @@ def performance(
         sm_configs = ",".join(config.label for config in args.sm_configs)
         print(
             "Forward ablation config: "
+            f"world_size={dist.get_world_size()}, "
             f"dataset={args.dataset}, target_tokens={args.target_tokens}, "
             f"cases={args.num_cases}, seed={args.seed}, "
             f"token_balance_tolerance={args.token_balance_tolerance}, "
@@ -771,7 +916,9 @@ def performance(
             performance_case(args, rank, device, case_index, raw_lengths)
         )
     if rank == 0:
-        print_performance_summary(summary_samples, args.num_cases, args.sm_configs)
+        print_performance_summary(
+            summary_samples, args.num_cases, args.sm_configs, dist.get_world_size()
+        )
 
 
 def main() -> None:
@@ -790,6 +937,7 @@ def main() -> None:
                 args.qhead,
                 args.kvhead,
                 args.headdim,
+                args.interleave_comm_windows,
             )
         performance(args, rank, device)
     finally:

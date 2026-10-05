@@ -394,7 +394,13 @@ public:
         if constexpr (IsProducerWarp) {
             int next_tile_idx = 0;
             if (threadIdx.x % NumProducerThreads == 0) {
-                next_tile_idx = atomicAdd(params.tile_count_semaphore, 1) + Base::virtual_grid_dim_x(params);
+                if constexpr (EnableChunkedSegments) {
+                    if (params.mega_ring_hierarchy.levels[3].full_tiles > 0) {
+                        next_tile_idx = atomicAdd(params.tile_count_semaphore, 1) + Base::virtual_grid_dim_x(params);
+                    }
+                } else {
+                    next_tile_idx = atomicAdd(params.tile_count_semaphore, 1) + Base::virtual_grid_dim_x(params);
+                }
             }
             next_tile_idx = __shfl_sync(0xffffffff, next_tile_idx, 0 /*lane*/);
             WorkTileInfo work_info = decode_mega_ring_tile(params, next_tile_idx, -1, {0, 0, 0, 0});
@@ -410,6 +416,9 @@ public:
     CUTLASS_DEVICE
     void
     prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {
+        if constexpr (EnableChunkedSegments) {
+            if (current_work.q_state_idx >= 0) { return; }
+        }
         if (threadIdx.x % NumProducerThreads == 0) {
             // Nonblocking ticket fetch only: load() still has its final V
             // transfer after this callback. Scanning belongs in get_next_work().
@@ -424,6 +433,11 @@ public:
         if constexpr (IsProducerWarp) {
             // thread 0 has the next tile_idx, just need to broadcast to the rest of warp 0
             int new_tile_idx = __shfl_sync(0xffffffff, current_work.tile_idx, 0 /*lane*/);
+            if constexpr (EnableChunkedSegments) {
+                if (current_work.q_state_idx >= 0) {
+                    new_tile_idx = params.mega_ring_hierarchy.levels[3].full_tiles;
+                }
+            }
             // MEGA_RING: reconstruct the base decoder hint from the previous
             // per-step varlen tile, then decode the new expanded tile id.
             typename Base::WorkTileInfo current_base_work{__shfl_sync(0xffffffff, current_work.tile_idx, 1 /*lane*/),

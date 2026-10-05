@@ -1,4 +1,4 @@
-// Causal W8 forward ablation copied and trimmed from
+// Causal all-CP forward ablation for 2/4/8 GPUs copied and trimmed from
 // include/mega_ring_min_fa3_varlen_ring_launch.h. The production dynamic
 // mega-ring launcher remains the L5/L6 implementation.
 
@@ -13,9 +13,9 @@
 namespace min_fa3_varlen_demo {
 namespace forward_ablation {
 
-template<bool StepOnly, bool EnableReduction, bool CollectStats>
+template<bool StepOnly, bool EnableReduction, bool CollectStats, int NumDevices>
 struct KernelConfig {
-    using Production = mega_ring_detail::MegaRingKernelConfig<true, 8, 8, CollectStats>;
+    using Production = mega_ring_detail::MegaRingKernelConfig<true, NumDevices, 8, CollectStats>;
     using Config = typename Production::Config;
     using ArchTag = typename Production::ArchTag;
     using TileShape_MNK = typename Production::TileShape_MNK;
@@ -99,7 +99,7 @@ CUTLASS_DEVICE void run_step_remote_load(
     }
     __syncthreads();
 
-    auto const& level = params.hierarchy.levels[0];
+    auto const& level = params.hierarchy.levels[mega_ring_level_for_size(params.ring_world_size)];
     bool const use_half = params.ring_step <= params.ring_rank;
     int const rows = use_half ? level.half_rows : level.full_rows;
     int const tiles = cute::ceil_div(rows, RingConfig::kRowsPerTask);
@@ -107,7 +107,7 @@ CUTLASS_DEVICE void run_step_remote_load(
     int const source_rank =
         (params.ring_rank - params.ring_step + params.ring_world_size)
         % params.ring_world_size;
-    int const ready_idx = params.ring_step - 1;
+    int const ready_idx = level.kv_ready_base + params.ring_step - 1;
     int const warp_id = warp::groupid();
     uint32_t phasebits = 0xFFFF0000;
 
@@ -462,7 +462,7 @@ void launch_kernel(
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-template<bool EnableReduction, bool CollectStats>
+template<bool EnableReduction, bool CollectStats, int NumDevices>
 void run_steps(
     Ring_fwd_params& params,
     kittens::py::TKParallelTensor& remote_k,
@@ -470,14 +470,14 @@ void run_steps(
     torch::Tensor& scratch_o,
     torch::Tensor& scratch_lse,
     cudaStream_t stream) {
-    using RingConfig = KernelConfig<true, EnableReduction, CollectStats>;
+    using RingConfig = KernelConfig<true, EnableReduction, CollectStats, NumDevices>;
     void* const running_o = params.o_ptr;
     void* const running_lse = params.softmax_lse_ptr;
     if constexpr (!EnableReduction) {
         params.o_ptr = scratch_o.data_ptr();
         params.softmax_lse_ptr = scratch_lse.data_ptr();
     }
-    for (int step = 0; step < 8; ++step) {
+    for (int step = 0; step < NumDevices; ++step) {
         params.ring_step = step;
         CHECK_CUDA(cudaMemsetAsync(params.tile_count_semaphore, 0, sizeof(int), stream));
         launch_kernel<RingConfig>(
@@ -503,13 +503,13 @@ void run_steps(
     params.softmax_lse_ptr = running_lse;
 }
 
-template<bool RecycleComm, bool CollectStats>
+template<bool RecycleComm, bool CollectStats, int NumDevices>
 void run_linear(
     Ring_fwd_params& params,
     kittens::py::TKParallelTensor& remote_k,
     kittens::py::TKParallelTensor& remote_v,
     cudaStream_t stream) {
-    using RingConfig = KernelConfig<false, true, CollectStats>;
+    using RingConfig = KernelConfig<false, true, CollectStats, NumDevices>;
     params.ring_step = -1;
     launch_kernel<RingConfig>(
         params, remote_k, remote_v, stream,

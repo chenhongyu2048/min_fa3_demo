@@ -839,10 +839,11 @@ py::tuple forward_varlen_mega_ring_ablation(
     TORCH_CHECK(remote_k.data_.data_ptr() == k.data_ptr()
                     && remote_v.data_.data_ptr() == v.data_ptr(),
                 "k/v must be owned by remote_k/remote_v");
-    int const world_size = 8;
-    TORCH_CHECK(remote_k.local_world_size_ == 8
-                    && remote_v.local_world_size_ == 8,
-                "forward ablation requires exactly 8 local GPUs");
+    int const world_size = remote_k.local_world_size_;
+    TORCH_CHECK(world_size == remote_v.local_world_size_,
+                "remote_k and remote_v must have the same local world size");
+    TORCH_CHECK(world_size == 2 || world_size == 4 || world_size == 8,
+                "forward ablation requires 2, 4, or 8 local GPUs");
     TORCH_CHECK(remote_k.local_rank_ == q.get_device()
                     && remote_v.local_rank_ == q.get_device(),
                 "remote tensor ranks must match q.device");
@@ -1003,7 +1004,7 @@ void bind_varlen_mega_ring(py::module_& m) {
         py::arg("scheduler_prepared"),
         py::arg("prepare_only"),
         py::arg("stats") = py::none(),
-        "Preallocated causal W8 forward-ablation runner.");
+        "Preallocated causal 2/4/8-GPU forward-ablation runner.");
     m.def(
         "forward_varlen_mega_ring",
         &forward_varlen_mega_ring,

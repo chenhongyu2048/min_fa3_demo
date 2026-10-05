@@ -1,4 +1,4 @@
-// Public declaration for the causal W8 forward ablation launcher. Kernel
+// Public declaration for the causal 2/4/8-GPU forward ablation launcher. Kernel
 // definitions remain private to csrc/mega_ring_forward_ablation.cu.
 
 #pragma once

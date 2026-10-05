@@ -1,4 +1,4 @@
-// Causal W8 forward ablation launcher copied and trimmed from
+// Causal forward ablation launcher copied and trimmed from
 // csrc/mega_ring_min_fa3_varlen_ring_launch.cu.
 
 #include "mega_ring_forward_ablation.h"
@@ -19,8 +19,9 @@ void run(
     bool prepare_only) {
     TORCH_CHECK(params.is_causal, "forward ablation supports causal mode only");
     bool const dynamic = profile == Profile::DynamicSegmentRecycle || profile == Profile::HybridBrPbs;
-    TORCH_CHECK(params.ring_world_size == 8,
-                "forward ablation requires exactly 8 GPUs");
+    TORCH_CHECK(params.ring_world_size == 2 || params.ring_world_size == 4
+                    || params.ring_world_size == 8,
+                "forward ablation requires 2, 4, or 8 GPUs");
     TORCH_CHECK(params.num_comp_sm > 0,
                 "forward ablation requires num_comp_sm > 0");
     TORCH_CHECK(params.num_comm_sm >= 0,
@@ -75,48 +76,54 @@ void run(
             2 * sizeof(unsigned long long), stream));
     }
 
+    if (dynamic) {
+        params.ring_step = -1;
+        run_mega_ring_min_fa3_varlen_ring_fwd(params, remote_k, remote_v, stream);
+        return;
+    }
     bool const collect_stats = params.mega_ring_stats != nullptr;
-    switch (profile) {
-        case Profile::StepExternalReduce:
-            if (collect_stats) {
-                run_steps<false, true>(
-                    params, remote_k, remote_v, scratch_o, scratch_lse, stream);
-            } else {
-                run_steps<false, false>(
-                    params, remote_k, remote_v, scratch_o, scratch_lse, stream);
-            }
-            break;
-        case Profile::StepFusedReduce:
-            if (collect_stats) {
-                run_steps<true, true>(
-                    params, remote_k, remote_v, scratch_o, scratch_lse, stream);
-            } else {
-                run_steps<true, false>(
-                    params, remote_k, remote_v, scratch_o, scratch_lse, stream);
-            }
-            break;
-        case Profile::LinearQueueNoRecycle:
-            if (collect_stats) {
-                run_linear<false, true>(params, remote_k, remote_v, stream);
-            } else {
-                run_linear<false, false>(params, remote_k, remote_v, stream);
-            }
-            break;
-        case Profile::LinearQueueRecycle:
-            if (collect_stats) {
-                run_linear<true, true>(params, remote_k, remote_v, stream);
-            } else {
-                run_linear<true, false>(params, remote_k, remote_v, stream);
-            }
-            break;
-        case Profile::DynamicSegmentRecycle:
-        case Profile::HybridBrPbs:
-            params.ring_step = -1;
-            run_mega_ring_min_fa3_varlen_ring_fwd(
-                params, remote_k, remote_v, stream);
-            break;
-        default:
-            TORCH_CHECK(false, "unknown forward ablation profile");
+    auto launch_legacy = [&]<int NumDevices>() {
+        switch (profile) {
+            case Profile::StepExternalReduce:
+                if (collect_stats) {
+                    run_steps<false, true, NumDevices>(
+                        params, remote_k, remote_v, scratch_o, scratch_lse, stream);
+                } else {
+                    run_steps<false, false, NumDevices>(
+                        params, remote_k, remote_v, scratch_o, scratch_lse, stream);
+                }
+                break;
+            case Profile::StepFusedReduce:
+                if (collect_stats) {
+                    run_steps<true, true, NumDevices>(
+                        params, remote_k, remote_v, scratch_o, scratch_lse, stream);
+                } else {
+                    run_steps<true, false, NumDevices>(
+                        params, remote_k, remote_v, scratch_o, scratch_lse, stream);
+                }
+                break;
+            case Profile::LinearQueueNoRecycle:
+                if (collect_stats) {
+                    run_linear<false, true, NumDevices>(params, remote_k, remote_v, stream);
+                } else {
+                    run_linear<false, false, NumDevices>(params, remote_k, remote_v, stream);
+                }
+                break;
+            case Profile::LinearQueueRecycle:
+                if (collect_stats) {
+                    run_linear<true, true, NumDevices>(params, remote_k, remote_v, stream);
+                } else {
+                    run_linear<true, false, NumDevices>(params, remote_k, remote_v, stream);
+                }
+                break;
+            default:
+                TORCH_CHECK(false, "unknown forward ablation profile");
+        }
+    };
+    switch (params.ring_world_size) {
+        case 2: launch_legacy.template operator()<2>(); break;
+        case 4: launch_legacy.template operator()<4>(); break;
+        case 8: launch_legacy.template operator()<8>(); break;
     }
 }
 

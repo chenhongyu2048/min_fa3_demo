@@ -77,7 +77,7 @@ public:
 
     using TileScheduler = TileScheduler_;
     static constexpr bool EnableTileReady = TileScheduler::EnableMegaRing && TileScheduler::EnableChunkedSegments;
-    static constexpr bool SyncReduction = EnableTileReady;
+    static constexpr bool SyncReduction = TileScheduler::EnableMegaRing;
     using TileSchedulerArguments = typename flash::TileSchedulerArguments;
     using TileSchedulerParams = typename TileScheduler::Params;
 

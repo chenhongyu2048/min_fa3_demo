@@ -1,8 +1,8 @@
-"""Preallocated six-level causal W8 Mega Ring forward ablation plans."""
+"""Preallocated causal Mega Ring ablations for W2/W4/W8."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Sequence
 
 import torch
@@ -105,6 +105,26 @@ PROFILE_BY_NAME = {profile.name: profile for profile in PROFILES}
 PROFILE_BY_ID = {profile.id: profile for profile in PROFILES}
 
 
+def profiles_for_world_size(world_size: int) -> tuple[ProfileSpec, ...]:
+    if world_size not in (2, 4, 8):
+        raise ValueError("forward ablation requires world_size in {2, 4, 8}")
+    if world_size == WORLD_SIZE:
+        return PROFILES
+    hybrid_topology = "br_pbs_" + "_".join(
+        f"g{ring_size}" for ring_size in LEVEL_RING_SIZES if ring_size <= world_size
+    )
+    return tuple(
+        replace(
+            profile,
+            scheduler=profile.scheduler.replace("w8", f"w{world_size}"),
+            topology=f"all_cp_g{world_size}" if profile.id <= 5 else hybrid_topology,
+            attention_launches=world_size if profile.id <= 2 else 1,
+            reduction_launches=world_size if profile.id == 1 else 0,
+        )
+        for profile in PROFILES
+    )
+
+
 def resolve_profile(profile: str | int | ProfileSpec) -> ProfileSpec:
     if isinstance(profile, ProfileSpec):
         return profile
@@ -119,7 +139,9 @@ def resolve_profile(profile: str | int | ProfileSpec) -> ProfileSpec:
         raise ValueError(f"unknown forward ablation profile id {profile}") from exc
 
 
-def profile_dispatch_manifest() -> tuple[dict[str, object], ...]:
+def profile_dispatch_manifest(
+    world_size: int = WORLD_SIZE,
+) -> tuple[dict[str, object], ...]:
     return tuple(
         {
             "id": profile.id,
@@ -132,7 +154,7 @@ def profile_dispatch_manifest() -> tuple[dict[str, object], ...]:
             "recycle_comm": profile.recycle_comm,
             "dynamic_segments": profile.dynamic_segments,
         }
-        for profile in PROFILES
+        for profile in profiles_for_world_size(world_size)
     )
 
 
@@ -175,7 +197,11 @@ def _validate_topology(
     ring_starts: Sequence[int],
     rank: int,
     local_lengths: Sequence[int],
+    world_size: int,
 ) -> None:
+    profiles_for_world_size(world_size)
+    if not 0 <= rank < world_size:
+        raise ValueError("rank must be within world_size")
     if not (
         len(global_lengths)
         == len(ring_sizes)
@@ -183,14 +209,14 @@ def _validate_topology(
         == len(local_lengths)
     ):
         raise ValueError("topology vectors and local lengths must have equal size")
-    previous_size = WORLD_SIZE
+    previous_size = world_size
     expected = local_lengths_for_rank(global_lengths, ring_sizes, ring_starts, rank)
     for batch, (global_length, ring_size, ring_start, local_length) in enumerate(
         zip(global_lengths, ring_sizes, ring_starts, local_lengths)
     ):
         if ring_size not in LEVEL_RING_SIZES or ring_size > previous_size:
             raise ValueError(f"invalid ring size/order at batch {batch}")
-        if ring_start < 0 or ring_start % ring_size or ring_start + ring_size > WORLD_SIZE:
+        if ring_start < 0 or ring_start % ring_size or ring_start + ring_size > world_size:
             raise ValueError(f"invalid ring start at batch {batch}")
         if global_length <= 0 or global_length % ring_size:
             raise ValueError(f"invalid global length at batch {batch}")
@@ -210,6 +236,7 @@ def build_hierarchy(
     ring_starts: Sequence[int],
     rank: int,
     q_heads: int,
+    world_size: int = WORLD_SIZE,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, int]]:
     if cu_seqlens_host.device.type != "cpu" or cu_seqlens_host.dtype != torch.int32:
         raise ValueError("cu_seqlens_host must be a CPU int32 tensor")
@@ -218,7 +245,7 @@ def build_hierarchy(
         for index in range(cu_seqlens_host.numel() - 1)
     )
     _validate_topology(
-        global_lengths, ring_sizes, ring_starts, rank, local_lengths
+        global_lengths, ring_sizes, ring_starts, rank, local_lengths, world_size
     )
 
     half_cu = torch.zeros_like(cu_seqlens_host)
@@ -307,12 +334,15 @@ class ForwardAblationPlan:
         num_comp_sm: int = NUM_COMP_SM,
         num_comm_sm: int = NUM_COMM_SM,
         collect_stats: bool = False,
+        world_size: int = WORLD_SIZE,
         interleave_comm_windows: bool = True,
     ) -> None:
         import min_fa3_op
 
         self._op = min_fa3_op._forward_varlen_mega_ring_ablation
-        self.profile = resolve_profile(profile)
+        profile_id = resolve_profile(profile).id
+        self.profile = profiles_for_world_size(world_size)[profile_id - 1]
+        self.world_size = world_size
         self.q = q
         self.remote_k = remote_k
         self.remote_v = remote_v
@@ -339,10 +369,12 @@ class ForwardAblationPlan:
             )
         rank = q.device.index
         if self.profile.id <= 5 and (
-            any(size != WORLD_SIZE for size in ring_sizes)
+            any(size != world_size for size in ring_sizes)
             or any(start != 0 for start in ring_starts)
         ):
-            raise ValueError(f"{self.profile.name} requires fixed all-CP G8 metadata")
+            raise ValueError(
+                f"{self.profile.name} requires fixed all-CP G{world_size} metadata"
+            )
         half_host, hierarchy_host, hierarchy = build_hierarchy(
             cu_seqlens_host,
             global_lengths,
@@ -350,6 +382,7 @@ class ForwardAblationPlan:
             ring_starts,
             rank,
             q.size(1),
+            world_size=world_size,
         )
         self.hierarchy = hierarchy
         if self.num_comm_sm == 0 and hierarchy["reduction_tiles"] > 0:
@@ -504,5 +537,6 @@ __all__ = [
     "local_lengths_for_rank",
     "make_cu_seqlens",
     "profile_dispatch_manifest",
+    "profiles_for_world_size",
     "resolve_profile",
 ]

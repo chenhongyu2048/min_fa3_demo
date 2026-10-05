@@ -492,7 +492,7 @@ the import path.
 | `ring_test/load_balance_bench/run.sh` | Dataset/GPU wrapper for the fixed five-method runtime load-balance suite |
 | `ring_test/benchmark_dataset_{forward,backward}.py` | Dataset sampling, BR-PBS placement, and topology benchmark frontend |
 | `ring_test/load_balance_bench/benchmark_{forward,backward}.py` | Native Megatron/Zeppelin versus three placement-mapped fused Mega Ring runtime frontends |
-| `ring_test/benchmark_forward_ablation.py` | Strict causal W8 six-level forward accumulation ablation with preallocated plans |
+| `ring_test/benchmark_forward_ablation.py` | Causal 2/4/8-GPU six-level forward accumulation ablation with preallocated plans |
 | `ring_test/benchmark_topology_{forward,backward}.py` | Explicit global-length and Buddy-ring topology benchmark |
 | `ring_test/benchmark_load_balance.py` | Metadata-only forward/backward token, FLOP, communication, and logical-tile load analysis |
 | `ring_test/benchmark_ring_{forward,backward}.py` | Ordinary all-CP distributed ring benchmark |
@@ -659,16 +659,7 @@ torchrun --standalone --nproc_per_node=8 --module \
   scripts.test_mega_ring.mega_ring_test_min_fa3_varlen_backward_validation_multi_rank
 ```
 
-Causal MegaRing forward publishes completed remote KV tiles through a per-sequence
-map while preserving rank-major payload addresses. Communication windows contain
-all front-Q dependencies (phase A) before back-Q-only tiles (phase B); all storer
-leaders synchronize once between these phases. Producers claim immutable KV
-intervals using the ready map prefix, and consumers merge concurrent intervals
-under a per-Q output lock. The normal topology/dataset benchmark accepts
-`--no-interleave-comm-windows` to concatenate sequences within each phase instead
-of the default round robin order.
-
-Strict six-level forward ablation on eight H100s:
+Six-level forward ablation supports 2, 4, or 8 SM90 GPUs. Example on eight H100s:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
@@ -678,13 +669,19 @@ torchrun --standalone --nproc_per_node=8 \
   --qhead 32 --kvhead 8 --headdim 128 --mode causal
 ```
 
+Set `--nproc_per_node=2` or `4` to run all six profiles with fewer GPUs.
+Choose an SM allocation that fits the device; `--sm-configs 8:2` is a small
+correctness configuration suitable for H20. L1 launches `world_size` attention
+kernels and `world_size` external reductions; L2 launches `world_size` attention
+kernels with fused reduction; L3-L6 each launch one fused kernel.
+
 The driver accepts the same comma-separated `--sm-configs COMP:COMM` sweep
 style and default `128:4,124:8,120:12,116:16` sweep as the normal Mega Ring
 benchmark. This ablation path retains its narrower head constraint:
 `D=128`, `KVH * D = 1024`, and `QH % KVH == 0`; the default is
 `QH=32, KVH=8, D=128`. It samples deterministic ArXiv cases with seed `0` and
 uses the dataset wrapper's `0.05` token-balance tolerance. L1-L5 run on each
-case after independent 2K all-CP alignment. L6 receives the BR-PBS workload
+case after independent `2 * world_size * 128`-token all-CP alignment. L6 receives the BR-PBS workload
 lengths and hybrid metadata, including only the padding required by its
 selected ring groups.
 
@@ -693,15 +690,23 @@ Timing matches the normal dataset benchmark: each profile runs 10 warmups and
 latency across ranks, and the case latency is the arithmetic mean of those 40
 maxima. The primary `Agg TFLOPS` and `Avg/GPU` columns use the BR-PBS workload
 lengths for all six levels. For L1-L5, the Note also reports original/aligned
-token counts, padding, and the same-latency TFLOPS calculated from the 2K
+token counts, padding, and the same-latency TFLOPS calculated from the all-CP
 aligned execution lengths. A final cross-case table groups results by level
 and SM config and reports minimum/mean/P50/maximum latency, arithmetic-mean
 TFLOPS, and workload-weighted aggregate/per-GPU TFLOPS.
 
 Correctness is controlled by `--check`/`--no-check` and defaults to disabled,
 as in the normal benchmark. When enabled, it runs the representative L1-L5
-all-CP and L6 mixed-hierarchy output checks; the ablation driver does not run a
-stats probe. `--b --seqlen ...` remains available as an explicit one-case
+all-CP and L6 mixed-hierarchy O/LSE checks, plus stats probes for all six profiles.
+L5/L6 also check repeated workspace reuse, final readiness/completion state,
+and the exact physical KV tile sets in each sequence's A/B map segments.
+Causal MegaRing keeps rank-major KV storage and publishes completed tiles through
+an unordered map. All storer leaders synchronize once between the batch's A and B
+phases. `--interleave-comm-windows` (default) uses round robin windows within each
+phase; `--no-interleave-comm-windows` concatenates sequences within each phase.
+Both options are available in the normal topology/dataset and ablation drivers.
+
+Stats probes are outside the timed region. `--b --seqlen ...` remains available as an explicit one-case
 debugging override.
 
 `run_experiments_when_idle.sh` reserves its experiment-queue lock immediately
