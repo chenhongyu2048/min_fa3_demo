@@ -26,6 +26,7 @@
 #include "utils.h"
 #include "softmax.h"
 #include "mega_ring_semaphore.cuh"
+#include "mega_ring_tile_ready.h"
 
 namespace flash {
 
@@ -75,6 +76,8 @@ public:
     static_assert(ArchTag::kMinComputeCapability >= 90);
 
     using TileScheduler = TileScheduler_;
+    static constexpr bool EnableTileReady = TileScheduler::EnableMegaRing && TileScheduler::EnableChunkedSegments;
+    static constexpr bool SyncReduction = EnableTileReady;
     using TileSchedulerArguments = typename flash::TileSchedulerArguments;
     using TileSchedulerParams = typename TileScheduler::Params;
 
@@ -340,10 +343,14 @@ public:
 
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 int mega_ring_segment_meta = 0;
+                int kv_begin = 0, kv_end = 0;
                 if constexpr (TileScheduler::EnableMegaRing) {
-                    // MEGA_RING_SEGMENTS: keep the packed claim intact across
-                    // the kernel and decode it only in short mainloop scopes.
+                    // Carry the legacy ring step separately from the immutable KV interval.
                     mega_ring_segment_meta = work_tile_info.segment_meta;
+                    if constexpr (EnableTileReady) {
+                        kv_begin = work_tile_info.kv_begin;
+                        kv_end = work_tile_info.kv_end;
+                    }
                 }
                 SeqlenInfo_t seqlen_info{
                     get<2>(block_coord) /*bidb*/,
@@ -368,10 +375,10 @@ public:
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
                 // pipeline_vt won't be used if we don't need to transpose V.
-                mainloop.template load<TileScheduler::EnableMegaRing>(
+                mainloop.template load<TileScheduler::EnableMegaRing, EnableTileReady>(
                     params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
                     shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx,
-                    mega_ring_segment_meta);
+                    mega_ring_segment_meta, kv_begin, kv_end);
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
@@ -398,6 +405,7 @@ public:
                 ) {
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 int mega_ring_segment_meta = 0;
+                int kv_begin = 0, kv_end = 0, q_state_idx = -1;
                 int mega_ring_reduction_tile_idx = 0;
                 int mega_ring_q_row_offset = 0;
                 int mega_ring_seqlen_o = -1;
@@ -406,6 +414,11 @@ public:
                     // tile across ring steps. For causal zigzag half-Q steps it
                     // is already mapped back into the full-Q back-half stream.
                     mega_ring_segment_meta = work_tile_info.segment_meta;
+                    if constexpr (EnableTileReady) {
+                        kv_begin = work_tile_info.kv_begin;
+                        kv_end = work_tile_info.kv_end;
+                        q_state_idx = work_tile_info.q_state_idx;
+                    }
                     mega_ring_reduction_tile_idx = work_tile_info.reduction_tile_idx;
                 }
                 int const bidb = get<2>(block_coord);
@@ -468,16 +481,16 @@ public:
                 bool tile_valid;
                 // if constexpr (!LargeHeadDimV) {
                 if constexpr (TileScheduler::CollectMegaRingStats) {
-                    tile_valid = mainloop.template mma<TileScheduler::EnableMegaRing, true>(
+                    tile_valid = mainloop.template mma<TileScheduler::EnableMegaRing, true, EnableTileReady>(
                         params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info,
                         block_coord, shared_storage, mega_ring_segment_meta,
-                        &mega_ring_qo_visits, &mega_ring_kv_tile_reads);
+                        &mega_ring_qo_visits, &mega_ring_kv_tile_reads, kv_begin, kv_end);
                 } else {
-                    tile_valid = mainloop.template mma<TileScheduler::EnableMegaRing>(
+                    tile_valid = mainloop.template mma<TileScheduler::EnableMegaRing, false, EnableTileReady>(
                         params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info,
-                        block_coord, shared_storage, mega_ring_segment_meta);
+                        block_coord, shared_storage, mega_ring_segment_meta, nullptr, nullptr, kv_begin, kv_end);
                 }
                 // } else {  // mma_pv might not compile if !LargeHeadDimV
                 //     if (warp_group_idx == 1) {
@@ -491,10 +504,9 @@ public:
                 //     }
                 // }
                 // Keep the copied scheduler/epilogue overlap for the ordinary
-                // paths.  A chunked mega-ring tile must publish its updated
-                // progress and clear the busy bit before asking for more work:
-                // the producer scheduler may otherwise be waiting for this
-                // very tile, while the consumer is waiting for the producer.
+                // paths. A readiness task publishes its merge and completion
+                // before consumers wait for the next descriptor. The producer
+                // may already be scanning while this epilogue is unfinished.
                 if constexpr (!TileScheduler::EnableChunkedSegments) {
                     work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info);
                     // Copied from the official Hopper Split+Varlen path. The
@@ -529,7 +541,25 @@ public:
                             min_fa3_varlen_demo::mega_ring::segment_begin_step(
                                 mega_ring_segment_meta) == 0;
                     }
-                    epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma_pv,
+                    if constexpr (EnableTileReady) {
+                        if (q_state_idx >= 0) {
+                            if (threadIdx.x == MmaThreadOffset) {
+                                int* const state = params.scheduler.mega_ring_q_output_state + q_state_idx;
+                                int old;
+                                do {
+                                    old = min_fa3_varlen_demo::mega_ring::load_acquire(state);
+                                    if (old != 1 && min_fa3_varlen_demo::mega_ring::compare_exchange_acquire(
+                                            state, old, 1) == old) { break; }
+                                    __nanosleep(64);
+                                } while (true);
+                                scheduler.mega_ring_work_info_smem()[2].x = old == 0;
+                            }
+                            cutlass::arch::NamedBarrier::sync(NumMmaThreads,
+                                cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                            mega_ring_initialize_output = scheduler.mega_ring_work_info_smem()[2].x;
+                        }
+                    }
+                    epilogue.template store<SyncReduction>(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma_pv,
                                    threadIdx.x - MmaThreadOffset, block_coord,
                                    mega_ring_q_row_offset, mega_ring_seqlen_o,
                                    mega_ring_initialize_output);
@@ -588,26 +618,22 @@ public:
                         epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
                     }
                 }
-                if constexpr (TileScheduler::EnableChunkedSegments) {
-                    // MEGA_RING_SEGMENTS: decode completion metadata only after
-                    // the O/LSE merge (or neutral initialization) is visible.
-                    // Step 0 advances its tile state but never contributes to
-                    // the remote-completion counter.
-                    if (mega_ring_is_cp_batch) {
-                        flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                if constexpr (EnableTileReady) {
+                    if (q_state_idx >= 0) {
+                        cutlass::arch::NamedBarrier::sync(NumMmaThreads,
+                            cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
                         if (threadIdx.x == MmaThreadOffset) {
-                            int const begin_step =
-                                min_fa3_varlen_demo::mega_ring::segment_begin_step(
-                                    mega_ring_segment_meta);
-                            int const end_step =
-                                min_fa3_varlen_demo::mega_ring::segment_end_step(
-                                    mega_ring_segment_meta);
+                            int* const merged = params.scheduler.mega_ring_q_merged + q_state_idx;
+                            int const new_c = *merged + kv_end - kv_begin;
+                            *merged = new_c;
                             min_fa3_varlen_demo::mega_ring::store_release(
-                                params.mainloop.mega_ring_step_ready + mega_ring_reduction_tile_idx,
-                                end_step + 1);
-                            if (begin_step > 0
-                                && min_fa3_varlen_demo::mega_ring::segment_is_terminal(
-                                    mega_ring_segment_meta)) {
+                                params.scheduler.mega_ring_q_output_state + q_state_idx, 2);
+                            int const g = params.mainloop.mega_ring_ring_sizes[bidb];
+                            int const h = seqlen_info.seqlen_k / (2 * CollectiveMainloop::kBlockN);
+                            int const total = get<0>(block_coord) + 1
+                                + min_fa3_varlen_demo::mega_ring::q_remote_tiles(
+                                    get<0>(block_coord), h, g, params.mainloop.mega_ring_rank % g);
+                            if (new_c == total) {
                                 min_fa3_varlen_demo::mega_ring::signal_release(
                                     params.scheduler.mega_ring_completed_tiles, 1);
                             }

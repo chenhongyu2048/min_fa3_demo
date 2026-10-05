@@ -44,6 +44,10 @@ struct TileSchedulerArguments {
     // FORWARD_ABLATION: used only by the causal W8 step scheduler. Production
     // varlen and dynamic mega-ring schedulers leave this at the default value.
     int const mega_ring_ablation_step = -1;
+    int const* const mega_ring_kv_ready_prefix = nullptr;
+    int* const mega_ring_q_assigned = nullptr;
+    int* const mega_ring_q_merged = nullptr;
+    int* const mega_ring_q_output_state = nullptr;
 };
 
 template<int kBlockM, int kBlockN, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
@@ -99,6 +103,10 @@ public:
         int* const mega_ring_scan_cursor;
         int* const mega_ring_completed_tiles;
         int const mega_ring_ablation_step;
+        int const* const mega_ring_kv_ready_prefix = nullptr;
+        int* const mega_ring_q_assigned = nullptr;
+        int* const mega_ring_q_merged = nullptr;
+        int* const mega_ring_q_output_state = nullptr;
     };
 
     static Params
@@ -133,7 +141,9 @@ public:
                 args.mega_ring_tile_states,
                 args.mega_ring_scan_cursor,
                 args.mega_ring_completed_tiles,
-                args.mega_ring_ablation_step};
+                args.mega_ring_ablation_step,
+                args.mega_ring_kv_ready_prefix, args.mega_ring_q_assigned,
+                args.mega_ring_q_merged, args.mega_ring_q_output_state};
     }
 
     static dim3

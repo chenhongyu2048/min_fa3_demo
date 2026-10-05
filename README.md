@@ -659,6 +659,15 @@ torchrun --standalone --nproc_per_node=8 --module \
   scripts.test_mega_ring.mega_ring_test_min_fa3_varlen_backward_validation_multi_rank
 ```
 
+Causal MegaRing forward publishes completed remote KV tiles through a per-sequence
+map while preserving rank-major payload addresses. Communication windows contain
+all front-Q dependencies (phase A) before back-Q-only tiles (phase B); all storer
+leaders synchronize once between these phases. Producers claim immutable KV
+intervals using the ready map prefix, and consumers merge concurrent intervals
+under a per-Q output lock. The normal topology/dataset benchmark accepts
+`--no-interleave-comm-windows` to concatenate sequences within each phase instead
+of the default round robin order.
+
 Strict six-level forward ablation on eight H100s:
 
 ```bash

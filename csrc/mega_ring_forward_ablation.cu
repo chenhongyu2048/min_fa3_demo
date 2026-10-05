@@ -14,9 +14,11 @@ void run(
     torch::Tensor& scratch_lse,
     Profile profile,
     int completed_storage_size,
+    int map_storage_size,
     cudaStream_t stream,
     bool prepare_only) {
     TORCH_CHECK(params.is_causal, "forward ablation supports causal mode only");
+    bool const dynamic = profile == Profile::DynamicSegmentRecycle || profile == Profile::HybridBrPbs;
     TORCH_CHECK(params.ring_world_size == 8,
                 "forward ablation requires exactly 8 GPUs");
     TORCH_CHECK(params.num_comp_sm > 0,
@@ -48,16 +50,24 @@ void run(
 
     CHECK_CUDA(cudaMemsetAsync(
         params.tile_count_semaphore, 0, sizeof(int), stream));
-    CHECK_CUDA(cudaMemsetAsync(
-        params.mega_ring_kv_ready_counts, 0,
-        kMegaRingNumKvReadySections * sizeof(int), stream));
-    CHECK_CUDA(cudaMemsetAsync(
-        params.mega_ring_step_ready, 0,
-        size_t(params.mega_ring_hierarchy.reduction_tiles) * sizeof(int), stream));
-    CHECK_CUDA(cudaMemsetAsync(
-        params.mega_ring_scan_cursor, 0, sizeof(int), stream));
-    CHECK_CUDA(cudaMemsetAsync(
-        params.mega_ring_completed_tiles, 0,
+    if (dynamic) {
+        CHECK_CUDA(cudaMemsetAsync(params.mega_ring_kv_ready_prefix, 0, params.b * sizeof(int), stream));
+        CHECK_CUDA(cudaMemsetAsync(params.mega_ring_q_assigned, 0,
+            3 * size_t(params.mega_ring_hierarchy.reduction_tiles > 0
+                ? params.mega_ring_hierarchy.reduction_tiles : 1) * sizeof(int), stream));
+        if (map_storage_size > 0) {
+            CHECK_CUDA(cudaMemsetAsync(params.mega_ring_kv_map, 0,
+                size_t(map_storage_size) * sizeof(int), stream));
+        }
+        CHECK_CUDA(cudaMemsetAsync(params.mega_ring_comm_phase_barrier, 0, sizeof(int), stream));
+    } else {
+        CHECK_CUDA(cudaMemsetAsync(params.mega_ring_kv_ready_counts, 0,
+            kMegaRingNumKvReadySections * sizeof(int), stream));
+        CHECK_CUDA(cudaMemsetAsync(params.mega_ring_step_ready, 0,
+            size_t(params.mega_ring_hierarchy.reduction_tiles) * sizeof(int), stream));
+    }
+    CHECK_CUDA(cudaMemsetAsync(params.mega_ring_scan_cursor, 0, sizeof(int), stream));
+    CHECK_CUDA(cudaMemsetAsync(params.mega_ring_completed_tiles, 0,
         size_t(completed_storage_size) * sizeof(int), stream));
     if (params.mega_ring_stats != nullptr) {
         CHECK_CUDA(cudaMemsetAsync(

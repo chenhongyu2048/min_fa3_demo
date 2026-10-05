@@ -11,6 +11,7 @@
 #include <optional>
 
 #include "min_fa3_mega_ring_hierarchy.h"
+#include "mega_ring_tile_ready.h"
 
 namespace min_fa3_varlen_demo {
 
@@ -129,9 +130,7 @@ struct Ring_fwd_params : public Flash_fwd_params {
     // Per-invocation [Q/O visits, KV tile reads] counters for the optional
     // mega-ring statistics kernel variant. The normal variant leaves this null.
     unsigned long long* __restrict__ mega_ring_stats = nullptr;
-    // MEGA_RING_SEGMENTS: causal mode encodes next_step in the low bits and a
-    // transient scheduler lock in the high bit. Non-causal mode keeps the old
-    // completed-step counter behavior.
+    // Legacy noncausal / ablation step-completion counters.
     int* __restrict__ mega_ring_step_ready = nullptr;
     int* __restrict__ mega_ring_scan_cursor = nullptr;
     int* __restrict__ mega_ring_completed_tiles = nullptr;
@@ -139,6 +138,17 @@ struct Ring_fwd_params : public Flash_fwd_params {
     // continue reading the current K/V from k_ptr / v_ptr.
     void* __restrict__ local_k_staging_ptr = nullptr;
     void* __restrict__ local_v_staging_ptr = nullptr;
+    // Causal forward: per-sequence remote prefix and per-Q assigned/merged/lock state.
+    int* __restrict__ mega_ring_kv_ready_prefix = nullptr;
+    int* __restrict__ mega_ring_q_assigned = nullptr;
+    int* __restrict__ mega_ring_q_merged = nullptr;
+    int* __restrict__ mega_ring_q_output_state = nullptr;
+    mega_ring::CommWindowDesc const* mega_ring_comm_windows = nullptr;
+    int mega_ring_num_comm_windows = 0;
+    int* mega_ring_kv_map = nullptr;
+    int const* mega_ring_kv_map_offsets = nullptr;
+    int* mega_ring_comm_phase_barrier = nullptr;
+    int mega_ring_num_a_comm_windows = 0;
 };
 
 void prepare_varlen_num_blocks(Flash_fwd_params& params,

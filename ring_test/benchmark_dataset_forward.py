@@ -225,6 +225,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a dataset-shaped workload and run the explicit-topology forward benchmark"
     )
+    parser.add_argument(
+        "--interleave-comm-windows", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--dataset", choices=tuple(balancer.DATASET_WEIGHTS))
     parser.add_argument(
         "--datasets",
@@ -371,6 +374,7 @@ def _benchmark_argv(
         "--num-iters",
         str(args.num_iters),
         *(["--collect-mega-ring-stats"] if args.collect_mega_ring_stats else []),
+        "--interleave-comm-windows" if args.interleave_comm_windows else "--no-interleave-comm-windows",
         "--atol",
         str(args.atol),
         "--rtol",

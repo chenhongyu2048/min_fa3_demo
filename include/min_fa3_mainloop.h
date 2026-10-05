@@ -29,6 +29,7 @@
 #include "utils.h"
 #include "sm90_pipeline_no_cluster.hpp"
 #include "mega_ring_semaphore.cuh"
+#include "mega_ring_tile_ready.h"
 
 namespace flash {
 
@@ -435,6 +436,8 @@ struct CollectiveMainloopFwdSm90 {
         int const* const mega_ring_ring_sizes = nullptr;
         min_fa3_varlen_demo::MegaRingHierarchyDesc const mega_ring_hierarchy{};
         unsigned long long* const mega_ring_stats = nullptr;
+        int const* const mega_ring_kv_map = nullptr;
+        int const* const mega_ring_kv_map_offsets = nullptr;
     };
 
     // Device side kernel params
@@ -502,6 +505,8 @@ struct CollectiveMainloopFwdSm90 {
         int const* const mega_ring_ring_sizes = nullptr;
         min_fa3_varlen_demo::MegaRingHierarchyDesc const mega_ring_hierarchy{};
         unsigned long long* const mega_ring_stats = nullptr;
+        int const* const mega_ring_kv_map = nullptr;
+        int const* const mega_ring_kv_map_offsets = nullptr;
     };
 
     static Params
@@ -637,7 +642,9 @@ struct CollectiveMainloopFwdSm90 {
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
                 args.mega_ring_kv_ready_counts, args.mega_ring_step_ready, args.mega_ring_half_cu_seqlens,
                 args.mega_ring_rank, args.mega_ring_world_size, args.mega_ring_rank_kv_capacity,
-                args.mega_ring_ring_sizes, args.mega_ring_hierarchy, args.mega_ring_stats};
+                args.mega_ring_ring_sizes, args.mega_ring_hierarchy, args.mega_ring_stats,
+                args.mega_ring_kv_map,
+                args.mega_ring_kv_map_offsets};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -659,7 +666,7 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
-    template <bool EnableMegaRing=false, typename SchedulerPrefetch, typename SharedStorage>
+    template <bool EnableMegaRing=false, bool EnableTileReady=false, typename SchedulerPrefetch, typename SharedStorage>
     CUTLASS_DEVICE void
     load(Params const& params,
          MainloopPipelineK pipeline_k,
@@ -671,7 +678,8 @@ struct CollectiveMainloopFwdSm90 {
          SeqlenInfo_t const& seqlen_info,
          cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
          int &work_idx,
-         int mega_ring_segment_meta = 0
+         int mega_ring_segment_meta = 0,
+         int kv_begin = 0, int kv_end = 0
          ) {
 
         // some of these are captured in lambda so can't use structured binding
@@ -683,15 +691,11 @@ struct CollectiveMainloopFwdSm90 {
         int mega_ring_local_rank = 0;
         int mega_ring_level_idx = 3;
         bool mega_ring_is_cp_batch = false;
-        bool mega_ring_remote_chunk = false;
         if constexpr (EnableMegaRing) {
             mega_ring_size = params.mega_ring_ring_sizes[bidb];
             int const ring_base = (params.mega_ring_rank / mega_ring_size) * mega_ring_size;
             mega_ring_local_rank = params.mega_ring_rank - ring_base;
             mega_ring_is_cp_batch = mega_ring_size > 1;
-            mega_ring_remote_chunk = Is_causal && mega_ring_is_cp_batch
-                && min_fa3_varlen_demo::mega_ring::segment_begin_step(
-                    mega_ring_segment_meta) > 0;
             #pragma unroll
             for (int level_idx = 0; level_idx < 4; ++level_idx) {
                 if (params.mega_ring_hierarchy.levels[level_idx].ring_size == mega_ring_size) {
@@ -711,8 +715,13 @@ struct CollectiveMainloopFwdSm90 {
         int mega_ring_q_row_offset = 0;
         int mega_ring_seqlen_q = seqlen_info.seqlen_q;
         int mega_ring_seqlen_k = seqlen_info.seqlen_k;
-        int mega_ring_chunk_n_blocks = 0;
-        if constexpr (EnableMegaRing) {
+        if constexpr (EnableTileReady) {
+            mega_ring_kv_rank = params.mega_ring_rank;
+            if (mega_ring_is_cp_batch) {
+                n_block_min = 0;
+                n_block_max = kv_end - kv_begin;
+            }
+        } else if constexpr (EnableMegaRing) {
             int const mega_ring_step =
                 min_fa3_varlen_demo::mega_ring::segment_begin_step(
                     mega_ring_segment_meta);
@@ -730,29 +739,15 @@ struct CollectiveMainloopFwdSm90 {
                 int const half_len = params.mega_ring_half_cu_seqlens[bidb + 1] - params.mega_ring_half_cu_seqlens[bidb];
                 int const block_m = get<0>(TileShape_MNK{});
                 int const block_n = get<1>(TileShape_MNK{});
-                bool const q_use_half = !mega_ring_remote_chunk && mega_ring_step > mega_ring_local_rank;
+                // Legacy single-step descriptors index the selected Q half locally.
+                bool const q_use_half = mega_ring_step > mega_ring_local_rank;
                 bool const kv_use_half = mega_ring_step >= 1 && mega_ring_step <= mega_ring_local_rank;
                 bool const is_diag = mega_ring_step == 0;
                 mega_ring_q_row_offset = q_use_half ? half_len : 0;
                 mega_ring_seqlen_q = q_use_half ? half_len : 2 * half_len;
                 mega_ring_seqlen_k = kv_use_half ? half_len : 2 * half_len;
                 n_block_min = 0;
-                if (mega_ring_remote_chunk) {
-                    int const mega_ring_segment_end =
-                        min_fa3_varlen_demo::mega_ring::segment_end_step(
-                            mega_ring_segment_meta);
-                    int const half_blocks = half_len / block_n;
-                    int const half_end = mega_ring_segment_end < mega_ring_local_rank
-                        ? mega_ring_segment_end : mega_ring_local_rank;
-                    int const num_half_segments = half_end >= mega_ring_step
-                        ? half_end - mega_ring_step + 1 : 0;
-                    int const num_segments = mega_ring_segment_end - mega_ring_step + 1;
-                    int const num_full_segments = num_segments - num_half_segments;
-                    mega_ring_chunk_n_blocks = half_blocks
-                        * (num_half_segments + 2 * num_full_segments);
-                    mega_ring_seqlen_k = mega_ring_chunk_n_blocks * block_n;
-                    n_block_max = mega_ring_chunk_n_blocks;
-                } else if (is_diag) {
+                if (is_diag) {
                     int const n_block_causal = cute::ceil_div((m_block + 1) * block_m, block_n);
                     int const n_block_full = cute::ceil_div(2 * half_len, block_n);
                     n_block_max = n_block_causal < n_block_full ? n_block_causal : n_block_full;
@@ -839,7 +834,7 @@ struct CollectiveMainloopFwdSm90 {
         Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(shape_V)(_, _, bidh_kv, _);
         int const mega_ring_kv_offset = [&] {
             if constexpr (EnableMegaRing) {
-                return mega_ring_remote_chunk ? 0
+                return (EnableTileReady && mega_ring_is_cp_batch) ? 0
                     : mega_ring_kv_rank * params.mega_ring_rank_kv_capacity;
             } else {
                 return 0;
@@ -847,7 +842,8 @@ struct CollectiveMainloopFwdSm90 {
         }();
 
         // if (cute::thread0()) { printf("Varlen = %d, params.leftpad_k = %p, leftpad_k = %d\n", Varlen, params.leftpad_k, leftpad_k); }
-        int const mega_ring_kv_batch_offset = mega_ring_remote_chunk ? 0 : seqlen_info.offset_k;
+        int const mega_ring_kv_batch_offset =
+            (EnableTileReady && mega_ring_is_cp_batch) ? 0 : seqlen_info.offset_k;
         Tensor gK_TMA = local_tile(domain_offset(make_coord(mega_ring_kv_batch_offset + mega_ring_kv_offset, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)
         Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, mega_ring_kv_batch_offset + mega_ring_kv_offset, _0{}), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));  // (K, N, _, _)
 
@@ -889,51 +885,21 @@ struct CollectiveMainloopFwdSm90 {
         );
 
         auto mega_ring_virtual_n_block = [&](int virtual_n_block) {
-            if (!mega_ring_remote_chunk) { return virtual_n_block; }
-            int const mega_ring_step =
-                min_fa3_varlen_demo::mega_ring::segment_begin_step(
-                    mega_ring_segment_meta);
-            int const mega_ring_segment_end =
-                min_fa3_varlen_demo::mega_ring::segment_end_step(
-                    mega_ring_segment_meta);
-            int const half_len = params.mega_ring_half_cu_seqlens[bidb + 1]
-                - params.mega_ring_half_cu_seqlens[bidb];
-            int const block_n = get<1>(TileShape_MNK{});
-            int const half_blocks = half_len / block_n;
-            int const half_end = mega_ring_segment_end < mega_ring_local_rank
-                ? mega_ring_segment_end : mega_ring_local_rank;
-            int const num_half_segments = half_end >= mega_ring_step
-                ? half_end - mega_ring_step + 1 : 0;
-            int const half_region_blocks = num_half_segments * half_blocks;
-            int const execution_ordinal =
-                mega_ring_chunk_n_blocks - 1 - virtual_n_block;
-            int step;
-            int local_block;
-            if (execution_ordinal < half_region_blocks) {
-                int const region_ordinal = execution_ordinal;
-                int const half_unit = region_ordinal / half_blocks;
-                int const remainder = region_ordinal - half_unit * half_blocks;
-                step = mega_ring_step + half_unit;
-                local_block = half_blocks - 1 - remainder;
-            } else {
-                int const region_ordinal = execution_ordinal - half_region_blocks;
-                int const half_unit = region_ordinal / half_blocks;
-                int const remainder = region_ordinal - half_unit * half_blocks;
-                int const segment_offset = half_unit >> 1;
-                int const block_in_full_segment =
-                    (half_unit & 1) * half_blocks + remainder;
-                step = mega_ring_step + num_half_segments + segment_offset;
-                local_block = 2 * half_blocks - 1 - block_in_full_segment;
+            if constexpr (EnableTileReady) {
+                if (mega_ring_is_cp_batch) {
+                    int const logical = kv_begin + (kv_end - kv_begin - 1 - virtual_n_block);
+                    int const local_tiles = m_block + 1;
+                    if (logical < local_tiles) {
+                        return params.mega_ring_rank * (params.mega_ring_rank_kv_capacity / kBlockN)
+                            + seqlen_info.offset_k / kBlockN + local_tiles - 1 - logical;
+                    }
+                    int const encoded = min_fa3_varlen_demo::mega_ring::load_relaxed(
+                        params.mega_ring_kv_map + params.mega_ring_kv_map_offsets[bidb]
+                        + logical - local_tiles);
+                    return encoded - 1;
+                }
             }
-            int const ring_base = params.mega_ring_rank - mega_ring_local_rank;
-            int const source_local_rank =
-                (mega_ring_local_rank - step + mega_ring_size) & (mega_ring_size - 1);
-            int const source_rank = ring_base + source_local_rank;
-            int const rank_capacity_blocks =
-                params.mega_ring_rank_kv_capacity / block_n;
-            int const batch_offset_blocks = seqlen_info.offset_k / block_n;
-            return source_rank * rank_capacity_blocks
-                + batch_offset_blocks + local_block;
+            return virtual_n_block;
         };
 
         // Set up for transposing V, only used if Transpose_V
@@ -1034,32 +1000,33 @@ struct CollectiveMainloopFwdSm90 {
         static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
         bool should_load_KV = !Use_TMA_KV || ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync()); // True for the elected thread
 
-        if constexpr (EnableMegaRing) {
+        if constexpr (EnableTileReady) {
+            if (mega_ring_is_cp_batch && kv_end > m_block + 1 && should_load_KV) {
+                asm volatile("fence.proxy.async.global;" ::: "memory");
+            }
+        } else if constexpr (EnableMegaRing) {
             // MEGA_RING_TILE_COPY: communication CTAs increment this counter
             // after each logical K/V tile is resident in the local concatenated
-            // KV buffer. One
-            // producer thread polls; the barrier releases the rest of the
+            // KV buffer. The TMA issuer polls; the barrier releases the rest of the
             // producer threads before they touch Q/K/V pipeline state.
-            if (mega_ring_remote_chunk && thread_idx == 0) {
+            if (mega_ring_is_cp_batch && should_load_KV
+                    && min_fa3_varlen_demo::mega_ring::segment_begin_step(
+                        mega_ring_segment_meta) > 0) {
                 int const mega_ring_step =
                     min_fa3_varlen_demo::mega_ring::segment_begin_step(
                         mega_ring_segment_meta);
-                int const mega_ring_segment_end =
-                    min_fa3_varlen_demo::mega_ring::segment_end_step(
-                        mega_ring_segment_meta);
                 enum : int { kReadyBlockN = CUTE_STATIC_V(get<1>(TileShape_MNK{})) };
                 auto const& level = params.mega_ring_hierarchy.levels[mega_ring_level_idx];
-                for (int step = mega_ring_step; step <= mega_ring_segment_end; ++step) {
-                    int kv_ready_target = ((level.full_rows + kReadyBlockN - 1) / kReadyBlockN) * 2;
-                    if constexpr (Is_causal) {
-                        if (step <= mega_ring_local_rank) {
-                            kv_ready_target = ((level.half_rows + kReadyBlockN - 1) / kReadyBlockN) * 2;
-                        }
+                int kv_ready_target = ((level.full_rows + kReadyBlockN - 1) / kReadyBlockN) * 2;
+                if constexpr (Is_causal) {
+                    if (mega_ring_step <= mega_ring_local_rank) {
+                        kv_ready_target = ((level.half_rows + kReadyBlockN - 1) / kReadyBlockN) * 2;
                     }
-                    min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
-                        params.mega_ring_kv_ready_counts + level.kv_ready_base + step - 1,
-                        kv_ready_target);
                 }
+                min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
+                    params.mega_ring_kv_ready_counts + level.kv_ready_base + mega_ring_step - 1,
+                    kv_ready_target);
+                asm volatile("fence.proxy.async.global;" ::: "memory");
             }
             flash::named_barrier_sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::MegaRingKVReady));
         }
@@ -1223,7 +1190,7 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
-    template <bool EnableMegaRing=false, bool CollectMegaRingStats=false,
+    template <bool EnableMegaRing=false, bool CollectMegaRingStats=false, bool EnableTileReady=false,
               typename SharedStorage, typename FrgTensorO, typename Softmax>
     CUTLASS_DEVICE bool
     mma(Params const& params,
@@ -1239,7 +1206,8 @@ struct CollectiveMainloopFwdSm90 {
         SharedStorage& shared_storage,
         int mega_ring_segment_meta = 0,
         unsigned long long* mega_ring_qo_visits = nullptr,
-        unsigned long long* mega_ring_kv_tile_reads = nullptr
+        unsigned long long* mega_ring_kv_tile_reads = nullptr,
+        int kv_begin = 0, int kv_end = 0
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -1254,15 +1222,11 @@ struct CollectiveMainloopFwdSm90 {
         int mega_ring_size = 1;
         int mega_ring_local_rank = 0;
         bool mega_ring_is_cp_batch = false;
-        bool mega_ring_remote_chunk = false;
         if constexpr (EnableMegaRing) {
             mega_ring_size = params.mega_ring_ring_sizes[bidb];
             int const ring_base = (params.mega_ring_rank / mega_ring_size) * mega_ring_size;
             mega_ring_local_rank = params.mega_ring_rank - ring_base;
             mega_ring_is_cp_batch = mega_ring_size > 1;
-            mega_ring_remote_chunk = Is_causal && mega_ring_is_cp_batch
-                && min_fa3_varlen_demo::mega_ring::segment_begin_step(
-                    mega_ring_segment_meta) > 0;
         }
         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
@@ -1273,7 +1237,12 @@ struct CollectiveMainloopFwdSm90 {
         int mega_ring_seqlen_q = seqlen_info.seqlen_q;
         int mega_ring_seqlen_k = seqlen_info.seqlen_k;
         bool mega_ring_use_causal_mask = true;
-        if constexpr (EnableMegaRing) {
+        if constexpr (EnableTileReady) {
+            if (mega_ring_is_cp_batch) {
+                n_block_min = 0;
+                n_block_max = kv_end - kv_begin;
+            }
+        } else if constexpr (EnableMegaRing) {
             int const mega_ring_step =
                 min_fa3_varlen_demo::mega_ring::segment_begin_step(
                     mega_ring_segment_meta);
@@ -1285,29 +1254,14 @@ struct CollectiveMainloopFwdSm90 {
                 static_assert(kBlockN == 128,
                               "causal mega-ring block mapping requires kBlockN == 128");
                 int const half_len = params.mega_ring_half_cu_seqlens[bidb + 1] - params.mega_ring_half_cu_seqlens[bidb];
-                bool const q_use_half = !mega_ring_remote_chunk && mega_ring_step > mega_ring_local_rank;
+                bool const q_use_half = mega_ring_step > mega_ring_local_rank;
                 bool const kv_use_half = mega_ring_step >= 1 && mega_ring_step <= mega_ring_local_rank;
                 bool const is_diag = mega_ring_step == 0;
                 mega_ring_seqlen_q = q_use_half ? half_len : 2 * half_len;
                 mega_ring_seqlen_k = kv_use_half ? half_len : 2 * half_len;
-                mega_ring_use_causal_mask = is_diag && !mega_ring_remote_chunk;
+                mega_ring_use_causal_mask = is_diag;
                 n_block_min = 0;
-                if (mega_ring_remote_chunk) {
-                    int const mega_ring_segment_end =
-                        min_fa3_varlen_demo::mega_ring::segment_end_step(
-                            mega_ring_segment_meta);
-                    int const half_blocks = half_len / kBlockN;
-                    int const half_end = mega_ring_segment_end < mega_ring_local_rank
-                        ? mega_ring_segment_end : mega_ring_local_rank;
-                    int const num_half_segments = half_end >= mega_ring_step
-                        ? half_end - mega_ring_step + 1 : 0;
-                    int const num_segments = mega_ring_segment_end - mega_ring_step + 1;
-                    int const num_full_segments = num_segments - num_half_segments;
-                    int const chunk_n_blocks = half_blocks
-                        * (num_half_segments + 2 * num_full_segments);
-                    mega_ring_seqlen_k = chunk_n_blocks * kBlockN;
-                    n_block_max = chunk_n_blocks;
-                } else if (is_diag) {
+                if (is_diag) {
                     int const n_block_causal = cute::ceil_div((m_block + 1) * kBlockM, kBlockN);
                     int const n_block_full = cute::ceil_div(2 * half_len, kBlockN);
                     n_block_max = n_block_causal < n_block_full ? n_block_causal : n_block_full;
@@ -1483,6 +1437,19 @@ struct CollectiveMainloopFwdSm90 {
             cute::copy(smem_tiled_copy_Q, tSsQ_copy_view, tSrQ_copy_view);
         }
 
+        auto tile_ready_mask = [&](auto& scores, int virtual_n) {
+            if constexpr (EnableTileReady) {
+                if (mega_ring_is_cp_batch) {
+                    int const logical = kv_begin + (kv_end - kv_begin - 1 - virtual_n);
+                    if (logical == 0) {
+                        mask.template apply<true, true, Is_local>(scores, m_block, m_block);
+                    }
+                } else {
+                    mask.template apply<true, Is_causal, Is_local>(scores, m_block, virtual_n);
+                }
+            }
+        };
+
         if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read);
@@ -1495,7 +1462,9 @@ struct CollectiveMainloopFwdSm90 {
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
             }
             scoremod_premask_fn(tSrS);
-            if constexpr (EnableMegaRing && Is_causal) {
+            if constexpr (EnableTileReady) {
+                tile_ready_mask(tSrS, n_block);
+            } else if constexpr (EnableMegaRing && Is_causal) {
                 // MEGA_RING: past rank blocks need to run with full-mask.
                 if (mega_ring_use_causal_mask) {
                     mask.template apply<true /*Seqlenk_mask*/, true /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
@@ -1563,43 +1532,50 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
             };
 
-            if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
-                auto mask_fn = [&](auto& tSrS, int n_block) {
-                    if constexpr (EnableMegaRing && Is_causal) {
-                        // MEGA_RING: no causal mask for rank blocks strictly
-                        // before the local rank in the global sequence.
-                        if (mega_ring_use_causal_mask) {
-                            mask.template apply<false /*Seqlenk_mask*/, true /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
-                        }else {
-                            mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
-                        }
-                    } else {
-                        mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
-                    }
-                };
-                int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
-                    seqlen_info, m_block, n_block_min, params.window_size_right,
-                    params.attention_chunk_divmod, params.qhead_per_khead_divmod);
-                #pragma unroll 1
-                for (; n_block >= n_block_min_causal_local_mask; --n_block) {
-                    fwd_step(n_block, mask_fn, cute::true_type{} /*check_inf*/);
-                }
-            }
-
-            int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
-                seqlen_info, m_block, n_block_min, params.window_size_left,
-                params.attention_chunk_divmod, params.qhead_per_khead_divmod);
-            auto no_mask_fn = [](auto& tSrS, int n_block) { };
-            #pragma unroll 1
-            for (; n_block >= n_block_min_before_local_mask; --n_block) {
-                fwd_step(n_block, no_mask_fn, cute::false_type{} /*check_inf*/);
-            }
-            // Separate masking iterations on the left for local attention
-            if constexpr (Is_local) {
-                auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+            if constexpr (EnableTileReady) {
                 #pragma unroll 1
                 for (; n_block >= n_block_min; --n_block) {
-                    fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
+                    fwd_step(n_block, tile_ready_mask, cute::true_type{} /*check_inf*/);
+                }
+            } else {
+                if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
+                    auto mask_fn = [&](auto& tSrS, int n_block) {
+                        if constexpr (EnableMegaRing && Is_causal) {
+                            // MEGA_RING: no causal mask for rank blocks strictly
+                            // before the local rank in the global sequence.
+                            if (mega_ring_use_causal_mask) {
+                                mask.template apply<false /*Seqlenk_mask*/, true /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
+                            }else {
+                                mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
+                            }
+                        } else {
+                            mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+                        }
+                    };
+                    int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
+                        seqlen_info, m_block, n_block_min, params.window_size_right,
+                        params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+                    #pragma unroll 1
+                    for (; n_block >= n_block_min_causal_local_mask; --n_block) {
+                        fwd_step(n_block, mask_fn, cute::true_type{} /*check_inf*/);
+                    }
+                }
+
+                int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
+                    seqlen_info, m_block, n_block_min, params.window_size_left,
+                    params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+                auto no_mask_fn = [](auto& tSrS, int n_block) { };
+                #pragma unroll 1
+                for (; n_block >= n_block_min_before_local_mask; --n_block) {
+                    fwd_step(n_block, no_mask_fn, cute::false_type{} /*check_inf*/);
+                }
+                // Separate masking iterations on the left for local attention
+                if constexpr (Is_local) {
+                    auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+                    #pragma unroll 1
+                    for (; n_block >= n_block_min; --n_block) {
+                        fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
+                    }
                 }
             }
             // Tell producers that smem_q is ready
@@ -1674,7 +1650,9 @@ struct CollectiveMainloopFwdSm90 {
             };
 
             auto first_iter_mask_fn = [&](auto& tSrS, int n_block) {
-                if constexpr (EnableMegaRing && Is_causal) {
+                if constexpr (EnableTileReady) {
+                    tile_ready_mask(tSrS, n_block);
+                } else if constexpr (EnableMegaRing && Is_causal) {
                     // MEGA_RING: past rank blocks need only the seqlen-k mask.
                     if (mega_ring_use_causal_mask) {
                         mask.template apply<true /*Seqlenk_mask*/, true /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
@@ -1687,42 +1665,49 @@ struct CollectiveMainloopFwdSm90 {
             };
             fwd_step(n_block, first_iter_mask_fn, cute::true_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
             --n_block;
-            if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
-                auto mask_fn = [&](auto& tSrS, int n_block) {
-                    if constexpr (EnableMegaRing && Is_causal) {
-                        // MEGA_RING: no causal mask for rank blocks strictly
-                        // before the local rank in the global sequence.
-                        if (mega_ring_use_causal_mask) {
-                            mask.template apply<false /*Seqlenk_mask*/, true /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
-                        } else {
-                            mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
-                        }
-                    } else {
-                        mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
-                    }
-                };
-                int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
-                    seqlen_info, m_block, n_block_min, params.window_size_right,
-                    params.attention_chunk_divmod, params.qhead_per_khead_divmod);
-                #pragma unroll 1
-                for (; n_block >= n_block_min_causal_local_mask; --n_block) {
-                    fwd_step(n_block, mask_fn, cute::false_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
-                }
-            }
-            int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
-                seqlen_info, m_block, n_block_min, params.window_size_left,
-                params.attention_chunk_divmod, params.qhead_per_khead_divmod);
-            auto no_mask_fn = [](auto& tSrS, int n_block) { };
-            #pragma unroll 1
-            for (; n_block >= n_block_min_before_local_mask; --n_block) {
-                fwd_step(n_block, no_mask_fn, cute::false_type{} /*is_first_iter*/, cute::false_type{} /*check_inf*/);
-            }
-            // Separate masking iterations on the left for local attention
-            if constexpr (Is_local) {
-                auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+            if constexpr (EnableTileReady) {
                 #pragma unroll 1
                 for (; n_block >= n_block_min; --n_block) {
-                    fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
+                    fwd_step(n_block, tile_ready_mask, cute::false_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
+                }
+            } else {
+                if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
+                    auto mask_fn = [&](auto& tSrS, int n_block) {
+                        if constexpr (EnableMegaRing && Is_causal) {
+                            // MEGA_RING: no causal mask for rank blocks strictly
+                            // before the local rank in the global sequence.
+                            if (mega_ring_use_causal_mask) {
+                                mask.template apply<false /*Seqlenk_mask*/, true /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
+                            } else {
+                                mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
+                            }
+                        } else {
+                            mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+                        }
+                    };
+                    int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
+                        seqlen_info, m_block, n_block_min, params.window_size_right,
+                        params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+                    #pragma unroll 1
+                    for (; n_block >= n_block_min_causal_local_mask; --n_block) {
+                        fwd_step(n_block, mask_fn, cute::false_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
+                    }
+                }
+                int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
+                    seqlen_info, m_block, n_block_min, params.window_size_left,
+                    params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+                auto no_mask_fn = [](auto& tSrS, int n_block) { };
+                #pragma unroll 1
+                for (; n_block >= n_block_min_before_local_mask; --n_block) {
+                    fwd_step(n_block, no_mask_fn, cute::false_type{} /*is_first_iter*/, cute::false_type{} /*check_inf*/);
+                }
+                // Separate masking iterations on the left for local attention
+                if constexpr (Is_local) {
+                    auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+                    #pragma unroll 1
+                    for (; n_block >= n_block_min; --n_block) {
+                        fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
+                    }
                 }
             }
             warp_scheduler_barrier_arrive();

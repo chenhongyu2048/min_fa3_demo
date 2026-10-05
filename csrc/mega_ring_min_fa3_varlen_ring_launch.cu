@@ -50,8 +50,17 @@ void run_mega_ring_min_fa3_varlen_ring_fwd(
                 "Mega ring varlen kernel requires mega_ring_rank_kv_capacity > 0. Got ",
                 params.mega_ring_rank_kv_capacity);
     TORCH_CHECK(params.mega_ring_ring_sizes != nullptr, "Mega ring varlen kernel requires device ring sizes");
-    TORCH_CHECK(params.mega_ring_kv_ready_counts != nullptr, "Mega ring varlen kernel requires mega_ring_kv_ready_counts storage");
-    TORCH_CHECK(params.mega_ring_step_ready != nullptr, "Mega ring varlen kernel requires mega_ring_step_ready counter storage");
+    if (params.is_causal) {
+        TORCH_CHECK(params.mega_ring_kv_ready_prefix != nullptr,
+                    "Causal mega ring requires KV ready prefix storage");
+        TORCH_CHECK(params.mega_ring_q_assigned != nullptr
+                        && params.mega_ring_q_merged != nullptr
+                        && params.mega_ring_q_output_state != nullptr,
+                    "Causal mega ring requires assigned, merged, and output state storage");
+    } else {
+        TORCH_CHECK(params.mega_ring_kv_ready_counts != nullptr, "Mega ring varlen kernel requires mega_ring_kv_ready_counts storage");
+        TORCH_CHECK(params.mega_ring_step_ready != nullptr, "Mega ring varlen kernel requires mega_ring_step_ready counter storage");
+    }
     TORCH_CHECK(params.mega_ring_scan_cursor != nullptr, "Mega ring varlen kernel requires mega_ring_scan_cursor storage");
     TORCH_CHECK(params.mega_ring_completed_tiles != nullptr, "Mega ring varlen kernel requires mega_ring_completed_tiles storage");
     TORCH_CHECK(params.num_comm_sm > 0 || params.mega_ring_hierarchy.reduction_tiles == 0,

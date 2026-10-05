@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <tuple>
 #include <vector>
 
 // MEGA_RING: use the fused multi-step mega-ring launch instead of the
@@ -27,6 +28,89 @@ using VarlenParams = min_fa3_varlen_demo::Flash_fwd_params;
 
 int round_multiple(int x, int m) {
     return (x + m - 1) / m * m;
+}
+
+// Shared by normal forward and the reusable ablation runner. Windows are immutable.
+auto prepare_mega_ring_causal_comm_windows(
+    torch::Tensor cu_seqlens_k_host, torch::Tensor ring_sizes_host, int rank,
+    bool interleave_comm_windows = true) {
+    TORCH_CHECK(!cu_seqlens_k_host.is_cuda() && !ring_sizes_host.is_cuda(),
+                "communication window metadata must be on CPU");
+    TORCH_CHECK(cu_seqlens_k_host.scalar_type() == torch::kInt32
+                    && ring_sizes_host.scalar_type() == torch::kInt32
+                    && cu_seqlens_k_host.is_contiguous() && ring_sizes_host.is_contiguous(),
+                "communication window metadata must be contiguous int32");
+    int const batch = ring_sizes_host.numel();
+    TORCH_CHECK(cu_seqlens_k_host.numel() == batch + 1, "cu_seqlens_k_host size mismatch");
+    using RingConfig = min_fa3_varlen_demo::mega_ring_detail::MegaRingKernelConfig<true, 8, 8>;
+    int constexpr width = RingConfig::kNumCommChunks;
+    using Window = min_fa3_varlen_demo::mega_ring::CommWindowDesc;
+    auto const* cu = cu_seqlens_k_host.data_ptr<int>();
+    auto const* sizes = ring_sizes_host.data_ptr<int>();
+    std::vector<std::vector<Window>> phase_a(batch), phase_b(batch);
+    auto offsets = torch::empty({batch + 1}, torch::TensorOptions().dtype(torch::kInt32));
+    auto* map_offsets = offsets.data_ptr<int>();
+    map_offsets[0] = 0;
+    size_t count = 0;
+    for (int b = 0; b < batch; ++b) {
+        int const g = sizes[b];
+        int const h = (cu[b + 1] - cu[b]) / (2 * RingConfig::kRowsPerTask);
+        int const r = rank % g;
+        map_offsets[b + 1] = map_offsets[b]
+            + (g > 1 ? min_fa3_varlen_demo::mega_ring::remote_tiles(h, g, r) : 0);
+        if (h == 0 || g == 1) { continue; }
+        for (int step = 1; step < g; ++step) {
+            int const begin = min_fa3_varlen_demo::mega_ring::step_begin(h, r, step);
+            int const end = begin + (step <= r ? h : 2 * h);
+            auto& windows = step <= r ? phase_a[b] : phase_b[b];
+            for (int j = begin; j < end; j += width) {
+                windows.push_back({b, step, j, std::min(j + width, end)});
+                ++count;
+            }
+        }
+    }
+    auto result = torch::empty({int64_t(count), 4}, torch::TensorOptions().dtype(torch::kInt32));
+    auto* dst = reinterpret_cast<Window*>(result.data_ptr<int>());
+    int index = 0;
+    auto append_phase = [&](auto const& per_sequence) {
+        if (interleave_comm_windows) {
+            size_t max_windows = 0;
+            for (auto const& sequence : per_sequence) {
+                max_windows = std::max(max_windows, sequence.size());
+            }
+            for (size_t window = 0; window < max_windows; ++window) {
+                for (auto const& sequence : per_sequence) {
+                    if (window < sequence.size()) { dst[index++] = sequence[window]; }
+                }
+            }
+        } else {
+            for (auto const& sequence : per_sequence) {
+                for (auto const& window : sequence) { dst[index++] = window; }
+            }
+        }
+    };
+    append_phase(phase_a);
+    int const num_a_windows = index;
+    append_phase(phase_b);
+    return std::make_tuple(result, offsets, num_a_windows);
+}
+
+void set_causal_ready_params(RingVarlenParams& params, torch::Tensor const& ready_prefix,
+                             torch::Tensor const& q_state, torch::Tensor const& comm_windows,
+                             int num_a_windows, torch::Tensor const& kv_map_offsets,
+                             torch::Tensor const& kv_map, torch::Tensor const& comm_phase_barrier) {
+    params.mega_ring_kv_ready_prefix = ready_prefix.data_ptr<int>();
+    int const stride = q_state.size(1);
+    params.mega_ring_q_assigned = q_state.data_ptr<int>();
+    params.mega_ring_q_merged = q_state.data_ptr<int>() + stride;
+    params.mega_ring_q_output_state = q_state.data_ptr<int>() + 2 * stride;
+    params.mega_ring_comm_windows = reinterpret_cast<
+        min_fa3_varlen_demo::mega_ring::CommWindowDesc const*>(comm_windows.data_ptr<int>());
+    params.mega_ring_num_comm_windows = comm_windows.size(0);
+    params.mega_ring_num_a_comm_windows = num_a_windows;
+    params.mega_ring_kv_map_offsets = kv_map_offsets.data_ptr<int>();
+    params.mega_ring_kv_map = kv_map.data_ptr<int>();
+    params.mega_ring_comm_phase_barrier = comm_phase_barrier.data_ptr<int>();
 }
 
 void check_varlen_qkv(const torch::Tensor& t, const char* name) {
@@ -322,7 +406,8 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
                                     py::object out_obj,
                                     py::object lse_obj,
                                     bool return_lse,
-                                    py::object stats_obj) {
+                                    py::object stats_obj,
+                                    bool interleave_comm_windows) {
     check_varlen_qkv(q, "q");
     check_varlen_qkv(k, "k");
     check_varlen_qkv(v, "v");
@@ -565,6 +650,23 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
     auto completed_tiles = torch::zeros(
         {stats.defined() ? 4 : 1}, q.options().dtype(torch::kInt32));
 
+    auto ready_prefix = torch::zeros({is_causal ? batch_size : 0}, q.options().dtype(torch::kInt32));
+    auto q_state = torch::zeros({3, is_causal ? std::max<int64_t>(reduction_tiles, 1) : 0},
+                               q.options().dtype(torch::kInt32));
+    auto comm_windows = torch::empty({0, 4}, q.options().dtype(torch::kInt32));
+    auto kv_map_offsets = torch::empty({0}, q.options().dtype(torch::kInt32));
+    int num_a_windows = 0;
+    int num_remote_tiles = 0;
+    if (is_causal) {
+        auto [windows_cpu, offsets_cpu, num_a] = prepare_mega_ring_causal_comm_windows(
+            cu_seqlens_k_host, ring_sizes_host, ring_rank, interleave_comm_windows);
+        comm_windows = windows_cpu.to(q.device());
+        kv_map_offsets = offsets_cpu.to(q.device());
+        num_a_windows = num_a;
+        num_remote_tiles = offsets_cpu.data_ptr<int>()[batch_size];
+    }
+    auto kv_map = torch::zeros({num_remote_tiles}, q.options().dtype(torch::kInt32));
+    auto comm_phase_barrier = torch::zeros({is_causal ? 1 : 0}, q.options().dtype(torch::kInt32));
     torch::Tensor q_descriptor = q;
     torch::Tensor out_descriptor = out;
     torch::Tensor lse_descriptor = lse;
@@ -609,6 +711,12 @@ py::object forward_varlen_mega_ring(torch::Tensor q,
         stats.defined()
             ? reinterpret_cast<unsigned long long*>(stats.data_ptr<int64_t>())
             : nullptr);
+
+    if (is_causal) {
+        set_causal_ready_params(params, ready_prefix, q_state, comm_windows,
+            num_a_windows, kv_map_offsets, kv_map, comm_phase_barrier);
+    }
+    params.skip_scheduler_metadata_computation = false;
 
     // MEGA_RING: one fused launch runs communication CTAs and compute CTAs.
     min_fa3_varlen_demo::run_mega_ring_min_fa3_varlen_ring_fwd(params, remote_k, remote_v, stream);
@@ -698,6 +806,13 @@ py::tuple forward_varlen_mega_ring_ablation(
     torch::Tensor scheduler_metadata,
     torch::Tensor kv_ready_counts,
     torch::Tensor step_ready,
+    torch::Tensor ready_prefix,
+    torch::Tensor q_state,
+    torch::Tensor comm_windows,
+    int num_a_windows,
+    torch::Tensor kv_map_offsets,
+    torch::Tensor kv_map,
+    torch::Tensor comm_phase_barrier,
     torch::Tensor scan_cursor,
     torch::Tensor completed_tiles,
     torch::Tensor out,
@@ -724,6 +839,7 @@ py::tuple forward_varlen_mega_ring_ablation(
     TORCH_CHECK(remote_k.data_.data_ptr() == k.data_ptr()
                     && remote_v.data_.data_ptr() == v.data_ptr(),
                 "k/v must be owned by remote_k/remote_v");
+    int const world_size = 8;
     TORCH_CHECK(remote_k.local_world_size_ == 8
                     && remote_v.local_world_size_ == 8,
                 "forward ablation requires exactly 8 local GPUs");
@@ -769,12 +885,23 @@ py::tuple forward_varlen_mega_ring_ablation(
     int const metadata_size = 1 + round_multiple(batch_size, 4) * 4;
     check_ablation_int_cuda(
         scheduler_metadata, q, metadata_size, "scheduler_metadata");
-    check_ablation_int_cuda(
-        kv_ready_counts, q,
-        min_fa3_varlen_demo::kMegaRingNumKvReadySections,
-        "kv_ready_counts");
-    check_ablation_int_cuda(
-        step_ready, q, std::max(hierarchy.reduction_tiles, 1), "step_ready");
+    if (profile_id >= 5) {
+        check_ablation_int_cuda(ready_prefix, q, batch_size, "ready_prefix");
+        TORCH_CHECK(q_state.dim() == 2 && q_state.size(0) == 3
+                        && q_state.size(1) == std::max(hierarchy.reduction_tiles, 1),
+                    "q_state must have shape [3, max(reduction_tiles, 1)]");
+        check_ablation_int_cuda(q_state.view({-1}), q, q_state.numel(), "q_state");
+        TORCH_CHECK(comm_windows.dim() == 2 && comm_windows.size(1) == 4,
+                    "comm_windows must have shape [num_windows, 4]");
+        check_ablation_int_cuda(comm_windows.view({-1}), q, comm_windows.numel(), "comm_windows");
+        check_ablation_int_cuda(kv_map_offsets, q, batch_size + 1, "kv_map_offsets");
+        check_ablation_int_cuda(kv_map, q, kv_map.numel(), "kv_map");
+        check_ablation_int_cuda(comm_phase_barrier, q, 1, "comm_phase_barrier");
+    } else {
+        check_ablation_int_cuda(kv_ready_counts, q,
+            min_fa3_varlen_demo::kMegaRingNumKvReadySections, "kv_ready_counts");
+        check_ablation_int_cuda(step_ready, q, std::max(hierarchy.reduction_tiles, 1), "step_ready");
+    }
     check_ablation_int_cuda(scan_cursor, q, 1, "scan_cursor");
 
     torch::Tensor stats;
@@ -793,9 +920,9 @@ py::tuple forward_varlen_mega_ring_ablation(
                 "num_comp_sm + num_comm_sm must not exceed the device SM count (",
                 props->multiProcessorCount, "). Got ",
                 num_comp_sm + num_comm_sm);
-    TORCH_CHECK(k.size(0) == v.size(0) && k.size(0) % 8 == 0,
-                "K/V arena rows must match and be divisible by 8");
-    int64_t const rank_capacity_i64 = k.size(0) / 8;
+    TORCH_CHECK(k.size(0) == v.size(0) && k.size(0) % world_size == 0,
+                "K/V arena rows must match and be divisible by the local world size");
+    int64_t const rank_capacity_i64 = k.size(0) / world_size;
     TORCH_CHECK(rank_capacity_i64 > 0
                     && rank_capacity_i64 <= std::numeric_limits<int>::max()
                     && rank_capacity_i64 % 128 == 0,
@@ -817,6 +944,10 @@ py::tuple forward_varlen_mega_ring_ablation(
         stats.defined()
             ? reinterpret_cast<unsigned long long*>(stats.data_ptr<int64_t>())
             : nullptr);
+    if (profile_id >= 5) {
+        set_causal_ready_params(params, ready_prefix, q_state, comm_windows,
+            num_a_windows, kv_map_offsets, kv_map, comm_phase_barrier);
+    }
     params.skip_scheduler_metadata_computation = scheduler_prepared;
     params.prepare_varlen_pdl = false;
 
@@ -824,7 +955,7 @@ py::tuple forward_varlen_mega_ring_ablation(
     min_fa3_varlen_demo::forward_ablation::run(
         params, remote_k, remote_v, scratch_out, scratch_lse,
         static_cast<min_fa3_varlen_demo::forward_ablation::Profile>(profile_id),
-        completed_tiles.numel(), stream, prepare_only);
+        completed_tiles.numel(), kv_map.numel(), stream, prepare_only);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return py::make_tuple(out, lse);
 }
@@ -832,6 +963,9 @@ py::tuple forward_varlen_mega_ring_ablation(
 }  // namespace
 
 void bind_varlen_mega_ring(py::module_& m) {
+    m.def("_prepare_mega_ring_causal_comm_windows", &prepare_mega_ring_causal_comm_windows,
+          py::arg("cu_seqlens_k_host"), py::arg("ring_sizes_host"), py::arg("rank"),
+          py::arg("interleave_comm_windows") = true);
     m.def(
         "forward_varlen_mega_ring_ablation",
         &forward_varlen_mega_ring_ablation,
@@ -853,6 +987,13 @@ void bind_varlen_mega_ring(py::module_& m) {
         py::arg("scheduler_metadata"),
         py::arg("kv_ready_counts"),
         py::arg("step_ready"),
+        py::arg("ready_prefix"),
+        py::arg("q_state"),
+        py::arg("comm_windows"),
+        py::arg("num_a_windows"),
+        py::arg("kv_map_offsets"),
+        py::arg("kv_map"),
+        py::arg("comm_phase_barrier"),
         py::arg("scan_cursor"),
         py::arg("completed_tiles"),
         py::arg("out"),
@@ -887,6 +1028,7 @@ void bind_varlen_mega_ring(py::module_& m) {
         py::arg("lse") = py::none(),
         py::arg("return_lse") = false,
         py::arg("stats") = py::none(),
+        py::arg("interleave_comm_windows") = true,
         "MEGA_RING: hierarchical fused Hopper varlen ring-attention forward.\n\n"
         "K/V must be contiguous [world_size * rank_kv_capacity, 8, 128] arenas. "
         "The kernel performs persistent compute and remote K/V TMA loads in one launch.");

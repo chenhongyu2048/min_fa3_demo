@@ -238,7 +238,7 @@ struct CollectiveEpilogueFwd {
         }
     }
 
-    template <typename SharedStorage, typename FrgTensorO, typename FrgTensorLSE, typename TiledMma>
+    template <bool SyncReduction=false, typename SharedStorage, typename FrgTensorO, typename FrgTensorLSE, typename TiledMma>
     CUTLASS_DEVICE void
     store(Params const& params,
           FrgTensorO& tOrO,
@@ -252,6 +252,15 @@ struct CollectiveEpilogueFwd {
           bool initialize_output = false
           ) {
 
+        auto epilogue_sync = [] {
+            if constexpr (SyncReduction) {
+                cutlass::arch::NamedBarrier::sync(NumEpilogueThreads,
+                    cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+            } else {
+                flash::named_barrier_sync(NumEpilogueThreads,
+                    cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+            }
+        };
         auto [m_block, bidh, bidb, split_idx] = block_coord;
         int num_splits = get<4>(params.shape_O_packed);
         if constexpr (Split && Varlen) {
@@ -277,7 +286,7 @@ struct CollectiveEpilogueFwd {
         // Technically we don't need this if we're not using smem, but the mainloop makes the assumption that
         // all epilogue threads sync at least once during the epilogue (so that we can start loading Q with
         // cp.async if we need).
-        flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+        epilogue_sync();
 
         // Step 1: Write O from rmem -> smem
         if constexpr (Use_smem) {
@@ -292,7 +301,7 @@ struct CollectiveEpilogueFwd {
                 cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
                                                     cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
             } else {
-                flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                epilogue_sync();
             }
         } else {
             if constexpr (ArchTag::kMinComputeCapability >= 90) {
@@ -372,7 +381,7 @@ struct CollectiveEpilogueFwd {
                 // Tensor tOsO = gmem_thr_copy_O.partition_S(sO_pi);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
                 Tensor tOrO = make_fragment_like(tOsO);
                 cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
-                if constexpr (ArchTag::kMinComputeCapability >= 90) {
+                if constexpr (!SyncReduction && ArchTag::kMinComputeCapability >= 90) {
                     cutlass::arch::fence_view_async_shared(); // ensure smem reads are done before next TMA to smem_v
                     #pragma unroll
                     for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
@@ -402,7 +411,7 @@ struct CollectiveEpilogueFwd {
                         constexpr int kLseFragSize = CUTE_STATIC_V(size(lse)); /* 2 */
 
                         if (initialize_output) {
-                            // Mega-ring step 0 owns the first write to this output tile. Its running
+                            // The first completed task owns initialization of this output tile. Its running
                             // state is exactly the current block, so avoid loading zero-initialized O.
                             #pragma unroll
                             for (int m = 0; m < kLseFragSize; ++m) {
@@ -456,6 +465,7 @@ struct CollectiveEpilogueFwd {
                             // Publish the per-row block scale through epilogue smem so the threads that own
                             // the coalesced O fragments can consume it later. This is the bridge between the
                             // row-based LSE ownership and the gmem-copy ownership used for O.
+                            if constexpr (SyncReduction) { epilogue_sync(); }
                             float* row_scale_smem_ptr = reinterpret_cast<float*>(shared_storage.tensors.epilogue.smem_o.data());
                             Tensor sBlockScale = make_tensor(make_smem_ptr(row_scale_smem_ptr), Shape<Int<kBlockM>>{});
                             #pragma unroll
@@ -474,7 +484,7 @@ struct CollectiveEpilogueFwd {
                                 gmem_tiled_copy_O, tOgO_load, tOrO_prev, tOcO, tOpO, seqlen_o - m_block * kBlockM
                             );
                             // Ensure all row-scale writes are visible before threads consume them for the merge.
-                            flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                            epilogue_sync();
 
                             // Merge old O with the current block O in registers. Each thread reads the block
                             // scale for the row(s) it owns in the gmem copy mapping and applies the online
@@ -508,6 +518,13 @@ struct CollectiveEpilogueFwd {
                 } else {
                     // If PackGQA, we split the work of compute O_ptr among threads in the same row
                     PackGQA_t::store_O(mO, tOrO, params.qhead_per_khead_divmod, thread_idx, seqlen_o, m_block);
+                }
+                if constexpr (SyncReduction && ArchTag::kMinComputeCapability >= 90) {
+                    cutlass::arch::fence_view_async_shared();
+                    #pragma unroll
+                    for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
+                        shared_storage.pipelines.barrier_O.arrive(cta_id);
+                    }
                 }
             } else {
                 Tensor mOpartial = make_tensor(make_gmem_ptr(params.ptr_O_partial + offset_o * get<0>(params.stride_O_partial)), params.shape_O_packed, params.stride_O_partial_packed)(_, _, bidh, !is_varlen ? bidb : 0, split_idx);

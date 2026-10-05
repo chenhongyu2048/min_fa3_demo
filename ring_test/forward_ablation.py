@@ -307,6 +307,7 @@ class ForwardAblationPlan:
         num_comp_sm: int = NUM_COMP_SM,
         num_comm_sm: int = NUM_COMM_SM,
         collect_stats: bool = False,
+        interleave_comm_windows: bool = True,
     ) -> None:
         import min_fa3_op
 
@@ -363,6 +364,22 @@ class ForwardAblationPlan:
         self.half_cu_seqlens = half_host.to(device=q.device)
         self.hierarchy_host = hierarchy_host
 
+        dynamic = self.profile.dynamic_segments
+        num_remote_tiles = 0
+        self.num_a_windows = 0
+        if dynamic:
+            windows_cpu, offsets_cpu, self.num_a_windows = (
+                min_fa3_op._prepare_mega_ring_causal_comm_windows(
+                    cu_seqlens_host, torch.tensor(ring_sizes, dtype=torch.int32),
+                    rank, interleave_comm_windows,
+                )
+            )
+            num_remote_tiles = int(offsets_cpu[-1])
+            self.comm_windows = windows_cpu.to(device=q.device)
+            self.kv_map_offsets = offsets_cpu.to(device=q.device)
+        else:
+            self.comm_windows = torch.empty((0, 4), device=q.device, dtype=torch.int32)
+            self.kv_map_offsets = torch.empty(0, device=q.device, dtype=torch.int32)
         b_rounded = (len(global_lengths) + 3) // 4 * 4
         self.scheduler_metadata = torch.empty(
             1 + 4 * b_rounded, device=q.device, dtype=torch.int32
@@ -379,6 +396,15 @@ class ForwardAblationPlan:
         self.completed_tiles = torch.empty(
             4 if collect_stats else 1, device=q.device, dtype=torch.int32
         )
+        self.ready_prefix = torch.empty(
+            len(global_lengths) if dynamic else 0, device=q.device, dtype=torch.int32
+        )
+        self.q_state = torch.empty(
+            (3, max(hierarchy["reduction_tiles"], 1) if dynamic else 0),
+            device=q.device, dtype=torch.int32,
+        )
+        self.kv_map = torch.empty(num_remote_tiles, device=q.device, dtype=torch.int32)
+        self.comm_phase_barrier = torch.empty(1 if dynamic else 0, device=q.device, dtype=torch.int32)
         self.out = torch.empty_like(q)
         self.lse = torch.empty(
             (q.size(1), q.size(0)), device=q.device, dtype=torch.float32
@@ -416,6 +442,13 @@ class ForwardAblationPlan:
             self.scheduler_metadata,
             self.kv_ready_counts,
             self.step_ready,
+            self.ready_prefix,
+            self.q_state,
+            self.comm_windows,
+            self.num_a_windows,
+            self.kv_map_offsets,
+            self.kv_map,
+            self.comm_phase_barrier,
             self.scan_cursor,
             self.completed_tiles,
             self.out,
@@ -430,7 +463,7 @@ class ForwardAblationPlan:
     def run(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self._invoke(scheduler_prepared=True, prepare_only=False)
 
-    def probe(self) -> dict[str, int | tuple[int, ...]]:
+    def probe(self) -> dict[str, int | str | tuple[int, ...]]:
         if not self.collect_stats or self.stats is None:
             raise RuntimeError("probe requires collect_stats=True")
         self.run()
@@ -444,6 +477,7 @@ class ForwardAblationPlan:
             "recycled_cta_work": completed[1]
             if self.profile.id in (3, 4)
             else 0,
+            "segment_span_unit": "kv_tiles" if self.profile.dynamic_segments else "ring_steps",
             "segment_span_sum": completed[1]
             if self.profile.dynamic_segments
             else self.hierarchy["total_work_tiles"],

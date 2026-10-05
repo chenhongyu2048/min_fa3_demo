@@ -23,6 +23,7 @@ from _min_fa3_op import (
     forward_varlen as _forward_varlen_cuda,
     forward_varlen_mega_ring as _forward_varlen_mega_ring_cuda,
     forward_varlen_mega_ring_ablation as _forward_varlen_mega_ring_ablation_cuda,
+    _prepare_mega_ring_causal_comm_windows,
     forward_varlen_ring as _forward_varlen_ring_cuda,
     parallel_remote_load as _parallel_remote_load_cuda,
     parallel_remote_load_vec as _parallel_remote_load_vec_cuda,
@@ -448,6 +449,7 @@ def forward_varlen_mega_ring(
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     stats: Optional[torch.Tensor] = None,
+    interleave_comm_windows: bool = True,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     # K/V are rank-major [world_size * rank_kv_capacity, KVH, 128] IPC arenas.
     return _forward_varlen_mega_ring_cuda(
@@ -472,6 +474,7 @@ def forward_varlen_mega_ring(
         lse,
         bool(return_lse),
         stats,
+        bool(interleave_comm_windows),
     )
 
 

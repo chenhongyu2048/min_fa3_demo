@@ -584,6 +584,9 @@ def magi_overlap_degree(value: str) -> int:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark explicit-topology mega-ring forward with all-CP baselines")
+    parser.add_argument(
+        "--interleave-comm-windows", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--global-seqlens")
     parser.add_argument("--ring-sizes")
     parser.add_argument("--ring-starts")
@@ -1412,6 +1415,7 @@ def _main_single(
                                 ring_starts_host=mega_ring_all_cp_ring_starts_host,
                                 return_lse=True,
                                 stats=stats,
+                                interleave_comm_windows=args.interleave_comm_windows,
                             )
 
                         runs.append(
@@ -1463,6 +1467,7 @@ def _main_single(
                                 ring_starts_host=hybrid_ring_starts_host,
                                 return_lse=True,
                                 stats=stats,
+                                interleave_comm_windows=args.interleave_comm_windows,
                             )
 
                         runs.append(

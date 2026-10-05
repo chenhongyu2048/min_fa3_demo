@@ -10,9 +10,8 @@
 namespace min_fa3_varlen_demo::mega_ring {
 
 enum : int {
-    kTileStateBusy = 1 << 30,
-    // MEGA_RING_SEGMENTS: one long-lived int carries the claimed causal
-    // segment. Ring sizes are limited to 2/4/8, so four bits also cover the
+    // Legacy ring-step descriptors retain packed metadata.
+    // Ring sizes are limited to 2/4/8, so four bits also cover the
     // invalid world_size sentinel (8).
     kSegmentBeginMask = 0x0f,
     kSegmentEndShift = 4,
@@ -37,11 +36,6 @@ constexpr int segment_end_step(int segment_meta) {
     return (segment_meta & kSegmentEndMask) >> kSegmentEndShift;
 }
 
-CUTLASS_HOST_DEVICE
-constexpr bool segment_is_terminal(int segment_meta) {
-    return (segment_meta & kSegmentTerminalBit) != 0;
-}
-
 CUTLASS_DEVICE
 int load_acquire(int const* address) {
     int value;
@@ -60,6 +54,29 @@ int compare_exchange_acquire(int* address, int compare, int value) {
     asm volatile("{atom.acquire.gpu.global.cas.b32 %0, [%1], %2, %3;}"
                  : "=r"(old) : "l"(address), "r"(compare), "r"(value) : "memory");
     return old;
+}
+
+// Map slots publish completed K/V stores, including through failed CAS acquires.
+CUTLASS_DEVICE
+int compare_exchange_acq_rel(int* address, int compare, int value) {
+    int old;
+    asm volatile("{atom.acq_rel.gpu.global.cas.b32 %0, [%1], %2, %3;}"
+                 : "=r"(old) : "l"(address), "r"(compare), "r"(value) : "memory");
+    return old;
+}
+
+CUTLASS_DEVICE
+void max_release(int* address, int value) {
+    asm volatile("{red.release.gpu.global.max.s32 [%0], %1;}"
+                 :: "l"(address), "r"(value) : "memory");
+}
+
+CUTLASS_DEVICE
+int load_relaxed(int const* address) {
+    int value;
+    asm volatile("{ld.relaxed.gpu.global.s32 %0, [%1];}"
+                 : "=r"(value) : "l"(address) : "memory");
+    return value;
 }
 
 // MEGA_RING: wait on a monotonically increasing device-local global counter.

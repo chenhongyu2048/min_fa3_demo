@@ -91,7 +91,9 @@ struct MegaRingKernelConfig {
         IsCausal,
         true,
         true,
-        CollectStats>;
+        CollectStats,
+        std::ratio<1, 2>,
+        std::ratio<4, 1>>;
     using AttnKernel = flash::enable_sm90<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
 
     static_assert(KVHeads == 1 || KVHeads == 2 || KVHeads == 4 || KVHeads == 8);
@@ -136,6 +138,14 @@ struct MegaRingKernelConfig {
         int const* half_cu_seqlens;
         min_fa3_varlen_demo::MegaRingHierarchyDesc hierarchy;
         int* kv_ready_counts;
+        int* kv_ready_prefix = nullptr;
+        mega_ring::CommWindowDesc const* comm_windows = nullptr;
+        int num_comm_windows = 0;
+        int const* ring_sizes = nullptr;
+        int* kv_map = nullptr;
+        int const* kv_map_offsets = nullptr;
+        int* comm_phase_barrier = nullptr;
+        int num_a_comm_windows = 0;
     };
 };
 
@@ -160,7 +170,7 @@ struct alignas(128) MegaRingRemoteLoadBarriers {
     semaphore finished[RingConfig::kNumCommChunks];
 };
 
-template <typename RingConfig>
+template <typename RingConfig, bool EnableTileReady = false>
 CUTLASS_DEVICE
 void run_mega_ring_remote_load(
     const typename RingConfig::KernelParams& params,
@@ -188,6 +198,99 @@ void run_mega_ring_remote_load(
     }
     __syncthreads();
 
+    if constexpr (EnableTileReady) {
+        int const warp_id = warp::groupid();
+        bool const loader = warp_id < RingConfig::kNumCommChunks;
+        if (warp_id < 2 * RingConfig::kNumCommChunks) {
+            int const pair = loader ? warp_id : warp_id - RingConfig::kNumCommChunks;
+            uint32_t phasebits = 0xFFFF0000;
+            auto run_phase = [&](int phase_begin, int phase_count) {
+                for (int local_wid = comm_bid; local_wid < phase_count; local_wid += params.num_comm_sm) {
+                    auto const window = params.comm_windows[phase_begin + local_wid];
+                    int const j = window.kv_begin + pair;
+                    if (j >= window.kv_end) { continue; }
+                    int const b = window.batch_idx;
+                    int const g = params.ring_sizes[b];
+                    int const r = params.ring_rank % g;
+                    int const h = (params.cu_seqlens_k[b + 1] - params.cu_seqlens_k[b])
+                        / (2 * RingConfig::kRowsPerTask);
+                    int const source_tiles = window.ring_step <= r ? h : 2 * h;
+                    int const source_n = source_tiles - 1
+                        - (j - mega_ring::step_begin(h, r, window.ring_step));
+                    int const source_rank = params.ring_rank - r + (r - window.ring_step + g) % g;
+                    int const row = source_rank * params.rank_kv_capacity
+                        + params.cu_seqlens_k[b] + source_n * RingConfig::kRowsPerTask;
+                    // Both leaders visit the same complete K tile, then complete V tile.
+                    for (int is_v = 0; is_v < 2; ++is_v) {
+                        for (int transfer = 0; transfer < RingConfig::kRowsPerTask / RingConfig::kRowsPerTransfer; ++transfer) {
+                            int const transfer_row = row + transfer * RingConfig::kRowsPerTransfer;
+                            if (loader) {
+                                wait(barriers.finished[pair], get_phasebit<1>(phasebits, 0));
+                                update_phasebit<1>(phasebits, 0);
+                                tma::expect_bytes(barriers.arrived[pair], sizeof(typename RingConfig::shared_tile));
+                                if (!is_v) {
+                                    tma::load_async(tile[pair], params.remote_k[source_rank],
+                                        {transfer_row / RingConfig::kRowsPerTransfer, 0}, barriers.arrived[pair]);
+                                } else {
+                                    tma::load_async(tile[pair], params.remote_v[source_rank],
+                                        {transfer_row / RingConfig::kRowsPerTransfer, 0}, barriers.arrived[pair]);
+                                }
+                            } else {
+                                wait(barriers.arrived[pair], get_phasebit<0>(phasebits, 0));
+                                update_phasebit<0>(phasebits, 0);
+                                if (!is_v) {
+                                    tma::store_async(params.local_k, tile[pair],
+                                        {transfer_row / RingConfig::kRowsPerTransfer, 0});
+                                } else {
+                                    tma::store_async(params.local_v, tile[pair],
+                                        {transfer_row / RingConfig::kRowsPerTransfer, 0});
+                                }
+                                tma::store_async_read_wait();
+                                arrive(barriers.finished[pair]);
+                                tma::store_async_wait();
+                            }
+                        }
+                    }
+                    if (!loader) {
+                        int* map_b = params.kv_map + params.kv_map_offsets[b];
+                        int* ready = params.kv_ready_prefix + b;
+                        int const encoded_tile = row / RingConfig::kRowsPerTask + 1;
+                        int pos = mega_ring::load_acquire(ready);
+                        // A failed acquire CAS imports the preceding slot's publication.
+                        while (mega_ring::compare_exchange_acq_rel(map_b + pos, 0, encoded_tile) != 0) {
+                            ++pos;
+                        }
+                        mega_ring::max_release(ready, pos + 1);
+                    }
+                }
+            };
+            bool const has_both_phases = params.num_a_comm_windows > 0
+                && params.num_a_comm_windows < params.num_comm_windows;
+            int const b_count = params.num_comm_windows - params.num_a_comm_windows;
+            if (loader) {
+                if (laneid() == 0) {
+                    run_phase(0, params.num_a_comm_windows);
+                    run_phase(params.num_a_comm_windows, b_count);
+                }
+            } else {
+                if (laneid() == 0) {
+                    run_phase(0, params.num_a_comm_windows);
+                    if (has_both_phases) {
+                        mega_ring::signal_release(params.comm_phase_barrier, 1);
+                        mega_ring::wait_until_at_least_acquire(params.comm_phase_barrier,
+                            params.num_comm_sm * RingConfig::kNumCommChunks);
+                    }
+                }
+                if (has_both_phases) { __syncwarp(); }
+                if (laneid() == 0) {
+                    run_phase(params.num_a_comm_windows, b_count);
+                }
+            }
+        }
+        return;
+    }
+
+    // Legacy noncausal communication schedule.
     int total_tasks = 0;
     #pragma unroll
     for (int level_idx = 0; level_idx < 3; ++level_idx) {
@@ -337,7 +440,8 @@ void mega_ring_flash_attn_varlen_kernel(CUTLASS_GRID_CONSTANT typename RingConfi
 
     // MEGA_RING: one grid contains both persistent attention CTAs and remote K/V copy CTAs. Compute CTAs occupy [0, num_comp_sm).
     if (int(blockIdx.x) >= params.num_comp_sm) {
-        run_mega_ring_remote_load<RingConfig>(params, int(blockIdx.x) - params.num_comp_sm, smem_buf);
+        run_mega_ring_remote_load<RingConfig, RingConfig::kIsCausal>(
+            params, int(blockIdx.x) - params.num_comp_sm, smem_buf);
         __syncthreads();
         typename RingConfig::AttnKernel attn_kernel;
         attn_kernel(params.compute, smem_buf, true);
@@ -429,7 +533,9 @@ void run_mega_ring_min_fa3_varlen_ring_sm90(
         rank_kv_capacity,
         params.mega_ring_ring_sizes,
         params.mega_ring_hierarchy,
-        params.mega_ring_stats};
+        params.mega_ring_stats,
+        params.mega_ring_kv_map,
+        params.mega_ring_kv_map_offsets};
 
     typename RingConfig::CollectiveEpilogue::Arguments epilogue_args{
         static_cast<ElementOut*>(params.o_ptr),
@@ -476,7 +582,12 @@ void run_mega_ring_min_fa3_varlen_ring_sm90(
         params.mega_ring_kv_ready_counts,
         params.mega_ring_step_ready,
         params.mega_ring_scan_cursor,
-        params.mega_ring_completed_tiles};
+        params.mega_ring_completed_tiles,
+        -1,
+        params.mega_ring_kv_ready_prefix,
+        params.mega_ring_q_assigned,
+        params.mega_ring_q_merged,
+        params.mega_ring_q_output_state};
 
     if (!params.skip_scheduler_metadata_computation) {
         // MEGA_RING: still uses the copied varlen scheduler metadata prep; the
@@ -542,7 +653,15 @@ void run_mega_ring_min_fa3_varlen_ring_sm90(
         params.cu_seqlens_k,
         params.mega_ring_half_cu_seqlens,
         params.mega_ring_hierarchy,
-        params.mega_ring_kv_ready_counts};
+        params.mega_ring_kv_ready_counts,
+        params.mega_ring_kv_ready_prefix,
+        params.mega_ring_comm_windows,
+        params.mega_ring_num_comm_windows,
+        params.mega_ring_ring_sizes,
+        params.mega_ring_kv_map,
+        params.mega_ring_kv_map_offsets,
+        params.mega_ring_comm_phase_barrier,
+        params.mega_ring_num_a_comm_windows};
 
     bool const launch_with_pdl = params.prepare_varlen_pdl && !params.skip_scheduler_metadata_computation;
     if (!launch_with_pdl) {
