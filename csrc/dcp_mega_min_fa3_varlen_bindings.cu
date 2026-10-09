@@ -135,8 +135,8 @@ void validate_metadata_header(
     int64_t total_vectors,
     int64_t batch_size,
     int dcp_size) {
-    TORCH_CHECK(header.version == 7,
-                "unsupported DCP mega metadata version; expected version 7");
+    TORCH_CHECK(header.version == 8,
+                "unsupported DCP mega metadata version; expected version 8");
     TORCH_CHECK(header.used_ints == metadata_used,
                 "metadata_used does not match the pinned header");
     TORCH_CHECK(metadata_used >= 40 && metadata_used <= metadata_capacity,
@@ -247,7 +247,7 @@ void validate_metadata_header(
             && header.history_splits_offset
                 == header.chunk_splits_offset + batch_size
             && header.used_ints == header.history_splits_offset + batch_size,
-        "DCP mega metadata v7 ranges must be contiguous and non-overlapping");
+        "DCP mega metadata v8 ranges must be contiguous and non-overlapping");
 }
 
 Flash_fwd_params make_attention_params(

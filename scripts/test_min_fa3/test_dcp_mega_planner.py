@@ -25,7 +25,7 @@ def expanded_combine(cu_q, splits, completions, heads, world, copy_vectors):
             while begin < end:
                 batch = batch_for_token[begin // heads]
                 region_end = min(end, cu_q[batch + 1] * heads)
-                step = 1 if splits[batch] > 1 else copy_vectors
+                step = 4 if splits[batch] > 1 else copy_vectors
                 for first in range(begin, region_end, step):
                     last = min(first + step, region_end)
                     deps = set()
@@ -34,20 +34,21 @@ def expanded_combine(cu_q, splits, completions, heads, world, copy_vectors):
                         deps.update(completions[
                             (metadata.HISTORY, batch, token, rank * heads + head)
                         ])
-                    tasks.append((tuple(sorted(deps)), 4 + (last - first) * splits[batch]))
+                    waves = len(range(first, last, 4))
+                    tasks.append((tuple(sorted(deps)), 4 + waves * splits[batch]))
                 begin = region_end
     return tasks
 
 
 def expanded_makespan(attention, tasks):
-    workers = [(time, cta, warp)
+    workers = [(time, cta, group)
                for cta, time in enumerate(attention.cta_finish_times)
-               for warp in range(metadata.MEGA_COMPUTE_WARPS)]
+               for group in range(3)]
     heapq.heapify(workers)
     for deps, work in tasks:
-        time, cta, warp = heapq.heappop(workers)
+        time, cta, group = heapq.heappop(workers)
         ready = max(attention.completion_finish_times[i] for i in deps)
-        heapq.heappush(workers, (max(time, ready) + work, cta, warp))
+        heapq.heappush(workers, (max(time, ready) + work, cta, group))
     return max(attention.makespan, max(time for time, _, _ in workers))
 
 
@@ -79,7 +80,7 @@ class PlannerTests(unittest.TestCase):
                 chunk_sequence_splits=chunk_splits,
                 history_sequence_splits=splits, reorder_history=reorder,
             )
-            for copy in (1, heads, 2 * heads, 4 * heads):
+            for copy in (4, 8, 16, 32):
                 with self.subTest(world=world, heads=heads, reorder=reorder, copy=copy):
                     compact = metadata._history_combine_schedule_tasks(
                         cu_q, splits, bases, hq_local=heads, dcp_size=world,
@@ -93,6 +94,17 @@ class PlannerTests(unittest.TestCase):
                     self.assertEqual(
                         metadata._overlapped_attention_combine_makespan(attention, compact),
                         expanded_makespan(attention, reference),
+                    )
+                    profile = metadata._history_combine_profile(
+                        cu_q, splits, hq_local=heads, dcp_size=world,
+                        copy_vectors_per_task=copy,
+                    )
+                    self.assertEqual(profile.task_count, len(reference))
+                    self.assertEqual(profile.work, sum(work for _, work in reference))
+                    self.assertEqual(
+                        profile.partial_vector_count,
+                        sum(length * split * heads * world
+                            for length, split in zip(q, splits)),
                     )
             # Uneven repeated task runs must preserve FIFO blocking and tie behavior.
             compact = tuple(metadata._HistoryCombineScheduleTask(

@@ -38,12 +38,15 @@ PUBLISH_DESC_FIELDS = 8
 HISTORY_COMBINE_DESC_FIELDS = 8
 FINAL_DESC_FIELDS = 8
 METADATA_HEADER_INTS = 40
-METADATA_VERSION = 7
+METADATA_VERSION = 8
 MEGA_COMPUTE_WARPS = 12
+HISTORY_WARPS_PER_TASK = 4
+HISTORY_WORKER_GROUPS = MEGA_COMPUTE_WARPS // HISTORY_WARPS_PER_TASK
 # Minimum adaptive final granularity and the runner capacity bound.
 FINAL_TOKENS_PER_TASK = 4
 FINAL_TOKEN_GRANULARITIES = (4, 8, 16)
 HISTORY_MAX_COPY_VECTORS = 32
+HISTORY_COPY_VECTOR_GRANULARITIES = (4, 8, 16, HISTORY_MAX_COPY_VECTORS)
 HISTORY_TASK_WAVE_TARGET = 0.8
 SCHEDULER_POLICY_FIFO = "fifo"
 SCHEDULER_POLICY_HEURISTIC = "release_lpt_critical_wave"
@@ -55,7 +58,6 @@ HISTORY_ORDER_POLICY_FIFO = "fifo"
 HISTORY_ORDER_POLICY_RELEASE_LPT = "release_lpt"
 HEURISTIC_TASK_OVERHEAD = 4
 HEURISTIC_COMBINE_TASK_OVERHEAD = HEURISTIC_TASK_OVERHEAD
-HEURISTIC_COMBINE_PARTIAL_VECTOR_COST = 1
 HEURISTIC_MIN_MAKESPAN_GAIN = 0.10
 HEURISTIC_SPLIT4_EXTRA_GAIN = 0.05
 
@@ -346,7 +348,7 @@ def choose_dispatch(
         pack_gqa=True,
         split=effective > 1,
         block_n=block_n,
-        history_copy_vectors_per_task=1,
+        history_copy_vectors_per_task=HISTORY_COPY_VECTOR_GRANULARITIES[0],
     )
 
 
@@ -1052,7 +1054,9 @@ def _history_combine_schedule_tasks(
             while region_begin < tile_end * hq_local:
                 region_end = min(tile_end, cu_q[region_batch + 1]) * hq_local
                 splits = history_sequence_splits[region_batch]
-                vectors_per_task = 1 if splits > 1 else copy_vectors_per_task
+                vectors_per_task = (
+                    HISTORY_WARPS_PER_TASK if splits > 1 else copy_vectors_per_task
+                )
                 base = history_completion_bases[region_batch]
                 vector = region_begin
                 while vector < region_end:
@@ -1060,11 +1064,11 @@ def _history_combine_schedule_tasks(
                     token, head = divmod(vector, hq_local)
                     packed = ((token - cu_q[region_batch]) * history_heads
                               + dst_rank * hq_local + head)
-                    if vectors_per_task == 1:
-                        # Adjacent heads in one history tile share every split
-                        # dependency. Keep their FIFO multiplicity, not objects.
+                    if splits > 1:
+                        # Adjacent four-vector groups in one history tile share
+                        # every split dependency. Preserve their FIFO repeats.
                         repeats = min(region_end - vector, hq_local - head,
-                                      128 - packed % 128)
+                                      128 - packed % 128) // HISTORY_WARPS_PER_TASK
                         first = base + (packed // 128) * splits
                         dependencies = tuple(range(first, first + splits))
                     else:
@@ -1085,7 +1089,9 @@ def _history_combine_schedule_tasks(
                         dependencies = tuple(sorted(dependency_set))
                     tasks.append(_HistoryCombineScheduleTask(
                         dependencies=dependencies,
-                        work=HEURISTIC_COMBINE_TASK_OVERHEAD + valid_vectors * splits,
+                        work=(HEURISTIC_COMBINE_TASK_OVERHEAD
+                              + _ceil_div(valid_vectors, HISTORY_WARPS_PER_TASK)
+                              * splits),
                         repeats=repeats,
                     ))
                     vector += valid_vectors * repeats
@@ -1108,7 +1114,7 @@ def _overlapped_attention_combine_makespan(
     workers_by_time: dict[int, int] = {}
     for available in attention_profile.cta_finish_times:
         workers_by_time[available] = (
-            workers_by_time.get(available, 0) + MEGA_COMPUTE_WARPS
+            workers_by_time.get(available, 0) + HISTORY_WORKER_GROUPS
         )
     worker_heap = list(workers_by_time.items())
     heapq.heapify(worker_heap)
@@ -1147,16 +1153,17 @@ def _history_combine_profile(
             actual_splits = history_sequence_splits[batch_idx]
             partial_vectors_per_destination += region_vectors * actual_splits
             if actual_splits > 1:
-                tasks_per_destination += region_vectors
+                tasks_per_destination += region_vectors // HISTORY_WARPS_PER_TASK
             else:
                 tasks_per_destination += _ceil_div(
                     region_vectors, copy_vectors_per_task
                 )
     task_count = dcp_size * tasks_per_destination
     partial_vector_count = dcp_size * partial_vectors_per_destination
+    # Hq_local and every task boundary are multiples of the four-vector round.
     work = (
         HEURISTIC_COMBINE_TASK_OVERHEAD * task_count
-        + HEURISTIC_COMBINE_PARTIAL_VECTOR_COST * partial_vector_count
+        + partial_vector_count // HISTORY_WARPS_PER_TASK
     )
     return _HistoryCombineProfile(
         task_count=task_count,
@@ -1191,18 +1198,9 @@ def _choose_history_copy_vectors_per_task(
     num_sms: int,
     num_comm_sm: int,
 ) -> int:
-    candidates = sorted(
-        {
-            1,
-            hq_local,
-            2 * hq_local,
-            4 * hq_local,
-            min(8 * hq_local, HISTORY_MAX_COPY_VECTORS),
-        }
-    )
-    worker_warps = (num_sms - num_comm_sm) * MEGA_COMPUTE_WARPS
-    target_claims = math.ceil(HISTORY_TASK_WAVE_TARGET * worker_warps)
-    for candidate in reversed(candidates):
+    worker_groups = (num_sms - num_comm_sm) * HISTORY_WORKER_GROUPS
+    target_claims = math.ceil(HISTORY_TASK_WAVE_TARGET * worker_groups)
+    for candidate in reversed(HISTORY_COPY_VECTOR_GRANULARITIES):
         task_count = _history_combine_profile(
             cu_q,
             history_sequence_splits,
@@ -1212,7 +1210,7 @@ def _choose_history_copy_vectors_per_task(
         ).task_count
         if task_count >= target_claims:
             return candidate
-    return 1
+    return HISTORY_COPY_VECTOR_GRANULARITIES[0]
 
 
 def build_dcp_mega_metadata(
@@ -1430,7 +1428,7 @@ def build_dcp_mega_metadata(
         pack_gqa=dispatch.pack_gqa,
         split=effective_num_splits > 1,
         block_n=dispatch.block_n,
-        history_copy_vectors_per_task=1,
+        history_copy_vectors_per_task=HISTORY_COPY_VECTOR_GRANULARITIES[0],
     )
     if auto_block_n and not dispatch.split:
         dispatch = DCPMegaDispatch(
@@ -1440,7 +1438,7 @@ def build_dcp_mega_metadata(
             pack_gqa=dispatch.pack_gqa,
             split=dispatch.split,
             block_n=176,
-            history_copy_vectors_per_task=1,
+            history_copy_vectors_per_task=HISTORY_COPY_VECTOR_GRANULARITIES[0],
         )
 
     copy_vectors_per_task = _choose_history_copy_vectors_per_task(
@@ -1611,7 +1609,8 @@ def build_dcp_mega_metadata(
                 region_end = min(tile_end, cu_q[batch_idx + 1] * hq_local)
                 actual_splits = history_sequence_splits[batch_idx]
                 vectors_per_task = (
-                    1 if actual_splits > 1 else copy_vectors_per_task
+                    HISTORY_WARPS_PER_TASK
+                    if actual_splits > 1 else copy_vectors_per_task
                 )
                 for task_vector_begin in range(
                     region_begin,
@@ -1935,16 +1934,9 @@ def validate_dcp_mega_metadata(
         raise AssertionError("invalid token-block count")
     if metadata.dcp_size != dcp_size:
         raise AssertionError("metadata DCP size mismatch")
-    valid_copy_vectors = {
-        1,
-        hq_local,
-        2 * hq_local,
-        4 * hq_local,
-        min(8 * hq_local, HISTORY_MAX_COPY_VECTORS),
-    }
     if (
         metadata.dispatch.history_copy_vectors_per_task
-        not in valid_copy_vectors
+        not in HISTORY_COPY_VECTOR_GRANULARITIES
     ):
         raise AssertionError("invalid history copy task granularity")
 
@@ -2063,8 +2055,8 @@ def validate_dcp_mega_metadata(
         if actual_splits != metadata.history_sequence_splits[batch_idx]:
             raise AssertionError("history combine split count is invalid")
         if actual_splits > 1:
-            if valid_vectors != 1:
-                raise AssertionError("split history combine task must contain one vector")
+            if valid_vectors != HISTORY_WARPS_PER_TASK:
+                raise AssertionError("split history combine task must contain four vectors")
         else:
             copy_vectors = metadata.dispatch.history_copy_vectors_per_task
             region_end = min(
@@ -2088,6 +2080,8 @@ def validate_dcp_mega_metadata(
                 history_completion_ids[(batch_idx, packed // 128)]
             )
         expected_ids = tuple(sorted(expected_id_set))
+        if actual_splits > 1 and len(expected_ids) != actual_splits:
+            raise AssertionError("split history combine task crosses a history M tile")
         dependencies = metadata.publish_dependencies[
             dep_begin : dep_begin + dep_count
         ]
@@ -2198,7 +2192,7 @@ def pack_dcp_mega_metadata(
     post_phase: int,
     capacity: int | None = None,
 ) -> array:
-    """Serialize a validated metadata v7 image into native int32 values."""
+    """Serialize a validated metadata v8 image into native int32 values."""
     if pre_phase <= 0 or post_phase <= pre_phase:
         raise ValueError("metadata phases must be positive and strictly increasing")
     payload = array("i", [0] * METADATA_HEADER_INTS)
@@ -2274,7 +2268,7 @@ def pack_dcp_mega_metadata(
         history_combine_offset,
     )
     if len(header) != METADATA_HEADER_INTS:
-        raise AssertionError("metadata v7 header width mismatch")
+        raise AssertionError("metadata v8 header width mismatch")
     payload[:METADATA_HEADER_INTS] = array("i", header)
     return payload
 
@@ -2289,6 +2283,7 @@ __all__ = [
     "FINAL_TOKENS_PER_TASK",
     "HISTORY",
     "HISTORY_COMBINE_DESC_FIELDS",
+    "HISTORY_COPY_VECTOR_GRANULARITIES",
     "HISTORY_ORDER_POLICY_FIFO",
     "HISTORY_ORDER_POLICY_RELEASE_LPT",
     "HISTORY_MAX_COPY_VECTORS",
@@ -2299,6 +2294,8 @@ __all__ = [
     "SPLIT_POLICY_CRITICAL_WAVE",
     "SPLIT_POLICY_FA3_NATIVE",
     "HISTORY_TASK_WAVE_TARGET",
+    "HISTORY_WARPS_PER_TASK",
+    "HISTORY_WORKER_GROUPS",
     "MEGA_COMPUTE_WARPS",
     "METADATA_HEADER_INTS",
     "METADATA_VERSION",

@@ -21,6 +21,8 @@ using I = int64_t;
 using Vec = std::vector<I>;
 constexpr I task_overhead = 4;
 constexpr I compute_warps = 12;
+constexpr I history_warps_per_task = 4;
+constexpr I history_worker_groups = compute_warps / history_warps_per_task;
 constexpr double min_gain = 0.10;
 I ceil_div(I a, I b) { return (a + b - 1) / b; }
 I split_work(I n, I s, I i) {
@@ -71,13 +73,13 @@ struct Planner {
         for (size_t b = 0; b < q.size(); ++b) {
             for (I tile = cu[b] / 16 * 16; tile < cu[b + 1]; tile += 16) {
                 I vectors = (std::min(tile + 16, cu[b + 1]) - std::max(tile, cu[b])) * heads;
-                p.tasks += splits[b] > 1 ? vectors : ceil_div(vectors, copy);
+                p.tasks += splits[b] > 1 ? vectors / history_warps_per_task : ceil_div(vectors, copy);
                 p.vectors += vectors * splits[b];
             }
         }
         p.tasks *= world;
         p.vectors *= world;
-        p.work = task_overhead * p.tasks + p.vectors;
+        p.work = task_overhead * p.tasks + p.vectors / history_warps_per_task;
         return p;
     }
 
@@ -88,18 +90,19 @@ struct Planner {
             ? native_chunk : chunk;
         bool reorder = legacy_native && source == "legacy_dynamic" ? false
             : (*std::max_element(splits.begin(), splits.end()) > 1 ? reorder_split : reorder_no_split);
-        I copy = 1;
-        std::set<I> copies{1, heads, 2 * heads, 4 * heads, std::min<I>(8 * heads, 32)};
+        I copy = history_warps_per_task;
+        std::set<I> copies{4, 8, 16, 32};
         CombineProfile combine;
         for (auto it = copies.rbegin(); it != copies.rend(); ++it) {
             combine = combine_profile(splits, *it);
-            if (combine.tasks >= static_cast<I>(std::ceil(0.8 * ctas * compute_warps)) || *it == 1) {
+            if (combine.tasks >= static_cast<I>(std::ceil(0.8 * ctas * history_worker_groups))
+                || *it == history_warps_per_task) {
                 copy = *it;
                 break;
             }
         }
         // Conservation of worker time is a lower bound on the final makespan.
-        // A CTA's attention occupies all of its combine warps. Dependencies can
+        // A CTA's attention occupies all of its combine groups. Dependencies can
         // only increase this bound. Pruning at cutoff preserves strict improvement.
         if (prune && cutoff != std::numeric_limits<I>::max()) {
             I work = 0, longest = 0;
@@ -112,8 +115,8 @@ struct Planner {
                 work += ceil_div(q[b] * heads * world, 128) * (history[b] + splits[b] * task_overhead);
                 longest = std::max(longest, split_work(history[b], splits[b], 0));
             }
-            I lower_bound = std::max(longest, ceil_div(work * compute_warps + combine.work,
-                                                     ctas * compute_warps));
+            I lower_bound = std::max(longest, ceil_div(work * history_worker_groups + combine.work,
+                                                     ctas * history_worker_groups));
             if (lower_bound >= cutoff) { ++stats.bound_pruned; return std::nullopt; }
         }
 
@@ -185,7 +188,7 @@ struct Planner {
         for (size_t i = 0; i < sorted_finish.size();) {
             size_t j = i + 1;
             while (j < sorted_finish.size() && sorted_finish[j] == sorted_finish[i]) ++j;
-            workers.emplace(sorted_finish[i], (j - i) * compute_warps);
+            workers.emplace(sorted_finish[i], (j - i) * history_worker_groups);
             i = j;
         }
         I score = attention_span;
@@ -198,14 +201,15 @@ struct Planner {
                 I vector = tile * heads;
                 while (vector < tile_end * heads) {
                     I region_end = std::min(tile_end, cu[b + 1]) * heads;
-                    I step = splits[b] > 1 ? 1 : copy;
+                    I step = splits[b] > 1 ? history_warps_per_task : copy;
                     while (vector < region_end) {
                         I valid = std::min(step, region_end - vector);
                         I token = vector / heads, head = vector % heads;
                         I packed = (token - cu[b]) * heads * world + rank * heads + head;
                         I repeats = 1, ready = 0;
-                        if (step == 1) {
-                            repeats = std::min({region_end - vector, heads - head, 128 - packed % 128});
+                        if (splits[b] > 1) {
+                            repeats = std::min({region_end - vector, heads - head, 128 - packed % 128})
+                                / history_warps_per_task;
                             I first = bases[b] + packed / 128 * splits[b];
                             for (I s = 0; s < splits[b]; ++s) ready = std::max(ready, completions[first + s]);
                         } else {
@@ -221,7 +225,8 @@ struct Planner {
                         while (remaining) {
                             auto [available, count] = workers.top(); workers.pop();
                             I used = std::min(remaining, count);
-                            I finish = std::max(available, ready) + task_overhead + valid * splits[b];
+                            I finish = std::max(available, ready) + task_overhead
+                                + ceil_div(valid, history_warps_per_task) * splits[b];
                             if (used < count) workers.emplace(available, count - used);
                             workers.emplace(finish, used);
                             score = std::max(score, finish);

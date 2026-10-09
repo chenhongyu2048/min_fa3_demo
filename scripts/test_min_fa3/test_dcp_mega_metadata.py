@@ -225,11 +225,19 @@ class DCPMegaMetadataTest(unittest.TestCase):
             )
             self.assertLessEqual(publish[1], row[1])
             self.assertLessEqual(row[1] + row[2], publish[1] + publish[2])
+            self.assertGreaterEqual(row[1], cu_q[row[5]] * hq_local)
+            self.assertLessEqual(row[1] + row[2], cu_q[row[5] + 1] * hq_local)
+            region_end = min(
+                publish[1] + publish[2], cu_q[row[5] + 1] * hq_local
+            )
             if row[6] > 1:
-                self.assertEqual(row[2], 1)
+                self.assertEqual(row[2], min(4, region_end - row[1]))
             else:
-                self.assertLessEqual(
-                    row[2], metadata.dispatch.history_copy_vectors_per_task
+                self.assertEqual(
+                    row[2], min(
+                        metadata.dispatch.history_copy_vectors_per_task,
+                        region_end - row[1],
+                    )
                 )
             self.assertGreater(row[4], 0)
             self.assertEqual(
@@ -489,9 +497,9 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(metadata.heuristic_split_sequence_splits, 4)
         self.assertEqual(metadata.heuristic_baseline_makespan, 798)
         self.assertEqual(metadata.heuristic_selected_makespan, 639)
-        self.assertEqual(metadata.heuristic_baseline_combine_penalty, 20)
-        self.assertEqual(metadata.heuristic_selected_combine_penalty, 36)
-        self.assertAlmostEqual(metadata.heuristic_gain, 143 / 818)
+        self.assertEqual(metadata.heuristic_baseline_combine_penalty, 12)
+        self.assertEqual(metadata.heuristic_selected_combine_penalty, 12)
+        self.assertAlmostEqual(metadata.heuristic_gain, 159 / 810)
         self.assertEqual(metadata.history_sequence_splits[2], 4)
         self.assertEqual(metadata.history_sequence_splits.count(4), 1)
         self.assertEqual(
@@ -534,7 +542,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(fixed_176.heuristic_split_sequence_splits, 4)
         self.assertEqual(fixed_176.heuristic_baseline_makespan, 586)
         self.assertEqual(fixed_176.heuristic_selected_makespan, 470)
-        self.assertAlmostEqual(fixed_176.heuristic_gain, 100 / 606)
+        self.assertAlmostEqual(fixed_176.heuristic_gain, 116 / 598)
 
     def test_multi_sequence_critical_wave_crosses_joint_sequence_plateau(self):
         q_lengths = (16,) * 8
@@ -566,16 +574,16 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(metadata.heuristic_selected_makespan, 45)
         self.assertEqual(metadata.heuristic_baseline_attention_tasks, 16)
         self.assertEqual(metadata.heuristic_selected_attention_tasks, 32)
-        self.assertEqual(metadata.heuristic_baseline_combine_tasks, 1024)
-        self.assertEqual(metadata.heuristic_selected_combine_tasks, 1024)
+        self.assertEqual(metadata.heuristic_baseline_combine_tasks, 256)
+        self.assertEqual(metadata.heuristic_selected_combine_tasks, 256)
         self.assertEqual(
             metadata.heuristic_baseline_combine_partial_vectors, 1024
         )
         self.assertEqual(
             metadata.heuristic_selected_combine_partial_vectors, 3072
         )
-        self.assertEqual(metadata.heuristic_baseline_combine_work, 5120)
-        self.assertEqual(metadata.heuristic_selected_combine_work, 7168)
+        self.assertEqual(metadata.heuristic_baseline_combine_work, 1280)
+        self.assertEqual(metadata.heuristic_selected_combine_work, 1792)
         self.assertEqual(metadata.heuristic_baseline_combine_penalty, 5)
         self.assertEqual(metadata.heuristic_selected_combine_penalty, 5)
         self.assertAlmostEqual(metadata.heuristic_gain, 317 / 367)
@@ -606,16 +614,16 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(metadata.heuristic_selected_makespan, 30)
         self.assertEqual(metadata.heuristic_baseline_attention_tasks, 76)
         self.assertEqual(metadata.heuristic_selected_attention_tasks, 80)
-        self.assertEqual(metadata.heuristic_baseline_combine_tasks, 1536)
-        self.assertEqual(metadata.heuristic_selected_combine_tasks, 1104)
+        self.assertEqual(metadata.heuristic_baseline_combine_tasks, 384)
+        self.assertEqual(metadata.heuristic_selected_combine_tasks, 276)
         self.assertEqual(
             metadata.heuristic_baseline_combine_partial_vectors, 6144
         )
         self.assertEqual(
             metadata.heuristic_selected_combine_partial_vectors, 6656
         )
-        self.assertEqual(metadata.heuristic_baseline_combine_work, 12288)
-        self.assertEqual(metadata.heuristic_selected_combine_work, 11072)
+        self.assertEqual(metadata.heuristic_baseline_combine_work, 3072)
+        self.assertEqual(metadata.heuristic_selected_combine_work, 2768)
         self.assertEqual(metadata.heuristic_baseline_combine_penalty, 8)
         self.assertEqual(metadata.heuristic_selected_combine_penalty, 6)
         self.assertAlmostEqual(metadata.heuristic_gain, 50 / 86)
@@ -636,12 +644,12 @@ class DCPMegaMetadataTest(unittest.TestCase):
             copy_vectors_per_task=4,
         )
 
-        self.assertEqual(split2.task_count, 160)
+        self.assertEqual(split2.task_count, 64)
         self.assertEqual(split3.task_count, split2.task_count)
         self.assertEqual(split2.partial_vector_count, 384)
         self.assertEqual(split3.partial_vector_count, 512)
-        self.assertEqual(split2.work, 1024)
-        self.assertEqual(split3.work, 1152)
+        self.assertEqual(split2.work, 352)
+        self.assertEqual(split3.work, 384)
 
     def test_history_combine_overlaps_late_attention_on_another_cta(self):
         attention = _AttentionScheduleProfile(
@@ -673,7 +681,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
             27,
         )
 
-    def test_blocked_combine_warps_hold_their_fifo_tasks(self):
+    def test_blocked_combine_warpgroups_hold_their_fifo_tasks(self):
         attention = _AttentionScheduleProfile(
             makespan=100,
             task_count=2,
@@ -684,8 +692,8 @@ class DCPMegaMetadataTest(unittest.TestCase):
         blocked = _HistoryCombineScheduleTask(dependencies=(0,), work=1)
         ready_long = _HistoryCombineScheduleTask(dependencies=(1,), work=100)
 
-        blocked_first = (blocked,) * 12 + (ready_long,)
-        ready_first = (ready_long,) + (blocked,) * 12
+        blocked_first = (blocked,) * 3 + (ready_long,)
+        ready_first = (ready_long,) + (blocked,) * 3
         self.assertEqual(
             _overlapped_attention_combine_makespan(attention, blocked_first),
             200,
@@ -733,9 +741,9 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(metadata.heuristic_selected_attention_tasks, 48)
         self.assertEqual(metadata.heuristic_baseline_makespan, 39)
         self.assertEqual(metadata.heuristic_selected_makespan, 16)
-        self.assertEqual(metadata.heuristic_baseline_combine_penalty, 5)
+        self.assertEqual(metadata.heuristic_baseline_combine_penalty, 6)
         self.assertEqual(metadata.heuristic_selected_combine_penalty, 10)
-        self.assertAlmostEqual(metadata.heuristic_gain, 18 / 44)
+        self.assertAlmostEqual(metadata.heuristic_gain, 19 / 45)
 
     def test_combine_work_can_prefer_iterative_over_legacy_dynamic(self):
         q_lengths = (16,) * 8
@@ -755,8 +763,8 @@ class DCPMegaMetadataTest(unittest.TestCase):
             metadata.history_sequence_splits,
             (2, 1, 3, 1, 1, 1, 1, 1),
         )
-        self.assertEqual(metadata.heuristic_baseline_combine_work, 5120)
-        self.assertEqual(metadata.heuristic_selected_combine_work, 5504)
+        self.assertEqual(metadata.heuristic_baseline_combine_work, 1280)
+        self.assertEqual(metadata.heuristic_selected_combine_work, 1376)
         self.assertEqual(metadata.heuristic_baseline_combine_penalty, 5)
         self.assertEqual(metadata.heuristic_selected_combine_penalty, 5)
         self.assertAlmostEqual(metadata.heuristic_gain, 49 / 86)
@@ -1350,7 +1358,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
                             final_vectors, list(range(cu_q[-1] * hq_local))
                         )
 
-    def test_small_non_split_history_combine_preserves_vector_parallelism(self):
+    def test_small_non_split_history_combine_uses_four_vector_tasks(self):
         cu_q = (0, 7, 23)
         cu_history = (0, 257, 1281)
         for dcp_size in (2, 4, 8):
@@ -1373,15 +1381,15 @@ class DCPMegaMetadataTest(unittest.TestCase):
                         )
                         self.assertFalse(metadata.dispatch.split)
                         self.assertEqual(
-                            metadata.dispatch.history_copy_vectors_per_task, 1
+                            metadata.dispatch.history_copy_vectors_per_task, 4
                         )
                         self.assertEqual(
                             len(metadata.history_combine),
-                            dcp_size * metadata.total_vectors,
+                            dcp_size * metadata.total_vectors // 4,
                         )
                         self.assertTrue(
                             all(
-                                row[2] == 1
+                                row[2] == 4
                                 for row in metadata.history_combine
                             )
                         )
@@ -1390,37 +1398,36 @@ class DCPMegaMetadataTest(unittest.TestCase):
                             for row in metadata.publish
                             if row[2] == 16 * hq_local
                         )
-                        self.assertEqual(full_publish[6], 16 * hq_local)
+                        self.assertEqual(full_publish[6], 4 * hq_local)
                         self._assert_publish_receive_mapping(
                             metadata, cu_q, hq_local, dcp_size
                         )
 
     def test_adaptive_copy_granularity_covers_each_task_wave(self):
-        expected_granularity = {
-            40: 1,
-            200: 4,
-            400: 8,
-            800: 16,
-            1200: 32,
-        }
-        for q_len, expected in expected_granularity.items():
-            with self.subTest(q_len=q_len):
-                metadata = build_dcp_mega_metadata(
-                    (0, q_len),
-                    (0, 257),
-                    hq_local=4,
-                    dcp_size=8,
-                    num_sms=132,
-                    num_comm_sm=8,
-                    requested_num_splits=1,
-                )
-                self.assertEqual(
-                    metadata.dispatch.history_copy_vectors_per_task,
-                    expected,
-                )
-                self._assert_publish_receive_mapping(
-                    metadata, (0, q_len), 4, 8
-                )
+        # 124 CTAs supply 372 warpgroups; ceil(0.8 * 372) = 298 tasks.
+        # The adjacent lengths straddle each candidate's exact task threshold.
+        for hq_local, cases in (
+            (4, ((1, 4), (74, 4), (75, 8), (148, 8), (149, 16), (296, 16), (297, 32))),
+            (8, ((1, 4), (37, 4), (38, 8), (74, 8), (75, 16), (148, 16), (149, 32))),
+        ):
+            for q_len, expected in cases:
+                with self.subTest(hq_local=hq_local, q_len=q_len):
+                    metadata = build_dcp_mega_metadata(
+                        (0, q_len),
+                        (0, 257),
+                        hq_local=hq_local,
+                        dcp_size=8,
+                        num_sms=132,
+                        num_comm_sm=8,
+                        requested_num_splits=1,
+                    )
+                    self.assertEqual(
+                        metadata.dispatch.history_copy_vectors_per_task,
+                        expected,
+                    )
+                    self._assert_publish_receive_mapping(
+                        metadata, (0, q_len), hq_local, 8
+                    )
 
     def test_chunk_split_does_not_force_fine_history_copy(self):
         metadata = build_dcp_mega_metadata(
@@ -1463,7 +1470,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
                     for begin, end in zip(cu_q, cu_q[1:]))
             )
 
-    def test_split_history_combine_keeps_one_vector_per_task(self):
+    def test_split_history_combine_groups_four_vectors_per_task(self):
         cu_q = (0, 7, 23)
         cu_history = (0, 4097, 12290)
         for hq_local in (4, 8):
@@ -1482,10 +1489,10 @@ class DCPMegaMetadataTest(unittest.TestCase):
                     self.assertTrue(metadata.dispatch.split)
                     self.assertEqual(
                         len(metadata.history_combine),
-                        8 * metadata.total_vectors,
+                        8 * metadata.total_vectors // 4,
                     )
                     self.assertTrue(
-                        all(row[2] == 1 for row in metadata.history_combine)
+                        all(row[2] == 4 for row in metadata.history_combine)
                     )
                     self._assert_publish_receive_mapping(
                         metadata, cu_q, hq_local, 8
@@ -1559,7 +1566,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         )
         image = pack_dcp_mega_metadata(metadata, pre_phase=11, post_phase=12)
         self.assertEqual(image[0], METADATA_VERSION)
-        self.assertEqual(METADATA_VERSION, 7)
+        self.assertEqual(METADATA_VERSION, 8)
         self.assertEqual(image[30], len(image))
         self.assertEqual(image[32], 1)
         self.assertEqual(image[33], metadata.token_block_count)

@@ -1,4 +1,4 @@
-// Build and serialize metadata v7 without materializing Python descriptors.
+// Build and serialize metadata v8 without materializing Python descriptors.
 // Layout and ordering reference: dcp_mega_metadata.py.
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -16,6 +16,7 @@ namespace {
 using Ints = std::vector<int32_t>;
 using Row = std::array<int32_t, 8>;
 using Rows = std::vector<Row>;
+constexpr int32_t history_warps_per_task = 4;
 int32_t ceil_div(int32_t a, int32_t b) { return (a + b - 1) / b; }
 
 Ints build_packed_queues(const Ints& cu, int32_t heads, int32_t world,
@@ -112,7 +113,7 @@ Ints build_packed_queues(const Ints& cu, int32_t heads, int32_t world,
             while (region < end) {
                 size_t b = std::upper_bound(cu.begin(), cu.end(), region / heads) - cu.begin() - 1;
                 int32_t region_end = std::min(end, cu[b + 1] * heads);
-                int32_t step = history_splits[b] > 1 ? 1 : copy_vectors;
+                int32_t step = history_splits[b] > 1 ? history_warps_per_task : copy_vectors;
                 for (int32_t vector = region; vector < region_end; vector += step) {
                     int32_t valid = std::min(step, region_end - vector);
                     Ints deps = dependencies(1, vector, vector + valid, rank);
@@ -165,7 +166,7 @@ Ints build_packed_queues(const Ints& cu, int32_t heads, int32_t world,
     int32_t max_history = *std::max_element(history_splits.begin(), history_splits.end());
     int32_t max_splits = std::max(max_chunk, max_history);
     Ints header{
-        7, static_cast<int32_t>(attention.size()), static_cast<int32_t>(q_tasks.size() / 4),
+        8, static_cast<int32_t>(attention.size()), static_cast<int32_t>(q_tasks.size() / 4),
         static_cast<int32_t>(q_deps.size()), static_cast<int32_t>(publish.size()),
         static_cast<int32_t>(publish_deps.size()), static_cast<int32_t>(final.size()),
         static_cast<int32_t>(final_deps.size()), chunk_count, static_cast<int32_t>(attention.size()) - chunk_count,
