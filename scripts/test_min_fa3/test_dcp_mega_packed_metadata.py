@@ -23,6 +23,7 @@ class PackedFallbackTests(unittest.TestCase):
                 q, h, pre_phase=7, post_phase=8, capacity=len(expected), **config)
         self.assertEqual(dispatch, reference.dispatch)
         self.assertEqual(payload, expected)
+        self.assertEqual(payload[0], 8)
 
 
 @unittest.skipIf(metadata._native_packed_queues is None, "C++ packed queue builder not built")
@@ -53,6 +54,7 @@ class NativePackedTests(unittest.TestCase):
             with self.subTest(case=i, config=config):
                 self.assertEqual(dispatch, reference.dispatch)
                 self.assertEqual(payload, expected)
+                self.assertEqual(payload[0], 8)
 
     def prepare(self, q=(0, 1, 2), h=(0, 8192, 16384), **options):
         config = dict(hq_local=8, dcp_size=4, num_sms=78, num_comm_sm=8,

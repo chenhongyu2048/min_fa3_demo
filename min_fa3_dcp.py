@@ -32,6 +32,7 @@ import triton.language as tl
 
 import min_fa3_op
 from dcp_mega_metadata import (
+    HISTORY_WORKER_GROUPS,
     MEGA_COMPUTE_WARPS,
     METADATA_HEADER_INTS,
     build_dcp_mega_metadata,
@@ -2832,9 +2833,12 @@ class DCPMegaAttentionRunner:
                 "history_combine_worker_warps": (
                     (self.num_sms - self.num_comm_sm) * MEGA_COMPUTE_WARPS
                 ),
+                "history_combine_worker_groups": (
+                    (self.num_sms - self.num_comm_sm) * HISTORY_WORKER_GROUPS
+                ),
                 "history_combine_task_waves": (
                     len(metadata.history_combine)
-                    / ((self.num_sms - self.num_comm_sm) * MEGA_COMPUTE_WARPS)
+                    / ((self.num_sms - self.num_comm_sm) * HISTORY_WORKER_GROUPS)
                 ),
                 "sequence_splits": {
                     "chunk": list(metadata.chunk_sequence_splits),

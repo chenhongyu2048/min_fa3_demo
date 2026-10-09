@@ -26,7 +26,7 @@ DCP Mega 将一个 chunk-prefill batch 拆成两个 attention domain：
 1. `chunk attention`：本 rank 的 causal chunk K/V；
 2. `history attention`：DCP group 聚合后的 Q 对本 rank history K/V 做 noncausal attention。
 
-host 为两个 domain 构造统一的 attention descriptor 队列。compute CTA 完成 attention 后继续处理 history combine 和 final combine；communication CTA 负责 Q all-gather、接收远端 history partial，并在空闲时协助 combine。
+host 为两个 domain 构造统一的 attention descriptor 队列。compute CTA 完成 attention 后继续处理 history combine 和 final combine；communication CTA 负责 Q all-gather 和接收远端 history partial。
 
 一个 batch 通常同时包含：
 
@@ -85,7 +85,7 @@ critical-wave 调度器的主要目标按优先级排列为：
 2. 改善 compute CTA 的负载均衡，减少最后一个未填满 wave 的尾部；
 3. 在收益接近时选择更少的 attention task 和更小的 split 向量；
 4. 保留 FA3 native dynamic split 作为候选和运行时回退；
-5. 不修改 CUDA attention 数学实现和 packed metadata ABI；
+5. 不修改 CUDA attention 数学实现和 packed metadata descriptor 布局；
 6. 保持 host 侧决策确定性，便于 CUDA Graph replay 和离线复现。
 
 非目标：
@@ -236,24 +236,24 @@ cost model 和最终 metadata 必须使用完全相同的顺序。history order 
 combine task 按实际 packed metadata 顺序构造：
 
 ```text
-final token tile
+16-token communication parent tile
     -> destination rank
         -> sequence region
-            -> vector task
+            -> four-warp history task
 ```
 
-NoSplit 路径可以在一个 task 中复制多个 vector；split 路径每个 vector 独立 combine。每个 task 的无量纲成本为：
+每个 history task 由一个 4-warp group（WG）领取。`actual_splits > 1` 时，一个 task 包含同一 history M-tile 的 4 个 vector，每个 warp 独立 combine 一个 vector；`actual_splits == 1` 时，从 4/8/16/32 vectors/task 中选择 copy 粒度，4 个 warp 按 `warp_in_group + 4*k` 分担。task 均不跨 sequence 或 publish tile，copy 可以通过精确依赖并集覆盖多个 M-tile。每个 task 的无量纲成本为：
 
 ```text
-combine_work = combine_task_overhead + valid_vectors * actual_splits
+combine_work = combine_task_overhead + ceil(valid_vectors / 4) * actual_splits
 combine_task_overhead = 4
 ```
 
-这同时计入固定 task 开销和随 partial vector 数增长的工作。
+这同时计入固定 task 开销和 WG 内按 4 个 vector 并行执行的轮次。`partial_vector_count` 仍统计实际的 `sum(valid_vectors * actual_splits)`，与 WG 时间单位区分。copy 选择满足 `task_count >= ceil(0.8 * 3 * num_compute_ctas)` 的最大候选，不足时使用 4；计数包括 split task，并按 sequence/publish 边界截断。
 
 ### 8.2 worker release 与依赖
 
-每个 compute CTA 提供 `MEGA_COMPUTE_WARPS = 12` 个 combine worker。一个 CTA 的 combine worker 只有在该 CTA 完成 attention 后才可用：
+每个 compute CTA 保留 `MEGA_COMPUTE_WARPS = 12` 个物理 warp，提供 `HISTORY_WORKER_GROUPS = 3` 个独立 combine worker。每个 worker 是一个 4-warp WG，只有在所属 CTA 完成 attention 后才可用：
 
 ```text
 worker.available_time = cta_attention_finish_time
@@ -272,7 +272,7 @@ finish_j = start_j + combine_work_j
 worker.available_time = finish_j
 ```
 
-先领取 task 再等待 dependency，模拟 device 端 FIFO claim 后 warp 被该 task 占住的行为。模型不允许同一个 warp 绕过未就绪 task 去执行后续 ready task。
+先领取 task 再等待 dependency，模拟 device 端 FIFO claim 后 WG 被该 task 占住的行为。模型不允许同一个 WG 绕过未就绪 task 去执行后续 ready task。
 
 最终评分为：
 
@@ -282,6 +282,8 @@ combine_penalty = score - attention_makespan
 ```
 
 因此 attention 和 combine 可以出现在同一个时间区间，`combine_penalty` 只表示未被 attention 覆盖并落在关键路径上的尾部。
+
+native planner 的工作量剪枝同样使用 WG 单位：下界为 `max(longest_attention_task, ceil((3 * attention_work + combine_work) / (3 * num_compute_ctas)))`。
 
 ## 9. 多序列迭代 split
 
@@ -450,7 +452,7 @@ else:
 
 ## 12. Metadata 构造与正确性约束
 
-优化只改变 host 侧 split 向量和队列顺序，不改变 attention 数学。metadata 必须维持以下不变量。
+调度不改变 attention 数学。metadata v8 沿用 40-int header 和 8-int history descriptor，`valid_vectors` 表示一个 WG task 的向量数；publish completion 计数记录 WG task 数。metadata 必须维持以下不变量。
 
 ### 12.1 descriptor 完整覆盖
 
@@ -463,6 +465,8 @@ history descriptor 必须引用覆盖其全部有效 packed Q rows 的 Q-ready c
 ### 12.3 combine dependency
 
 每个 history combine task 必须依赖它读取的所有 history partial completion ID。排序后 dependency 仍按 completion ID 查找，不能按新的 queue ordinal 推断。
+
+split task 的 4 个 vector 共享同一 M-tile 的完整 split completion 集合，索引为 `base + m_block * actual_splits + split_idx`；copy task 保留所覆盖 vector 的精确依赖并集。每个 `(destination, vector)` 仍须恰好覆盖一次。
 
 ### 12.4 Q task 与 attention order 一致
 
@@ -513,6 +517,7 @@ history_order_policy:
 - model/effective BlockN；
 - baseline/selected attention task 数；
 - combine task、partial vector 和 work；
+- history combine 的物理 warp 数、WG worker 数及按 WG worker 数计算的 task waves；
 - baseline/selected attention makespan；
 - combine penalty 和完整 gain；
 - selected split vector、plan source 和 Q block order。

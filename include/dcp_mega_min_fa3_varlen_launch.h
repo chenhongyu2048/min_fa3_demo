@@ -226,6 +226,7 @@ struct DCPMegaKernelConfig {
 
     struct alignas(128) HelperSharedStorage {
         int work_id;
+        int history_work_ids[3];
         int receive_task_ids[kNumCommChunks];
         float source_lse[kNumCommChunks][16 * CommHeads];
         alignas(128) CommTile comm_tiles[kNumCommChunks];
@@ -503,7 +504,7 @@ CUTLASS_DEVICE void complete_history_combine_task(
             params.publish_ready + work.publish_id, 1);
         if (previous == publish.combine_task_count - 1
             && publish.dst_rank != params.dcp_rank) {
-            // The acq_rel RMW observes every prior warp's release in this tile.
+            // The acq_rel RMW observes every prior task's release in this tile.
             // Promote the generic stores before publishing to the peer GPU.
             fence_acq_rel_system();
             int const token_block
@@ -695,61 +696,62 @@ template <typename Config>
 CUTLASS_DEVICE void run_history_combine(
     typename Config::KernelParams const& params,
     typename Config::HelperSharedStorage& shared) {
-    int const lane = kittens::laneid();
+    int const group_id = int(threadIdx.x) / cutlass::NumThreadsPerWarpGroup;
+    int const group_thread = int(threadIdx.x) % cutlass::NumThreadsPerWarpGroup;
+    int const warp_in_group = group_thread / cutlass::NumThreadsPerWarp;
+    // User barriers 3/4/5 are unused by this two-MMA-WG, non-AppendKV path.
+    // The three groups advance independently, so use the unaligned barrier.
+    cutlass::arch::NamedBarrier const group_barrier(
+        cutlass::NumThreadsPerWarpGroup,
+        static_cast<uint32_t>(flash::FwdNamedBarriers::WarpSchedulerWG3)
+            + group_id);
     while (true) {
-        int ticket = -1;
-        if (lane == 0) {
-            ticket = atomicAdd(
+        if (group_thread == 0) {
+            int const ticket = atomicAdd(
                 params.queue_state + kHistoryCombineCounter, 1);
+            shared.history_work_ids[group_id] = ticket;
+            if (ticket < params.get_history_combine_count()) {
+                HistoryCombineWorkDesc const work
+                    = params.get_history_combine()[ticket];
+                for (int dep = 0; dep < work.dependency_count; ++dep) {
+                    int const completion_id = params.get_publish_dependencies()[
+                        work.dependency_begin + dep];
+                    min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
+                        params.attention_done + completion_id, 1);
+                }
+            }
         }
-        ticket = __shfl_sync(0xffffffffu, ticket, 0);
+        group_barrier.arrive_and_wait_unaligned();
+        int const ticket = shared.history_work_ids[group_id];
         if (ticket >= params.get_history_combine_count()) {
             break;
         }
         HistoryCombineWorkDesc const work = params.get_history_combine()[ticket];
-        if (lane == 0) {
-            for (int dep = 0; dep < work.dependency_count; ++dep) {
-                int const completion_id = params.get_publish_dependencies()[
-                    work.dependency_begin + dep];
-                min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
-                    params.attention_done + completion_id, 1);
-            }
-        }
-        __syncwarp();
         PublishWorkDesc const publish = params.get_publish()[work.publish_id];
-        if constexpr (Config::HistoryKernel::Split) {
-            if (work.actual_splits > 1) {
-                int const vector = work.vector_begin;
-                int const local_head = vector % params.hq_local;
-                int const history_head
-                    = publish.dst_rank * params.hq_local + local_head;
-                combine_history_splits<Config>(
-                    params, shared, work, publish, vector, history_head);
-            } else {
-                for (int vector_in_task = 0;
-                     vector_in_task < work.valid_vectors;
-                     ++vector_in_task) {
-                    int const vector = work.vector_begin + vector_in_task;
-                    int const local_head = vector % params.hq_local;
-                    int const history_head
-                        = publish.dst_rank * params.hq_local + local_head;
+        for (int vector_in_task = warp_in_group;
+             vector_in_task < work.valid_vectors;
+             vector_in_task += 4) {
+            int const vector = work.vector_begin + vector_in_task;
+            int const local_head = vector % params.hq_local;
+            int const history_head
+                = publish.dst_rank * params.hq_local + local_head;
+            if constexpr (Config::HistoryKernel::Split) {
+                if (work.actual_splits > 1) {
+                    combine_history_splits<Config>(
+                        params, shared, work, publish, vector, history_head);
+                } else {
                     copy_single_history_split<Config>(
                         params, publish, vector, history_head);
                 }
-            }
-        } else {
-            for (int vector_in_task = 0;
-                 vector_in_task < work.valid_vectors;
-                 ++vector_in_task) {
-                int const vector = work.vector_begin + vector_in_task;
-                int const local_head = vector % params.hq_local;
-                int const history_head
-                    = publish.dst_rank * params.hq_local + local_head;
+            } else {
                 copy_single_history_split<Config>(
                     params, publish, vector, history_head);
             }
         }
-        complete_history_combine_task<Config>(params, work);
+        group_barrier.arrive_and_wait_unaligned();
+        if (warp_in_group == 0) {
+            complete_history_combine_task<Config>(params, work);
+        }
     }
 }
 
@@ -1050,8 +1052,9 @@ CUTLASS_DEVICE void run_final_combine(
                             mask, max_lse, offset, 16);
                         max_lse = max_lse > other ? max_lse : other;
                     }
-                    float denominator = isfinite(owned_lse)
+                    float const owned_weight = isfinite(owned_lse)
                         ? expf(owned_lse - max_lse) : 0.0f;
+                    float denominator = owned_weight;
                     #pragma unroll
                     for (int offset = 8; offset > 0; offset >>= 1) {
                         denominator += __shfl_xor_sync(
@@ -1062,10 +1065,8 @@ CUTLASS_DEVICE void run_final_combine(
                     #pragma unroll
                     for (int source = 0; source < Config::kDCPSize; ++source) {
                         bool const self_source = source == params.dcp_rank;
-                        float const state_lse
-                            = __shfl_sync(mask, owned_lse, source, 16);
-                        float const state_scale = isfinite(state_lse)
-                            ? expf(state_lse - max_lse) : 0.0f;
+                        float const state_scale
+                            = __shfl_sync(mask, owned_weight, source, 16);
                         #pragma unroll
                         for (int item = 0; item < 8; ++item) {
                             int const dim = lane * 8 + item;
@@ -1194,7 +1195,7 @@ void dcp_mega_varlen_kernel(
         kAttentionPhaseCounter, kAttentionDoneTimestamp,
         params.num_sms - params.num_comm_sm);
     run_history_combine<Config>(params, helper_shared);
-    // History combine uses independent per-warp queues. This is the only CTA
+    // History combine uses independent warpgroup workers. This is the only CTA
     // convergence point before the existing CTA-oriented final combine.
     __syncthreads();
     record_fused_history_publish_completion(
