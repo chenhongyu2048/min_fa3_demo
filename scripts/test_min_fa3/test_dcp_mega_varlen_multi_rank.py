@@ -37,6 +37,25 @@ class CorrectnessCase:
     num_comm_sm: int
 
 
+def assert_inbox_aliases(runner: DCPMegaAttentionRunner) -> None:
+    assert (
+        runner._history_receive_o.data_ptr()
+        == runner._ipc_history_send_o.data_.data_ptr()
+    )
+    assert (
+        runner._history_receive_lse.data_ptr()
+        == runner._ipc_history_send_lse.data_.data_ptr()
+    )
+
+
+def assert_phase_timestamps(timestamps: torch.Tensor) -> None:
+    values = timestamps.tolist()
+    assert len(values) == 8 and all(value > 0 for value in values), values
+    assert all(values[0] <= value <= values[7] for value in values), values
+    assert values[3] == values[4], "fused history/publish timestamps differ"
+    assert values[5] <= values[6] <= values[7], values
+
+
 def parse_lengths(value: str, name: str) -> list[int]:
     try:
         result = [int(item) for item in value.split(",") if item]
@@ -163,6 +182,7 @@ def run_case(
         record_phase_timestamps=True,
     )
     try:
+        assert_inbox_aliases(runner)
         seed = 410_003 + group_index * 100_019
         q = runner.q_local(total_q)
         local_history_lengths = [
@@ -251,8 +271,7 @@ def run_case(
             torch.testing.assert_close(
                 actual_lse, expected_lse, atol=3.0e-2, rtol=3.0e-2
             )
-            if timestamps[3].item() != timestamps[4].item():
-                raise AssertionError("fused history/publish timestamps differ")
+            assert_phase_timestamps(timestamps)
             expected_phase = runner._phase - 1
             ready = runner._ipc_tile_ready.data_[
                 : case.dcp_size, : (total_q + 15) // 16
@@ -276,8 +295,7 @@ def run_case(
             torch.testing.assert_close(
                 replay_lse, expected_lse, atol=3.0e-2, rtol=3.0e-2
             )
-            if timestamps[3].item() != timestamps[4].item():
-                raise AssertionError("fused replay history/publish timestamps differ")
+            assert_phase_timestamps(timestamps)
             replay_phase = runner._phase - 1
             for source in range(case.dcp_size):
                 if source != dcp_rank:
@@ -290,7 +308,7 @@ def run_case(
 
             graph = runner.capture_last_forward(capture_warmup=1)
             try:
-                for graph_replay in range(2):
+                for _ in range(2):
                     graph_o, graph_lse = graph.replay()
                     runner.copy_last_phase_timestamps(timestamps)
                     torch.cuda.synchronize(device)
@@ -300,11 +318,7 @@ def run_case(
                     torch.testing.assert_close(
                         graph_lse, expected_lse, atol=3.0e-2, rtol=3.0e-2
                     )
-                    if timestamps[3].item() != timestamps[4].item():
-                        raise AssertionError(
-                            "fused CUDA Graph history/publish timestamps differ "
-                            f"at replay {graph_replay}"
-                        )
+                    assert_phase_timestamps(timestamps)
             finally:
                 graph.close()
             graph_phase = runner._phase - 1
