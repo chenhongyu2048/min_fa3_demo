@@ -37,15 +37,26 @@ class CorrectnessCase:
     num_comm_sm: int
 
 
-def assert_inbox_aliases(runner: DCPMegaAttentionRunner) -> None:
+def assert_receive_workspace(runner: DCPMegaAttentionRunner) -> None:
     assert (
         runner._history_receive_o.data_ptr()
-        == runner._ipc_history_send_o.data_.data_ptr()
+        != runner._ipc_history_send_o.data_.data_ptr()
     )
     assert (
         runner._history_receive_lse.data_ptr()
-        == runner._ipc_history_send_lse.data_.data_ptr()
+        != runner._ipc_history_send_lse.data_.data_ptr()
     )
+    assert runner._history_receive_o.shape == runner._ipc_history_send_o.data_.shape
+    assert runner._history_receive_lse.shape == runner._ipc_history_send_lse.data_.shape
+    assert runner._receive_ready.shape == (
+        runner._max_token_blocks * (runner.world_size - 1),
+    )
+
+
+def assert_receive_ready(runner: DCPMegaAttentionRunner, total_q: int) -> None:
+    receive_count = (total_q + 15) // 16 * (runner.world_size - 1)
+    ready = runner._receive_ready[:receive_count]
+    torch.testing.assert_close(ready, torch.ones_like(ready), rtol=0, atol=0)
 
 
 def assert_phase_timestamps(timestamps: torch.Tensor) -> None:
@@ -53,7 +64,7 @@ def assert_phase_timestamps(timestamps: torch.Tensor) -> None:
     assert len(values) == 8 and all(value > 0 for value in values), values
     assert all(values[0] <= value <= values[7] for value in values), values
     assert values[3] == values[4], "fused history/publish timestamps differ"
-    assert values[5] <= values[6] <= values[7], values
+    assert values[5] <= values[7] and values[6] <= values[7], values
 
 
 def parse_lengths(value: str, name: str) -> list[int]:
@@ -182,7 +193,7 @@ def run_case(
         record_phase_timestamps=True,
     )
     try:
-        assert_inbox_aliases(runner)
+        assert_receive_workspace(runner)
         seed = 410_003 + group_index * 100_019
         q = runner.q_local(total_q)
         local_history_lengths = [
@@ -272,6 +283,7 @@ def run_case(
                 actual_lse, expected_lse, atol=3.0e-2, rtol=3.0e-2
             )
             assert_phase_timestamps(timestamps)
+            assert_receive_ready(runner, total_q)
             expected_phase = runner._phase - 1
             ready = runner._ipc_tile_ready.data_[
                 : case.dcp_size, : (total_q + 15) // 16
@@ -296,6 +308,7 @@ def run_case(
                 replay_lse, expected_lse, atol=3.0e-2, rtol=3.0e-2
             )
             assert_phase_timestamps(timestamps)
+            assert_receive_ready(runner, total_q)
             replay_phase = runner._phase - 1
             for source in range(case.dcp_size):
                 if source != dcp_rank:
@@ -319,6 +332,7 @@ def run_case(
                         graph_lse, expected_lse, atol=3.0e-2, rtol=3.0e-2
                     )
                     assert_phase_timestamps(timestamps)
+                    assert_receive_ready(runner, total_q)
             finally:
                 graph.close()
             graph_phase = runner._phase - 1

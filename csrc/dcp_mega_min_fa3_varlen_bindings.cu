@@ -135,8 +135,8 @@ void validate_metadata_header(
     int64_t total_vectors,
     int64_t batch_size,
     int dcp_size) {
-    TORCH_CHECK(header.version == 9,
-                "unsupported DCP mega metadata version; expected version 9");
+    TORCH_CHECK(header.version == 10,
+                "unsupported DCP mega metadata version; expected version 10");
     TORCH_CHECK(header.used_ints == metadata_used,
                 "metadata_used does not match the pinned header");
     TORCH_CHECK(metadata_used >= 40 && metadata_used <= metadata_capacity,
@@ -192,10 +192,10 @@ void validate_metadata_header(
                     && header.history_combine_count
                         <= total_vectors * dcp_size,
                 "invalid history combine descriptor count");
-    TORCH_CHECK(header.receive_count == 0
-                    && header.tile_ready_count
-                        == header.token_block_count * (dcp_size - 1),
-                "invalid inbox tile-ready count or nonempty receive queue");
+    TORCH_CHECK(header.receive_count
+                        == header.token_block_count * (dcp_size - 1)
+                    && header.tile_ready_count == header.receive_count,
+                "invalid fixed-layout receive/tile-ready queue counts");
 
     auto check_range = [&](int offset, int64_t elements, char const* name) {
         TORCH_CHECK(offset >= 40 && elements >= 0
@@ -356,6 +356,7 @@ double forward_chunk_prefill_varlen_dcp_mega(
     torch::Tensor q_ready,
     torch::Tensor attention_done,
     torch::Tensor publish_ready,
+    torch::Tensor receive_ready,
     torch::Tensor queue_state,
     torch::Tensor phase_timestamps,
     torch::Tensor graph_post_phase,
@@ -386,6 +387,7 @@ double forward_chunk_prefill_varlen_dcp_mega(
     check_cuda_int32(q_ready, "q_ready");
     check_cuda_int32(attention_done, "attention_done");
     check_cuda_int32(publish_ready, "publish_ready");
+    check_cuda_int32(receive_ready, "receive_ready");
     check_cuda_int32(queue_state, "queue_state");
     check_cuda_int32(graph_post_phase, "graph_post_phase");
     TORCH_CHECK(phase_timestamps.is_cuda()
@@ -427,7 +429,7 @@ double forward_chunk_prefill_varlen_dcp_mega(
              {&metadata_device, "metadata_device"}, {&q_ready, "q_ready"},
              {&attention_done, "attention_done"},
              {&publish_ready, "publish_ready"},
-             {&queue_state, "queue_state"},
+             {&receive_ready, "receive_ready"}, {&queue_state, "queue_state"},
              {&phase_timestamps, "phase_timestamps"},
              {&graph_post_phase, "graph_post_phase"}}) {
         check_same_device(q, *named.first, named.second);
@@ -516,7 +518,7 @@ double forward_chunk_prefill_varlen_dcp_mega(
     TORCH_CHECK(ipc_barrier.data_.scalar_type() == torch::kInt32
                     && ipc_barrier.data_.numel() >= 1,
                 "ipc_barrier must contain at least one int32 phase flag");
-    check_alignment(ipc_history_send_lse.data_.data_ptr(), 16,
+    check_alignment(ipc_history_send_lse.data_.data_ptr(), 4,
                     "ipc_history_send_lse");
     check_alignment(ipc_tile_ready.data_.data_ptr(), 4, "ipc_tile_ready");
 
@@ -547,6 +549,8 @@ double forward_chunk_prefill_varlen_dcp_mega(
                 "partial workspace split capacity is too small");
     TORCH_CHECK(publish_ready.numel() >= header.publish_count,
                 "publish_ready capacity is too small");
+    TORCH_CHECK(receive_ready.numel() >= header.receive_count,
+                "receive_ready capacity is too small");
     TORCH_CHECK(ipc_tile_ready.data_.numel()
                     >= int64_t(dcp_size) * header.token_block_count,
                 "tile-ready IPC arena is too small");
@@ -581,10 +585,6 @@ double forward_chunk_prefill_varlen_dcp_mega(
                     && history_receive_lse.size(1) == token_capacity
                     && history_receive_lse.size(2) == q.size(1),
                 "history_receive_lse must be [DCP, capacity_q, Hq_local] FP32");
-    TORCH_CHECK(history_receive_o.data_ptr() == ipc_history_send_o.data_.data_ptr()
-                    && history_receive_lse.data_ptr()
-                        == ipc_history_send_lse.data_.data_ptr(),
-                "history receive views must alias the local IPC inbox arenas");
     TORCH_CHECK(final_o.sizes() == q.sizes(),
                 "final_o must have the active q shape");
     TORCH_CHECK(chunk_lse.scalar_type() == torch::kFloat32
@@ -659,6 +659,7 @@ double forward_chunk_prefill_varlen_dcp_mega(
     params.q_ready = q_ready.data_ptr<int>();
     params.attention_done = attention_done.data_ptr<int>();
     params.publish_ready = publish_ready.data_ptr<int>();
+    params.receive_ready = receive_ready.data_ptr<int>();
     params.queue_state = queue_state.data_ptr<int>();
     params.phase_timestamps = record_phase_timestamps
         ? reinterpret_cast<uint64_t*>(phase_timestamps.data_ptr<int64_t>())
@@ -689,7 +690,7 @@ double forward_chunk_prefill_varlen_dcp_mega(
         check_alignment(params.ipc_q_ptrs[rank], 128, "remote IPC Q base");
         check_alignment(params.ipc_history_send_o_ptrs[rank], 128,
                         "remote history send O base");
-        check_alignment(params.ipc_history_send_lse_ptrs[rank], 16,
+        check_alignment(params.ipc_history_send_lse_ptrs[rank], 4,
                         "remote history send LSE base");
         check_alignment(params.ipc_tile_ready_ptrs[rank], 4,
                         "remote tile-ready base");
@@ -716,6 +717,9 @@ double forward_chunk_prefill_varlen_dcp_mega(
         C10_CUDA_CHECK(cudaMemsetAsync(
             publish_ready.data_ptr<int>(), 0,
             (dynamic_metadata ? publish_ready.numel() : header.publish_count) * sizeof(int32_t), stream));
+        C10_CUDA_CHECK(cudaMemsetAsync(
+            receive_ready.data_ptr<int>(), 0,
+            (dynamic_metadata ? receive_ready.numel() : header.receive_count) * sizeof(int32_t), stream));
         C10_CUDA_CHECK(cudaMemsetAsync(
             queue_state.data_ptr<int>(), 0, queue_state.nbytes(), stream));
         if (record_phase_timestamps) {
@@ -860,6 +864,7 @@ void bind_dcp_mega_varlen(py::module_& module) {
         py::arg("q_ready"),
         py::arg("attention_done"),
         py::arg("publish_ready"),
+        py::arg("receive_ready"),
         py::arg("queue_state"),
         py::arg("phase_timestamps"),
         py::arg("graph_post_phase"),

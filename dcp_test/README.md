@@ -63,7 +63,7 @@ Packed-varlen also accepts the explicit experimental category
 `--implementations mega`, reported as `dcp_mega_varlen`. It is chunk-only and
 supports both the default CUDA Graph mode and `--no-cuda-graph` eager mode.
 `--mega-block-n auto|128|176` selects the BlockN policy and
-`--mega-num-comm-sm N` selects the initial Q communication-CTA budget. The default auto
+`--mega-num-comm-sm N` selects the dedicated communication-CTA budget. The default auto
 policy uses BlockN=128 as the canonical critical-wave decision model, then
 dispatches NoSplit with BlockN=176 or a selected split plan with BlockN=128.
 Explicit 128 or 176 fixes both the model and dispatch. The split and queue-order
@@ -73,17 +73,17 @@ axes are independently selectable with
 PackGQA with `Hq_local` 4 or 8 and `[16,Hq_local,128]` Q tiles. Each history
 task runs on a four-warp group: split combine handles four vectors and NoSplit
 copy selects 4, 8, 16, or 32 vectors. A vector contains one query head's 128
-output elements and one LSE. Double-buffered history output is pushed by TMA
-directly into the Q source rank's IPC inbox. A tile-ready phase is published
-only after all its history tasks have completed their stores. After Q
-all-gather, communication CTAs join the attention queue, then history and final; there is no
-output receive queue or separate publish pass. Each final task handles four
-vectors on one four-warp group, with one warp per vector. Groups enter final
-independently after draining their history stores.
+output elements and one LSE. History writes local IPC send buffers and publishes
+a tile-ready phase after all tasks for that 16-token parent finish. Dedicated
+communication CTAs complete Q all-gather, then pull each ready parent's O/LSE
+into separate local receive buffers and publish receive-ready flags. Each final
+task handles four vectors on one four-warp group, with one warp per vector.
+Groups enter final independently after completing their history work, then wait
+for that parent's local history and remote receive-ready dependencies.
 
-For `S` device SMs and `R=--mega-num-comm-sm`, planning retains the initial
-`C=S-R` compute CTAs and `3C` history worker groups. Runtime can use all `S`
-CTAs and `3S` groups after Q communication finishes. Queue diagnostics label
+For `S` device SMs and `R=--mega-num-comm-sm`, planning and execution both use
+`C=S-R` compute CTAs and `3C` history worker groups. The other `R` CTAs remain
+dedicated to Q and output communication. Queue diagnostics label
 the modeled worker counts and task waves with `planner_`, report
 `initial_compute_ctas`, `planner_compute_ctas`, `runtime_compute_ctas`, and
 `runtime_worker_groups`, and use `final_vectors_per_task=4`.
@@ -98,12 +98,14 @@ CUDA events time that complete graph replay. Add `--mega-phase-timestamps` to
 include optional `%globaltimer` milestones in JSON. Fused
 `history_combine_done` and
 `publish_done` are intentionally identical; `publish_done` means all history
-TMA stores have completed and every remote ready release has been issued.
-Slot 5 is `inbox_ready_observed_done`: all final tasks have
-observed their inputs ready, rather than a timestamp of the last network
-arrival. The tail `inbox_ready_observed_to_final_done` measures from that
-observation to final completion. Existing saved phase-summary CSVs retain
-their historical receive-stage semantics.
+outputs have been written to local send buffers and every remote ready release
+has been issued. Slot 5 is `receive_done`: all communication CTAs have completed
+output pull and published the local receive-ready flags. A communication CTA's
+final synchronization can finish after final combine consumes its last ready
+tile, so `receive_done` need not precede `final_combine_done`; both precede
+`kernel_done`. The tail `publish_done_to_receive_done` compares local outgoing
+publication with incoming receive completion; these can overlap and the tail can
+be negative.
 
 A2A stage timing separates pack, `all_to_all_single`, and unpack/FP32 base-e
 LSE-weighted combine. `output_collective_ms` covers only the all-to-all. The
@@ -312,7 +314,7 @@ The arrival-4 phase and wave-timestamp scripts also use eager kernel-only
 timing for Mega. Uniform workloads use the same batch frontend: select
 `--no-cuda-graph` together with `--mega-num-comm-sms` to match this timing.
 The measured interval contains the persistent Mega kernel, including its Q
-communication, attention, history combine/push, and final combine. Metadata
+communication, attention, history combine, output pull, and final combine. Metadata
 preparation, workspace reset, and pre/post barriers are outside that interval.
 This matches historical Mega kernel-only results; it does not measure the same
 end-to-end boundary as the baseline graph runs.

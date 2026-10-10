@@ -26,7 +26,7 @@ DCP Mega 将一个 chunk-prefill batch 拆成两个 attention domain：
 1. `chunk attention`：本 rank 的 causal chunk K/V；
 2. `history attention`：DCP group 聚合后的 Q 对本 rank history K/V 做 noncausal attention。
 
-host 为两个 domain 构造统一的 attention descriptor 队列。初始 compute CTA 立即进入 attention，communication CTA 完成各自的 Q all-gather 工作后加入动态计算队列。每个 CTA 完成 attention 后由 3 个独立 WG 处理 history combine；结果通过 TMA 直接写入 Q 来源 rank 的 IPC inbox，各 WG 完成本组 history 工作后独立进入 final，无专用 output receive CTA。
+host 为两个 domain 构造统一的 attention descriptor 队列。compute CTA 执行 attention，专门的 communication CTA 完成 Q all-gather 后继续处理 output pull。每个 compute CTA 完成 attention 后由 3 个独立 WG 处理 history combine，将结果写入本地 IPC send buffer 并按 16-token parent 发布 ready；目的 rank 的 communication CTA 拉取整个 parent 到本地 receive buffer。各 WG 完成本组 history 工作后独立进入 final，等待该 parent 的本地 history 和远端 receive-ready 依赖。
 
 一个 batch 通常同时包含：
 
@@ -285,7 +285,7 @@ combine_penalty = score - attention_makespan
 
 native planner 的工作量剪枝同样使用 WG 单位：下界为 `max(longest_attention_task, ceil((3 * attention_work + combine_work) / (3 * num_compute_ctas)))`。
 
-当前模型继续使用初始 `num_compute_ctas = num_sms - num_comm_sm`，copy 粒度门槛也保持这一容量。运行时 Q CTA 稍后加入，最终可用 `3 * num_sms` 个 WG；模型未预测这些 CTA 的到达时间或 TMA push 成本，不能把全部 SM 视作时间 0 就可用。final 不参与上述候选评分。
+模型与运行时都使用 `num_compute_ctas = num_sms - num_comm_sm` 和 `3 * num_compute_ctas` 个 WG，copy 粒度门槛也保持这一容量。其余 CTA 专门执行 Q all-gather 和 output pull；模型没有计入实际通信开销。final 不参与上述候选评分。
 
 ## 9. 多序列迭代 split
 
@@ -454,7 +454,7 @@ else:
 
 ## 12. Metadata 构造与正确性约束
 
-调度不改变 attention 数学。metadata v9 沿用 40-int header 和 8-int history/final descriptor，`valid_vectors` 表示一个 WG task 的向量数；publish completion 计数记录 history WG task 数。`receive_count=0`，远端 inbox 的 `tile_ready_count` 仍为 `(DCP_size - 1) * ceil(total_q / 16)`。metadata 必须维持以下不变量。
+调度不改变 attention 数学。metadata v10 沿用 40-int header 和 8-int history/final descriptor，`valid_vectors` 表示一个 WG task 的向量数；publish completion 计数记录 history WG task 数。`receive_count` 和远端 `tile_ready_count` 均为 `(DCP_size - 1) * ceil(total_q / 16)`，每个 receive task 拉取一个远端 source 的 16-token parent。metadata 必须维持以下不变量。
 
 ### 12.1 descriptor 完整覆盖
 
@@ -522,15 +522,15 @@ history_order_policy:
 - baseline/selected attention task 数；
 - combine task、partial vector 和 work；
 - history combine 的物理 warp 数、WG worker 数及按 WG worker 数计算的 task waves；
-- 初始计算 CTA 数、Q 完成后的计算 CTA 数和 planner 使用的 CTA 数；
-- `final_vectors_per_task=4`、零 receive task 数和保留的远端 ready signal 数；
+- 初始计算 CTA 数、运行时计算 CTA 数和 planner 使用的 CTA 数，均为 `num_sms - num_comm_sm`；
+- `final_vectors_per_task=4`、receive task 数和远端 ready signal 数；
 - baseline/selected attention makespan；
 - combine penalty 和完整 gain；
 - selected split vector、plan source 和 Q block order。
 
 这些字段用于解释决策和回归测试，不构成 device metadata ABI。
 
-阶段时间戳中的 `inbox_ready_observed_done` 表示全部 final task 已观察到输入就绪，不是网络数据抵达的精确时间。history/publish 仍共用完成时间，按全部 WG 完成计数；本地 outgoing publish 完成与 incoming inbox 就绪之间不保证先后顺序。
+阶段时间戳中的 `receive_done` 表示全部 `num_comm_sm` 个通信 CTA 完成 output pull 并发布本地 receive-ready。history/publish 共用完成时间，按 `3 * num_compute_ctas` 个 WG 完成计数，表示本地 send buffer 写入和远端 ready 发布结束。通信 CTA 的末尾同步可以晚于 final 消费最后一个 ready tile，因此只要求 `receive_done` 和 `final_combine_done` 均不晚于 `kernel_done`。本地 outgoing publish 与 incoming receive 完成不保证先后顺序，`publish_done_to_receive_done` 可以为负。
 
 ## 14. 踩坑总结
 
@@ -553,7 +553,7 @@ critical-wave 已显式建模 attention descriptor、CTA wave、completion depen
 - Q all-gather 的实际 ready timestamp；release epoch 只是离散近似；
 - HBM/L2 contention、TMA pipeline 状态和不同 task 间 cache reuse；
 - atomic claim 的运行时非确定性和 warp scheduling 细节；
-- Q CTA 晚加入、TMA push、remote publication 与 final combine 的完整成本模型；
+- Q all-gather、output pull、remote publication 与 final combine 的完整成本模型；
 - BlockN=128/176 在不同 N-block 长度上的真实 kernel throughput 曲线；
 - 多节点通信和非 SM90 平台。
 

@@ -41,6 +41,7 @@ enum QueueStateIndex : int {
     kQAllGatherPhaseCounter = 3,
     kAttentionPhaseCounter = 4,
     kHistoryCombinePhaseCounter = 5,
+    kReceivePhaseCounter = 6,
     kFinalCombinePhaseCounter = 7,
     kKernelPhaseCounter = 8,
     kQueueStateCount = 9,
@@ -142,8 +143,10 @@ struct DCPMegaKernelConfig {
     static constexpr int kCombineMaxSplits = CombineMaxSplits;
     static constexpr int kCombineStages = 4;
     static constexpr int kHistoryMaxCopyVectorsPerTask = 32;
+    static constexpr int kReceiveScanWindow = 8;
     static_assert(kHistoryMaxCopyVectorsPerTask >= CommHeads);
     static_assert(kHistoryMaxCopyVectorsPerTask % CommHeads == 0);
+    static_assert(kReceiveScanWindow > 0);
 
     using ArchTag = cutlass::arch::Sm90;
     using TileShapeMNK = Shape<_128, Int<BlockN>, _128>;
@@ -215,21 +218,24 @@ struct DCPMegaKernelConfig {
     static constexpr int kNumHistoryGroups = kNumWarps / 4;
     static constexpr int kHistorySplitStorageBytes
         = kNumWarps * kCombineStages * 128 * sizeof(float);
-    static constexpr int kHistoryOutputOBytes
-        = kHistoryMaxCopyVectorsPerTask * 128 * sizeof(Element);
-    static constexpr int kHistoryOutputSlotBytes
-        = kHistoryOutputOBytes + kHistoryMaxCopyVectorsPerTask * sizeof(float);
     static_assert(kNumWarps == 12);
     using CommTile = kittens::st_bf<16, CommHeads * 128>;
     using QGlobal = kittens::gl<
         kittens::bf16, 1, -1, -1, CommHeads * 128,
         kittens::tma::descriptor<CommTile, kittens::dim::DEPTH>>;
     using QRemote = kittens::pgl<QGlobal, DCPSize, false>;
+    using HistoryGlobal = kittens::gl<
+        kittens::bf16, 1, DCPSize, -1, CommHeads * 128, CommTile>;
+    using HistoryRemote = kittens::pgl<HistoryGlobal, DCPSize, false>;
+
     struct alignas(128) HelperSharedStorage {
         int history_work_ids[kNumHistoryGroups];
+        int receive_task_ids[kNumCommChunks];
+        float source_lse[kNumCommChunks][16 * CommHeads];
         alignas(128) CommTile comm_tiles[kNumCommChunks];
         alignas(16) kittens::semaphore arrived[kNumCommChunks];
         alignas(16) kittens::semaphore finished[kNumCommChunks];
+        alignas(16) kittens::semaphore work_ready[kNumCommChunks];
     };
 
     static constexpr int SharedStorageSize =
@@ -242,11 +248,9 @@ struct DCPMegaKernelConfig {
     static_assert(sizeof(CommTile)
                   == 16 * CommHeads * 128 * sizeof(kittens::bf16));
     static_assert(sizeof(CommTile) % 128 == 0);
-    static_assert(kHistoryOutputSlotBytes % 128 == 0);
     static_assert(
         sizeof(CommTile) * kNumCommChunks
-        >= kHistorySplitStorageBytes
-            + kNumHistoryGroups * 2 * kHistoryOutputSlotBytes);
+        >= kHistorySplitStorageBytes);
     static_assert(alignof(HelperSharedStorage) == 128);
     static_assert(
         alignof(typename ChunkKernel::SharedStorage)
@@ -269,6 +273,8 @@ struct DCPMegaKernelConfig {
         HistoryParams history;
         QRemote q_remote;
         QGlobal q_group;
+        HistoryRemote history_send_remote;
+        HistoryGlobal history_receive_local;
         Element* history_receive_o = nullptr;
         float* history_receive_lse = nullptr;
         Element* final_o = nullptr;
@@ -284,6 +290,7 @@ struct DCPMegaKernelConfig {
         int32_t* q_ready = nullptr;
         int32_t* attention_done = nullptr;
         int32_t* publish_ready = nullptr;
+        int32_t* receive_ready = nullptr;
         int32_t* queue_state = nullptr;
         uint64_t* phase_timestamps = nullptr;
         int32_t const* graph_post_phase = nullptr;
@@ -364,25 +371,34 @@ struct DCPMegaKernelConfig {
         int num_comm_sm = 0;
         bool return_lse = false;
 
-        Element* history_send_o_remote[DCPSize]{};
         float* history_send_lse_remote[DCPSize]{};
         int32_t* tile_ready_remote[DCPSize]{};
+        Element* history_send_o = nullptr;
+        float* history_send_lse = nullptr;
         int token_block_capacity = 0;
 
         KernelParams(
             ChunkParams const& chunk_,
             HistoryParams const& history_,
             QRemote const& q_remote_,
-            QGlobal const& q_group_)
+            QGlobal const& q_group_,
+            HistoryRemote const& history_send_remote_,
+            HistoryGlobal const& history_receive_local_)
             : chunk(chunk_), history(history_),
-              q_remote(q_remote_), q_group(q_group_) {}
+              q_remote(q_remote_), q_group(q_group_),
+              history_send_remote(history_send_remote_),
+              history_receive_local(history_receive_local_) {}
     };
 
     static_assert(alignof(QRemote) >= 64);
     static_assert(alignof(QGlobal) >= 64);
+    static_assert(alignof(HistoryRemote) >= 64);
+    static_assert(alignof(HistoryGlobal) >= 64);
     static_assert(alignof(KernelParams) >= 128);
     static_assert(offsetof(KernelParams, q_remote) % 64 == 0);
     static_assert(offsetof(KernelParams, q_group) % 64 == 0);
+    static_assert(offsetof(KernelParams, history_send_remote) % 64 == 0);
+    static_assert(offsetof(KernelParams, history_receive_local) % 64 == 0);
 };
 
 template <typename Config>
@@ -492,7 +508,7 @@ CUTLASS_DEVICE void complete_history_combine_task(
         if (previous == publish.combine_task_count - 1
             && publish.dst_rank != params.dcp_rank) {
             // The acq_rel RMW observes every prior task's release in this tile.
-            // Promote the completed TMA writes before publishing to the peer GPU.
+            // Promote the generic stores before publishing to the peer GPU.
             fence_acq_rel_system();
             int const token_block
                 = publish.vector_begin / (16 * Config::kCommHeads);
@@ -684,8 +700,6 @@ CUTLASS_DEVICE void run_history_combine(
         cutlass::NumThreadsPerWarpGroup,
         static_cast<uint32_t>(flash::FwdNamedBarriers::WarpSchedulerWG3)
             + group_id);
-    int pending_ticket = -1;
-    int slot = 0;
     while (true) {
         if (group_thread == 0) {
             int const ticket = atomicAdd(
@@ -709,12 +723,11 @@ CUTLASS_DEVICE void run_history_combine(
         }
         HistoryCombineWorkDesc const work = params.get_history_combine()[ticket];
         PublishWorkDesc const publish = params.get_publish()[work.publish_id];
-        char* output_slot = reinterpret_cast<char*>(&shared.comm_tiles[0])
-            + Config::kHistorySplitStorageBytes
-            + (group_id * 2 + slot) * Config::kHistoryOutputSlotBytes;
-        Element* output_o = reinterpret_cast<Element*>(output_slot);
-        float* output_lse = reinterpret_cast<float*>(
-            output_slot + Config::kHistoryOutputOBytes);
+        Element* output_o = params.history_send_o
+            + publish.dst_rank * params.history_send_rank_stride
+            + work.vector_begin * 128;
+        float* output_lse = params.history_send_lse
+            + publish.dst_rank * params.signal_rank_stride + work.vector_begin;
         for (int vector_in_task = warp_in_group;
              vector_in_task < work.valid_vectors;
              vector_in_task += 4) {
@@ -741,45 +754,225 @@ CUTLASS_DEVICE void run_history_combine(
                     output_lse + vector_in_task);
             }
         }
-        cutlass::arch::fence_view_async_shared();
         group_barrier.arrive_and_wait_unaligned();
         if (warp_in_group == 0) {
-            if (pending_ticket >= 0) {
-                if (group_thread == 0) {
-                    kittens::tma::store_async_wait();
-                }
-                complete_history_combine_task<Config>(
-                    params, params.get_history_combine()[pending_ticket]);
-            }
-            if (group_thread == 0) {
-                kittens::tma::store_async(
-                    static_cast<void*>(params.history_send_o_remote[publish.dst_rank]
-                        + params.dcp_rank * params.history_send_rank_stride
-                        + work.vector_begin * 128),
-                    static_cast<void*>(output_o),
-                    work.valid_vectors * 128 * sizeof(Element));
-                kittens::tma::store_async(
-                    static_cast<void*>(params.history_send_lse_remote[publish.dst_rank]
-                        + params.dcp_rank * params.signal_rank_stride
-                        + work.vector_begin),
-                    static_cast<void*>(output_lse),
-                    work.valid_vectors * sizeof(float));
-            }
-            pending_ticket = ticket;
+            complete_history_combine_task<Config>(params, work);
         }
-        slot ^= 1;
     }
-    if (warp_in_group == 0 && pending_ticket >= 0) {
-        if (group_thread == 0) {
-            kittens::tma::store_async_wait();
-        }
-        complete_history_combine_task<Config>(
-            params, params.get_history_combine()[pending_ticket]);
-    }
-    // A group may enter final while the other groups still produce history.
-    group_barrier.arrive_and_wait_unaligned();
 }
 
+template <typename Config>
+CUTLASS_DEVICE int receive_task_id_from_pull_ordinal(
+    typename Config::KernelParams const& params,
+    int pull_ordinal) {
+    constexpr int kReceiveSources = Config::kDCPSize - 1;
+    int const parent_ordinal = pull_ordinal / kReceiveSources;
+    int const source_ordinal
+        = pull_ordinal - parent_ordinal * kReceiveSources;
+    QTaskDesc const parent_q_task
+        = params.get_q_tasks()[parent_ordinal * Config::kDCPSize];
+    int const parent_token_block = parent_q_task.token_begin / 16;
+    return parent_token_block * kReceiveSources + source_ordinal;
+}
+
+template <typename Config>
+CUTLASS_DEVICE void run_communication_post_q(
+    typename Config::KernelParams const& params,
+    typename Config::HelperSharedStorage& shared) {
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int chunk = 0; chunk < Config::kNumCommChunks; ++chunk) {
+            kittens::init_semaphore(shared.arrived[chunk], 0, 1);
+            kittens::init_semaphore(shared.finished[chunk], 0, 1);
+            kittens::init_semaphore(shared.work_ready[chunk], 0, 1);
+            shared.receive_task_ids[chunk] = -1;
+        }
+    }
+    __syncthreads();
+
+    int const warp_id = int(threadIdx.x) / cutlass::NumThreadsPerWarp;
+    int const lane = kittens::laneid();
+    constexpr int kReceiveSources = Config::kDCPSize - 1;
+    int const total_receive_tasks
+        = params.get_token_block_count() * kReceiveSources;
+    int const receive_stride = Config::kNumCommChunks * params.num_comm_sm;
+    int const expected_phase = params.graph_post_phase != nullptr
+        ? *params.graph_post_phase - 1 : params.tile_ready_phase;
+    int const chunk = warp_id < Config::kNumCommChunks
+        ? warp_id : warp_id - Config::kNumCommChunks;
+    int const base_task
+        = Config::kNumCommChunks * int(blockIdx.x) + chunk;
+    int const task_count = base_task < total_receive_tasks
+        ? 1 + (total_receive_tasks - 1 - base_task) / receive_stride
+        : 0;
+
+    if (warp_id < Config::kNumCommChunks) {
+        int cursor = 0;
+        int finished_phase = 1;
+        for (int issued = 0; issued < task_count; ++issued) {
+            if (lane == 0) {
+                kittens::wait(shared.finished[chunk], finished_phase);
+                finished_phase ^= 1;
+            }
+            __syncwarp();
+
+            int selected_task = -1;
+            if (lane == 0) {
+                if (task_count == 1) {
+                    selected_task = receive_task_id_from_pull_ordinal<Config>(
+                        params, base_task);
+                    int const parent_token_block
+                        = selected_task / kReceiveSources;
+                    int const source_ordinal
+                        = selected_task
+                            - parent_token_block * kReceiveSources;
+                    int const source = source_ordinal
+                        + (source_ordinal >= params.dcp_rank);
+                    while (load_acquire_system_s32(
+                               params.tile_ready_remote[params.dcp_rank]
+                                   + source * params.token_block_capacity
+                                   + parent_token_block) < expected_phase) {
+                        __nanosleep(64);
+                    }
+                } else {
+                    while (selected_task < 0) {
+                        int ordinal = cursor;
+                        #pragma unroll
+                        for (int probe = 0;
+                             probe < Config::kReceiveScanWindow;
+                             ++probe) {
+                            if (probe >= task_count) {
+                                break;
+                            }
+                            int const pull_ordinal
+                                = base_task + ordinal * receive_stride;
+                            int const task_id
+                                = receive_task_id_from_pull_ordinal<Config>(
+                                    params, pull_ordinal);
+                            int next_ordinal = ordinal + 1;
+                            if (next_ordinal == task_count) {
+                                next_ordinal = 0;
+                            }
+                            ordinal = next_ordinal;
+                            if (min_fa3_varlen_demo::mega_ring::load_acquire(
+                                    params.receive_ready + task_id) >= 1) {
+                                continue;
+                            }
+                            int const parent_token_block
+                                = task_id / kReceiveSources;
+                            int const source_ordinal
+                                = task_id
+                                    - parent_token_block * kReceiveSources;
+                            int const source = source_ordinal
+                                + (source_ordinal >= params.dcp_rank);
+                            if (load_acquire_system_s32(
+                                    params.tile_ready_remote[params.dcp_rank]
+                                        + source * params.token_block_capacity
+                                        + parent_token_block) >= expected_phase) {
+                                selected_task = task_id;
+                                cursor = next_ordinal;
+                                break;
+                            }
+                        }
+                        if (selected_task < 0) {
+                            cursor = ordinal;
+                            __nanosleep(64);
+                        }
+                    }
+                }
+            }
+            selected_task = __shfl_sync(0xffffffffu, selected_task, 0);
+            __syncwarp();
+
+            int const parent_token_block
+                = selected_task / kReceiveSources;
+            int const source_ordinal
+                = selected_task - parent_token_block * kReceiveSources;
+            int const source
+                = source_ordinal + (source_ordinal >= params.dcp_rank);
+            int const publish_id
+                = params.dcp_rank * params.get_token_block_count()
+                + parent_token_block;
+            PublishWorkDesc const work = params.get_publish()[publish_id];
+            if (lane == 0) {
+                shared.receive_task_ids[chunk] = selected_task;
+            }
+            for (int vector_in_task = lane;
+                 vector_in_task < work.valid_vectors;
+                 vector_in_task += cutlass::NumThreadsPerWarp) {
+                int const vector = work.vector_begin + vector_in_task;
+                shared.source_lse[chunk][vector_in_task]
+                    = params.history_send_lse_remote[source][
+                        params.dcp_rank * params.signal_rank_stride + vector];
+            }
+            __syncwarp();
+            if (lane == 0) {
+                kittens::arrive(shared.work_ready[chunk]);
+                asm volatile("fence.proxy.async.global;" ::: "memory");
+                kittens::tma::expect_bytes(
+                    shared.arrived[chunk], sizeof(typename Config::CommTile));
+                kittens::tma::load_async(
+                    shared.comm_tiles[chunk],
+                    params.history_send_remote[source],
+                    {0, params.dcp_rank,
+                     parent_token_block, 0},
+                    shared.arrived[chunk]);
+            }
+        }
+    } else {
+        int work_ready_phase = 0;
+        int arrived_phase = 0;
+        for (int received = 0; received < task_count; ++received) {
+            int task_id = -1;
+            if (lane == 0) {
+                kittens::wait(shared.work_ready[chunk], work_ready_phase);
+                work_ready_phase ^= 1;
+                kittens::wait(shared.arrived[chunk], arrived_phase);
+                arrived_phase ^= 1;
+                asm volatile("" ::: "memory");
+                task_id = shared.receive_task_ids[chunk];
+            }
+            task_id = __shfl_sync(0xffffffffu, task_id, 0);
+            __syncwarp();
+
+            int const parent_token_block = task_id / kReceiveSources;
+            int const source_ordinal
+                = task_id - parent_token_block * kReceiveSources;
+            int const source
+                = source_ordinal + (source_ordinal >= params.dcp_rank);
+            int const publish_id
+                = params.dcp_rank * params.get_token_block_count()
+                + parent_token_block;
+            PublishWorkDesc const work = params.get_publish()[publish_id];
+            for (int vector_in_task = lane;
+                 vector_in_task < work.valid_vectors;
+                 vector_in_task += cutlass::NumThreadsPerWarp) {
+                int const vector = work.vector_begin + vector_in_task;
+                params.history_receive_lse[
+                    source * params.signal_rank_stride + vector]
+                    = shared.source_lse[chunk][vector_in_task];
+            }
+            __syncwarp();
+            if (lane == 0) {
+                kittens::tma::store_async(
+                    params.history_receive_local,
+                    shared.comm_tiles[chunk],
+                    {0, source, parent_token_block, 0});
+                kittens::tma::store_async_read_wait();
+                kittens::tma::store_async_wait();
+                asm volatile("fence.proxy.async.global;" ::: "memory");
+                min_fa3_varlen_demo::mega_ring::store_release(
+                    params.receive_ready + task_id, 1);
+                kittens::arrive(shared.finished[chunk]);
+            }
+        }
+    }
+    __syncthreads();
+    record_phase_completion(
+        params.queue_state, params.phase_timestamps,
+        kReceivePhaseCounter, kReceiveDoneTimestamp,
+        params.num_comm_sm);
+}
 
 template <typename Config>
 CUTLASS_DEVICE void run_final_combine(
@@ -794,9 +987,6 @@ CUTLASS_DEVICE void run_final_combine(
         cutlass::NumThreadsPerWarpGroup,
         static_cast<uint32_t>(flash::FwdNamedBarriers::WarpSchedulerWG3)
             + group_id);
-    int const expected_phase = params.graph_post_phase != nullptr
-        ? *params.graph_post_phase - 1 : params.tile_ready_phase;
-    uint64_t last_ready_timestamp = 0;
     while (true) {
         if (group_thread == 0) {
             int const ticket = atomicAdd(params.queue_state + kFinalCounter, 1);
@@ -816,18 +1006,14 @@ CUTLASS_DEVICE void run_final_combine(
                 min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
                     params.publish_ready + publish_id, publish.combine_task_count);
                 #pragma unroll
-                for (int source = 0; source < Config::kDCPSize; ++source) {
-                    if (source != params.dcp_rank) {
-                        while (load_acquire_system_s32(
-                                   params.tile_ready_remote[params.dcp_rank]
-                                       + source * params.token_block_capacity
-                                       + work.parent_token_block) < expected_phase) {
-                            __nanosleep(64);
-                        }
-                    }
-                }
-                if (params.phase_timestamps != nullptr) {
-                    last_ready_timestamp = read_globaltimer();
+                for (int source_ordinal = 0;
+                     source_ordinal < Config::kDCPSize - 1;
+                     ++source_ordinal) {
+                    int const receive_id
+                        = work.parent_token_block * (Config::kDCPSize - 1)
+                        + source_ordinal;
+                    min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
+                        params.receive_ready + receive_id, 1);
                 }
             }
         }
@@ -845,8 +1031,11 @@ CUTLASS_DEVICE void run_final_combine(
         float owned_lse = -INFINITY;
         if (lane < Config::kDCPSize) {
             int const source = lane;
-            float const state_lse = params.history_receive_lse[
-                source * params.signal_rank_stride + vector];
+            float const state_lse = source == params.dcp_rank
+                ? params.history_send_lse[
+                    params.dcp_rank * params.signal_rank_stride + vector]
+                : params.history_receive_lse[
+                    source * params.signal_rank_stride + vector];
             owned_lse = isfinite(state_lse)
                 ? state_lse : -INFINITY;
         }
@@ -874,8 +1063,11 @@ CUTLASS_DEVICE void run_final_combine(
             #pragma unroll
             for (int item = 0; item < 4; ++item) {
                 int const dim = lane * 4 + item;
-                Element const* source_o = params.history_receive_o
-                    + source * params.history_send_rank_stride;
+                Element const* source_o = source == params.dcp_rank
+                    ? params.history_send_o
+                        + params.dcp_rank * params.history_send_rank_stride
+                    : params.history_receive_o
+                        + source * params.history_send_rank_stride;
                 float const value = static_cast<float>(
                     source_o[vector * 128 + dim]);
                 accum[item] += value * state_scale;
@@ -949,12 +1141,6 @@ CUTLASS_DEVICE void run_final_combine(
         }
         group_barrier.arrive_and_wait_unaligned();
     }
-    if (group_thread == 0 && last_ready_timestamp != 0) {
-        atomicMax(
-            reinterpret_cast<unsigned long long*>(
-                params.phase_timestamps + kInboxReadyObservedDoneTimestamp),
-            static_cast<unsigned long long>(last_ready_timestamp));
-    }
 }
 
 template <typename Config>
@@ -978,34 +1164,32 @@ void dcp_mega_varlen_kernel(
             params.queue_state, params.phase_timestamps,
             kQAllGatherPhaseCounter, kQAllGatherDoneTimestamp,
             params.num_comm_sm);
-        if (threadIdx.x == 0) {
-            #pragma unroll
-            for (int chunk = 0; chunk < Config::kNumCommChunks; ++chunk) {
-                kittens::invalidate_semaphore(helper_shared.arrived[chunk]);
-                kittens::invalidate_semaphore(helper_shared.finished[chunk]);
-            }
-        }
-        __syncthreads();
+        run_communication_post_q<Config>(params, helper_shared);
+        record_phase_completion(
+            params.queue_state, params.phase_timestamps,
+            kKernelPhaseCounter, kKernelDoneTimestamp,
+            params.num_sms);
+        return;
     }
-    // Q CTAs join the same attention queue after draining their own Q work.
-    // All threads rendezvous before the FA shared region is reused by combines.
+    // Communication CTAs keep pulling output while compute CTAs run attention.
+    // Compute threads rendezvous before the FA shared region is reused by combines.
     typename Config::AttentionKernel attention_kernel;
     attention_kernel(params, smem_buf);
     __syncthreads();
     record_phase_completion(
         params.queue_state, params.phase_timestamps,
         kAttentionPhaseCounter, kAttentionDoneTimestamp,
-        params.num_sms);
+        params.num_sms - params.num_comm_sm);
     run_history_combine<Config>(params, helper_shared);
     record_fused_history_publish_completion(
         params.queue_state, params.phase_timestamps,
-        Config::kNumHistoryGroups * params.num_sms);
+        Config::kNumHistoryGroups * (params.num_sms - params.num_comm_sm));
     run_final_combine<Config>(params, helper_shared);
     __syncthreads();
     record_phase_completion(
         params.queue_state, params.phase_timestamps,
         kFinalCombinePhaseCounter, kFinalCombineDoneTimestamp,
-        params.num_sms);
+        params.num_sms - params.num_comm_sm);
     record_phase_completion(
         params.queue_state, params.phase_timestamps,
         kKernelPhaseCounter, kKernelDoneTimestamp,
@@ -1195,10 +1379,13 @@ void launch_dcp_mega_instance(
     }
 
     uint64_t q_remote_ptrs[DCPSize]{};
+    uint64_t history_remote_ptrs[DCPSize]{};
     #pragma unroll
     for (int rank = 0; rank < DCPSize; ++rank) {
         q_remote_ptrs[rank]
             = reinterpret_cast<uint64_t>(params.ipc_q_ptrs[rank]);
+        history_remote_ptrs[rank]
+            = reinterpret_cast<uint64_t>(params.ipc_history_send_o_ptrs[rank]);
     }
     int const comm_width = CommHeads * 128;
     auto q_remote = kittens::make_pgl<typename Config::QRemote>(
@@ -1207,15 +1394,21 @@ void launch_dcp_mega_instance(
     auto q_group = kittens::make_gl<typename Config::QGlobal>(
         reinterpret_cast<uint64_t>(params.q_group_ptr),
         1, params.ipc_q_token_capacity, DCPSize, comm_width);
+    int const history_rows = params.ipc_q_token_capacity;
+    auto history_remote = kittens::make_pgl<typename Config::HistoryRemote>(
+        history_remote_ptrs, 1, DCPSize, history_rows, comm_width);
+    auto history_receive_local = kittens::make_gl<typename Config::HistoryGlobal>(
+        reinterpret_cast<uint64_t>(params.history_receive_o_ptr),
+        1, DCPSize, history_rows, comm_width);
     typename Config::KernelParams kernel_params(
         chunk_kernel_params,
         history_kernel_params,
         q_remote,
-        q_group);
+        q_group,
+        history_remote,
+        history_receive_local);
     #pragma unroll
     for (int rank = 0; rank < DCPSize; ++rank) {
-        kernel_params.history_send_o_remote[rank]
-            = static_cast<Element*>(params.ipc_history_send_o_ptrs[rank]);
         kernel_params.history_send_lse_remote[rank]
             = params.ipc_history_send_lse_ptrs[rank];
         kernel_params.tile_ready_remote[rank] = params.ipc_tile_ready_ptrs[rank];
@@ -1237,6 +1430,7 @@ void launch_dcp_mega_instance(
     kernel_params.q_ready = params.q_ready;
     kernel_params.attention_done = params.attention_done;
     kernel_params.publish_ready = params.publish_ready;
+    kernel_params.receive_ready = params.receive_ready;
     kernel_params.queue_state = params.queue_state;
     kernel_params.phase_timestamps = params.phase_timestamps;
     kernel_params.graph_post_phase = params.graph_post_phase;
@@ -1259,6 +1453,10 @@ void launch_dcp_mega_instance(
     kernel_params.num_sms = params.num_sms;
     kernel_params.num_comm_sm = params.num_comm_sm;
     kernel_params.return_lse = params.return_lse;
+    kernel_params.history_send_o = static_cast<Element*>(
+        params.ipc_history_send_o_ptrs[params.dcp_rank]);
+    kernel_params.history_send_lse
+        = params.ipc_history_send_lse_ptrs[params.dcp_rank];
     kernel_params.token_block_capacity = params.ipc_token_block_capacity;
 
     auto kernel = dcp_mega_varlen_kernel<Config>;

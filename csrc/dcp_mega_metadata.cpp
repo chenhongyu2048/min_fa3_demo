@@ -1,4 +1,4 @@
-// Build and serialize metadata v9 without materializing Python descriptors.
+// Build and serialize metadata v10 without materializing Python descriptors.
 // Layout and ordering reference: dcp_mega_metadata.py.
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -164,7 +164,7 @@ Ints build_packed_queues(const Ints& cu, int32_t heads, int32_t world,
     int32_t max_history = *std::max_element(history_splits.begin(), history_splits.end());
     int32_t max_splits = std::max(max_chunk, max_history);
     Ints header{
-        9, static_cast<int32_t>(attention.size()), static_cast<int32_t>(q_tasks.size() / 4),
+        10, static_cast<int32_t>(attention.size()), static_cast<int32_t>(q_tasks.size() / 4),
         static_cast<int32_t>(q_deps.size()), static_cast<int32_t>(publish.size()),
         static_cast<int32_t>(publish_deps.size()), static_cast<int32_t>(final.size()),
         static_cast<int32_t>(final_deps.size()), chunk_count, static_cast<int32_t>(attention.size()) - chunk_count,
@@ -172,7 +172,7 @@ Ints build_packed_queues(const Ints& cu, int32_t heads, int32_t world,
         static_cast<int32_t>(chunk_splits.size()), 1, 2, attention_offset, q_offset, q_deps_offset,
         publish_offset, publish_deps_offset, final_offset, final_deps_offset,
         chunk_splits_offset, history_splits_offset, static_cast<int32_t>(payload.size()), 0, 1,
-        token_blocks, token_blocks, 0, token_blocks * (world - 1), world,
+        token_blocks, token_blocks, token_blocks * (world - 1), token_blocks * (world - 1), world,
         static_cast<int32_t>(combine.size()), combine_offset};
     std::copy(header.begin(), header.end(), payload.begin());
     return payload;

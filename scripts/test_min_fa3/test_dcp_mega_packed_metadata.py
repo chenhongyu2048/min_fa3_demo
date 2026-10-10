@@ -23,9 +23,9 @@ class PackedFallbackTests(unittest.TestCase):
                 q, h, pre_phase=7, post_phase=8, capacity=len(expected), **config)
         self.assertEqual(dispatch, reference.dispatch)
         self.assertEqual(payload, expected)
-        self.assertEqual(payload[0], 9)
+        self.assertEqual(payload[0], 10)
         self.assertEqual(payload[6], q[-1] * config["hq_local"] // 4)
-        self.assertEqual(payload[35], 0)
+        self.assertEqual(payload[35], 6)
         self.assertEqual(payload[36], 6)
 
 
@@ -57,7 +57,7 @@ class NativePackedTests(unittest.TestCase):
             with self.subTest(case=i, config=config):
                 self.assertEqual(dispatch, reference.dispatch)
                 self.assertEqual(payload, expected)
-                self.assertEqual(payload[0], 9)
+                self.assertEqual(payload[0], 10)
 
     def test_fixed_final_vectors_and_capacity_match_for_both_head_counts(self):
         q, h = (0, 1, 18), (0, 8192, 24576)
@@ -77,7 +77,7 @@ class NativePackedTests(unittest.TestCase):
                         for i in range(payload[26], payload[27], 8)]
                 self.assertEqual([row[1] for row in rows], [4] * payload[6])
                 self.assertEqual(sorted(row[0] for row in rows), list(range(0, q[-1] * heads, 4)))
-                self.assertEqual(payload[35:37].tolist(), [0, 6])
+                self.assertEqual(payload[35:37].tolist(), [6, 6])
                 with self.assertRaisesRegex(ValueError, "exceeds capacity"):
                     metadata.build_packed_dcp_mega_metadata(
                         q, h, pre_phase=3, post_phase=4, capacity=len(expected) - 1, **config)

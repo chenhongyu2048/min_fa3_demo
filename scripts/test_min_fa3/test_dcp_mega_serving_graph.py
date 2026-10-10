@@ -16,8 +16,9 @@ from min_fa3_dcp import DCPMegaAttentionRunner
 from dcp_test.baselines import VLLMDCPAttentionRunner, VLLMA2ADCPAttentionRunner
 from scripts.test_min_fa3.test_dcp_mega_varlen_multi_rank import (
     append_chunk,
-    assert_inbox_aliases,
     assert_phase_timestamps,
+    assert_receive_ready,
+    assert_receive_workspace,
     make_cu,
     randn_bf16,
     shard_history,
@@ -44,7 +45,7 @@ def main():
             max_total_q=32, max_batch=4, Hq_local=hq_local, max_num_splits=128,
             num_comm_sm=4, block_n_override=128, record_phase_timestamps=True,
         )
-        assert_inbox_aliases(runner)
+        assert_receive_workspace(runner)
         q = runner.q_backing[:32]
     else:
         cls = VLLMDCPAttentionRunner if backend == "vllm-ag-rs" else VLLMA2ADCPAttentionRunner
@@ -170,6 +171,8 @@ def main():
             if options.pipeline and len(pending_checks) < 2:
                 continue
             torch.cuda.synchronize()
+            if backend == "mega":
+                assert_receive_ready(runner, sum(q_lengths))
             for i, cap, ql, hl, reference, outputs, phases in pending_checks:
                 for out, lse in outputs:
                     torch.testing.assert_close(out[:sum(ql)], reference[0], atol=0.03, rtol=0.03)

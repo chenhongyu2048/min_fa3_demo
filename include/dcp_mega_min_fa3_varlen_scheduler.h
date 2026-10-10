@@ -137,7 +137,7 @@ private:
     CUTLASS_DEVICE WorkTileInfo claim_initial(Params const& params) const {
         int descriptor_idx = params.attention_count;
         if (threadIdx.x % NumProducerThreads == 0) {
-            descriptor_idx = initial_descriptor_idx();
+            descriptor_idx = int(blockIdx.x) - params.compute_block_offset;
             wait_for_q_dependency(params, descriptor_idx);
         }
         descriptor_idx = __shfl_sync(0xffffffff, descriptor_idx, 0);
@@ -211,17 +211,8 @@ public:
             params.attention_done + desc.completion_id, 1);
     }
 
-    CUTLASS_DEVICE static int claim_initial_descriptor_idx(Params const& params) {
-        if (int(blockIdx.x) >= params.compute_block_offset) {
-            return int(blockIdx.x) - params.compute_block_offset;
-        }
-        // Q CTAs join the same dynamic tail after their Q tasks finish.
-        return params.num_compute_ctas
-            + atomicAdd(params.attention_dynamic_counter, 1);
-    }
-
-    CUTLASS_DEVICE int initial_descriptor_idx() const {
-        return work_info_smem_->y;
+    CUTLASS_DEVICE static int initial_descriptor_idx(Params const& params) {
+        return int(blockIdx.x) - params.compute_block_offset;
     }
 
     template <bool IsProducerWarp = false>

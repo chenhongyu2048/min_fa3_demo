@@ -2145,6 +2145,7 @@ class _DCPMegaReplay:
     q_ready_count: int
     attention_count: int
     publish_count: int
+    receive_count: int
 
 
 @dataclass(frozen=True)
@@ -2264,7 +2265,7 @@ class DCPMegaAttentionRunner:
         "attention_done",
         "history_combine_done",
         "publish_done",
-        "inbox_ready_observed_done",
+        "receive_done",
         "final_combine_done",
         "kernel_done",
     )
@@ -2431,9 +2432,16 @@ class DCPMegaAttentionRunner:
         self._history_lse = torch.empty(
             (group_heads, max_total_q), dtype=torch.float32, **cuda
         )
-        # Each source pushes directly into its slice of this rank's IPC inbox.
-        self._history_receive_o = self._ipc_history_send_o.data_
-        self._history_receive_lse = self._ipc_history_send_lse.data_
+        self._history_receive_o = torch.empty(
+            (self.world_size, self._padded_total_q, Hq_local, 128),
+            dtype=torch.bfloat16,
+            **cuda,
+        )
+        self._history_receive_lse = torch.empty(
+            (self.world_size, self._padded_total_q, Hq_local),
+            dtype=torch.float32,
+            **cuda,
+        )
         self._chunk_o_partial = torch.empty(
             (max_num_splits, Hq_local, max_total_q, 128),
             dtype=torch.float32,
@@ -2523,6 +2531,11 @@ class DCPMegaAttentionRunner:
         )
         self._publish_ready = torch.empty(
             max_publish, dtype=torch.int32, **cuda
+        )
+        self._receive_ready = torch.empty(
+            self._max_token_blocks * (self.world_size - 1),
+            dtype=torch.int32,
+            **cuda,
         )
         self._queue_state = torch.empty(9, dtype=torch.int32, **cuda)
         self._phase_timestamps = torch.empty(
@@ -2819,8 +2832,10 @@ class DCPMegaAttentionRunner:
                 "scheduler_mode": metadata.scheduler_mode,
                 "initial_compute_ctas": self.num_sms - self.num_comm_sm,
                 "planner_compute_ctas": self.num_sms - self.num_comm_sm,
-                "runtime_compute_ctas": self.num_sms,
-                "runtime_worker_groups": self.num_sms * HISTORY_WORKER_GROUPS,
+                "runtime_compute_ctas": self.num_sms - self.num_comm_sm,
+                "runtime_worker_groups": (
+                    (self.num_sms - self.num_comm_sm) * HISTORY_WORKER_GROUPS
+                ),
                 "planner_history_combine_worker_warps": (
                     (self.num_sms - self.num_comm_sm) * MEGA_COMPUTE_WARPS
                 ),
@@ -2948,6 +2963,7 @@ class DCPMegaAttentionRunner:
                 q_ready_count=metadata.q_ready_count,
                 attention_count=len(metadata.attention),
                 publish_count=len(metadata.publish),
+                receive_count=metadata.receive_count,
             )
             return result
         finally:
@@ -2995,6 +3011,7 @@ class DCPMegaAttentionRunner:
             self._q_ready,
             self._attention_done,
             self._publish_ready,
+            self._receive_ready,
             self._queue_state,
             self._phase_timestamps,
             self._graph_post_phase,
@@ -3218,6 +3235,7 @@ class DCPMegaAttentionRunner:
             self._q_ready[: replay.q_ready_count].zero_()
             self._attention_done[: replay.attention_count].zero_()
             self._publish_ready[: replay.publish_count].zero_()
+            self._receive_ready[: replay.receive_count].zero_()
             self._queue_state.zero_()
             if self.record_phase_timestamps:
                 self._phase_timestamps.zero_()

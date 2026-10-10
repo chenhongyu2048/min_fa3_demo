@@ -199,7 +199,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
                 )
             ],
         )
-        self.assertEqual(metadata.receive_count, 0)
+        self.assertEqual(metadata.receive_count, token_blocks * (dcp_size - 1))
         self.assertEqual(metadata.tile_ready_count, token_blocks * (dcp_size - 1))
         final_vectors = []
         for row in metadata.final:
@@ -244,7 +244,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
             metadata.total_vectors // FINAL_VECTORS_PER_TASK,
         )
         self.assertEqual(metadata.q_ready_count, metadata.token_block_count)
-        self.assertEqual(metadata.receive_count, 0)
+        self.assertEqual(metadata.receive_count, 7 * metadata.token_block_count)
         self.assertEqual(metadata.tile_ready_count, 7 * metadata.token_block_count)
 
     def test_final_four_vector_granularity_is_independent_of_worker_count(self):
@@ -265,6 +265,8 @@ class DCPMegaMetadataTest(unittest.TestCase):
                     )
                     self.assertEqual(metadata.final_vectors_per_task, 4)
                     self.assertEqual(len(metadata.final), total_q * hq_local // 4)
+                    self.assertEqual(metadata.receive_count, 2)
+                    self.assertEqual(metadata.tile_ready_count, 2)
                     self.assertEqual(
                         [(row[0], row[1], row[4]) for row in metadata.final],
                         [(begin, 4, begin // (16 * hq_local))
@@ -1242,7 +1244,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
                             len(metadata.final),
                             cu_q[-1] * hq_local // FINAL_VECTORS_PER_TASK,
                         )
-                        self.assertEqual(metadata.receive_count, 0)
+                        self.assertEqual(metadata.receive_count, token_blocks * (dcp_size - 1))
                         self.assertEqual(metadata.tile_ready_count, token_blocks * (dcp_size - 1))
                         self.assertEqual(
                             [(row[2] // 16, row[0]) for row in metadata.q_tasks],
@@ -1463,7 +1465,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
                 )
             )
 
-    def test_metadata_v9_header_offsets_counts_and_capacity(self):
+    def test_metadata_v10_header_offsets_counts_and_capacity(self):
         metadata = build_dcp_mega_metadata(
             (0, 3, 20, 53),
             (0, 129, 516, 1541),
@@ -1475,7 +1477,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         )
         image = pack_dcp_mega_metadata(metadata, pre_phase=11, post_phase=12)
         self.assertEqual(image[0], METADATA_VERSION)
-        self.assertEqual(METADATA_VERSION, 9)
+        self.assertEqual(METADATA_VERSION, 10)
         self.assertEqual(image[30], len(image))
         self.assertEqual(image[32], 1)
         self.assertEqual(image[33], metadata.token_block_count)

@@ -38,7 +38,7 @@ PUBLISH_DESC_FIELDS = 8
 HISTORY_COMBINE_DESC_FIELDS = 8
 FINAL_DESC_FIELDS = 8
 METADATA_HEADER_INTS = 40
-METADATA_VERSION = 9
+METADATA_VERSION = 10
 MEGA_COMPUTE_WARPS = 12
 HISTORY_WARPS_PER_TASK = 4
 HISTORY_WORKER_GROUPS = MEGA_COMPUTE_WARPS // HISTORY_WARPS_PER_TASK
@@ -1705,7 +1705,7 @@ def build_dcp_mega_metadata(
         final_vectors_per_task=FINAL_VECTORS_PER_TASK,
         token_block_count=num_token_subtiles,
         q_ready_count=num_token_subtiles,
-        receive_count=0,
+        receive_count=num_token_subtiles * (dcp_size - 1),
         tile_ready_count=num_token_subtiles * (dcp_size - 1),
         dcp_size=dcp_size,
         **diagnostics,
@@ -1906,8 +1906,8 @@ def validate_dcp_mega_metadata(
     expected_tile_ready = metadata.token_block_count * (dcp_size - 1)
     if metadata.q_ready_count != expected_q_ready:
         raise AssertionError("invalid Q-ready counter count")
-    if metadata.receive_count != 0:
-        raise AssertionError("push metadata must not contain receive tasks")
+    if metadata.receive_count != expected_tile_ready:
+        raise AssertionError("invalid receive queue count")
     if metadata.tile_ready_count != expected_tile_ready:
         raise AssertionError("invalid tile-ready counter count")
     if metadata.token_block_count != _ceil_div(metadata.total_q, 16):
@@ -2157,7 +2157,7 @@ def pack_dcp_mega_metadata(
     post_phase: int,
     capacity: int | None = None,
 ) -> array:
-    """Serialize a validated metadata v9 image into native int32 values."""
+    """Serialize a validated metadata v10 image into native int32 values."""
     if pre_phase <= 0 or post_phase <= pre_phase:
         raise ValueError("metadata phases must be positive and strictly increasing")
     payload = array("i", [0] * METADATA_HEADER_INTS)
@@ -2233,7 +2233,7 @@ def pack_dcp_mega_metadata(
         history_combine_offset,
     )
     if len(header) != METADATA_HEADER_INTS:
-        raise AssertionError("metadata v9 header width mismatch")
+        raise AssertionError("metadata v10 header width mismatch")
     payload[:METADATA_HEADER_INTS] = array("i", header)
     return payload
 
