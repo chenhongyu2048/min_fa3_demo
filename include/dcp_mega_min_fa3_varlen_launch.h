@@ -759,6 +759,8 @@ CUTLASS_DEVICE void run_history_combine(
             complete_history_combine_task<Config>(params, work);
         }
     }
+    // All warps must consume the exit ticket before final reuses this slot.
+    group_barrier.arrive_and_wait_unaligned();
 }
 
 template <typename Config>
