@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Profile CUDA Graph Mega timestamps and baseline phase breakdowns for
+# Profile eager kernel-only Mega timestamps and graph baseline phases for
 # the arrival-rate=4 trace at DCP sizes 2, 4, and 8.
 
 set -euo pipefail
@@ -107,7 +107,7 @@ mkdir -p "$RESULT_DIR" "$LOG_DIR/logs"
     printf 'arrival_rate=%s dcp_sizes=2,4,8 mega_num_comm_sms=%s\n' \
         "$ARRIVAL_RATE" "$MEGA_NUM_COMM_SMS"
     printf 'num_cases=%s warmup=%s iters=%s\n' "$NUM_CASES" "$WARMUP" "$ITERS"
-    printf 'mega_mode=graph mega_phase_timestamps=1 baseline_mode=graph baseline_phase_timing=1\n'
+    printf 'mega_mode=eager mega_timing_boundary=mega_kernel_only mega_phase_timestamps=1 baseline_mode=graph baseline_phase_timing=1\n'
     printf 'cuda_visible_devices=%s\n' "$CUDA_VISIBLE_DEVICES"
 } | tee "$MASTER_LOG"
 
@@ -152,7 +152,7 @@ for dcp_size in "${DCP_SIZES[@]}"; do
         --module dcp_test.benchmark_dcp_mega_batch \
         "${common_args[@]}" \
         --implementations mega \
-        --cuda-graph \
+        --no-cuda-graph \
         --mega-phase-timestamps \
         --no-baseline-phase-timing \
         --mega-num-comm-sms "$MEGA_NUM_COMM_SMS" \

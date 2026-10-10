@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Reproduce the 01_dcp_wave-b scheduler ablation with Mega DCP phase
-# timestamps and CUDA Graph enabled. Results go to a new timestamped directory.
+# timestamps and eager kernel-only timing. Results go to a new timestamped directory.
 
 set -euo pipefail
 
@@ -201,7 +201,7 @@ run_strategy() {
         --warmup "$WARMUP"
         --iters "$ITERS"
         "$CHECK_ARG"
-        --cuda-graph
+        --no-cuda-graph
         --mega-phase-timestamps
         --no-baseline-phase-timing
         "${scheduler_args[@]}"
@@ -296,7 +296,7 @@ if ((DRY_RUN == 0)); then
         printf 'arrival_time_scales=%s dcp_sizes=%s num_cases=%s\n' \
             "$ARRIVAL_TIME_SCALES" "$DCP_SIZES" "$NUM_CASES"
         printf 'strategies=%s\n' "$(IFS=,; echo "${STRATEGIES[*]}")"
-        printf 'comm_sm_by_dcp=dcp2:%s,dcp4:%s,dcp8:%s execution=cuda_graph block_n=auto\n' \
+        printf 'comm_sm_by_dcp=dcp2:%s,dcp4:%s,dcp8:%s execution=eager timing=mega_kernel_only block_n=auto\n' \
             "$DCP2_COMM_SM" "$DCP4_COMM_SM" "$DCP8_COMM_SM"
         printf 'expected_traces=%s expected_strategy_launches=%s warmup=%s iters=%s check=%s\n' \
             "$EXPECTED_TRACES" "$EXPECTED_LAUNCHES" "$WARMUP" "$ITERS" "$CHECK"

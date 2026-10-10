@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Generate trace cases, then run Mega and baselines in eager and graph modes.
+# Generate trace cases, then run eager Mega/baselines and graph baselines.
 
 set -euo pipefail
 
@@ -21,7 +21,7 @@ BATCH_CONFIG=${BATCH_CONFIG:-dcp_test/configs/dcp_mega_six_loads.json}
 NUM_CASES=${NUM_CASES:-20}
 MODES=${MODES:-"eager,graph"}
 EAGER_IMPLEMENTATIONS=${EAGER_IMPLEMENTATIONS:-"mega,ours,vllm,sglang"}
-GRAPH_IMPLEMENTATIONS=${GRAPH_IMPLEMENTATIONS:-"mega,ours,vllm,sglang"}
+GRAPH_IMPLEMENTATIONS=${GRAPH_IMPLEMENTATIONS:-"ours,vllm,sglang"}
 WARMUP=${WARMUP:-10}
 ITERS=${ITERS:-40}
 CHECK=${CHECK:-0}

@@ -261,8 +261,9 @@ command with the same output filename, pass `--force` explicitly.
 The wrapper first replays `dcp_test/trace/example_config.json` and writes one
 JSONL containing exactly `NUM_CASES` uniformly reservoir-sampled eligible
 scheduler steps. It then runs all selected trace cases in one eager `torchrun`
-and one CUDA Graph `torchrun`. Both batches default to
-`mega,ours,vllm,sglang`. Setting `MODES=eager` or `MODES=graph`
+and one CUDA Graph `torchrun`. The eager batch defaults to
+`mega,ours,vllm,sglang`; the graph batch defaults to `ours,vllm,sglang`.
+Mega uses eager kernel-only timing by default. Setting `MODES=eager` or `MODES=graph`
 restricts that to one launch. `WARMUP`, `ITERS`, `CHECK`, implementation lists, Mega
 kernel controls, and `BASELINE_PHASE_TIMING` use the same environment-variable
 interface as the six-load wrapper. Trace defaults are 20 cases, 10 warmups, 40
@@ -295,7 +296,7 @@ python -m dcp_test.trace.generate \
 `benchmark_dcp_mega_arrival_matrix.sh` is the full arrival/DCP study wrapper.
 It defaults to the Cartesian product of arrival scales `1,2,4` and DCP sizes
 `2,4,8`. Every combination generates an independent 100-case JSONL and then
-uses three `torchrun` launches: a CUDA Graph Mega-only launch that sweeps comm-SM
+uses three `torchrun` launches: an eager kernel-only Mega launch that sweeps comm-SM
 budgets `4,8,12,16,20`, a six-method eager baseline launch, and the same
 baselines under CUDA Graph. The baseline selection is
 `ours,vllm,sglang,full`, which expands to six result labels.
@@ -307,12 +308,18 @@ The Mega sweep is selected with `--mega-num-comm-sms` and requires
 results use `comm_sm_N/` case directories and a top-level incremental sweep
 manifest whose variants each retain their own workload-weighted summary.
 
-The arrival-4 phase and wave-timestamp scripts also run Mega under CUDA Graph.
-Uniform workloads use the same batch frontend: select `--cuda-graph` together
-with `--mega-num-comm-sms`. Graph capture and CPU metadata preparation are
-outside the measured replay interval; Mega reset, phase updates, IPC barriers,
-and the persistent kernel are included. The main matrix retains eager
-baselines as an additional reference alongside the graph baselines.
+The arrival-4 phase and wave-timestamp scripts also use eager kernel-only
+timing for Mega. Uniform workloads use the same batch frontend: select
+`--no-cuda-graph` together with `--mega-num-comm-sms` to match this timing.
+The measured interval contains the persistent Mega kernel, including its Q
+communication, attention, history combine/push, and final combine. Metadata
+preparation, workspace reset, and pre/post barriers are outside that interval.
+This matches historical Mega kernel-only results; it does not measure the same
+end-to-end boundary as the baseline graph runs.
+
+Explicit `--cuda-graph` runs remain supported and measure the full replay,
+including reset, device phase updates, IPC barriers, and the persistent kernel.
+Keep graph-replay and kernel-only results separate when comparing versions.
 
 After the 27 launches, `dcp_test.summarize_dcp_mega_matrix` verifies execution
 modes, method sets, case counts, trace config SHA reuse within each combination,
@@ -333,8 +340,8 @@ The command writes three 1-by-3 figures, each with one panel per DCP size:
 latency in microseconds, workload-weighted effective TFLOPS/GPU, and
 workload-weighted effective KV GB/s/GPU. Each arrival-scale group contains
 eager and CUDA Graph bars for vLLM AG+RS, vLLM A2A, and SGLang, plus Mega
-DCP labeled with its recorded execution mode. New matrix runs use CUDA Graph
-for Mega; historical eager results remain readable. By default the Mega bar
+DCP labeled with its recorded execution mode. New matrix runs use eager
+kernel-only timing for Mega; saved graph results remain readable. By default the Mega bar
 selects and labels the lowest-latency measured
 comm-SM value for that workload; `--mega-num-comm-sm N` fixes it instead. All
 three figures reuse that selection. Mega labels compare against the best of the

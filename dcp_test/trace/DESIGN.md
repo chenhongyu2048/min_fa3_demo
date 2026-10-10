@@ -575,7 +575,7 @@ python -m dcp_test.trace.generate \
 | `FORCE_TRACE` | `0` | 1 允许覆盖已有 JSONL |
 | `MODES` | `eager,graph` | execution mode 列表 |
 | `EAGER_IMPLEMENTATIONS` | `mega,ours,vllm,sglang` | eager method 集合 |
-| `GRAPH_IMPLEMENTATIONS` | `mega,ours,vllm,sglang` | graph method 集合，包含 Mega |
+| `GRAPH_IMPLEMENTATIONS` | `ours,vllm,sglang` | graph baseline 集合；Mega 默认在 eager batch 中计 kernel-only |
 | `WARMUP` | `10` | 每个 case 的 warmup 次数 |
 | `ITERS` | `40` | 每个 case 的测量次数 |
 | `CHECK` | `0` | 是否做 correctness precheck |
