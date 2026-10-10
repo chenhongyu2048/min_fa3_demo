@@ -626,7 +626,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--mega-num-comm-sms",
         type=_arg_positive_int_list,
         default=None,
-        help="Mega-only eager comm-SM sweep executed in one torchrun",
+        help="Mega-only comm-SM sweep executed in one torchrun",
     )
     parser.add_argument(
         "--mega-block-n",
@@ -1259,8 +1259,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise SystemExit(
                 "--mega-num-comm-sms requires --implementations mega"
             )
-        if args.cuda_graph:
-            raise SystemExit("--mega-num-comm-sms supports eager execution only")
 
     mode = "graph" if args.cuda_graph else "eager"
     if args.print_cases:

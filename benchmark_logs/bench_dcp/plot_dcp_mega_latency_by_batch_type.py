@@ -367,6 +367,9 @@ def load_batch_type_records(
         for dcp_size in dcp_sizes:
             dcp_dir = arrival_dir / f"dcp_{dcp_size}"
             mega_root = dcp_dir / "mega"
+            mega_mode = json.loads(
+                (mega_root / "manifest.json").read_text(encoding="utf-8")
+            )["execution_mode"]
             comm_sm_dirs: list[tuple[int, Path]] = []
             for path in mega_root.glob("comm_sm_*"):
                 try:
@@ -393,7 +396,7 @@ def load_batch_type_records(
                     baseline_methods,
                 ),
                 *[
-                    ("mega", "eager", comm_sm, path, (base.METHOD_MEGA,))
+                    ("mega", mega_mode, comm_sm, path, (base.METHOD_MEGA,))
                     for comm_sm, path in sorted(comm_sm_dirs)
                 ],
             ]
@@ -479,8 +482,15 @@ def plot_metric(
         sharey="row",
         squeeze=False,
     )
+    selected_series = base.series_for_points(
+        {
+            key: point
+            for points in points_by_batch_type.values()
+            for key, point in points.items()
+        }
+    )
     group_width = 0.88
-    bar_width = group_width / len(base.SERIES)
+    bar_width = group_width / len(selected_series)
     for row, batch_type in enumerate(BATCH_TYPES):
         points = points_by_batch_type[batch_type]
         available_values = [
@@ -496,7 +506,7 @@ def plot_metric(
                 tuple[float, Decimal, base.PlotPoint]
             ] = []
             missing_positions: list[float] = []
-            for series_index, series in enumerate(base.SERIES):
+            for series_index, series in enumerate(selected_series):
                 offset = -group_width / 2 + (series_index + 0.5) * bar_width
                 positions = [index + offset for index in range(len(arrivals))]
                 values: list[float] = []
@@ -600,7 +610,7 @@ def plot_metric(
             hatch=series.hatch,
             label=base._legend_label(series, mega_num_comm_sm),
         )
-        for series in base.SERIES
+        for series in selected_series
     ]
     figure.legend(
         handles=legend_handles,
@@ -725,9 +735,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"latency_column={base.LATENCY_COLUMNS[args.latency_stat]}")
     print("aggregation=loaded_from_batch_type_summary_csv")
     for batch_type, points in points_by_batch_type.items():
-        for dcp_size in args.dcp_sizes:
+        for dcp_size, series in (
+            (dcp_size, series)
+            for dcp_size in args.dcp_sizes
+            for series in base.SERIES
+            if series.method == base.METHOD_MEGA
+        ):
             for arrival in args.arrival_time_scales:
-                point = points.get((dcp_size, arrival, "mega_eager"))
+                point = points.get((dcp_size, arrival, series.key))
                 if point is None:
                     continue
                 comparisons = []
@@ -753,6 +768,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         )
                 print(
                     f"mega_selection batch_type={batch_type} "
+                    f"execution_mode={series.execution_mode} "
                     f"case_count={case_counts[(batch_type, dcp_size, arrival)]} "
                     f"dcp={dcp_size} "
                     f"arrival={base._decimal_label(arrival)} "

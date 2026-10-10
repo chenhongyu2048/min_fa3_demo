@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Benchmark independent arrival-time-scale/DCP trace workloads. Each combination
-# uses one Mega comm-SM sweep torchrun and eager/graph baseline torchruns.
+# uses one CUDA Graph Mega comm-SM sweep and eager/graph baseline torchruns.
 
 set -euo pipefail
 
@@ -277,7 +277,7 @@ run_combo_mode() {
     case "$suite" in
         mega)
             implementations=mega
-            graph_arg=--no-cuda-graph
+            graph_arg=--cuda-graph
             phase_arg=$MEGA_PHASE_ARG
             extra_args=(--mega-num-comm-sms "$MEGA_NUM_COMM_SMS")
             ;;
@@ -331,6 +331,7 @@ if ((DRY_RUN == 0)); then
             "$ARRIVAL_TIME_SCALES" "$DCP_SIZES" "$MEGA_NUM_COMM_SMS"
         printf 'num_cases=%s warmup=%s iters=%s check=%s\n' \
             "$NUM_CASES" "$WARMUP" "$ITERS" "$CHECK"
+        printf 'mega_execution=cuda_graph\n'
         printf 'baseline_implementations=%s baseline_phase_timing=%s\n' \
             "$BASELINE_IMPLEMENTATIONS" "$BASELINE_PHASE_TIMING"
         printf 'cuda_visible_devices=%s\n' "$CUDA_VISIBLE_DEVICES"

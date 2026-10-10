@@ -106,6 +106,14 @@ SERIES = (
         "#E15759",
         "xx",
     ),
+    Series(
+        "mega_graph",
+        "Mega DCP CUDA Graph",
+        METHOD_MEGA,
+        "cuda_graph",
+        "#E15759",
+        "///",
+    ),
 )
 
 
@@ -204,7 +212,7 @@ def _mega_selector(value: str) -> str | int:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Plot eager/CUDA-Graph baseline and eager Mega DCP latency, "
+            "Plot eager/CUDA-Graph baseline and Mega DCP latency, "
             "per-GPU FLOPS, and KV bandwidth from matrix_summary.csv"
         )
     )
@@ -392,7 +400,11 @@ def load_records(path: Path, latency_stat: str) -> list[LatencyRecord]:
             suite = row["suite"]
             execution_mode = row["execution_mode"]
             if method == METHOD_MEGA:
-                if suite != "mega" or execution_mode != "eager" or comm_sm is None:
+                if (
+                    suite != "mega"
+                    or execution_mode not in {"eager", "cuda_graph"}
+                    or comm_sm is None
+                ):
                     raise ValueError(
                         f"invalid Mega suite/mode/comm-SM at {path}:{line_number}"
                     )
@@ -431,7 +443,10 @@ def select_plot_points(
     allow_incomplete: bool,
 ) -> dict[tuple[int, Decimal, str], PlotPoint]:
     baseline: dict[tuple[int, Decimal, str, str], LatencyRecord] = {}
-    mega: dict[tuple[int, Decimal, int], LatencyRecord] = {}
+    mega: dict[tuple[int, Decimal, str, int], LatencyRecord] = {}
+    mega_modes = {
+        record.execution_mode for record in records if record.method == METHOD_MEGA
+    }
     requested_arrivals = set(arrivals)
     requested_dcp_sizes = set(dcp_sizes)
     for record in records:
@@ -445,10 +460,11 @@ def select_plot_points(
             key = (
                 record.dcp_size,
                 record.arrival_time_scale,
+                record.execution_mode,
                 record.mega_num_comm_sm,
             )
             if key in mega:
-                raise ValueError(f"duplicate Mega row for DCP/arrival/comm-SM={key}")
+                raise ValueError(f"duplicate Mega row for DCP/arrival/mode/comm-SM={key}")
             mega[key] = record
         else:
             key = (
@@ -463,9 +479,16 @@ def select_plot_points(
 
     points: dict[tuple[int, Decimal, str], PlotPoint] = {}
     missing: list[str] = []
+    if not mega_modes:
+        missing.append("Mega DCP")
     for dcp_size in dcp_sizes:
         for arrival in arrivals:
             for series in SERIES:
+                if (
+                    series.method == METHOD_MEGA
+                    and series.execution_mode not in mega_modes
+                ):
+                    continue
                 point_key = (dcp_size, arrival, series.key)
                 if series.method != METHOD_MEGA:
                     record = baseline.get(
@@ -489,10 +512,12 @@ def select_plot_points(
                     for (
                         candidate_dcp,
                         candidate_arrival,
+                        candidate_mode,
                         candidate_sm,
                     ), record in mega.items()
                     if candidate_dcp == dcp_size
                     and candidate_arrival == arrival
+                    and candidate_mode == series.execution_mode
                     and (
                         mega_num_comm_sm == "best"
                         or candidate_sm == mega_num_comm_sm
@@ -506,7 +531,7 @@ def select_plot_points(
                     )
                     missing.append(
                         f"DCP={dcp_size}/arrival={_decimal_label(arrival)}/"
-                        f"Mega {selection}"
+                        f"{series.label} {selection}"
                     )
                 else:
                     record = min(
@@ -526,6 +551,17 @@ def select_plot_points(
             f"matrix is missing {len(missing)} required plot points: {preview}{suffix}"
         )
     return points
+
+
+def series_for_points(
+    points: Mapping[tuple[int, Decimal, str], PlotPoint],
+) -> tuple[Series, ...]:
+    keys = {key for _dcp, _arrival, key in points}
+    return tuple(
+        series
+        for series in SERIES
+        if series.method != METHOD_MEGA or series.key in keys
+    )
 
 
 def _decimal_label(value: Decimal) -> str:
@@ -608,8 +644,9 @@ def plot_metric(
         squeeze=False,
     )
     axes_row = axes[0]
+    selected_series = series_for_points(points)
     group_width = 0.88
-    bar_width = group_width / len(SERIES)
+    bar_width = group_width / len(selected_series)
     available_values = [
         _metric_value(point, metric) * metric.scale for point in points.values()
     ]
@@ -620,7 +657,7 @@ def plot_metric(
     for axis, dcp_size in zip(axes_row, dcp_sizes):
         mega_annotations: list[tuple[float, Decimal, PlotPoint]] = []
         missing_positions: list[float] = []
-        for series_index, series in enumerate(SERIES):
+        for series_index, series in enumerate(selected_series):
             offset = -group_width / 2 + (series_index + 0.5) * bar_width
             positions = [index + offset for index in range(len(arrivals))]
             values: list[float] = []
@@ -709,7 +746,7 @@ def plot_metric(
             hatch=series.hatch,
             label=_legend_label(series, mega_num_comm_sm),
         )
-        for series in SERIES
+        for series in selected_series
     ]
     figure.legend(
         handles=legend_handles,
@@ -810,9 +847,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"input={csv_path}")
     print(f"latency_column={LATENCY_COLUMNS[args.latency_stat]}")
-    for dcp_size in args.dcp_sizes:
+    for dcp_size, series in (
+        (dcp_size, series)
+        for dcp_size in args.dcp_sizes
+        for series in SERIES
+        if series.method == METHOD_MEGA
+    ):
         for arrival in args.arrival_time_scales:
-            point = points.get((dcp_size, arrival, "mega_eager"))
+            point = points.get((dcp_size, arrival, series.key))
             if point is None:
                 continue
             comparisons = []
@@ -838,6 +880,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
             print(
                 f"mega_selection dcp={dcp_size} "
+                f"execution_mode={series.execution_mode} "
                 f"arrival={_decimal_label(arrival)} "
                 f"comm_sm={point.mega_num_comm_sm} "
                 f"latency_us={point.latency_ms * 1000.0:.6f} "

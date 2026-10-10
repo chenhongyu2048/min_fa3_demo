@@ -394,8 +394,9 @@ def _mega_run(
     config_sha256 = _validate_trace(manifest, arrival, dcp_size, num_cases)
     if manifest.get("manifest_kind") != "mega_comm_sm_sweep":
         raise ValueError(f"not a Mega comm-SM sweep manifest: {path}")
-    if manifest.get("execution_mode") != "eager":
-        raise ValueError(f"Mega sweep must use eager execution: {path}")
+    execution_mode = manifest.get("execution_mode")
+    if execution_mode not in ("eager", "cuda_graph"):
+        raise ValueError(f"unsupported Mega execution mode in {path}")
     variants = manifest.get("variants")
     if not isinstance(variants, list):
         raise ValueError(f"Mega sweep is missing variants: {path}")
@@ -421,7 +422,7 @@ def _mega_run(
             arrival=arrival,
             dcp_size=dcp_size,
             suite="mega",
-            execution_mode="eager",
+            execution_mode=execution_mode,
             comm_sm=int(variant["mega_num_comm_sm"]),
             config_sha256=config_sha256,
             manifest_path=path,
@@ -466,7 +467,7 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
         for dcp_size in args.dcp_sizes:
             combo_dir = args.result_dir / f"arrival_{arrival}" / f"dcp_{dcp_size}"
             specs = (
-                ("mega", "eager", combo_dir / "mega" / "manifest.json"),
+                ("mega", None, combo_dir / "mega" / "manifest.json"),
                 (
                     "baseline",
                     "eager",
@@ -480,7 +481,10 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
             )
             for suite, execution_mode, path in specs:
                 run = {
-                    "run_id": f"arrival_{arrival}_dcp_{dcp_size}_{suite}_{execution_mode}",
+                    "run_id": (
+                        f"arrival_{arrival}_dcp_{dcp_size}_{suite}"
+                        + (f"_{execution_mode}" if execution_mode else "")
+                    ),
                     "arrival_time_scale": arrival,
                     "dcp_size": dcp_size,
                     "suite": suite,
@@ -505,6 +509,8 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
                             comm_sms=args.mega_num_comm_sms,
                             num_cases=args.num_cases,
                         )
+                        run["execution_mode"] = manifest["execution_mode"]
+                        run["run_id"] += f"_{manifest['execution_mode']}"
                     else:
                         manifest, run_rows = _standard_run(
                             path,

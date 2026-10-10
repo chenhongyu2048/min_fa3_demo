@@ -20,6 +20,7 @@ from dcp_test.benchmark_dcp_mega_batch import (
     expand_cases,
     load_batch_config,
     load_trace_workloads,
+    main,
     parse_args,
 )
 from dcp_test.utils import BenchmarkPhaseRecorder
@@ -799,6 +800,42 @@ class DCPMegaBatchTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             with mock.patch("sys.stderr"):
                 parse_args(["--mega-num-comm-sms", "4,132"])
+
+    def test_comm_sm_graph_sweep_forwards_mode_and_prints_cases(self) -> None:
+        argv = [
+            "--implementations", "mega", "--cuda-graph",
+            "--mega-phase-timestamps",
+            "--mega-num-comm-sms", "4,8",
+            "--workloads", "small1", "--dcp-sizes", "2",
+            "--output-dir", "results", "--print-cases",
+        ]
+        args = parse_args(argv)
+        config = load_batch_config(DEFAULT_CONFIG)
+        cases = expand_cases(config, workloads="small1", dcp_sizes="2")
+        output_path = _result_path(args, cases[0], 8)
+        self.assertEqual(
+            output_path, Path("results/comm_sm_8/small1_dcp2_hkv4_graph.json")
+        )
+        direct_args = benchmark_dcp_varlen.parse_args(
+            _case_argv(args, config, cases[0], output_path, mega_num_comm_sm=8)
+        )
+        self.assertTrue(direct_args.cuda_graph)
+        self.assertTrue(direct_args.mega_phase_timestamps)
+        self.assertEqual(direct_args.mega_num_comm_sm, 8)
+        manifest = _build_manifest(
+            args, config, "2", ("mega",), None, cases, args.mega_num_comm_sms
+        )
+        self.assertEqual(manifest["execution_mode"], "cuda_graph")
+        self.assertEqual(manifest["case_total"], 2)
+        with mock.patch("builtins.print") as output, mock.patch(
+            "dcp_test.benchmark_dcp_mega_batch.initialize_distributed_sm90"
+        ) as initialize:
+            main(argv)
+        initialize.assert_not_called()
+        printed = "\n".join(call.args[0] for call in output.call_args_list)
+        self.assertIn("mode=graph", printed)
+        self.assertIn("executions=2", printed)
+        self.assertIn(str(output_path), printed)
 
     def test_trace_matrix_overrides_require_trace_inputs(self) -> None:
         for option, value in (

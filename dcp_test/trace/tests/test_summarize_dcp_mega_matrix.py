@@ -90,7 +90,7 @@ class DCPMegaMatrixSummaryTest(unittest.TestCase):
             ]
         )
 
-    def _write_complete_matrix(self) -> None:
+    def _write_complete_matrix(self, mega_execution_mode: str = "eager") -> None:
         variants = []
         for comm_sm in (4, 8):
             variants.append(
@@ -108,7 +108,7 @@ class DCPMegaMatrixSummaryTest(unittest.TestCase):
                 "schema_version": 1,
                 "manifest_kind": "mega_comm_sm_sweep",
                 "status": "complete",
-                "execution_mode": "eager",
+                "execution_mode": mega_execution_mode,
                 "trace": self.trace,
                 "variant_total": 2,
                 "completed_variant_count": 2,
@@ -149,6 +149,8 @@ class DCPMegaMatrixSummaryTest(unittest.TestCase):
             rows = list(csv.DictReader(handle))
         self.assertEqual(len(rows), 14)
         mega_rows = [row for row in rows if row["suite"] == "mega"]
+        self.assertEqual({row["execution_mode"] for row in mega_rows}, {"eager"})
+        self.assertEqual(payload["runs"][0]["run_id"], "arrival_1_dcp_2_mega_eager")
         self.assertEqual(
             [row["mega_num_comm_sm"] for row in mega_rows], ["4", "8"]
         )
@@ -159,6 +161,48 @@ class DCPMegaMatrixSummaryTest(unittest.TestCase):
             ],
             ["100.0", "100.0"],
         )
+
+    def test_mega_graph_mode_is_preserved_in_run_and_summary_outputs(self) -> None:
+        self._write_complete_matrix(mega_execution_mode="cuda_graph")
+        args = self._args()
+        payload = summarize(args)
+
+        self.assertEqual(payload["status"], "complete")
+        self.assertEqual(payload["summary_row_count"], 14)
+        mega_run = payload["runs"][0]
+        self.assertEqual(mega_run["execution_mode"], "cuda_graph")
+        self.assertEqual(mega_run["run_id"], "arrival_1_dcp_2_mega_cuda_graph")
+        self.assertEqual(
+            {row["execution_mode"] for row in payload["summary_rows"]
+             if row["suite"] == "mega"},
+            {"cuda_graph"},
+        )
+        with args.output_csv.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(
+            {row["execution_mode"] for row in rows if row["suite"] == "mega"},
+            {"cuda_graph"},
+        )
+
+    def test_partial_mega_graph_sweep_keeps_completed_variants(self) -> None:
+        self._write_complete_matrix(mega_execution_mode="cuda_graph")
+        manifest_path = self.combo / "mega" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["status"] = "failed"
+        manifest["completed_variant_count"] = 1
+        manifest["completed_case_count"] = 2
+        manifest["variants"][1]["status"] = "failed"
+        manifest["variants"][1]["completed_case_count"] = 0
+        self._write("mega/manifest.json", manifest)
+        payload = summarize(self._args())
+
+        self.assertEqual(payload["status"], "incomplete")
+        self.assertEqual(payload["failed_launch_count"], 1)
+        self.assertEqual(payload["runs"][0]["run_id"], "arrival_1_dcp_2_mega_cuda_graph")
+        mega_rows = [row for row in payload["summary_rows"] if row["suite"] == "mega"]
+        self.assertEqual(len(mega_rows), 1)
+        self.assertEqual(mega_rows[0]["execution_mode"], "cuda_graph")
+        self.assertEqual(mega_rows[0]["mega_num_comm_sm"], 4)
 
     def test_old_manifest_bandwidth_is_backfilled_from_case_outputs(self) -> None:
         entries = []
