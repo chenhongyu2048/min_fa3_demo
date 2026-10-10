@@ -24,7 +24,7 @@ enum PhaseTimestampIndex : int32_t {
     kAttentionDoneTimestamp = 2,
     kHistoryCombineDoneTimestamp = 3,
     kPublishDoneTimestamp = 4,
-    kReceiveDoneTimestamp = 5,
+    kInboxReadyObservedDoneTimestamp = 5,
     kFinalCombineDoneTimestamp = 6,
     kKernelDoneTimestamp = 7,
     kPhaseTimestampCount = 8,
@@ -146,6 +146,7 @@ struct DCPMega_fwd_params {
     Flash_fwd_params history{};
 
     void const* ipc_q_ptrs[8]{};
+    // Source-indexed inboxes; each history worker pushes to the Q source rank.
     void* ipc_history_send_o_ptrs[8]{};
     float* ipc_history_send_lse_ptrs[8]{};
     int32_t* ipc_tile_ready_ptrs[8]{};
@@ -166,7 +167,6 @@ struct DCPMega_fwd_params {
     int32_t* q_ready = nullptr;
     int32_t* attention_done = nullptr;
     int32_t* publish_ready = nullptr;
-    int32_t* receive_ready = nullptr;
     int32_t* queue_state = nullptr;
     uint64_t* phase_timestamps = nullptr;
     int32_t const* graph_post_phase = nullptr;

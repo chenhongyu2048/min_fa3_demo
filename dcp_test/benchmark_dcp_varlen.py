@@ -610,6 +610,8 @@ def measure_mega(
                 raise RuntimeError(
                     "fused history_combine_done and publish_done timestamps differ"
                 )
+            if bool(((raw[:, 5] > raw[:, 6]) | (raw[:, 6] > raw[:, 7])).any()):
+                raise RuntimeError("mega inbox/final/kernel timestamps are out of order")
             relative_ns = raw - raw[:, :1]
             relative_ns_device = relative_ns.to(device)
             dist.all_reduce(relative_ns_device, op=dist.ReduceOp.MAX)
@@ -620,7 +622,7 @@ def measure_mega(
             }
             tail_pairs = {
                 "q_done_to_publish_done": (1, 4),
-                "publish_done_to_receive_done": (4, 5),
+                "inbox_ready_observed_to_final_done": (5, 6),
                 "attention_done_to_history_combine_done": (2, 3),
                 "history_combine_done_to_final_combine_done": (3, 6),
             }
@@ -639,8 +641,13 @@ def measure_mega(
                     "per-iteration MAX across DCP ranks, then percentile across iterations"
                 ),
                 "publish_done_semantics": (
-                    "all fused remote ready releases issued; recorded from the same "
+                    "all history TMA stores completed and remote ready releases issued; "
+                    "recorded from the same "
                     "%globaltimer read as history_combine_done"
+                ),
+                "inbox_ready_observed_done_semantics": (
+                    "all final tasks have observed their local and remote inputs ready; "
+                    "this is an observation timestamp, not the last network arrival"
                 ),
                 "milestones_us": milestones,
                 "post_global_completion_tails_us": {

@@ -16,6 +16,8 @@ from min_fa3_dcp import DCPMegaAttentionRunner
 from dcp_test.baselines import VLLMDCPAttentionRunner, VLLMA2ADCPAttentionRunner
 from scripts.test_min_fa3.test_dcp_mega_varlen_multi_rank import (
     append_chunk,
+    assert_inbox_aliases,
+    assert_phase_timestamps,
     make_cu,
     randn_bf16,
     shard_history,
@@ -40,8 +42,9 @@ def main():
         runner = DCPMegaAttentionRunner(
             dist.group.WORLD, dist.group.WORLD,
             max_total_q=32, max_batch=4, Hq_local=hq_local, max_num_splits=128,
-            num_comm_sm=4, block_n_override=128,
+            num_comm_sm=4, block_n_override=128, record_phase_timestamps=True,
         )
+        assert_inbox_aliases(runner)
         q = runner.q_backing[:32]
     else:
         cls = VLLMDCPAttentionRunner if backend == "vllm-ag-rs" else VLLMA2ADCPAttentionRunner
@@ -129,13 +132,18 @@ def main():
             torch.cuda.synchronize()
             dist.barrier()
             graph = torch.cuda.CUDAGraph()
+            phase_samples = []
             with torch.cuda.graph(graph, stream=stream):
                 # Two layer calls share scratch and phase state in one graph.
                 out1, lse1 = forward(args)
                 first = out1.clone(), lse1.clone()
+                if backend == "mega":
+                    phase_samples.append(runner._phase_timestamps.clone())
                 out2, lse2 = forward(args)
                 second = out2.clone(), lse2.clone()
-            graphs[capacity] = graph, first, second, args
+                if backend == "mega":
+                    phase_samples.append(runner._phase_timestamps.clone())
+            graphs[capacity] = graph, first, second, args, phase_samples
 
         cases = [
             (16, [1, 1], [128, 256]),
@@ -148,21 +156,26 @@ def main():
         pending_checks = []
         for iteration, (capacity, q_lengths, h_lengths) in enumerate(cases * 2):
             _, expected = prepare(capacity, q_lengths, h_lengths, 100 + iteration)
-            graph, first, second, _ = graphs[capacity]
+            graph, first, second, _, phase_samples = graphs[capacity]
             graph.replay()
             previous_done = torch.cuda.Event()
             previous_done.record()
             # Preserve this replay's outputs before the next batch overwrites
             # the shared graph buffers on the same stream.
             saved = tuple((out.clone(), lse.clone()) for out, lse in (first, second))
-            pending_checks.append((iteration, capacity, q_lengths, h_lengths, expected, saved))
+            saved_phases = tuple(sample.clone() for sample in phase_samples)
+            pending_checks.append((
+                iteration, capacity, q_lengths, h_lengths, expected, saved, saved_phases,
+            ))
             if options.pipeline and len(pending_checks) < 2:
                 continue
             torch.cuda.synchronize()
-            for i, cap, ql, hl, reference, outputs in pending_checks:
+            for i, cap, ql, hl, reference, outputs, phases in pending_checks:
                 for out, lse in outputs:
                     torch.testing.assert_close(out[:sum(ql)], reference[0], atol=0.03, rtol=0.03)
                     torch.testing.assert_close(lse[:, :sum(ql)], reference[1], atol=0.03, rtol=0.03)
+                for timestamps in phases:
+                    assert_phase_timestamps(timestamps)
                 if rank == 0:
                     print(f"PASS backend={backend} mode={options.scheduler_mode} pipeline={options.pipeline} replay={i} capacity={cap} q={ql} history={hl}", flush=True)
             pending_checks.clear()

@@ -62,6 +62,19 @@ class QueueCacheTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             metadata.validate_dcp_mega_metadata(bad, (0, 1, 2), hq_local=8, dcp_size=4)
 
+    def test_push_ready_count_is_preserved_without_receive_queue(self):
+        value = self.build()
+        self.assertEqual(value.final_vectors_per_task, 4)
+        self.assertEqual(len(value.final), 4)
+        self.assertEqual(value.receive_count, 0)
+        self.assertEqual(value.tile_ready_count, 3)
+        for changes, message in ((dict(receive_count=1), "receive tasks"),
+                                 (dict(tile_ready_count=0), "tile-ready")):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(AssertionError, message):
+                    metadata.validate_dcp_mega_metadata(
+                        replace(value, **changes), (0, 1, 2), hq_local=8, dcp_size=4)
+
     def test_queue_cache_is_bounded(self):
         for length in range(1, metadata._METADATA_QUEUE_CACHE_SIZE + 3):
             self.build(q=(0, length, length + 1))
