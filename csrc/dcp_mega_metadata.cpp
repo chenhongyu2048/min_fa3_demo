@@ -1,4 +1,4 @@
-// Build and serialize metadata v10 without materializing Python descriptors.
+// Build and serialize metadata v11 without materializing Python descriptors.
 // Layout and ordering reference: dcp_mega_metadata.py.
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -17,14 +17,15 @@ using Ints = std::vector<int32_t>;
 using Row = std::array<int32_t, 8>;
 using Rows = std::vector<Row>;
 constexpr int32_t history_warps_per_task = 4;
-constexpr int32_t final_vectors_per_task = 4;
 int32_t ceil_div(int32_t a, int32_t b) { return (a + b - 1) / b; }
 
 Ints build_packed_queues(const Ints& cu, int32_t heads, int32_t world,
-                        int32_t /*sms*/, int32_t comm, int32_t block_n,
+                        int32_t sms, int32_t comm, int32_t block_n,
                         const Ints& chunk_splits, const Ints& history_splits,
                         int32_t copy_vectors, const std::optional<Ints>& history_blocks) {
     const int32_t total_q = cu.back(), token_blocks = ceil_div(total_q, 16);
+    const int32_t ctas = sms - comm;
+    const int32_t final_tokens = token_blocks < ctas ? 4 : token_blocks < 2 * ctas ? 8 : 16;
     Rows attention, publish, combine, final;
     Ints q_tasks, q_deps, publish_deps, final_deps;
     std::array<Ints, 2> bases{Ints(cu.size() - 1), Ints(cu.size() - 1)};
@@ -133,9 +134,10 @@ Ints build_packed_queues(const Ints& cu, int32_t heads, int32_t world,
         combine.insert(combine.end(), tasks.begin(), tasks.end());
     }
     for (int32_t tile : order) {
-        int32_t end = std::min((tile + 1) * 16, total_q) * heads;
-        for (int32_t begin = tile * 16 * heads; begin < end; begin += final_vectors_per_task) {
-            int32_t valid = final_vectors_per_task;
+        int32_t valid_tokens = std::min(16, total_q - tile * 16);
+        for (int32_t offset = 0; offset < valid_tokens; offset += final_tokens) {
+            int32_t begin = (tile * 16 + offset) * heads;
+            int32_t valid = std::min(final_tokens, valid_tokens - offset) * heads;
             Ints deps = dependencies(0, begin, begin + valid, 0);
             final.push_back({begin, valid, static_cast<int32_t>(final_deps.size()),
                              static_cast<int32_t>(deps.size()), tile, 0, 0, 0});
@@ -164,7 +166,7 @@ Ints build_packed_queues(const Ints& cu, int32_t heads, int32_t world,
     int32_t max_history = *std::max_element(history_splits.begin(), history_splits.end());
     int32_t max_splits = std::max(max_chunk, max_history);
     Ints header{
-        10, static_cast<int32_t>(attention.size()), static_cast<int32_t>(q_tasks.size() / 4),
+        11, static_cast<int32_t>(attention.size()), static_cast<int32_t>(q_tasks.size() / 4),
         static_cast<int32_t>(q_deps.size()), static_cast<int32_t>(publish.size()),
         static_cast<int32_t>(publish_deps.size()), static_cast<int32_t>(final.size()),
         static_cast<int32_t>(final_deps.size()), chunk_count, static_cast<int32_t>(attention.size()) - chunk_count,

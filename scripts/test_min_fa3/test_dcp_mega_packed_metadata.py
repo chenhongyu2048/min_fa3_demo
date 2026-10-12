@@ -23,8 +23,8 @@ class PackedFallbackTests(unittest.TestCase):
                 q, h, pre_phase=7, post_phase=8, capacity=len(expected), **config)
         self.assertEqual(dispatch, reference.dispatch)
         self.assertEqual(payload, expected)
-        self.assertEqual(payload[0], 10)
-        self.assertEqual(payload[6], q[-1] * config["hq_local"] // 4)
+        self.assertEqual(payload[0], 11)
+        self.assertEqual(payload[6], 5)
         self.assertEqual(payload[35], 6)
         self.assertEqual(payload[36], 6)
 
@@ -57,30 +57,36 @@ class NativePackedTests(unittest.TestCase):
             with self.subTest(case=i, config=config):
                 self.assertEqual(dispatch, reference.dispatch)
                 self.assertEqual(payload, expected)
-                self.assertEqual(payload[0], 10)
+                self.assertEqual(payload[0], 11)
 
-    def test_fixed_final_vectors_and_capacity_match_for_both_head_counts(self):
-        q, h = (0, 1, 18), (0, 8192, 24576)
+    def test_adaptive_final_tokens_and_capacity_match_for_both_head_counts(self):
         for heads in (4, 8):
-            with self.subTest(heads=heads):
-                config = dict(hq_local=heads, dcp_size=4, num_sms=78, num_comm_sm=4,
-                              max_num_splits=8, requested_num_splits=2,
-                              block_n_override=128, scheduler_heuristic=False,
-                              reorder_history_override=True)
-                reference = metadata.build_dcp_mega_metadata(q, h, **config)
-                expected = metadata.pack_dcp_mega_metadata(reference, pre_phase=3, post_phase=4)
-                _, payload = metadata.build_packed_dcp_mega_metadata(
-                    q, h, pre_phase=3, post_phase=4, capacity=len(expected), **config)
-                self.assertEqual(payload, expected)
-                self.assertEqual(payload[6], q[-1] * heads // 4)
-                rows = [tuple(payload[i:i + 8])
-                        for i in range(payload[26], payload[27], 8)]
-                self.assertEqual([row[1] for row in rows], [4] * payload[6])
-                self.assertEqual(sorted(row[0] for row in rows), list(range(0, q[-1] * heads, 4)))
-                self.assertEqual(payload[35:37].tolist(), [6, 6])
-                with self.assertRaisesRegex(ValueError, "exceeds capacity"):
-                    metadata.build_packed_dcp_mega_metadata(
-                        q, h, pre_phase=3, post_phase=4, capacity=len(expected) - 1, **config)
+            for total_q, tokens in ((112, 4), (113, 8), (240, 8), (241, 16)):
+                with self.subTest(heads=heads, total_q=total_q):
+                    q, h = (0, 1, 18, total_q), (0, 8192, 24576, 45059)
+                    config = dict(hq_local=heads, dcp_size=4, num_sms=12, num_comm_sm=4,
+                                  max_num_splits=8, requested_num_splits=2,
+                                  block_n_override=128, scheduler_heuristic=False,
+                                  reorder_history_override=True)
+                    reference = metadata.build_dcp_mega_metadata(q, h, **config)
+                    expected = metadata.pack_dcp_mega_metadata(reference, pre_phase=3, post_phase=4)
+                    _, payload = metadata.build_packed_dcp_mega_metadata(
+                        q, h, pre_phase=3, post_phase=4, capacity=len(expected), **config)
+                    self.assertEqual(payload, expected)
+                    self.assertEqual(reference.final_tokens_per_task, tokens)
+                    self.assertEqual(payload[6], (total_q + tokens - 1) // tokens)
+                    rows = [tuple(payload[i:i + 8])
+                            for i in range(payload[26], payload[27], 8)]
+                    self.assertEqual(
+                        sorted((row[0], row[1], row[4]) for row in rows),
+                        [(begin * heads, min(tokens, total_q - begin) * heads,
+                          begin // 16) for begin in range(0, total_q, tokens)],
+                    )
+                    receive_count = 3 * ((total_q + 15) // 16)
+                    self.assertEqual(payload[35:37].tolist(), [receive_count] * 2)
+                    with self.assertRaisesRegex(ValueError, "exceeds capacity"):
+                        metadata.build_packed_dcp_mega_metadata(
+                            q, h, pre_phase=3, post_phase=4, capacity=len(expected) - 1, **config)
 
     def prepare(self, q=(0, 1, 2), h=(0, 8192, 16384), **options):
         config = dict(hq_local=8, dcp_size=4, num_sms=78, num_comm_sm=8,

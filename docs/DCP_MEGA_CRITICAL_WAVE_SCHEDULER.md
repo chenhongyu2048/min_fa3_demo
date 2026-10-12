@@ -454,7 +454,7 @@ else:
 
 ## 12. Metadata 构造与正确性约束
 
-调度不改变 attention 数学。metadata v10 沿用 40-int header 和 8-int history/final descriptor，`valid_vectors` 表示一个 WG task 的向量数；publish completion 计数记录 history WG task 数。`receive_count` 和远端 `tile_ready_count` 均为 `(DCP_size - 1) * ceil(total_q / 16)`，每个 receive task 拉取一个远端 source 的 16-token parent。metadata 必须维持以下不变量。
+调度不改变 attention 数学。metadata v11 沿用 40-int header 和 8-int history/final descriptor，`valid_vectors` 表示一个 WG task 的向量数；publish completion 计数记录 history WG task 数。`receive_count` 和远端 `tile_ready_count` 均为 `(DCP_size - 1) * ceil(total_q / 16)`，每个 receive task 拉取一个远端 source 的 16-token parent。metadata 必须维持以下不变量。
 
 ### 12.1 descriptor 完整覆盖
 
@@ -470,7 +470,7 @@ history descriptor 必须引用覆盖其全部有效 packed Q rows 的 Q-ready c
 
 split task 的 4 个 vector 共享同一 M-tile 的完整 split completion 集合，索引为 `base + m_block * actual_splits + split_idx`；copy task 保留所覆盖 vector 的精确依赖并集。每个 `(destination, vector)` 仍须恰好覆盖一次。
 
-final 固定每个 4-warp WG task 处理 4 个 vector，每个 warp 的 32 个线程处理一个 vector。H4 对应一个 token，H8 对应半个 token；`final_count = total_q * Hq_local / 4`。任务沿 Q parent 顺序生成，不跨 16-token parent，依赖其读取的全部 chunk completion 和该 parent 的所有来源数据就绪信号。`final_vectors_per_task=4` 是 host 诊断字段，不占用 header 槽；无需等待其他 parent 的 history 工作完成。
+final 每个 4-warp WG task 自适应处理 4/8/16 个 token。设 `C = num_sms - num_comm_sm`、`T = ceil(total_q / 16)`，`T < C` 时选择 4 tokens，`C <= T < 2C` 时选择 8 tokens，否则选择 16 tokens。每个 warp 的 32 个线程处理一个 vector，并按 `warp_in_group + 4*k` 依次处理任务中的多个 vector；`final_count = ceil(total_q / final_tokens_per_task)`。任务沿 Q parent 顺序生成，不跨 16-token parent，依赖其读取的全部 chunk completion 和该 parent 的所有来源数据就绪信号。`final_tokens_per_task` 是 host 诊断字段，不占用 header 槽；无需等待其他 parent 的 history 工作完成。
 
 ### 12.4 Q task 与 attention order 一致
 
@@ -523,7 +523,7 @@ history_order_policy:
 - combine task、partial vector 和 work；
 - history combine 的物理 warp 数、WG worker 数及按 WG worker 数计算的 task waves；
 - 初始计算 CTA 数、运行时计算 CTA 数和 planner 使用的 CTA 数，均为 `num_sms - num_comm_sm`；
-- `final_vectors_per_task=4`、receive task 数和远端 ready signal 数；
+- `final_tokens_per_task`、receive task 数和远端 ready signal 数；
 - baseline/selected attention makespan；
 - combine penalty 和完整 gain；
 - selected split vector、plan source 和 Q block order。

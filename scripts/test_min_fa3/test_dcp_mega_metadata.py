@@ -8,7 +8,7 @@ import unittest
 
 from dcp_mega_metadata import (
     CHUNK,
-    FINAL_VECTORS_PER_TASK,
+    FINAL_TOKENS_PER_TASK,
     HISTORY,
     HISTORY_COMBINE_DESC_FIELDS,
     HISTORY_ORDER_POLICY_FIFO,
@@ -203,7 +203,9 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(metadata.tile_ready_count, token_blocks * (dcp_size - 1))
         final_vectors = []
         for row in metadata.final:
-            self.assertEqual(row[1], FINAL_VECTORS_PER_TASK)
+            self.assertLessEqual(row[1], metadata.final_tokens_per_task * hq_local)
+            self.assertEqual(row[0] % hq_local, 0)
+            self.assertEqual(row[1] % hq_local, 0)
             self.assertEqual(
                 row[4], row[0] // (16 * hq_local)
             )
@@ -238,71 +240,73 @@ class DCPMegaMetadataTest(unittest.TestCase):
         history = [row for row in metadata.attention if row[0] == HISTORY]
         self.assertTrue(all(row[6] > 0 for row in history))
         self.assertTrue(all(row[6] == 0 for row in metadata.attention if row[0] == CHUNK))
-        self.assertEqual(metadata.final[-1][1], FINAL_VECTORS_PER_TASK)
+        self.assertEqual(metadata.final[-1][1], 2 * 4)
         self.assertEqual(
             len(metadata.final),
-            metadata.total_vectors // FINAL_VECTORS_PER_TASK,
+            (metadata.total_q + metadata.final_tokens_per_task - 1)
+            // metadata.final_tokens_per_task,
         )
         self.assertEqual(metadata.q_ready_count, metadata.token_block_count)
         self.assertEqual(metadata.receive_count, 7 * metadata.token_block_count)
         self.assertEqual(metadata.tile_ready_count, 7 * metadata.token_block_count)
 
-    def test_final_four_vector_granularity_is_independent_of_worker_count(self):
-        self.assertEqual(FINAL_VECTORS_PER_TASK, 4)
+    def test_adaptive_final_granularity_uses_parent_task_waves(self):
+        self.assertEqual(FINAL_TOKENS_PER_TASK, 4)
+        # Eight compute CTAs: the eighth and sixteenth parent cross thresholds.
+        cases = ((112, 4), (113, 8), (128, 8), (240, 8), (241, 16), (256, 16))
         for hq_local in (4, 8):
-            for num_sms, num_comm_sm in ((12, 4), (78, 8), (132, 12)):
-                with self.subTest(hq_local=hq_local, num_sms=num_sms):
-                    total_q = 17
+            for total_q, tokens in cases:
+                with self.subTest(hq_local=hq_local, total_q=total_q):
                     metadata = build_dcp_mega_metadata(
                         (0, total_q),
                         (0, 257),
                         hq_local=hq_local,
                         dcp_size=2,
-                        num_sms=num_sms,
-                        num_comm_sm=num_comm_sm,
+                        num_sms=12,
+                        num_comm_sm=4,
                         requested_num_splits=1,
                         scheduler_heuristic=False,
                     )
-                    self.assertEqual(metadata.final_vectors_per_task, 4)
-                    self.assertEqual(len(metadata.final), total_q * hq_local // 4)
-                    self.assertEqual(metadata.receive_count, 2)
-                    self.assertEqual(metadata.tile_ready_count, 2)
+                    self.assertEqual(metadata.final_tokens_per_task, tokens)
+                    self.assertEqual(len(metadata.final), (total_q + tokens - 1) // tokens)
+                    self.assertEqual(metadata.receive_count, (total_q + 15) // 16)
+                    self.assertEqual(metadata.tile_ready_count, metadata.receive_count)
                     self.assertEqual(
                         [(row[0], row[1], row[4]) for row in metadata.final],
-                        [(begin, 4, begin // (16 * hq_local))
-                         for begin in range(0, total_q * hq_local, 4)],
+                        [(begin * hq_local, min(tokens, total_q - begin) * hq_local,
+                          begin // 16) for begin in range(0, total_q, tokens)],
                     )
+                    self._assert_publish_receive_mapping(metadata, (0, total_q), hq_local, 2)
 
-    def test_h8_final_head_halves_keep_exact_chunk_split_dependencies(self):
+    def test_adaptive_final_keeps_exact_chunk_dependencies_across_batches(self):
         cu_q = (0, 1, 18, 275)
-        for reorder in (False, True):
-            with self.subTest(reorder=reorder):
+        for num_sms, tokens, reorder in ((78, 4, False), (22, 8, True), (12, 16, True)):
+            with self.subTest(tokens=tokens, reorder=reorder):
                 metadata = build_dcp_mega_metadata(
                     cu_q, (0, 4097, 12290, 45059),
-                    hq_local=8, dcp_size=4, num_sms=78, num_comm_sm=4,
+                    hq_local=8, dcp_size=4, num_sms=num_sms, num_comm_sm=4,
                     requested_num_splits=2,
                     scheduler_heuristic=False,
                     reorder_history_override=reorder,
                 )
-                self.assertGreater(max(metadata.chunk_sequence_splits), 1)
-                for first, second in zip(metadata.final[::2], metadata.final[1::2]):
-                    self.assertEqual((first[0] % 8, second[0] % 8), (0, 4))
-                    self.assertEqual(second[0], first[0] + 4)
-                    self.assertEqual((first[1], second[1]), (4, 4))
-                    self.assertEqual(first[4], second[4])
-                    token = first[0] // 8
-                    batch = next(i for i in range(len(cu_q) - 1)
-                                 if cu_q[i] <= token < cu_q[i + 1])
-                    m_block = (token - cu_q[batch]) * 8 // 128
-                    expected = tuple(sorted(
-                        row[7] for row in metadata.attention
-                        if row[0] == CHUNK and row[1] == batch and row[2] == m_block
-                    ))
-                    self.assertEqual(len(expected), metadata.chunk_sequence_splits[batch])
-                    for row in (first, second):
-                        self.assertEqual(
-                            metadata.final_dependencies[row[2]:row[2] + row[3]], expected
+                self.assertEqual(metadata.final_tokens_per_task, tokens)
+                if tokens == 4:
+                    self.assertGreater(max(metadata.chunk_sequence_splits), 1)
+                for row in metadata.final:
+                    expected = set()
+                    for token in range(row[0] // 8, (row[0] + row[1]) // 8):
+                        batch = next(i for i in range(len(cu_q) - 1)
+                                     if cu_q[i] <= token < cu_q[i + 1])
+                        m_block = (token - cu_q[batch]) * 8 // 128
+                        expected.update(
+                            attention[7] for attention in metadata.attention
+                            if attention[0] == CHUNK and attention[1] == batch
+                            and attention[2] == m_block
                         )
+                    self.assertEqual(
+                        metadata.final_dependencies[row[2]:row[2] + row[3]],
+                        tuple(sorted(expected)),
+                    )
                 self._assert_publish_receive_mapping(metadata, cu_q, 8, 4)
                 wrong_dependencies = list(metadata.final_dependencies)
                 wrong_dependencies[0] = next(
@@ -313,6 +317,33 @@ class DCPMegaMetadataTest(unittest.TestCase):
                         replace(metadata, final_dependencies=tuple(wrong_dependencies)),
                         cu_q, hq_local=8, dcp_size=4,
                     )
+
+    def test_adaptive_final_one_token_batches_fit_dependency_capacity(self):
+        cu_q = tuple(range(81))
+        cu_history = tuple(i * 129 for i in range(81))
+        max_final = (cu_q[-1] + FINAL_TOKENS_PER_TASK - 1) // FINAL_TOKENS_PER_TASK
+        for heads in (4, 8):
+            for num_sms, tokens in ((78, 4), (8, 8), (6, 16)):
+                with self.subTest(heads=heads, tokens=tokens):
+                    metadata = build_dcp_mega_metadata(
+                        cu_q, cu_history, hq_local=heads, dcp_size=4,
+                        num_sms=num_sms, num_comm_sm=4, requested_num_splits=1,
+                        max_num_splits=1, scheduler_heuristic=False,
+                    )
+                    self.assertEqual(metadata.final_tokens_per_task, tokens)
+                    self.assertLessEqual(len(metadata.final), max_final)
+                    self.assertEqual(len(metadata.final_dependencies), cu_q[-1])
+                    self.assertLessEqual(len(metadata.final_dependencies), max_final * 4)
+                    chunk_completions = {
+                        row[1]: row[7] for row in metadata.attention if row[0] == CHUNK
+                    }
+                    for row in metadata.final:
+                        begin, end = row[0] // heads, (row[0] + row[1]) // heads
+                        self.assertEqual(
+                            metadata.final_dependencies[row[2]:row[2] + row[3]],
+                            tuple(chunk_completions[batch] for batch in range(begin, end)),
+                        )
+                    self._assert_publish_receive_mapping(metadata, cu_q, heads, 4)
 
     def test_default_critical_wave_preserves_fifo_when_no_split_is_selected(self):
         kwargs = {
@@ -1242,7 +1273,8 @@ class DCPMegaMetadataTest(unittest.TestCase):
                         self.assertEqual(len(metadata.publish), token_blocks * dcp_size)
                         self.assertEqual(
                             len(metadata.final),
-                            cu_q[-1] * hq_local // FINAL_VECTORS_PER_TASK,
+                            (cu_q[-1] + metadata.final_tokens_per_task - 1)
+                            // metadata.final_tokens_per_task,
                         )
                         self.assertEqual(metadata.receive_count, token_blocks * (dcp_size - 1))
                         self.assertEqual(metadata.tile_ready_count, token_blocks * (dcp_size - 1))
@@ -1465,7 +1497,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
                 )
             )
 
-    def test_metadata_v10_header_offsets_counts_and_capacity(self):
+    def test_metadata_v11_header_offsets_counts_and_capacity(self):
         metadata = build_dcp_mega_metadata(
             (0, 3, 20, 53),
             (0, 129, 516, 1541),
@@ -1477,7 +1509,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         )
         image = pack_dcp_mega_metadata(metadata, pre_phase=11, post_phase=12)
         self.assertEqual(image[0], METADATA_VERSION)
-        self.assertEqual(METADATA_VERSION, 10)
+        self.assertEqual(METADATA_VERSION, 11)
         self.assertEqual(image[30], len(image))
         self.assertEqual(image[32], 1)
         self.assertEqual(image[33], metadata.token_block_count)

@@ -77,7 +77,11 @@ output elements and one LSE. History writes local IPC send buffers and publishes
 a tile-ready phase after all tasks for that 16-token parent finish. Dedicated
 communication CTAs complete Q all-gather, then pull each ready parent's O/LSE
 into separate local receive buffers and publish receive-ready flags. Each final
-task handles four vectors on one four-warp group, with one warp per vector.
+task handles 4, 8, or 16 tokens on one four-warp group, with one warp per vector
+and each warp processing vector indices `warp_in_group + 4*k`. The task size
+is 4 tokens below one 16-token parent per compute CTA, 8 below two parents per
+compute CTA, and 16 otherwise.
+Final recomputes each history source's exponential weight when combining O.
 Groups enter final independently after completing their history work, then wait
 for that parent's local history and remote receive-ready dependencies.
 
@@ -86,7 +90,7 @@ For `S` device SMs and `R=--mega-num-comm-sm`, planning and execution both use
 dedicated to Q and output communication. Queue diagnostics label
 the modeled worker counts and task waves with `planner_`, report
 `initial_compute_ctas`, `planner_compute_ctas`, `runtime_compute_ctas`, and
-`runtime_worker_groups`, and use `final_vectors_per_task=4`.
+`runtime_worker_groups`, and report the selected `final_tokens_per_task`.
 
 The existing default method list remains unchanged. Its first eager
 correctness call builds and uploads fixed-shape metadata. Benchmark replays

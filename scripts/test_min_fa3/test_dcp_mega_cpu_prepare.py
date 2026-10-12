@@ -62,10 +62,11 @@ class QueueCacheTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             metadata.validate_dcp_mega_metadata(bad, (0, 1, 2), hq_local=8, dcp_size=4)
 
-    def test_receive_queue_keeps_four_vector_final_tasks(self):
+    def test_receive_queue_keeps_adaptive_final_tasks(self):
         value = self.build()
-        self.assertEqual(value.final_vectors_per_task, 4)
-        self.assertEqual(len(value.final), 4)
+        self.assertEqual(value.final_tokens_per_task, 4)
+        self.assertEqual(len(value.final), 1)
+        self.assertEqual(value.final[0][1], 16)
         self.assertEqual(value.receive_count, 3)
         self.assertEqual(value.tile_ready_count, 3)
         for changes, message in ((dict(receive_count=0), "receive queue"),

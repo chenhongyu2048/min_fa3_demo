@@ -135,8 +135,8 @@ void validate_metadata_header(
     int64_t total_vectors,
     int64_t batch_size,
     int dcp_size) {
-    TORCH_CHECK(header.version == 10,
-                "unsupported DCP mega metadata version; expected version 10");
+    TORCH_CHECK(header.version == 11,
+                "unsupported DCP mega metadata version; expected version 11");
     TORCH_CHECK(header.used_ints == metadata_used,
                 "metadata_used does not match the pinned header");
     TORCH_CHECK(metadata_used >= 40 && metadata_used <= metadata_capacity,
@@ -186,8 +186,11 @@ void validate_metadata_header(
                 "invalid fixed-layout Q queue counts");
     TORCH_CHECK(header.publish_count == header.token_block_count * dcp_size,
                 "invalid fixed-layout publish queue count");
-    TORCH_CHECK(header.final_count == total_vectors / 4,
-                "invalid four-vector final queue count");
+    TORCH_CHECK(
+        header.final_count == (total_q + 3) / 4
+            || header.final_count == (total_q + 7) / 8
+            || header.final_count == (total_q + 15) / 16,
+        "invalid adaptive final queue count");
     TORCH_CHECK(header.history_combine_count >= header.publish_count
                     && header.history_combine_count
                         <= total_vectors * dcp_size,

@@ -1025,121 +1025,127 @@ CUTLASS_DEVICE void run_final_combine(
             break;
         }
         FinalWorkDesc const work = params.get_final()[ticket];
-        int const vector = work.vector_begin + warp_in_group;
-        int const token = vector / params.hq_local;
-        int const local_head = vector - token * params.hq_local;
-        int const batch = batch_for_token(
-            token, params.cu_seqlens_q, params.get_batch_size());
-        float owned_lse = -INFINITY;
-        if (lane < Config::kDCPSize) {
-            int const source = lane;
-            float const state_lse = source == params.dcp_rank
-                ? params.history_send_lse[
-                    params.dcp_rank * params.signal_rank_stride + vector]
-                : params.history_receive_lse[
-                    source * params.signal_rank_stride + vector];
-            owned_lse = isfinite(state_lse)
-                ? state_lse : -INFINITY;
-        }
-        float max_lse = owned_lse;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            float const other = __shfl_xor_sync(
-                mask, max_lse, offset, 32);
-            max_lse = max_lse > other ? max_lse : other;
-        }
-        float const owned_weight = isfinite(owned_lse)
-            ? expf(owned_lse - max_lse) : 0.0f;
-        float denominator = owned_weight;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            denominator += __shfl_xor_sync(
-                mask, denominator, offset, 32);
-        }
-        float accum[4]{};
-
-        #pragma unroll
-        for (int source = 0; source < Config::kDCPSize; ++source) {
-            float const state_scale
-                = __shfl_sync(mask, owned_weight, source, 32);
-            #pragma unroll
-            for (int item = 0; item < 4; ++item) {
-                int const dim = lane * 4 + item;
-                Element const* source_o = source == params.dcp_rank
-                    ? params.history_send_o
-                        + params.dcp_rank * params.history_send_rank_stride
-                    : params.history_receive_o
-                        + source * params.history_send_rank_stride;
-                float const value = static_cast<float>(
-                    source_o[vector * 128 + dim]);
-                accum[item] += value * state_scale;
+        #pragma unroll 1
+        for (int vector_in_task = warp_in_group;
+             vector_in_task < work.valid_vectors;
+             vector_in_task += 4) {
+            int const vector = work.vector_begin + vector_in_task;
+            int const token = vector / params.hq_local;
+            int const local_head = vector - token * params.hq_local;
+            int const batch = batch_for_token(
+                token, params.cu_seqlens_q, params.get_batch_size());
+            float owned_lse = -INFINITY;
+            if (lane < Config::kDCPSize) {
+                int const source = lane;
+                float const state_lse = source == params.dcp_rank
+                    ? params.history_send_lse[
+                        params.dcp_rank * params.signal_rank_stride + vector]
+                    : params.history_receive_lse[
+                        source * params.signal_rank_stride + vector];
+                owned_lse = isfinite(state_lse)
+                    ? state_lse : -INFINITY;
             }
-        }
+            float max_lse = owned_lse;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                float const other = __shfl_xor_sync(
+                    mask, max_lse, offset, 32);
+                max_lse = max_lse > other ? max_lse : other;
+            }
+            float denominator = isfinite(owned_lse)
+                ? expf(owned_lse - max_lse) : 0.0f;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                denominator += __shfl_xor_sync(
+                    mask, denominator, offset, 32);
+            }
+            float accum[4]{};
 
-        int const chunk_splits = Config::ChunkKernel::Split
-            ? params.get_chunk_sequence_splits()[batch] : 1;
-        for (int split = 0; split < chunk_splits; ++split) {
-            float state_lse;
-            if constexpr (Config::ChunkKernel::Split) {
-                state_lse = chunk_splits > 1
-                    ? params.chunk.epilogue.ptr_LSE_partial[
-                        split * get<3>(params.chunk.epilogue.stride_LSE_partial)
-                        + local_head * get<1>(params.chunk.epilogue.stride_LSE_partial)
-                        + token]
-                    : params.chunk.epilogue.ptr_LSE[
+            #pragma unroll
+            for (int source = 0; source < Config::kDCPSize; ++source) {
+                float const state_lse
+                    = __shfl_sync(mask, owned_lse, source, 32);
+                float const state_scale = isfinite(state_lse)
+                    ? expf(state_lse - max_lse) : 0.0f;
+                #pragma unroll
+                for (int item = 0; item < 4; ++item) {
+                    int const dim = lane * 4 + item;
+                    Element const* source_o = source == params.dcp_rank
+                        ? params.history_send_o
+                            + params.dcp_rank * params.history_send_rank_stride
+                        : params.history_receive_o
+                            + source * params.history_send_rank_stride;
+                    float const value = static_cast<float>(
+                        source_o[vector * 128 + dim]);
+                    accum[item] += value * state_scale;
+                }
+            }
+
+            int const chunk_splits = Config::ChunkKernel::Split
+                ? params.get_chunk_sequence_splits()[batch] : 1;
+            for (int split = 0; split < chunk_splits; ++split) {
+                float state_lse;
+                if constexpr (Config::ChunkKernel::Split) {
+                    state_lse = chunk_splits > 1
+                        ? params.chunk.epilogue.ptr_LSE_partial[
+                            split * get<3>(params.chunk.epilogue.stride_LSE_partial)
+                            + local_head * get<1>(params.chunk.epilogue.stride_LSE_partial)
+                            + token]
+                        : params.chunk.epilogue.ptr_LSE[
+                            local_head * get<1>(params.chunk.epilogue.stride_LSE)
+                            + token];
+                } else {
+                    state_lse = params.chunk.epilogue.ptr_LSE[
                         local_head * get<1>(params.chunk.epilogue.stride_LSE)
                         + token];
-            } else {
-                state_lse = params.chunk.epilogue.ptr_LSE[
-                    local_head * get<1>(params.chunk.epilogue.stride_LSE)
-                    + token];
+                }
+                float const next_max
+                    = max_lse > state_lse ? max_lse : state_lse;
+                float const previous_scale
+                    = isfinite(max_lse) && isfinite(state_lse)
+                    ? expf(max_lse - next_max)
+                    : (isfinite(max_lse) ? 1.0f : 0.0f);
+                float const state_scale = isfinite(state_lse)
+                    ? expf(state_lse - next_max) : 0.0f;
+                #pragma unroll
+                for (int item = 0; item < 4; ++item) {
+                    int const dim = lane * 4 + item;
+                    float value;
+                    if constexpr (Config::ChunkKernel::Split) {
+                        value = chunk_splits > 1
+                            ? params.chunk.epilogue.ptr_O_partial[
+                                split * get<4>(params.chunk.epilogue.stride_O_partial)
+                                + local_head * get<2>(params.chunk.epilogue.stride_O_partial)
+                                + token * get<0>(params.chunk.epilogue.stride_O_partial)
+                                + dim]
+                            : static_cast<float>(params.chunk.epilogue.ptr_O[
+                                token * params.hq_local * 128
+                                + local_head * 128 + dim]);
+                    } else {
+                        value = static_cast<float>(
+                            params.chunk.epilogue.ptr_O[
+                                token * params.hq_local * 128
+                                + local_head * 128 + dim]);
+                    }
+                    accum[item]
+                        = accum[item] * previous_scale + value * state_scale;
+                }
+                denominator = denominator * previous_scale + state_scale;
+                if (isfinite(state_lse)) { max_lse = next_max; }
             }
-            float const next_max
-                = max_lse > state_lse ? max_lse : state_lse;
-            float const previous_scale
-                = isfinite(max_lse) && isfinite(state_lse)
-                ? expf(max_lse - next_max)
-                : (isfinite(max_lse) ? 1.0f : 0.0f);
-            float const state_scale = isfinite(state_lse)
-                ? expf(state_lse - next_max) : 0.0f;
             #pragma unroll
             for (int item = 0; item < 4; ++item) {
                 int const dim = lane * 4 + item;
-                float value;
-                if constexpr (Config::ChunkKernel::Split) {
-                    value = chunk_splits > 1
-                        ? params.chunk.epilogue.ptr_O_partial[
-                            split * get<4>(params.chunk.epilogue.stride_O_partial)
-                            + local_head * get<2>(params.chunk.epilogue.stride_O_partial)
-                            + token * get<0>(params.chunk.epilogue.stride_O_partial)
-                            + dim]
-                        : static_cast<float>(params.chunk.epilogue.ptr_O[
-                            token * params.hq_local * 128
-                            + local_head * 128 + dim]);
-                } else {
-                    value = static_cast<float>(
-                        params.chunk.epilogue.ptr_O[
-                            token * params.hq_local * 128
-                            + local_head * 128 + dim]);
-                }
-                accum[item]
-                    = accum[item] * previous_scale + value * state_scale;
+                float const value = denominator > 0.0f
+                    ? accum[item] / denominator : 0.0f;
+                params.final_o[vector * 128 + dim] = Element(value);
             }
-            denominator = denominator * previous_scale + state_scale;
-            if (isfinite(state_lse)) { max_lse = next_max; }
-        }
-        #pragma unroll
-        for (int item = 0; item < 4; ++item) {
-            int const dim = lane * 4 + item;
-            float const value = denominator > 0.0f
-                ? accum[item] / denominator : 0.0f;
-            params.final_o[vector * 128 + dim] = Element(value);
-        }
-        if (lane == 0 && params.return_lse) {
-            params.final_lse[
-                local_head * params.final_lse_head_stride + token]
-                = denominator > 0.0f
-                ? max_lse + logf(denominator) : -INFINITY;
+            if (lane == 0 && params.return_lse) {
+                params.final_lse[
+                    local_head * params.final_lse_head_stride + token]
+                    = denominator > 0.0f
+                    ? max_lse + logf(denominator) : -INFINITY;
+            }
         }
         group_barrier.arrive_and_wait_unaligned();
     }

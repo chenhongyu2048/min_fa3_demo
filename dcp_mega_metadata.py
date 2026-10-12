@@ -38,11 +38,12 @@ PUBLISH_DESC_FIELDS = 8
 HISTORY_COMBINE_DESC_FIELDS = 8
 FINAL_DESC_FIELDS = 8
 METADATA_HEADER_INTS = 40
-METADATA_VERSION = 10
+METADATA_VERSION = 11
 MEGA_COMPUTE_WARPS = 12
 HISTORY_WARPS_PER_TASK = 4
 HISTORY_WORKER_GROUPS = MEGA_COMPUTE_WARPS // HISTORY_WARPS_PER_TASK
-FINAL_VECTORS_PER_TASK = 4
+FINAL_TOKENS_PER_TASK = 4
+FINAL_TOKEN_GRANULARITIES = (4, 8, 16)
 HISTORY_MAX_COPY_VECTORS = 32
 HISTORY_COPY_VECTOR_GRANULARITIES = (4, 8, 16, HISTORY_MAX_COPY_VECTORS)
 HISTORY_TASK_WAVE_TARGET = 0.8
@@ -129,7 +130,7 @@ class DCPMegaMetadata:
     history_sequence_splits: tuple[int, ...]
     total_q: int
     total_vectors: int
-    final_vectors_per_task: int
+    final_tokens_per_task: int
     token_block_count: int
     q_ready_count: int
     receive_count: int
@@ -181,6 +182,17 @@ _METADATA_QUEUE_CACHE_SIZE = 32
 
 def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+def _choose_final_tokens_per_task(
+    token_block_count: int, num_compute_ctas: int
+) -> int:
+    """Choose final compute granularity from 16-token communication tasks."""
+    if token_block_count < num_compute_ctas:
+        return 4
+    if token_block_count < 2 * num_compute_ctas:
+        return 8
+    return 16
 
 
 def _combined_scheduler_policy(
@@ -1521,6 +1533,9 @@ def build_dcp_mega_metadata(
 
     total_q = cu_q[-1]
     num_token_subtiles = _ceil_div(total_q, 16)
+    final_tokens_per_task = _choose_final_tokens_per_task(
+        num_token_subtiles, num_sms - num_comm_sm
+    )
     q_tasks: list[tuple[int, ...]] = []
     for token_subtile in range(num_token_subtiles):
         for src_rank in range(dcp_size):
@@ -1659,12 +1674,15 @@ def build_dcp_mega_metadata(
     final_dependencies: list[int] = []
     total_vectors = total_q * hq_local
     for parent_token_block in heuristic_q_block_order:
-        parent_vector_begin = parent_token_block * 16 * hq_local
-        parent_vector_end = min(parent_vector_begin + 16 * hq_local, total_vectors)
-        for vector_begin in range(
-            parent_vector_begin, parent_vector_end, FINAL_VECTORS_PER_TASK
-        ):
-            valid_vectors = FINAL_VECTORS_PER_TASK
+        parent_token_begin = parent_token_block * 16
+        parent_valid_tokens = min(16, total_q - parent_token_begin)
+        for token_offset in range(0, parent_valid_tokens, final_tokens_per_task):
+            token_begin = parent_token_begin + token_offset
+            valid_tokens = min(
+                final_tokens_per_task, parent_valid_tokens - token_offset
+            )
+            vector_begin = token_begin * hq_local
+            valid_vectors = valid_tokens * hq_local
             dependency_set: set[int] = set()
             for vector in range(vector_begin, vector_begin + valid_vectors):
                 token, local_head = divmod(vector, hq_local)
@@ -1702,7 +1720,7 @@ def build_dcp_mega_metadata(
         history_sequence_splits=history_sequence_splits,
         total_q=total_q,
         total_vectors=total_vectors,
-        final_vectors_per_task=FINAL_VECTORS_PER_TASK,
+        final_tokens_per_task=final_tokens_per_task,
         token_block_count=num_token_subtiles,
         q_ready_count=num_token_subtiles,
         receive_count=num_token_subtiles * (dcp_size - 1),
@@ -1896,9 +1914,9 @@ def validate_dcp_mega_metadata(
         raise AssertionError(
             "history combine queue does not cover every destination vector"
         )
-    if metadata.final_vectors_per_task != FINAL_VECTORS_PER_TASK:
+    if metadata.final_tokens_per_task not in FINAL_TOKEN_GRANULARITIES:
         raise AssertionError("invalid final task granularity")
-    expected_final = metadata.total_vectors // FINAL_VECTORS_PER_TASK
+    expected_final = _ceil_div(metadata.total_q, metadata.final_tokens_per_task)
     if len(metadata.final) != expected_final:
         raise AssertionError("final queue does not cover every local output vector")
 
@@ -1941,15 +1959,21 @@ def validate_dcp_mega_metadata(
 
     expected_final_layout = []
     for parent_token_block in metadata.heuristic_q_block_order:
-        parent_vector_begin = parent_token_block * 16 * hq_local
-        parent_vector_end = min(
-            parent_vector_begin + 16 * hq_local, metadata.total_vectors
-        )
-        for vector_begin in range(
-            parent_vector_begin, parent_vector_end, FINAL_VECTORS_PER_TASK
+        parent_token_begin = parent_token_block * 16
+        parent_valid_tokens = min(16, metadata.total_q - parent_token_begin)
+        for token_offset in range(
+            0, parent_valid_tokens, metadata.final_tokens_per_task
         ):
+            valid_tokens = min(
+                metadata.final_tokens_per_task,
+                parent_valid_tokens - token_offset,
+            )
             expected_final_layout.append(
-                (vector_begin, FINAL_VECTORS_PER_TASK, parent_token_block)
+                (
+                    (parent_token_begin + token_offset) * hq_local,
+                    valid_tokens * hq_local,
+                    parent_token_block,
+                )
             )
     chunk_completion_ids: dict[tuple[int, int], list[int]] = {}
     for row in metadata.attention[:chunk_count]:
@@ -2157,7 +2181,7 @@ def pack_dcp_mega_metadata(
     post_phase: int,
     capacity: int | None = None,
 ) -> array:
-    """Serialize a validated metadata v10 image into native int32 values."""
+    """Serialize a validated metadata v11 image into native int32 values."""
     if pre_phase <= 0 or post_phase <= pre_phase:
         raise ValueError("metadata phases must be positive and strictly increasing")
     payload = array("i", [0] * METADATA_HEADER_INTS)
@@ -2233,7 +2257,7 @@ def pack_dcp_mega_metadata(
         history_combine_offset,
     )
     if len(header) != METADATA_HEADER_INTS:
-        raise AssertionError("metadata v10 header width mismatch")
+        raise AssertionError("metadata v11 header width mismatch")
     payload[:METADATA_HEADER_INTS] = array("i", header)
     return payload
 
@@ -2244,7 +2268,8 @@ __all__ = [
     "DCPMegaDispatch",
     "DCPMegaMetadata",
     "FINAL_DESC_FIELDS",
-    "FINAL_VECTORS_PER_TASK",
+    "FINAL_TOKENS_PER_TASK",
+    "FINAL_TOKEN_GRANULARITIES",
     "HISTORY",
     "HISTORY_COMBINE_DESC_FIELDS",
     "HISTORY_COPY_VECTOR_GRANULARITIES",
@@ -2272,4 +2297,5 @@ __all__ = [
     "num_splits_heuristic",
     "pack_dcp_mega_metadata",
     "validate_dcp_mega_metadata",
+    "_choose_final_tokens_per_task",
 ]
