@@ -1015,8 +1015,8 @@ CUTLASS_DEVICE void run_final_combine(
             }
         }
         __syncthreads();
-        if (threadIdx.x < 256) {
-            constexpr int kVectorsPerWave = 16;
+        {
+            constexpr int kVectorsPerWave = Config::kNumWarps * 2;
             int const vector_in_wave = int(threadIdx.x) / 16;
             int const lane = int(threadIdx.x) % 16;
             unsigned const subgroup = (int(threadIdx.x) % 32) / 16;
