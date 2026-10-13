@@ -371,6 +371,24 @@ through 128 keep the BlockN=128 fallback when BlockN is `auto`. See
 [`DCP_MEGA_CRITICAL_WAVE_SCHEDULER.md`](../DCP_MEGA_CRITICAL_WAVE_SCHEDULER.md)
 for the model, thresholds, and measured A/B results.
 
+Final combine uses only the eight MMA warps (warp IDs 4-11) in each compute
+CTA; the four producer warps skip it. With `C = num_sms - num_comm_sm`, the
+final worker count is `W = 8*C`. Metadata selects the largest task size in
+`4, 2, 1` tokens whose task count `ceil(total_q / tokens_per_task)` is at least
+`W`, falling back to one token for smaller batches. Descriptors stay within
+their 16-token parent, with a shorter final descriptor for the tail.
+
+Each warp independently claims a task and processes two vectors per round,
+using 16 threads per vector and eight dimensions per thread. At most `W`
+tasks use static assignment `mma_warp_id*C + compute_cta_id`; larger queues
+use lane-0 atomic claims and warp shuffle broadcast. Dependencies and task
+iterations synchronize within the warp. The history-to-final CTA barrier and
+one CTA barrier after all final workers exit are retained. History weights
+are recomputed when combining source outputs; the separate weight-reuse
+experiment is not included. Queue diagnostics report
+`final_tokens_per_task`, `final_worker_warps`, and `final_task_waves`; the last
+field is a task-count ratio, not measured concurrency.
+
 The fixed eight-GPU correctness matrix runs DCP 2/4/8, Hq-local 4/8,
 BlockN 128/176, split/nosplit, and auto-split cases in a single process group.
 It uses ragged Q/history lengths,

@@ -32,6 +32,8 @@ import triton.language as tl
 
 import min_fa3_op
 from dcp_mega_metadata import (
+    FINAL_COMPUTE_WARPS,
+    FINAL_TOKENS_PER_TASK,
     MEGA_COMPUTE_WARPS,
     METADATA_HEADER_INTS,
     build_dcp_mega_metadata,
@@ -2483,9 +2485,11 @@ class DCPMegaAttentionRunner:
         max_q_ready = self._max_token_blocks
         max_publish = self.world_size * self._max_token_blocks
         max_history_combine = self.world_size * max_total_q * Hq_local
-        max_final = (max_total_q + 3) // 4
+        max_final = (
+            max_total_q + FINAL_TOKENS_PER_TASK - 1
+        ) // FINAL_TOKENS_PER_TASK
         vectors_per_publish = 16 * Hq_local
-        vectors_per_final = 4 * Hq_local
+        vectors_per_final = FINAL_TOKENS_PER_TASK * Hq_local
         max_q_dependencies = max_history_base_tiles * min(128, max_q_ready)
         max_publish_dependencies = (
             max_publish * vectors_per_publish * max_num_splits
@@ -2811,6 +2815,13 @@ class DCPMegaAttentionRunner:
             self._last_queue_counts = {
                 "token_blocks": token_blocks,
                 "final_tokens_per_task": metadata.final_tokens_per_task,
+                "final_worker_warps": (
+                    (self.num_sms - self.num_comm_sm) * FINAL_COMPUTE_WARPS
+                ),
+                "final_task_waves": (
+                    len(metadata.final)
+                    / ((self.num_sms - self.num_comm_sm) * FINAL_COMPUTE_WARPS)
+                ),
                 "q_ready_counters": metadata.q_ready_count,
                 "block_n_policy": (
                     "fixed"

@@ -477,6 +477,14 @@ FIFO 模式下两者都必须保持原 token-major/batch-major 顺序。
 
 同一组 shape、host cu-seqlens 和策略输入必须生成完全确定的 metadata。所有 tie-break 都包含原始 ID 或完整坐标，禁止依赖 Python set/dict 的非确定遍历顺序。
 
+### 12.6 Final combine 的 warp 任务
+
+final combine 使用每个 compute CTA 的八个 MMA warp（warp 4–11）；producer warp 0–3 跳过 final。令 `C = num_sms - num_comm_sm`、`W = 8C`，metadata 从 `4、2、1 tokens/task` 中选择满足 `ceil(total_q / tokens_per_task) >= W` 的最大粒度；不足一轮 worker 的小 batch 使用 1 token/task。descriptor 不跨 16-token parent，尾部只覆盖有效 token。
+
+每个 warp 独立处理一票，每轮两个 vector，保持 16 threads/vector、每线程 8 维。`final_count <= W` 时采用静态任务编号 `mma_warp_id * C + compute_cta_id`，其中 `mma_warp_id = warp_id - 4`；更大队列由每个 warp 的 lane 0 从同一 counter 领取，再广播给本 warp。任务依赖与票内计算只使用 warp 同步；保留 history→final 的 CTA barrier，以及全部 warp 退出 final 后的一次 CTA barrier。final 的 source 权重仍在输出加权时重新计算，不包含独立的权重复用优化。
+
+这些任务不进入 attention/history 的 critical-wave 成本模型。metadata 语义版本为 12，header 仍为 40 个整数，final descriptor 仍为 8 个整数；runner 按最小的 1-token 任务预留容量。
+
 ## 13. 运行时接口与诊断
 
 split 轴：
@@ -516,6 +524,8 @@ history_order_policy:
 - baseline/selected attention makespan；
 - combine penalty 和完整 gain；
 - selected split vector、plan source 和 Q block order。
+
+final 另记录 `final_tokens_per_task`、`final_worker_warps = 8C` 与 `final_task_waves = final_count / (8C)`。后者只表示名义任务轮数，不表示实测并发，也不改变 history worker 的诊断或成本模型。
 
 这些字段用于解释决策和回归测试，不构成 device metadata ABI。
 

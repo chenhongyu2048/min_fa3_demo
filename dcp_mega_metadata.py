@@ -38,11 +38,12 @@ PUBLISH_DESC_FIELDS = 8
 HISTORY_COMBINE_DESC_FIELDS = 8
 FINAL_DESC_FIELDS = 8
 METADATA_HEADER_INTS = 40
-METADATA_VERSION = 7
+METADATA_VERSION = 12
 MEGA_COMPUTE_WARPS = 12
+FINAL_COMPUTE_WARPS = 8
 # Minimum adaptive final granularity and the runner capacity bound.
-FINAL_TOKENS_PER_TASK = 4
-FINAL_TOKEN_GRANULARITIES = (4, 8, 16)
+FINAL_TOKENS_PER_TASK = 1
+FINAL_TOKEN_GRANULARITIES = (1, 2, 4)
 HISTORY_MAX_COPY_VECTORS = 32
 HISTORY_TASK_WAVE_TARGET = 0.8
 SCHEDULER_POLICY_FIFO = "fifo"
@@ -184,14 +185,14 @@ def _ceil_div(value: int, divisor: int) -> int:
 
 
 def _choose_final_tokens_per_task(
-    token_block_count: int, num_compute_ctas: int
+    total_q: int, num_compute_ctas: int
 ) -> int:
-    """Choose final compute granularity from 16-token communication tasks."""
-    if token_block_count < num_compute_ctas:
-        return 4
-    if token_block_count < 2 * num_compute_ctas:
-        return 8
-    return 16
+    """Choose the largest task size that supplies every final warp a task."""
+    workers = FINAL_COMPUTE_WARPS * num_compute_ctas
+    for tokens in reversed(FINAL_TOKEN_GRANULARITIES):
+        if _ceil_div(total_q, tokens) >= workers:
+            return tokens
+    return FINAL_TOKENS_PER_TASK
 
 
 def _combined_scheduler_policy(
@@ -1537,7 +1538,7 @@ def build_dcp_mega_metadata(
     total_q = cu_q[-1]
     num_token_subtiles = _ceil_div(total_q, 16)
     final_tokens_per_task = _choose_final_tokens_per_task(
-        num_token_subtiles, num_sms - num_comm_sm
+        total_q, num_sms - num_comm_sm
     )
     q_tasks: list[tuple[int, ...]] = []
     for token_subtile in range(num_token_subtiles):
@@ -2198,7 +2199,7 @@ def pack_dcp_mega_metadata(
     post_phase: int,
     capacity: int | None = None,
 ) -> array:
-    """Serialize a validated metadata v7 image into native int32 values."""
+    """Serialize a validated metadata v12 image into native int32 values."""
     if pre_phase <= 0 or post_phase <= pre_phase:
         raise ValueError("metadata phases must be positive and strictly increasing")
     payload = array("i", [0] * METADATA_HEADER_INTS)
@@ -2274,7 +2275,7 @@ def pack_dcp_mega_metadata(
         history_combine_offset,
     )
     if len(header) != METADATA_HEADER_INTS:
-        raise AssertionError("metadata v7 header width mismatch")
+        raise AssertionError("metadata v12 header width mismatch")
     payload[:METADATA_HEADER_INTS] = array("i", header)
     return payload
 
@@ -2284,6 +2285,7 @@ __all__ = [
     "CHUNK",
     "DCPMegaDispatch",
     "DCPMegaMetadata",
+    "FINAL_COMPUTE_WARPS",
     "FINAL_DESC_FIELDS",
     "FINAL_TOKEN_GRANULARITIES",
     "FINAL_TOKENS_PER_TASK",

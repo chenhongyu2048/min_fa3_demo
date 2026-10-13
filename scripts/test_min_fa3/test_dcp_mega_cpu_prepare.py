@@ -62,6 +62,17 @@ class QueueCacheTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             metadata.validate_dcp_mega_metadata(bad, (0, 1, 2), hq_local=8, dcp_size=4)
 
+    def test_final_granularity_cache_tracks_mma_worker_capacity(self):
+        q, history = (0, 1, 127), (0, 129, 1153)
+        first = self.build(q=q, history=history, num_sms=12, num_comm_sm=4)
+        self.assertEqual(first.final_tokens_per_task, 2)
+        more_workers = self.build(q=q, history=history, num_sms=13, num_comm_sm=4)
+        self.assertEqual(more_workers.final_tokens_per_task, 1)
+        self.assertEqual(len(first.final), 64)
+        self.assertEqual(len(more_workers.final), 127)
+        cached = self.build(q=q, history=history, num_sms=12, num_comm_sm=4)
+        self.assertIs(cached.final, first.final)
+
     def test_queue_cache_is_bounded(self):
         for length in range(1, metadata._METADATA_QUEUE_CACHE_SIZE + 3):
             self.build(q=(0, length, length + 1))

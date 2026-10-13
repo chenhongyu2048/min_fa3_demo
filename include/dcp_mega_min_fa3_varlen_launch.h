@@ -972,13 +972,17 @@ CUTLASS_DEVICE void run_final_combine(
     int const num_compute_ctas = params.num_sms - params.num_comm_sm;
     int const warp_id = int(threadIdx.x) / cutlass::NumThreadsPerWarp;
     int const warp_lane = kittens::laneid();
+    constexpr int kNumFinalWarps
+        = Config::AttentionKernel::NumMmaThreads / cutlass::NumThreadsPerWarp;
+    constexpr int kFirstFinalWarp = Config::kNumWarps - kNumFinalWarps;
     bool const static_schedule
-        = params.get_final_count() <= num_compute_ctas * Config::kNumWarps;
-    while (true) {
+        = params.get_final_count() <= num_compute_ctas * kNumFinalWarps;
+    while (warp_id >= kFirstFinalWarp) {
         int work_id = -1;
         if (static_schedule) {
             // Spread small queues across CTAs before assigning another warp.
-            work_id = warp_id * num_compute_ctas + compute_cta_id;
+            work_id = (warp_id - kFirstFinalWarp) * num_compute_ctas
+                + compute_cta_id;
         } else {
             if (warp_lane == 0) {
                 work_id = atomicAdd(

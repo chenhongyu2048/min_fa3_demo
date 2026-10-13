@@ -54,6 +54,22 @@ class NativePackedTests(unittest.TestCase):
                 self.assertEqual(dispatch, reference.dispatch)
                 self.assertEqual(payload, expected)
 
+    def test_final_warp_granularity_boundaries_match_python(self):
+        for hq_local in (4, 8):
+            for total_q, expected_tokens in ((126, 1), (127, 2), (252, 2), (253, 4)):
+                with self.subTest(hq_local=hq_local, total_q=total_q):
+                    q, h = (0, 1, 4, total_q), (0, 129, 1153, 9345)
+                    config = dict(hq_local=hq_local, dcp_size=4,
+                                  num_sms=12, num_comm_sm=4,
+                                  requested_num_splits=2, scheduler_heuristic=False)
+                    reference = metadata.build_dcp_mega_metadata(q, h, **config)
+                    self.assertEqual(reference.final_tokens_per_task, expected_tokens)
+                    expected = metadata.pack_dcp_mega_metadata(
+                        reference, pre_phase=1, post_phase=2)
+                    _, actual = metadata.build_packed_dcp_mega_metadata(
+                        q, h, pre_phase=1, post_phase=2, **config)
+                    self.assertEqual(actual, expected)
+
     def prepare(self, q=(0, 1, 2), h=(0, 8192, 16384), **options):
         config = dict(hq_local=8, dcp_size=4, num_sms=78, num_comm_sm=8,
                       scheduler_heuristic=False, max_num_splits=1,
