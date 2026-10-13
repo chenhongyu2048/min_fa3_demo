@@ -1050,8 +1050,9 @@ CUTLASS_DEVICE void run_final_combine(
                             mask, max_lse, offset, 16);
                         max_lse = max_lse > other ? max_lse : other;
                     }
-                    float denominator = isfinite(owned_lse)
+                    float const owned_weight = isfinite(owned_lse)
                         ? expf(owned_lse - max_lse) : 0.0f;
+                    float denominator = owned_weight;
                     #pragma unroll
                     for (int offset = 8; offset > 0; offset >>= 1) {
                         denominator += __shfl_xor_sync(
@@ -1062,10 +1063,8 @@ CUTLASS_DEVICE void run_final_combine(
                     #pragma unroll
                     for (int source = 0; source < Config::kDCPSize; ++source) {
                         bool const self_source = source == params.dcp_rank;
-                        float const state_lse
-                            = __shfl_sync(mask, owned_lse, source, 16);
-                        float const state_scale = isfinite(state_lse)
-                            ? expf(state_lse - max_lse) : 0.0f;
+                        float const state_scale
+                            = __shfl_sync(mask, owned_weight, source, 16);
                         #pragma unroll
                         for (int item = 0; item < 8; ++item) {
                             int const dim = lane * 8 + item;
