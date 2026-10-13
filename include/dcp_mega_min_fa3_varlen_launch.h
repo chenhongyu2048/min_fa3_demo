@@ -225,7 +225,6 @@ struct DCPMegaKernelConfig {
     using HistoryRemote = kittens::pgl<HistoryGlobal, DCPSize, false>;
 
     struct alignas(128) HelperSharedStorage {
-        int work_id;
         int receive_task_ids[kNumCommChunks];
         float source_lse[kNumCommChunks][16 * CommHeads];
         alignas(128) CommTile comm_tiles[kNumCommChunks];
@@ -968,28 +967,30 @@ CUTLASS_DEVICE void run_communication_post_q(
 
 template <typename Config>
 CUTLASS_DEVICE void run_final_combine(
-    typename Config::KernelParams const& params,
-    typename Config::HelperSharedStorage& shared) {
+    typename Config::KernelParams const& params) {
     int const compute_cta_id = int(blockIdx.x) - params.num_comm_sm;
     int const num_compute_ctas = params.num_sms - params.num_comm_sm;
-    bool const static_schedule = params.get_final_count() <= num_compute_ctas;
+    int const warp_id = int(threadIdx.x) / cutlass::NumThreadsPerWarp;
+    int const warp_lane = kittens::laneid();
+    bool const static_schedule
+        = params.get_final_count() <= num_compute_ctas * Config::kNumWarps;
     while (true) {
-        int work_id;
+        int work_id = -1;
         if (static_schedule) {
-            work_id = compute_cta_id;
+            // Spread small queues across CTAs before assigning another warp.
+            work_id = warp_id * num_compute_ctas + compute_cta_id;
         } else {
-            if (threadIdx.x == 0) {
-                shared.work_id = atomicAdd(
+            if (warp_lane == 0) {
+                work_id = atomicAdd(
                     params.queue_state + kFinalCounter, 1);
             }
-            __syncthreads();
-            work_id = shared.work_id;
+            work_id = __shfl_sync(0xffffffffu, work_id, 0);
         }
         if (work_id >= params.get_final_count()) {
             break;
         }
         FinalWorkDesc const work = params.get_final()[work_id];
-        if (threadIdx.x == 0) {
+        if (warp_lane == 0) {
             for (int dep = 0; dep < work.dependency_count; ++dep) {
                 int const completion_id = params.get_final_dependencies()[
                     work.dependency_begin + dep];
@@ -1014,10 +1015,10 @@ CUTLASS_DEVICE void run_final_combine(
                     params.receive_ready + receive_id, 1);
             }
         }
-        __syncthreads();
+        __syncwarp();
         {
-            constexpr int kVectorsPerWave = Config::kNumWarps * 2;
-            int const vector_in_wave = int(threadIdx.x) / 16;
+            constexpr int kVectorsPerWave = 2;
+            int const vector_in_wave = warp_lane / 16;
             int const lane = int(threadIdx.x) % 16;
             unsigned const subgroup = (int(threadIdx.x) % 32) / 16;
             unsigned const mask = 0xffffu << (subgroup * 16);
@@ -1148,11 +1149,12 @@ CUTLASS_DEVICE void run_final_combine(
                     }
             }
         }
-        __syncthreads();
+        __syncwarp();
         if (static_schedule) {
             break;
         }
     }
+    __syncthreads();
 }
 
 template <typename Config>
@@ -1195,12 +1197,12 @@ void dcp_mega_varlen_kernel(
         params.num_sms - params.num_comm_sm);
     run_history_combine<Config>(params, helper_shared);
     // History combine uses independent per-warp queues. This is the only CTA
-    // convergence point before the existing CTA-oriented final combine.
+    // convergence point before the warp-oriented final combine.
     __syncthreads();
     record_fused_history_publish_completion(
         params.queue_state, params.phase_timestamps,
         params.num_sms - params.num_comm_sm);
-    run_final_combine<Config>(params, helper_shared);
+    run_final_combine<Config>(params);
     record_phase_completion(
         params.queue_state, params.phase_timestamps,
         kFinalCombinePhaseCounter, kFinalCombineDoneTimestamp,

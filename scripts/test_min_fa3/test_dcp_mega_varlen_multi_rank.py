@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 
 import min_fa3_op
+from dcp_mega_metadata import MEGA_COMPUTE_WARPS
 from min_fa3_dcp import DCPMegaAttentionRunner
 
 
@@ -35,6 +36,15 @@ class CorrectnessCase:
     block_n: int
     repeat: int
     num_comm_sm: int
+
+
+def assert_final_claims(runner: DCPMegaAttentionRunner) -> None:
+    final_tasks = runner.last_queue_counts["actual"]["final_tasks"]
+    worker_warps = (runner.num_sms - runner.num_comm_sm) * MEGA_COMPUTE_WARPS
+    expected = 0 if final_tasks <= worker_warps else final_tasks + worker_warps
+    actual = int(runner._queue_state[2].item())  # kFinalCounter
+    if actual != expected:
+        raise AssertionError(f"final warp claims: expected {expected}, got {actual}")
 
 
 def parse_lengths(value: str, name: str) -> list[int]:
@@ -245,6 +255,7 @@ def run_case(
             )
             runner.copy_last_phase_timestamps(timestamps)
             torch.cuda.synchronize(device)
+            assert_final_claims(runner)
             torch.testing.assert_close(
                 actual_o, expected_o, atol=3.0e-2, rtol=3.0e-2
             )
@@ -270,6 +281,7 @@ def run_case(
             replay_o, replay_lse = runner.replay_last_forward()
             runner.copy_last_phase_timestamps(timestamps)
             torch.cuda.synchronize(device)
+            assert_final_claims(runner)
             torch.testing.assert_close(
                 replay_o, expected_o, atol=3.0e-2, rtol=3.0e-2
             )
@@ -294,6 +306,7 @@ def run_case(
                     graph_o, graph_lse = graph.replay()
                     runner.copy_last_phase_timestamps(timestamps)
                     torch.cuda.synchronize(device)
+                    assert_final_claims(runner)
                     torch.testing.assert_close(
                         graph_o, expected_o, atol=3.0e-2, rtol=3.0e-2
                     )
