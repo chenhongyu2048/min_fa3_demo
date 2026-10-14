@@ -479,11 +479,13 @@ FIFO 模式下两者都必须保持原 token-major/batch-major 顺序。
 
 ### 12.6 Final combine 的 warp 任务
 
-每个 compute CTA 在完成 attention 并经过原有 CTA barrier 后，将三个 WG 的每线程寄存器配额从 `24/240/240` 统一为 `168/168/168`：producer WG 使用 `warpgroup_reg_alloc<168>()`，两个 MMA WG 使用 `warpgroup_reg_dealloc<168>()`。CTA 总配额仍为 64,512 个寄存器。随后沿用各 warp 独立领取的 history combine/copy；不新增 barrier，也不改变下述 final 的参与 warp 和任务分配。
+每个 compute CTA 在完成 attention 并经过原有 CTA barrier 后，将三个 WG 的每线程寄存器配额从 `24/240/240` 统一为 `168/168/168`：producer WG 使用 `warpgroup_reg_alloc<168>()`，两个 MMA WG 使用 `warpgroup_reg_dealloc<168>()`。CTA 总配额仍为 64,512 个寄存器。随后沿用各 warp 独立领取的 history combine/copy；寄存器切换不新增 barrier，全部 12 个物理 warp 以统一配额参与 final。
 
 final combine 保留原始 metadata v7、4/8/16-token 自适应规则和 descriptor，每个 descriptor 在 kernel 内对应八张虚拟 warp 票。`ticket / 8` 选择 descriptor，`ticket % 8` 选择原始 warp 的数据份额；vector 从 `2 * (ticket % 8) + lane / 16` 开始，步长为 16。每张 warp 票的数据子集及遍历顺序与原始版对应 warp 完全一致，包括尾部的空份额。
 
-参与计算的是 MMA warp 4–11，分别接手原 warp 0–7 的数据份额；producer warp 0–3 跳过 final 计算。保持 16 threads/vector、每线程 8 维。令 `C = num_sms - num_comm_sm`、`F = final_count`，`F <= C` 时静态票号为 `8 * compute_cta_id + (warp_id - 4)`，保留原来的 CTA→descriptor 分配；否则由各 warp 的 lane 0 从同一 counter 领取 `8F` 张虚拟票，再广播给本 warp。各票等待原 descriptor 的完整依赖，票内只使用 warp 同步；保留 history→final 的 CTA barrier，以及全部 warp 退出 final 后的一次 CTA barrier。final 的数学计算保持原样，不包含独立的权重复用优化。
+物理 warp 0–11 全部参与领取，保持 16 threads/vector、每线程 8 维。12 个物理 worker 与每个 descriptor 的八份逻辑数据分工独立，每票数据量和步长 16 均保持原样。令 `C = num_sms - num_comm_sm`、`F = final_count`，静态条件仍为 `F <= C`，静态票号为 `12 * compute_cta_id + warp_id`，同一 descriptor 的八份数据可以由两个 CTA 分担；否则由全部 warp 的 lane 0 从同一 counter 领取 `8F` 张虚拟票，再广播给本 warp。动态队列排空后 counter 为 `8F + 12C`，包括每个物理 worker 的一次退出领取。各票独立等待原 descriptor 的完整依赖，票内只使用 warp 同步；保留 history→final 的 CTA barrier，以及全部 warp 退出 final 后的一次 CTA barrier。final 的数学计算保持原样，不包含独立的权重复用优化。
+
+静态有效票集中在 `ceil(8F/12)` 个 CTA，相比八-worker 映射的 `F` 个 CTA 更少；每份逻辑数据量保持不变，但 CTA 分布随物理 worker 数变化。
 
 虚拟票不进入 metadata，也不改变 attention/history 的 critical-wave 成本模型。header 仍为 40 个整数，final descriptor 仍为 8 个整数，`final_count` 仍统计原始 descriptor 数；runner 容量与原始版相同。
 

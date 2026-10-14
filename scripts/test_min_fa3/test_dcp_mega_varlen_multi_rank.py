@@ -42,7 +42,7 @@ def assert_final_claims(runner: DCPMegaAttentionRunner) -> None:
     num_compute_ctas = runner.num_sms - runner.num_comm_sm
     expected = (
         0 if final_tasks <= num_compute_ctas
-        else 8 * (final_tasks + num_compute_ctas)
+        else 8 * final_tasks + 12 * num_compute_ctas
     )
     actual = int(runner._queue_state[2].item())  # kFinalCounter
     if actual != expected:

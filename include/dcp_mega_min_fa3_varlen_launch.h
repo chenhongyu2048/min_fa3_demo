@@ -972,15 +972,12 @@ CUTLASS_DEVICE void run_final_combine(
     int const num_compute_ctas = params.num_sms - params.num_comm_sm;
     int const warp_id = int(threadIdx.x) / cutlass::NumThreadsPerWarp;
     int const warp_lane = kittens::laneid();
-    constexpr int kNumFinalWarps
-        = Config::AttentionKernel::NumMmaThreads / cutlass::NumThreadsPerWarp;
-    constexpr int kFirstFinalWarp = Config::kNumWarps - kNumFinalWarps;
+    constexpr int kWarpTasksPerDescriptor = 8;
     bool const static_schedule = params.get_final_count() <= num_compute_ctas;
-    while (warp_id >= kFirstFinalWarp) {
+    while (true) {
         int warp_work_id = -1;
         if (static_schedule) {
-            warp_work_id = compute_cta_id * kNumFinalWarps
-                + warp_id - kFirstFinalWarp;
+            warp_work_id = compute_cta_id * Config::kNumWarps + warp_id;
         } else {
             if (warp_lane == 0) {
                 warp_work_id = atomicAdd(
@@ -988,10 +985,10 @@ CUTLASS_DEVICE void run_final_combine(
             }
             warp_work_id = __shfl_sync(0xffffffffu, warp_work_id, 0);
         }
-        if (warp_work_id >= params.get_final_count() * kNumFinalWarps) {
+        if (warp_work_id >= params.get_final_count() * kWarpTasksPerDescriptor) {
             break;
         }
-        int const work_id = warp_work_id / kNumFinalWarps;
+        int const work_id = warp_work_id / kWarpTasksPerDescriptor;
         FinalWorkDesc const work = params.get_final()[work_id];
         if (warp_lane == 0) {
             for (int dep = 0; dep < work.dependency_count; ++dep) {
@@ -1022,7 +1019,7 @@ CUTLASS_DEVICE void run_final_combine(
         {
             constexpr int kVectorsPerWave = 16;
             int const vector_in_wave
-                = (warp_work_id % kNumFinalWarps) * 2 + warp_lane / 16;
+                = (warp_work_id % kWarpTasksPerDescriptor) * 2 + warp_lane / 16;
             int const lane = int(threadIdx.x) % 16;
             unsigned const subgroup = (int(threadIdx.x) % 32) / 16;
             unsigned const mask = 0xffffu << (subgroup * 16);
