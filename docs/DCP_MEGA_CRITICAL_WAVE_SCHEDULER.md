@@ -477,17 +477,15 @@ FIFO 模式下两者都必须保持原 token-major/batch-major 顺序。
 
 同一组 shape、host cu-seqlens 和策略输入必须生成完全确定的 metadata。所有 tie-break 都包含原始 ID 或完整坐标，禁止依赖 Python set/dict 的非确定遍历顺序。
 
-### 12.6 Final combine 的 warp 任务
+### 12.6 Combine 寄存器与任务分配
 
-每个 compute CTA 在完成 attention 并经过原有 CTA barrier 后，将三个 WG 的每线程寄存器配额从 `24/240/240` 统一为 `168/168/168`：producer WG 使用 `warpgroup_reg_alloc<168>()`，两个 MMA WG 使用 `warpgroup_reg_dealloc<168>()`。CTA 总配额仍为 64,512 个寄存器。随后沿用各 warp 独立领取的 history combine/copy；寄存器切换不新增 barrier，全部 12 个物理 warp 以统一配额参与 final。
+每个 compute CTA 在完成 attention 并经过原有 CTA barrier 后，将三个 WG 的每线程寄存器配额从 `24/240/240` 统一为 `168/168/168`：producer WG 使用 `warpgroup_reg_alloc<168>()`，两个 MMA WG 使用 `warpgroup_reg_dealloc<168>()`。CTA 总配额仍为 64,512 个寄存器，寄存器切换不新增 barrier。History combine/copy 由 12 个 warp 各自独立领取和执行任务。
 
-final combine 保留原始 metadata v7、4/8/16-token 自适应规则和 descriptor，每个 descriptor 在 kernel 内对应八张虚拟 warp 票。`ticket / 8` 选择 descriptor，`ticket % 8` 选择原始 warp 的数据份额；vector 从 `2 * (ticket % 8) + lane / 16` 开始，步长为 16。每张 warp 票的数据子集及遍历顺序与原始版对应 warp 完全一致，包括尾部的空份额。
+Final combine 使用 metadata v7 和 4/8/16-token 自适应 descriptor，由 CTA 领取。令 `C = num_sms - num_comm_sm`、`F = final_count`，`F <= C` 时静态任务编号为 `compute_cta_id`；更大队列由 thread 0 从 counter 原子领取任务，通过 shared memory 和 CTA barrier 广播编号。
 
-物理 warp 0–11 全部参与领取，保持 16 threads/vector、每线程 8 维。12 个物理 worker 与每个 descriptor 的八份逻辑数据分工独立，每票数据量和步长 16 均保持原样。令 `C = num_sms - num_comm_sm`、`F = final_count`，静态条件仍为 `F <= C`，静态票号为 `12 * compute_cta_id + warp_id`，同一 descriptor 的八份数据可以由两个 CTA 分担；否则由全部 warp 的 lane 0 从同一 counter 领取 `8F` 张虚拟票，再广播给本 warp。动态队列排空后 counter 为 `8F + 12C`，包括每个物理 worker 的一次退出领取。各票独立等待原 descriptor 的完整依赖，票内只使用 warp 同步；保留 history→final 的 CTA barrier，以及全部 warp 退出 final 后的一次 CTA barrier。final 的数学计算保持原样，不包含独立的权重复用优化。
+Thread 0 等待本票的 chunk attention、本地 history publish 和远端 receive 依赖，随后经 CTA barrier 开始计算。Warp 0–7 每轮处理 16 个 vector，采用 16 threads/vector、每线程 8 维；其余线程参加同步。每票完成后全 CTA 同步，再进入下一票。History→final 的 CTA barrier 和 combine 数学计算保持原样。
 
-静态有效票集中在 `ceil(8F/12)` 个 CTA，相比八-worker 映射的 `F` 个 CTA 更少；每份逻辑数据量保持不变，但 CTA 分布随物理 worker 数变化。
-
-虚拟票不进入 metadata，也不改变 attention/history 的 critical-wave 成本模型。header 仍为 40 个整数，final descriptor 仍为 8 个整数，`final_count` 仍统计原始 descriptor 数；runner 容量与原始版相同。
+Attention/history 的 critical-wave 成本模型、metadata 数量和 runner 容量保持不变。Header 为 40 个整数，final descriptor 为 8 个整数。
 
 ## 13. 运行时接口与诊断
 

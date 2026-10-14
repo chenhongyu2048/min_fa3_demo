@@ -374,33 +374,20 @@ for the model, thresholds, and measured A/B results.
 After each compute CTA completes attention and its existing CTA barrier,
 the producer warpgroup increases its per-thread register budget from 24 to
 168, while both MMA warpgroups reduce theirs from 240 to 168. This preserves
-the CTA's total register budget and gives all 12 warps the same budget for
-history combine/copy and final combine. The transition uses CUTLASS
-`setmaxnreg` wrappers with no additional barrier. All 12 physical warps
-participate in final combine with this unified register budget.
+the CTA's total register budget. The transition uses CUTLASS `setmaxnreg`
+wrappers with no additional barrier. History combine/copy uses all 12 warps,
+each independently claiming tasks from the history queue.
 
-Final combine retains the original metadata v7 descriptors and adaptive
-4/8/16-token selection. Each descriptor has eight virtual warp tickets;
-`ticket / 8` selects the descriptor and `ticket % 8` selects its original
-warp's vector subset. The subset starts at `2 * (ticket % 8) + lane / 16`
-and advances by 16 vectors, preserving the original per-warp work exactly.
-Physical warp IDs 0-11 process these tickets, using 16 threads per vector and
-eight dimensions per thread. The 12 physical workers are independent of the
-eight logical subsets per descriptor; the original per-ticket work and
-16-vector stride remain unchanged.
-
-With `C = num_sms - num_comm_sm` and `F` metadata final descriptors, `F <= C`
-uses static tickets `12 * compute_cta_id + warp_id`. A descriptor's subsets
-can therefore span two CTAs, and valid tickets occupy `ceil(8 * F / 12)`
-CTAs. Larger queues use independent lane-0 atomic
-claims and warp shuffle broadcast over `8 * F` tickets. Each ticket waits
-on its descriptor's original dependencies and synchronizes within the warp.
-After a dynamic queue drains, its counter is `8 * F + 12 * C`, including one
-exit claim per physical worker.
-Tail descriptors retain all eight tickets; empty subsets naturally perform
-no vector work. The history-to-final CTA barrier and one final exit CTA
-barrier are retained. Metadata counts and workspace capacity are unchanged;
-the separate history-weight-reuse experiment is not included.
+Final combine uses metadata v7 and adaptive 4/8/16-token descriptors claimed
+by each CTA. With `C = num_sms - num_comm_sm` and `F` final descriptors,
+`F <= C` assigns task `compute_cta_id` statically; larger queues use thread 0
+to claim a task atomically and broadcast its ID through shared memory.
+Thread 0 waits for the task's chunk attention, local history publication,
+and remote receive dependencies before a CTA barrier releases computation.
+Warp IDs 0-7 process 16 vectors per round, using 16 threads per vector and
+eight dimensions per thread. Every CTA thread joins the task-completion
+barrier before the next task. History-to-final synchronization, metadata
+counts, workspace capacity, and combine arithmetic remain unchanged.
 
 The fixed eight-GPU correctness matrix runs DCP 2/4/8, Hq-local 4/8,
 BlockN 128/176, split/nosplit, and auto-split cases in a single process group.
