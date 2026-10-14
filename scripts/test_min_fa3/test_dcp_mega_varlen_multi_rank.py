@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 
 import min_fa3_op
+from dcp_mega_metadata import MEGA_COMPUTE_WARPS
 from min_fa3_dcp import DCPMegaAttentionRunner
 
 
@@ -35,6 +36,16 @@ class CorrectnessCase:
     block_n: int
     repeat: int
     num_comm_sm: int
+
+
+def assert_history_claims(runner: DCPMegaAttentionRunner) -> None:
+    history_tasks = runner.last_queue_counts["actual"]["history_combine_tasks"]
+    num_compute_ctas = runner.num_sms - runner.num_comm_sm
+    task_batches = (history_tasks + MEGA_COMPUTE_WARPS - 1) // MEGA_COMPUTE_WARPS
+    expected = MEGA_COMPUTE_WARPS * (task_batches + num_compute_ctas)
+    actual = int(runner._queue_state[1].item())  # kHistoryCombineCounter
+    if actual != expected:
+        raise AssertionError(f"history CTA claims: expected {expected}, got {actual}")
 
 
 def assert_final_claims(runner: DCPMegaAttentionRunner) -> None:
@@ -257,6 +268,7 @@ def run_case(
             )
             runner.copy_last_phase_timestamps(timestamps)
             torch.cuda.synchronize(device)
+            assert_history_claims(runner)
             assert_final_claims(runner)
             torch.testing.assert_close(
                 actual_o, expected_o, atol=3.0e-2, rtol=3.0e-2
@@ -283,6 +295,7 @@ def run_case(
             replay_o, replay_lse = runner.replay_last_forward()
             runner.copy_last_phase_timestamps(timestamps)
             torch.cuda.synchronize(device)
+            assert_history_claims(runner)
             assert_final_claims(runner)
             torch.testing.assert_close(
                 replay_o, expected_o, atol=3.0e-2, rtol=3.0e-2
@@ -308,6 +321,7 @@ def run_case(
                     graph_o, graph_lse = graph.replay()
                     runner.copy_last_phase_timestamps(timestamps)
                     torch.cuda.synchronize(device)
+                    assert_history_claims(runner)
                     assert_final_claims(runner)
                     torch.testing.assert_close(
                         graph_o, expected_o, atol=3.0e-2, rtol=3.0e-2

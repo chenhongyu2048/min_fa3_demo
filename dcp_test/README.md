@@ -375,8 +375,18 @@ After each compute CTA completes attention and its existing CTA barrier,
 the producer warpgroup increases its per-thread register budget from 24 to
 168, while both MMA warpgroups reduce theirs from 240 to 168. This preserves
 the CTA's total register budget. The transition uses CUTLASS `setmaxnreg`
-wrappers with no additional barrier. History combine/copy uses all 12 warps,
-each independently claiming tasks from the history queue.
+wrappers with no additional barrier.
+
+History combine/copy claims 12 existing descriptors per CTA round. Thread 0
+increments the history counter by 12 and broadcasts the base ticket through
+`shared.work_id` and a CTA barrier. Warp `w` handles ticket `base + w`,
+independently waits for its descriptor's dependencies, computes the result,
+and immediately performs the existing per-task publication. A second CTA
+barrier waits for the slowest warp before reusing the shared ticket for the
+next round. If the base reaches the history task count, the entire CTA exits;
+warps beyond the last partial batch skip computation and join the barrier.
+Descriptor granularity, combine arithmetic, and the publication protocol are
+unchanged.
 
 Final combine uses metadata v7 and adaptive 4/8/16-token descriptors claimed
 by each CTA. With `C = num_sms - num_comm_sm` and `F` final descriptors,

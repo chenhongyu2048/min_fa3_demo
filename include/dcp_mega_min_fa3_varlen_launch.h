@@ -695,36 +695,51 @@ template <typename Config>
 CUTLASS_DEVICE void run_history_combine(
     typename Config::KernelParams const& params,
     typename Config::HelperSharedStorage& shared) {
+    int const warp_id = int(threadIdx.x) / cutlass::NumThreadsPerWarp;
     int const lane = kittens::laneid();
     while (true) {
-        int ticket = -1;
-        if (lane == 0) {
-            ticket = atomicAdd(
-                params.queue_state + kHistoryCombineCounter, 1);
+        if (threadIdx.x == 0) {
+            shared.work_id = atomicAdd(
+                params.queue_state + kHistoryCombineCounter, Config::kNumWarps);
         }
-        ticket = __shfl_sync(0xffffffffu, ticket, 0);
-        if (ticket >= params.get_history_combine_count()) {
+        __syncthreads();
+        int const ticket_base = shared.work_id;
+        if (ticket_base >= params.get_history_combine_count()) {
             break;
         }
-        HistoryCombineWorkDesc const work = params.get_history_combine()[ticket];
-        if (lane == 0) {
-            for (int dep = 0; dep < work.dependency_count; ++dep) {
-                int const completion_id = params.get_publish_dependencies()[
-                    work.dependency_begin + dep];
-                min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
-                    params.attention_done + completion_id, 1);
+        int const ticket = ticket_base + warp_id;
+        if (ticket < params.get_history_combine_count()) {
+            HistoryCombineWorkDesc const work = params.get_history_combine()[ticket];
+            if (lane == 0) {
+                for (int dep = 0; dep < work.dependency_count; ++dep) {
+                    int const completion_id = params.get_publish_dependencies()[
+                        work.dependency_begin + dep];
+                    min_fa3_varlen_demo::mega_ring::wait_until_at_least_acquire(
+                        params.attention_done + completion_id, 1);
+                }
             }
-        }
-        __syncwarp();
-        PublishWorkDesc const publish = params.get_publish()[work.publish_id];
-        if constexpr (Config::HistoryKernel::Split) {
-            if (work.actual_splits > 1) {
-                int const vector = work.vector_begin;
-                int const local_head = vector % params.hq_local;
-                int const history_head
-                    = publish.dst_rank * params.hq_local + local_head;
-                combine_history_splits<Config>(
-                    params, shared, work, publish, vector, history_head);
+            __syncwarp();
+            PublishWorkDesc const publish = params.get_publish()[work.publish_id];
+            if constexpr (Config::HistoryKernel::Split) {
+                if (work.actual_splits > 1) {
+                    int const vector = work.vector_begin;
+                    int const local_head = vector % params.hq_local;
+                    int const history_head
+                        = publish.dst_rank * params.hq_local + local_head;
+                    combine_history_splits<Config>(
+                        params, shared, work, publish, vector, history_head);
+                } else {
+                    for (int vector_in_task = 0;
+                         vector_in_task < work.valid_vectors;
+                         ++vector_in_task) {
+                        int const vector = work.vector_begin + vector_in_task;
+                        int const local_head = vector % params.hq_local;
+                        int const history_head
+                            = publish.dst_rank * params.hq_local + local_head;
+                        copy_single_history_split<Config>(
+                            params, publish, vector, history_head);
+                    }
+                }
             } else {
                 for (int vector_in_task = 0;
                      vector_in_task < work.valid_vectors;
@@ -737,19 +752,9 @@ CUTLASS_DEVICE void run_history_combine(
                         params, publish, vector, history_head);
                 }
             }
-        } else {
-            for (int vector_in_task = 0;
-                 vector_in_task < work.valid_vectors;
-                 ++vector_in_task) {
-                int const vector = work.vector_begin + vector_in_task;
-                int const local_head = vector % params.hq_local;
-                int const history_head
-                    = publish.dst_rank * params.hq_local + local_head;
-                copy_single_history_split<Config>(
-                    params, publish, vector, history_head);
-            }
+            complete_history_combine_task<Config>(params, work);
         }
-        complete_history_combine_task<Config>(params, work);
+        __syncthreads();
     }
 }
 
@@ -1200,8 +1205,7 @@ void dcp_mega_varlen_kernel(
         cutlass::arch::warpgroup_reg_dealloc<168>();
     }
     run_history_combine<Config>(params, helper_shared);
-    // History combine uses independent per-warp queues. This is the only CTA
-    // convergence point before the existing CTA-oriented final combine.
+    // Finish history before reusing shared.work_id for final tasks.
     __syncthreads();
     record_fused_history_publish_completion(
         params.queue_state, params.phase_timestamps,

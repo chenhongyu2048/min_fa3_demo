@@ -272,7 +272,7 @@ finish_j = start_j + combine_work_j
 worker.available_time = finish_j
 ```
 
-先领取 task 再等待 dependency，模拟 device 端 FIFO claim 后 warp 被该 task 占住的行为。模型不允许同一个 warp 绕过未就绪 task 去执行后续 ready task。
+先领取 task 再等待 dependency，模拟 device 端 FIFO claim 后 warp 被该 task 占住的行为。模型不允许同一个 warp 绕过未就绪 task 去执行后续 ready task。模型仍按独立 worker 推进，不计入 CTA 批量领取时的轮间等待与同步成本。
 
 最终评分为：
 
@@ -479,7 +479,9 @@ FIFO 模式下两者都必须保持原 token-major/batch-major 顺序。
 
 ### 12.6 Combine 寄存器与任务分配
 
-每个 compute CTA 在完成 attention 并经过原有 CTA barrier 后，将三个 WG 的每线程寄存器配额从 `24/240/240` 统一为 `168/168/168`：producer WG 使用 `warpgroup_reg_alloc<168>()`，两个 MMA WG 使用 `warpgroup_reg_dealloc<168>()`。CTA 总配额仍为 64,512 个寄存器，寄存器切换不新增 barrier。History combine/copy 由 12 个 warp 各自独立领取和执行任务。
+每个 compute CTA 在完成 attention 并经过原有 CTA barrier 后，将三个 WG 的每线程寄存器配额从 `24/240/240` 统一为 `168/168/168`：producer WG 使用 `warpgroup_reg_alloc<168>()`，两个 MMA WG 使用 `warpgroup_reg_dealloc<168>()`。CTA 总配额仍为 64,512 个寄存器，寄存器切换不新增 barrier。
+
+History combine/copy 每轮由 thread 0 对现有 history counter 执行 `atomicAdd(..., 12)`，将起始票号写入 `shared.work_id`，通过顶部 CTA barrier 广播。Warp `w` 处理 `base + w`，独立等待原 descriptor 的依赖、计算并立即执行原有 completion/publication。底部 CTA barrier 等待本轮最慢 warp 完成后，才复用 shared 票号进入下一轮。`base >= history_count` 时整个 CTA 退出；最后不足 12 票时，无有效票的 warp 跳过计算并参加 barrier。Descriptor、任务粒度、数学和 publish 协议保持不变。
 
 Final combine 使用 metadata v7 和 4/8/16-token 自适应 descriptor，由 CTA 领取。令 `C = num_sms - num_comm_sm`、`F = final_count`，`F <= C` 时静态任务编号为 `compute_cta_id`；更大队列由 thread 0 从 counter 原子领取任务，通过 shared memory 和 CTA barrier 广播编号。
 
