@@ -21,7 +21,6 @@ import torch
 import torch.distributed as dist
 
 import min_fa3_op
-from dcp_mega_metadata import FINAL_COMPUTE_WARPS
 from min_fa3_dcp import DCPMegaAttentionRunner
 
 
@@ -40,8 +39,11 @@ class CorrectnessCase:
 
 def assert_final_claims(runner: DCPMegaAttentionRunner) -> None:
     final_tasks = runner.last_queue_counts["actual"]["final_tasks"]
-    worker_warps = (runner.num_sms - runner.num_comm_sm) * FINAL_COMPUTE_WARPS
-    expected = 0 if final_tasks <= worker_warps else final_tasks + worker_warps
+    num_compute_ctas = runner.num_sms - runner.num_comm_sm
+    expected = (
+        0 if final_tasks <= num_compute_ctas
+        else 8 * (final_tasks + num_compute_ctas)
+    )
     actual = int(runner._queue_state[2].item())  # kFinalCounter
     if actual != expected:
         raise AssertionError(f"final warp claims: expected {expected}, got {actual}")

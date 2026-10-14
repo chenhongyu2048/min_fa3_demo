@@ -371,23 +371,24 @@ through 128 keep the BlockN=128 fallback when BlockN is `auto`. See
 [`DCP_MEGA_CRITICAL_WAVE_SCHEDULER.md`](../DCP_MEGA_CRITICAL_WAVE_SCHEDULER.md)
 for the model, thresholds, and measured A/B results.
 
-Final combine uses only the eight MMA warps (warp IDs 4-11) in each compute
-CTA; the four producer warps skip it. With `C = num_sms - num_comm_sm`, the
-final worker count is `W = 8*C`. Metadata selects the largest task size in
-`4, 2, 1` tokens whose task count `ceil(total_q / tokens_per_task)` is at least
-`W`, falling back to one token for smaller batches. Descriptors stay within
-their 16-token parent, with a shorter final descriptor for the tail.
+Final combine retains the original metadata v7 descriptors and adaptive
+4/8/16-token selection. Each descriptor has eight virtual warp tickets;
+`ticket / 8` selects the descriptor and `ticket % 8` selects its original
+warp's vector subset. The subset starts at `2 * (ticket % 8) + lane / 16`
+and advances by 16 vectors, preserving the original per-warp work exactly.
+MMA warp IDs 4-11 compute final, using 16 threads per vector and eight
+dimensions per thread; producer warp IDs 0-3 only join the final exit CTA
+barrier.
 
-Each warp independently claims a task and processes two vectors per round,
-using 16 threads per vector and eight dimensions per thread. At most `W`
-tasks use static assignment `mma_warp_id*C + compute_cta_id`; larger queues
-use lane-0 atomic claims and warp shuffle broadcast. Dependencies and task
-iterations synchronize within the warp. The history-to-final CTA barrier and
-one CTA barrier after all final workers exit are retained. History weights
-are recomputed when combining source outputs; the separate weight-reuse
-experiment is not included. Queue diagnostics report
-`final_tokens_per_task`, `final_worker_warps`, and `final_task_waves`; the last
-field is a task-count ratio, not measured concurrency.
+With `C = num_sms - num_comm_sm` and `F` metadata final descriptors, `F <= C`
+uses static tickets `8 * compute_cta_id + (warp_id - 4)`, preserving the
+original CTA-to-descriptor mapping. Larger queues use independent lane-0 atomic
+claims and warp shuffle broadcast over `8 * F` tickets. Each ticket waits
+on its descriptor's original dependencies and synchronizes within the warp.
+Tail descriptors retain all eight tickets; empty subsets naturally perform
+no vector work. The history-to-final CTA barrier and one final exit CTA
+barrier are retained. Metadata counts and workspace capacity are unchanged;
+the separate history-weight-reuse experiment is not included.
 
 The fixed eight-GPU correctness matrix runs DCP 2/4/8, Hq-local 4/8,
 BlockN 128/176, split/nosplit, and auto-split cases in a single process group.

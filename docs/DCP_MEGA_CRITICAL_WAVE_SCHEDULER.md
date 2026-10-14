@@ -479,11 +479,11 @@ FIFO 模式下两者都必须保持原 token-major/batch-major 顺序。
 
 ### 12.6 Final combine 的 warp 任务
 
-final combine 使用每个 compute CTA 的八个 MMA warp（warp 4–11）；producer warp 0–3 跳过 final。令 `C = num_sms - num_comm_sm`、`W = 8C`，metadata 从 `4、2、1 tokens/task` 中选择满足 `ceil(total_q / tokens_per_task) >= W` 的最大粒度；不足一轮 worker 的小 batch 使用 1 token/task。descriptor 不跨 16-token parent，尾部只覆盖有效 token。
+final combine 保留原始 metadata v7、4/8/16-token 自适应规则和 descriptor，每个 descriptor 在 kernel 内对应八张虚拟 warp 票。`ticket / 8` 选择 descriptor，`ticket % 8` 选择原始 warp 的数据份额；vector 从 `2 * (ticket % 8) + lane / 16` 开始，步长为 16。每张 warp 票的数据子集及遍历顺序与原始版对应 warp 完全一致，包括尾部的空份额。
 
-每个 warp 独立处理一票，每轮两个 vector，保持 16 threads/vector、每线程 8 维。`final_count <= W` 时采用静态任务编号 `mma_warp_id * C + compute_cta_id`，其中 `mma_warp_id = warp_id - 4`；更大队列由每个 warp 的 lane 0 从同一 counter 领取，再广播给本 warp。任务依赖与票内计算只使用 warp 同步；保留 history→final 的 CTA barrier，以及全部 warp 退出 final 后的一次 CTA barrier。final 的 source 权重仍在输出加权时重新计算，不包含独立的权重复用优化。
+参与计算的是 MMA warp 4–11，分别接手原 warp 0–7 的数据份额；producer warp 0–3 跳过 final 计算。保持 16 threads/vector、每线程 8 维。令 `C = num_sms - num_comm_sm`、`F = final_count`，`F <= C` 时静态票号为 `8 * compute_cta_id + (warp_id - 4)`，保留原来的 CTA→descriptor 分配；否则由各 warp 的 lane 0 从同一 counter 领取 `8F` 张虚拟票，再广播给本 warp。各票等待原 descriptor 的完整依赖，票内只使用 warp 同步；保留 history→final 的 CTA barrier，以及全部 warp 退出 final 后的一次 CTA barrier。final 的数学计算保持原样，不包含独立的权重复用优化。
 
-这些任务不进入 attention/history 的 critical-wave 成本模型。metadata 语义版本为 12，header 仍为 40 个整数，final descriptor 仍为 8 个整数；runner 按最小的 1-token 任务预留容量。
+虚拟票不进入 metadata，也不改变 attention/history 的 critical-wave 成本模型。header 仍为 40 个整数，final descriptor 仍为 8 个整数，`final_count` 仍统计原始 descriptor 数；runner 容量与原始版相同。
 
 ## 13. 运行时接口与诊断
 
@@ -524,8 +524,6 @@ history_order_policy:
 - baseline/selected attention makespan；
 - combine penalty 和完整 gain；
 - selected split vector、plan source 和 Q block order。
-
-final 另记录 `final_tokens_per_task`、`final_worker_warps = 8C` 与 `final_task_waves = final_count / (8C)`。后者只表示名义任务轮数，不表示实测并发，也不改变 history worker 的诊断或成本模型。
 
 这些字段用于解释决策和回归测试，不构成 device metadata ABI。
 

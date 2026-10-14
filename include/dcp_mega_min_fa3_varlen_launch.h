@@ -975,24 +975,23 @@ CUTLASS_DEVICE void run_final_combine(
     constexpr int kNumFinalWarps
         = Config::AttentionKernel::NumMmaThreads / cutlass::NumThreadsPerWarp;
     constexpr int kFirstFinalWarp = Config::kNumWarps - kNumFinalWarps;
-    bool const static_schedule
-        = params.get_final_count() <= num_compute_ctas * kNumFinalWarps;
+    bool const static_schedule = params.get_final_count() <= num_compute_ctas;
     while (warp_id >= kFirstFinalWarp) {
-        int work_id = -1;
+        int warp_work_id = -1;
         if (static_schedule) {
-            // Spread small queues across CTAs before assigning another warp.
-            work_id = (warp_id - kFirstFinalWarp) * num_compute_ctas
-                + compute_cta_id;
+            warp_work_id = compute_cta_id * kNumFinalWarps
+                + warp_id - kFirstFinalWarp;
         } else {
             if (warp_lane == 0) {
-                work_id = atomicAdd(
+                warp_work_id = atomicAdd(
                     params.queue_state + kFinalCounter, 1);
             }
-            work_id = __shfl_sync(0xffffffffu, work_id, 0);
+            warp_work_id = __shfl_sync(0xffffffffu, warp_work_id, 0);
         }
-        if (work_id >= params.get_final_count()) {
+        if (warp_work_id >= params.get_final_count() * kNumFinalWarps) {
             break;
         }
+        int const work_id = warp_work_id / kNumFinalWarps;
         FinalWorkDesc const work = params.get_final()[work_id];
         if (warp_lane == 0) {
             for (int dep = 0; dep < work.dependency_count; ++dep) {
@@ -1021,8 +1020,9 @@ CUTLASS_DEVICE void run_final_combine(
         }
         __syncwarp();
         {
-            constexpr int kVectorsPerWave = 2;
-            int const vector_in_wave = warp_lane / 16;
+            constexpr int kVectorsPerWave = 16;
+            int const vector_in_wave
+                = (warp_work_id % kNumFinalWarps) * 2 + warp_lane / 16;
             int const lane = int(threadIdx.x) % 16;
             unsigned const subgroup = (int(threadIdx.x) % 32) / 16;
             unsigned const mask = 0xffffu << (subgroup * 16);
