@@ -371,6 +371,14 @@ through 128 keep the BlockN=128 fallback when BlockN is `auto`. See
 [`DCP_MEGA_CRITICAL_WAVE_SCHEDULER.md`](../DCP_MEGA_CRITICAL_WAVE_SCHEDULER.md)
 for the model, thresholds, and measured A/B results.
 
+After each compute CTA completes attention and its existing CTA barrier,
+the producer warpgroup increases its per-thread register budget from 24 to
+168, while both MMA warpgroups reduce theirs from 240 to 168. This preserves
+the CTA's total register budget and gives all 12 warps the same budget for
+history combine/copy and final combine. The transition uses CUTLASS
+`setmaxnreg` wrappers with no additional barrier; final participation remains
+MMA warps 4-11 so this experiment only changes register allocation.
+
 Final combine retains the original metadata v7 descriptors and adaptive
 4/8/16-token selection. Each descriptor has eight virtual warp tickets;
 `ticket / 8` selects the descriptor and `ticket % 8` selects its original

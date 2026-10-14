@@ -479,6 +479,8 @@ FIFO 模式下两者都必须保持原 token-major/batch-major 顺序。
 
 ### 12.6 Final combine 的 warp 任务
 
+每个 compute CTA 在完成 attention 并经过原有 CTA barrier 后，将三个 WG 的每线程寄存器配额从 `24/240/240` 统一为 `168/168/168`：producer WG 使用 `warpgroup_reg_alloc<168>()`，两个 MMA WG 使用 `warpgroup_reg_dealloc<168>()`。CTA 总配额仍为 64,512 个寄存器。随后沿用各 warp 独立领取的 history combine/copy；不新增 barrier，也不改变下述 final 的参与 warp 和任务分配。
+
 final combine 保留原始 metadata v7、4/8/16-token 自适应规则和 descriptor，每个 descriptor 在 kernel 内对应八张虚拟 warp 票。`ticket / 8` 选择 descriptor，`ticket % 8` 选择原始 warp 的数据份额；vector 从 `2 * (ticket % 8) + lane / 16` 开始，步长为 16。每张 warp 票的数据子集及遍历顺序与原始版对应 warp 完全一致，包括尾部的空份额。
 
 参与计算的是 MMA warp 4–11，分别接手原 warp 0–7 的数据份额；producer warp 0–3 跳过 final 计算。保持 16 threads/vector、每线程 8 维。令 `C = num_sms - num_comm_sm`、`F = final_count`，`F <= C` 时静态票号为 `8 * compute_cta_id + (warp_id - 4)`，保留原来的 CTA→descriptor 分配；否则由各 warp 的 lane 0 从同一 counter 领取 `8F` 张虚拟票，再广播给本 warp。各票等待原 descriptor 的完整依赖，票内只使用 warp 同步；保留 history→final 的 CTA barrier，以及全部 warp 退出 final 后的一次 CTA barrier。final 的数学计算保持原样，不包含独立的权重复用优化。

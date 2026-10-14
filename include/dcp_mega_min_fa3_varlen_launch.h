@@ -1199,6 +1199,12 @@ void dcp_mega_varlen_kernel(
         params.queue_state, params.phase_timestamps,
         kAttentionPhaseCounter, kAttentionDoneTimestamp,
         params.num_sms - params.num_comm_sm);
+    // Rebalance 24/240/240 to 168/168/168 before the scalar combines.
+    if (threadIdx.x < cutlass::NumThreadsPerWarpGroup) {
+        cutlass::arch::warpgroup_reg_alloc<168>();
+    } else {
+        cutlass::arch::warpgroup_reg_dealloc<168>();
+    }
     run_history_combine<Config>(params, helper_shared);
     // History combine uses independent per-warp queues. This is the only CTA
     // convergence point before the warp-oriented final combine.
