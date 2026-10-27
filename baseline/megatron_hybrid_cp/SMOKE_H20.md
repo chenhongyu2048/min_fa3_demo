@@ -59,12 +59,7 @@ CUDA_VISIBLE_DEVICES=0,2,3,6 GPUS=4 TARGET_TOKENS=131072 NUM_CASES=4 \
 
 ## Records
 
-The remote checkout and local checkout both contain:
-
-- [Small-workload results](../../benchmark_logs/cp_motivation_smoke_4gpu/results.jsonl)
-  and [console log](../../benchmark_logs/cp_motivation_smoke_4gpu/console.log).
-- [Default-workload results](../../benchmark_logs/cp_motivation_4gpu_128k/results.jsonl)
-  and [console log](../../benchmark_logs/cp_motivation_4gpu_128k/console.log).
+The commands write `results.jsonl` and `console.log` under `LOG_DIR`.
 
 Each JSONL records the backend, selected devices, configuration, original and
 execution lengths, CP assignments, correctness status, and timing samples.

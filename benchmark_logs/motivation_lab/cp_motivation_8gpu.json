@@ -1,0 +1,38 @@
+{
+  "source": "User-provided console summary, 2026-10-21",
+  "commit": "0eac13f2",
+  "branch": "motivation-v3",
+  "world_size": 8,
+  "target_tokens": 131072,
+  "cases_per_dataset": 20,
+  "warmup_iters": 10,
+  "measurement_iters": 40,
+  "seed": 0,
+  "causal": true,
+  "dtype": "BF16",
+  "q_heads": 32,
+  "kv_heads": 8,
+  "head_dim": 128,
+  "scheduler": "Megatron hybrid CP",
+  "target_tokens_per_rank": 8192,
+  "max_cp_size": 8,
+  "aggregation": "mean over 20 cases of mean over 40 measurements of maximum rank wall time; milliseconds",
+  "modes": {
+    "normal": "P2P KV/dKV ring transfers overlapped with the original per-step attention, O/LSE combination, and FP32 gradient accumulation.",
+    "compute-only": "KV ready before timing; no timed KV/dKV transfers; the original step partitioning and local operations remain.",
+    "one-step": "KV prefixes ready before timing; per sample, both zigzag Q halves and their respective KV prefixes are packed into one varlen FA3 call; overlapping-prefix dKV contributions are combined."
+  },
+  "timing": "Complete forward_all or backward_all, including Python dispatch, kernels, local combination, mode-specific communication, and inter-group world barriers; setup, KV prefetch/packing, gradient buffer resets, and pre-phase synchronization are excluded.",
+  "records": [
+    {"dataset": "arxiv", "phase": "forward", "normal_ms": 10.763, "compute_only_ms": 9.065, "one_step_ms": 6.889},
+    {"dataset": "arxiv", "phase": "backward", "normal_ms": 28.702, "compute_only_ms": 23.150, "one_step_ms": 21.137},
+    {"dataset": "freelaw", "phase": "forward", "normal_ms": 5.050, "compute_only_ms": 4.384, "one_step_ms": 3.538},
+    {"dataset": "freelaw", "phase": "backward", "normal_ms": 13.160, "compute_only_ms": 11.350, "one_step_ms": 10.635},
+    {"dataset": "github", "phase": "forward", "normal_ms": 5.507, "compute_only_ms": 4.852, "one_step_ms": 3.957},
+    {"dataset": "github", "phase": "backward", "normal_ms": 14.967, "compute_only_ms": 12.761, "one_step_ms": 12.045},
+    {"dataset": "pile", "phase": "forward", "normal_ms": 3.043, "compute_only_ms": 2.697, "one_step_ms": 2.231},
+    {"dataset": "pile", "phase": "backward", "normal_ms": 8.187, "compute_only_ms": 7.136, "one_step_ms": 6.781},
+    {"dataset": "prolong", "phase": "forward", "normal_ms": 20.786, "compute_only_ms": 17.808, "one_step_ms": 14.460},
+    {"dataset": "prolong", "phase": "backward", "normal_ms": 57.234, "compute_only_ms": 45.804, "one_step_ms": 43.657}
+  ]
+}

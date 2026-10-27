@@ -22,7 +22,7 @@ from matplotlib.patches import Patch
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = SCRIPT_DIR.parent / "transformer_layer_cp.log"
+DEFAULT_INPUT = SCRIPT_DIR / "transformer_layer_cp.log"
 METHOD_LABELS = {
     "allgather_attention": "AllGather",
     "llama3_allgather_attention": "Llama3 AllGather",

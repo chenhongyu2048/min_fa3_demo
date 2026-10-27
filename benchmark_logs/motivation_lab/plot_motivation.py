@@ -1,4 +1,4 @@
-"""Render combined T1/T2 comparisons and stacked D1 cases as PNG + PDF figures.
+"""Render training motivation comparisons and stacked D1 cases as PNG + PDF figures.
 
 Run: python plot_motivation.py
 Requires matplotlib (the repository's plot dependency group); no CUDA or torch.
@@ -15,7 +15,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.collections import PolyCollection
-from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
 
@@ -31,12 +30,9 @@ METHOD_LABELS = {"fa3_ring": "FA3 Ring", "megatron_hybrid_cp": "Megatron Hybrid 
                  "magi_attention": "MagiAttention", "zeppelin": "Zeppelin"}
 DATASET_LABELS = {"prolong": "ProLong", "arxiv": "ArXiv", "freelaw": "FreeLaw",
                   "github": "GitHub", "pile": "Pile"}
-COMPONENTS = (("otherB_ms", "OtherBwd", "//"), ("otherF_ms", "OtherFwd", "\\\\"),
-              ("coreB_ms", "CoreBwd", "xx"), ("coreF_ms", "CoreFwd", ".."))
+COMPONENT_KEYS = ("otherB_ms", "otherF_ms", "coreB_ms", "coreF_ms")
 PHASE_COLORS = ["#4C78A8", "#59A14F", "#9C755F", "#B07AA1", "#F28E2B", "#E15759"]
 MODES = ["comm_only", "comp_only", "serial", "overlap"]
-MODE_LABELS = ["Comm-only", "Comp-only", "Serial (measured)", "Overlap"]
-MODE_STYLES = [":", "--", "-.", "-"]
 TAIL_COLOR = "#D8D8D8"
 
 
@@ -123,74 +119,120 @@ def load_t2(path):
     require(len(rows) == 20 and {(r["dataset"], r["method"]) for r in rows} == expected,
             "T2 requires five datasets and four unique methods each")
     for row in rows:
-        for key in [c[0] for c in COMPONENTS] + ["layerFB_ms"]:
+        for key in (*COMPONENT_KEYS, "layerFB_ms"):
             row[key] = float(row[key])
             require(math.isfinite(row[key]) and row[key] >= 0, "T2 timing invalid")
         # Source summaries round each of the four components and total to 0.001 ms.
-        require(abs(sum(row[key] for key, _, _ in COMPONENTS) - row["layerFB_ms"]) <= .00251,
+        require(abs(sum(row[key] for key in COMPONENT_KEYS) - row["layerFB_ms"]) <= .00251,
                 "T2 components do not sum to layer latency within source rounding")
+        row["core_ms"] = row["coreF_ms"] + row["coreB_ms"]
+        row["other_ms"] = row["otherF_ms"] + row["otherB_ms"]
         recorded, total = map(int, row["cases"].split("/"))
         require(recorded == total and total > 0, "T2 incomplete cases")
     return rows
 
 
-def plot_t1_t2(records, layer_rows, output_dir):
-    fig, axes = plt.subplots(1, 2, figsize=(17, 7.2))
-    batches = [1, 2, 4, 8, 16]
-    lookup = {(r["batch_size"], r["method"], r["mode"]): r["timing"] for r in records}
-    ax = axes[0]
-    for method, color, marker in (("ring", METHOD_COLORS["fa3_ring"], "o"),
-                                   ("allgather", METHOD_COLORS["allgather_attention"], "s")):
-        for mode, linestyle in zip(MODES, MODE_STYLES):
-            ratios = [lookup[b, method, mode]["p50_ms"] / lookup[b, method, "comp_only"]["p50_ms"]
-                      for b in batches]
-            ax.plot(range(5), ratios, color=color, marker=marker, linestyle=linestyle,
-                    markersize=5.5, linewidth=2)
-    ax.set_xticks(range(5), batches)
-    ax.set_xlabel("Batch size", fontsize=24, labelpad=6)
-    ax.set_ylabel("Latency / comp-only (×)", fontsize=24, labelpad=6)
-    ax.yaxis.set_major_formatter("{x:.1f}×")
-    ax.set_ylim(bottom=0)
+def t1_metrics(records, metadata):
+    """Count useful forward QK/PV FLOPs; CP includes overlapped communication."""
+    lookup = {(r["batch_size"], r["method"], r["mode"]): r for r in records}
+    metrics = []
+    for batch in sorted({r["batch_size"] for r in records}):
+        for method in ("ring", "allgather"):
+            row = lookup[batch, method, "comp_only"]
+            length = row["global_seqlen"]
+            scores = length * (length + 1) // 2 if metadata["causal"] else length * length
+            flops = 4 * batch * scores * metadata["q_heads"] * metadata["head_dim"]
+            comp_ms = row["timing"]["p50_ms"]
+            cp_ms = lookup[batch, method, "overlap"]["timing"]["p50_ms"]
+            metrics.append({"batch_size": batch, "global_seqlen": length, "method": method,
+                            "effective_flops": flops, "comp_only_ms": comp_ms, "cp_ms": cp_ms,
+                            "compute_tflops_per_gpu": flops / (metadata["environment"]["world_size"] * comp_ms * 1e9),
+                            "cp_efficiency": comp_ms / cp_ms})
+    return metrics
 
-    ax = axes[1]
+
+def plot_training_motivation(layer_rows, ablation, output_dir):
+    font_size = 9.5
+    fig = plt.figure(figsize=(7.2, 2.85))
+    layout = fig.add_gridspec(1, 2, width_ratios=(1, 1))
+    left_layout = layout[0, 0].subgridspec(2, 1, hspace=.15)
+    right_layout = layout[0, 1].subgridspec(2, 1, hspace=.15)
+    core_ax = fig.add_subplot(left_layout[0, 0])
+    other_ax = fig.add_subplot(left_layout[1, 0], sharex=core_ax)
+    forward_ax = fig.add_subplot(right_layout[0, 0])
+    backward_ax = fig.add_subplot(right_layout[1, 0], sharex=forward_ax)
+    datasets = list(DATASET_LABELS)
+    labels = ["Pile-CC" if name == "pile" else DATASET_LABELS[name]
+              for name in datasets]
     lookup = {(r["dataset"], r["method"]): r for r in layer_rows}
     bar_width = .84 / len(METHOD_LABELS)
-    for dataset_index, dataset in enumerate(DATASET_LABELS):
-        rows = [lookup[dataset, method] for method in METHOD_LABELS]
-        positions = [dataset_index + (i - 1.5) * bar_width for i in range(4)]
-        bottoms = [0.] * len(rows)
-        for key, _, hatch in COMPONENTS:
+    for ax, key, label, tick_step in ((core_ax, "core_ms", "Attention", 10),
+                                      (other_ax, "other_ms", "Other", 5)):
+        for dataset_index, dataset in enumerate(datasets):
+            rows = [lookup[dataset, method] for method in METHOD_LABELS]
+            positions = [dataset_index + (i - 1.5) * bar_width for i in range(4)]
             values = [row[key] for row in rows]
-            ax.bar(positions, values, bottom=bottoms, width=bar_width * .92,
+            ax.bar(positions, values, width=bar_width * .92,
                    color=[METHOD_COLORS[row["method"]] for row in rows],
-                   edgecolor="#333333", linewidth=.25, hatch=hatch)
-            bottoms = [bottom + value for bottom, value in zip(bottoms, values)]
-    ax.set_xticks(range(5), DATASET_LABELS.values())
-    ax.set_xlabel("Dataset", fontsize=24, labelpad=6)
-    ax.set_ylabel("Mean layer latency (ms)", fontsize=24, labelpad=6)
-    ax.set_ylim(0, max(row["layerFB_ms"] for row in layer_rows) * 1.10)
-    ax.set_xlim(-.55, 4.55)
-    for ax in axes:
-        ax.grid(axis="y", color="#D8D8D8", linewidth=.5, alpha=.8)
+                   edgecolor="#333333", linewidth=.2)
+        ax.set_ylabel(f"{label} (ms)", fontsize=font_size, labelpad=3)
+        ax.set_ylim(0, max(row[key] for row in layer_rows) * 1.12)
+        ax.set_yticks(range(0, math.floor(ax.get_ylim()[1] / tick_step) * tick_step + 1,
+                           tick_step))
+        ax.set_xlim(-.55, 4.55)
+
+    modes = (("normal_ms", "Normal", "#4C78A8"),
+             ("compute_only_ms", "Compute-only", "#F28E2B"),
+             ("one_step_ms", "One-step", "#59A14F"))
+    lookup = {(row["dataset"], row["phase"]): row for row in ablation["records"]}
+    bar_width = .84 / len(modes)
+    for ax, phase, label in ((forward_ax, "forward", "Forward"),
+                             (backward_ax, "backward", "Backward")):
+        for mode_index, (key, _, color) in enumerate(modes):
+            positions = [i + (mode_index - 1) * bar_width for i in range(5)]
+            values = [lookup[dataset, phase][key] / lookup[dataset, phase]["one_step_ms"]
+                      for dataset in datasets]
+            ax.bar(positions, values, width=bar_width * .92,
+                   color=color, edgecolor="#333333", linewidth=.2)
+        ax.set_ylabel(f"{label}\n(norm. time)", fontsize=font_size, labelpad=3)
+        ax.set_xlim(-.55, 4.55)
+        ax.set_ylim(0, 1.75)
+        ax.set_yticks([i / 4 for i in range(8)],
+                      ("0", "0.25", "0.50", "0.75", "1.00", "1.25", "1.50", "1.75"))
+
+    for ax in (other_ax, backward_ax):
+        ax.set_xticks(range(5), labels)
+        ax.set_xlabel("Dataset", fontsize=font_size, labelpad=2)
+    for ax in (core_ax, forward_ax):
+        ax.tick_params(axis="x", labelbottom=False)
+    for ax in (core_ax, other_ax, forward_ax, backward_ax):
+        ax.grid(axis="y", color="#D8D8D8", linewidth=.35, alpha=.8)
         style_axis(ax)
-    fig.subplots_adjust(left=.09, right=.985, top=.73, bottom=.14, wspace=.18)
-    centers = [(ax.get_position().x0 + ax.get_position().x1) / 2 for ax in axes]
-    legend_args = dict(loc="upper center", ncol=2, frameon=False, fontsize=20,
-                       handlelength=1.7, handletextpad=.4, columnspacing=1.0, labelspacing=.35)
-    fig.legend(handles=[Line2D([0], [0], color=METHOD_COLORS[method], marker=marker, linewidth=2, label=label)
-                        for method, marker, label in (("fa3_ring", "o", "Ring"),
-                                                       ("allgather_attention", "s", "Allgather"))],
-               bbox_to_anchor=(centers[0], .98), **{**legend_args, "fontsize": 22})
-    fig.legend(handles=[Line2D([0], [0], color="#333333", linestyle=style, linewidth=2, label=label)
-                        for style, label in zip(MODE_STYLES, MODE_LABELS)],
-               bbox_to_anchor=(centers[0], .90), **{**legend_args, "fontsize": 22})
-    fig.legend(handles=[Patch(facecolor=METHOD_COLORS[method], label=label)
-                        for method, label in METHOD_LABELS.items()],
-               bbox_to_anchor=(centers[1], .98), **legend_args)
-    fig.legend(handles=[Patch(facecolor="white", edgecolor="#333333", linewidth=.25, hatch=hatch, label=label)
-                        for _, label, hatch in COMPONENTS],
-               bbox_to_anchor=(centers[1], .855), **{**legend_args, "ncol": 4, "fontsize": 18, "handlelength": 1.1})
-    save_figure(fig, output_dir, "motivition_overlap_balance")
+        ax.tick_params(axis="both", labelsize=font_size, pad=2)
+        ax.tick_params(axis="y", length=2)
+        ax.tick_params(axis="x", pad=3)
+        for spine in ax.spines.values():
+            spine.set_linewidth(.5)
+    for ax in (core_ax, other_ax, forward_ax, backward_ax):
+        ax.tick_params(axis="y", labelsize=8.5)
+    fig.subplots_adjust(left=.075, right=.99, top=.975, bottom=.205, wspace=.30)
+    left_center = (core_ax.get_position().x0 + core_ax.get_position().x1) / 2
+    right_center = (forward_ax.get_position().x0 + forward_ax.get_position().x1) / 2
+    legend_args = dict(loc="lower right", frameon=True, facecolor="white",
+                       edgecolor="none", framealpha=.94, fontsize=8,
+                       handlelength=1.0, handletextpad=.3, columnspacing=.65,
+                       labelspacing=.2, borderaxespad=.35, borderpad=.25)
+    other_ax.legend(handles=[Patch(facecolor=METHOD_COLORS[method], label=label)
+                             for method, label in METHOD_LABELS.items()],
+                    ncol=2, **legend_args)
+    backward_ax.legend(handles=[Patch(facecolor=color, label=label)
+                                for _, label, color in modes],
+                       ncol=3, **legend_args)
+    fig.text(left_center, .025, "(a) Performance under Workload Placement",
+             ha="center", fontsize=font_size)
+    fig.text(right_center, .025, "(b) Execution Efficiency of Megatron",
+             ha="center", fontsize=font_size)
+    save_figure(fig, output_dir, "motivation_overlap_balance")
 
 
 def compact_phase_times(row):
@@ -227,15 +269,15 @@ def draw_timeline(ax, row, phase_indices):
     if ticks[-1] != len(sm_ids) - 1:
         ticks[-1] = len(sm_ids) - 1
     ax.set_yticks(ticks, [sm_ids[i] for i in ticks])
-    ax.set_ylabel("Physical SM ID", fontsize=29, labelpad=6)
+    ax.set_ylabel("Physical SM ID", fontsize=34, labelpad=2)
     style_axis(ax)
-    ax.tick_params(axis="both", labelsize=27)
+    ax.tick_params(axis="both", labelsize=32)
     if len(phase_indices) > 1:
         for phase in phase_indices:
             times = phases[phase]
             begin, finish = min(t[0] for t in times) / 1000, max(t[1] for t in times) / 1000
-            ax.text((begin + finish) / 2, 1.025, str(phase + 1), transform=ax.get_xaxis_transform(),
-                    ha="center", color=PHASE_COLORS[phase], fontsize=25, fontweight="bold")
+            ax.text((begin + finish) / 2, 1.005, str(phase + 1), transform=ax.get_xaxis_transform(),
+                    ha="center", color=PHASE_COLORS[phase], fontsize=30, fontweight="bold")
 
 
 def phase_stats(row):
@@ -261,8 +303,8 @@ def plot_d1(rows, output_dir):
                for i, (name, color) in enumerate(zip(PHASE_LABELS, PHASE_COLORS))]
     handles += [Patch(facecolor=TAIL_COLOR, label="Tail idle")]
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(.5, 1), ncol=4,
-               frameon=False, fontsize=27, handlelength=1.1, handletextpad=.4, columnspacing=.9, labelspacing=.35)
-    fig.supxlabel("Timeline across serial stages (µs)", fontsize=29, y=.025)
+               frameon=False, fontsize=32, handlelength=.7, handletextpad=.25, columnspacing=.35, labelspacing=.25)
+    fig.supxlabel("Timeline across serial stages (µs)", fontsize=34, y=.015)
     fig.subplots_adjust(left=.085, right=.985, top=.84, bottom=.10, hspace=.20)
     save_figure(fig, output_dir, "motivation_wave_quant")
 
@@ -272,24 +314,35 @@ def main():
     parser.add_argument("--input", type=Path, default=Path(__file__).with_name("motivation.log"))
     parser.add_argument("--layer-input", type=Path, default=Path(__file__).resolve().parent.parent /
                         "end2end" / "megaring" / "transformer_layer_selected.csv")
+    parser.add_argument("--cp-input", type=Path,
+                        default=Path(__file__).with_name("cp_motivation_8gpu.json"))
     parser.add_argument("--output-dir", type=Path, help="default: input log's directory")
+    parser.add_argument("--training-only", action="store_true", help="update the T1/T2 figure without redrawing D1")
     args = parser.parse_args()
     output_dir = args.output_dir or args.input.parent
     rows = [json.loads(line) for line in args.input.read_text().splitlines() if line.strip()]
     t1_meta, d1_meta, t1, d1 = check_data(rows)
     layer_rows = load_t2(args.layer_input)
+    ablation = json.loads(args.cp_input.read_text())
     output_dir.mkdir(parents=True, exist_ok=True)
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 14,
                          "pdf.fonttype": 42, "ps.fonttype": 42, "hatch.linewidth": .2})
-    plot_t1_t2(t1, layer_rows, output_dir)
-    plot_d1(d1, output_dir)
+    plot_training_motivation(layer_rows, ablation, output_dir)
+    metrics = t1_metrics(t1, t1_meta)
+    if not args.training_only:
+        plot_d1(d1, output_dir)
     report = {"checks": "PASS: T1 coverage, token counts, samples and quantiles; T2 coverage and component sums; D1 SM coverage and timestamp/barrier order",
+              "cp_execution_ablation": ablation,
+              "cp_execution_normalization": "Within each dataset and phase, divide each mode's dataset-mean latency by One-step's dataset-mean latency; One-step is 1.0.",
               "t2": {"source": str(args.layer_input), "aggregation": "equal-case arithmetic mean, layer forward + backward",
+                     "components": {"CoreAttn": "coreF_ms + coreB_ms", "Other": "otherF_ms + otherB_ms"},
                      "records": layer_rows},
               "d1_axis": "Concatenated [earliest work_start, latest work_end] spans; entry/exit and rank barriers omitted. Within-stage offsets unchanged; not actual elapsed time.",
               "limits": "Compact log omits other ranks/replays: rank-max reduction and representative selection cannot be independently rechecked. Tail idle is not a direct wave-count measurement.",
               "t1_backend": t1_meta["backend"],
-              "t1_normalization": "mode p50 / comp_only p50 for the same method and batch size; no percentile shading",
+              "t1_throughput": "effective forward QK/PV FLOPs / (world_size * comp_only p50 seconds) / 1e12; compute-only retains local processing and output combination",
+              "t1_normalization": "CP efficiency = comp_only p50 / overlap p50 for the same method and batch shape; no percentile shading",
+              "t1": metrics,
               "d1": []}
     for row in d1:
         off, on = (row["timings"][name]["p50_ms"] for name in ("phased_trace_off", "phased_trace_on"))
@@ -301,7 +354,7 @@ def main():
                              "phases": phase_stats(row)})
     (output_dir / "plot_summary.json").write_text(json.dumps(report, indent=2) + "\n")
     print(report["checks"])
-    print(f"Wrote 2 figures (PNG + PDF) and plot_summary.json to {output_dir}")
+    print(f"Wrote {1 if args.training_only else 2} figures (PNG + PDF) and plot_summary.json to {output_dir}")
 
 
 if __name__ == "__main__":
