@@ -54,6 +54,19 @@ class NativePackedTests(unittest.TestCase):
                 self.assertEqual(dispatch, reference.dispatch)
                 self.assertEqual(payload, expected)
 
+    def test_release_lpt_uses_calibrated_attention_overhead(self):
+        q, history = offsets((1, 33)), offsets((128, 1280))
+        config = dict(hq_local=4, dcp_size=2, num_sms=132, num_comm_sm=4,
+                      requested_num_splits=1, block_n_override=128,
+                      scheduler_heuristic=False, reorder_history_override=True)
+        reference = metadata.build_dcp_mega_metadata(q, history, **config)
+        self.assertEqual(reference.heuristic_q_block_order, (2, 0, 1))
+        expected = metadata.pack_dcp_mega_metadata(reference, pre_phase=1, post_phase=2)
+        dispatch, payload = metadata.build_packed_dcp_mega_metadata(
+            q, history, pre_phase=1, post_phase=2, capacity=len(expected), **config)
+        self.assertEqual(dispatch, reference.dispatch)
+        self.assertEqual(payload, expected)
+
     def prepare(self, q=(0, 1, 2), h=(0, 8192, 16384), **options):
         config = dict(hq_local=8, dcp_size=4, num_sms=78, num_comm_sm=8,
                       scheduler_heuristic=False, max_num_splits=1,

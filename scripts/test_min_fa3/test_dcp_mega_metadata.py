@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import functools
 import unittest
+from unittest.mock import patch
 
+import dcp_mega_metadata
 from dcp_mega_metadata import (
     CHUNK,
     FINAL_TOKEN_GRANULARITIES,
@@ -36,6 +39,36 @@ from dcp_mega_metadata import (
 
 _RECEIVE_CHUNKS = 6
 _RECEIVE_SCAN_WINDOW = 8
+
+
+def _legacy_cost_model(test):
+    """Pin the calibration that these golden plans were derived with.
+
+    A bandwidth floor of one makes attention progress independent of load. The
+    native planner compiles its constants in, so use the Python reference.
+    """
+
+    def clear_caches():
+        dcp_mega_metadata._critical_wave_plan_cached.cache_clear()
+        dcp_mega_metadata._metadata_queue_cache.clear()
+
+    @functools.wraps(test)
+    def wrapper(self):
+        with patch.multiple(
+            dcp_mega_metadata,
+            HEURISTIC_TASK_OVERHEAD=4,
+            HEURISTIC_BANDWIDTH_FLOOR=1.0,
+            HEURISTIC_COMBINE_TASK_OVERHEAD=4,
+            HEURISTIC_COMBINE_PARTIAL_VECTOR_COST=1,
+            _native_critical_wave_plan=None,
+        ):
+            clear_caches()
+            try:
+                return test(self)
+            finally:
+                clear_caches()
+
+    return wrapper
 
 
 def _cumulative(lengths):
@@ -452,6 +485,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(fixed_176.dispatch.block_n, 176)
         self.assertEqual(fixed_176.heuristic_model_block_n, 176)
 
+    @_legacy_cost_model
     def test_scheduler_heuristic_selects_case40_critical_wave(self):
         q_lengths = [16] * 30 + [4096]
         global_history_lengths = [
@@ -536,6 +570,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(fixed_176.heuristic_selected_makespan, 470)
         self.assertAlmostEqual(fixed_176.heuristic_gain, 100 / 606)
 
+    @_legacy_cost_model
     def test_multi_sequence_critical_wave_crosses_joint_sequence_plateau(self):
         q_lengths = (16,) * 8
         history_lengths = (584, 5123, 7719, 764, 13338, 12098, 3417, 45807)
@@ -584,6 +619,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
             list(range(len(metadata.attention))),
         )
 
+    @_legacy_cost_model
     def test_multi_sequence_critical_wave_can_choose_smaller_iterative_plan(self):
         q_lengths = (16, 16, 16, 16, 16, 16, 16, 656)
         history_lengths = (6486, 4864, 1146, 624, 9375, 800, 1657, 2304)
@@ -620,6 +656,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(metadata.heuristic_selected_combine_penalty, 6)
         self.assertAlmostEqual(metadata.heuristic_gain, 50 / 86)
 
+    @_legacy_cost_model
     def test_history_combine_profile_counts_partial_vector_work(self):
         split2 = _history_combine_profile(
             (0, 16, 32),
@@ -695,6 +732,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
             101,
         )
 
+    @_legacy_cost_model
     def test_overlapped_combine_avoids_dcp4_case8_oversplit(self):
         q_lengths = (16,) * 12
         local_history_lengths = (
@@ -737,6 +775,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(metadata.heuristic_selected_combine_penalty, 10)
         self.assertAlmostEqual(metadata.heuristic_gain, 18 / 44)
 
+    @_legacy_cost_model
     def test_combine_work_can_prefer_iterative_over_legacy_dynamic(self):
         q_lengths = (16,) * 8
         history_lengths = (5503, 904, 9852, 1297, 1359, 3577, 2354, 809)
@@ -761,6 +800,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(metadata.heuristic_selected_combine_penalty, 5)
         self.assertAlmostEqual(metadata.heuristic_gain, 49 / 86)
 
+    @_legacy_cost_model
     def test_attention_profile_finds_all_tied_critical_sequences(self):
         profile = _fifo_attention_profile(
             (16,) * 8,
@@ -908,6 +948,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertEqual(final_parent_order, list(release_lpt.heuristic_q_block_order))
         self.assertEqual(history_parent_order, list(release_lpt.heuristic_q_block_order))
 
+    @_legacy_cost_model
     def test_critical_wave_cost_model_uses_the_requested_history_order(self):
         q_lengths = [16] * 30 + [4096]
         global_history_lengths = [
@@ -1111,6 +1152,7 @@ class DCPMegaMetadataTest(unittest.TestCase):
         self.assertTrue(metadata.dispatch.pack_gqa)
         self.assertEqual(metadata.dispatch.block_n, 128)
 
+    @_legacy_cost_model
     def test_auto_can_select_fa3_native_split_and_fifo_schedule(self):
         q_lengths = (16, 1, 8, 16, 16, 8, 16, 8, 4, 4, 8, 4, 1, 8)
         history_lengths = (

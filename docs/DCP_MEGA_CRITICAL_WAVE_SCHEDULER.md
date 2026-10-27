@@ -141,34 +141,41 @@ split_n_blocks(i, s) = clamp(
 
 ### 6.2 task cost
 
-attention descriptor 使用无量纲成本：
+chunk 和 history attention descriptor 使用相同的工作量公式：
 
 ```text
 attention_work = n_blocks + attention_task_overhead
-attention_task_overhead = 4
+attention_task_overhead = 32
 ```
 
 `n_blocks` 表示随 K/V 长度增长的主体工作；固定开销近似 descriptor claim、pipeline 启停和短 task 中无法忽略的常量成本。
 
-这里保留无量纲表达，而不直接拟合微秒，原因是不同 BlockN、DCP size、batch shape 和系统负载下绝对时间不稳定；相对调度关系比绝对标定更可靠。
+时间单位归一化为：所有 compute CTA 同时读取 KV 时，一个 CTA 处理一个 KV tile 的时间。任务工作量与活跃 CTA 数共同决定耗时，模型输出用于比较候选方案，不直接表示微秒。
 
 ### 6.3 CTA list scheduling
 
-compute CTA 数为：
+compute CTA 总数为 `C = num_sms - num_comm_sm`。有 `k` 个 CTA 执行 attention 时，每个 CTA 完成一个单位工作量的耗时为：
 
 ```text
-num_compute_ctas = num_sms - num_comm_sm
+tau(k) = max(bandwidth_floor, k / C)
+bandwidth_floor = 0.43
 ```
 
-模型维护一个按当前 load 排序的 CTA min-heap，按照候选方案的真实 descriptor 顺序逐个放置 task：
+活跃 CTA 共享 KV 带宽；当 `k < 0.43 * C` 时，单 CTA 耗时达到下限，不再随并行度降低而缩短。`bandwidth_floor = 1` 时，每单位工作耗时固定为 1。
+
+模型按真实 descriptor 顺序执行列表调度，最先完成的 CTA 领取下一项。所有活跃 CTA 以相同速率推进，用整数累计工作进度表示完成事件，再转换成浮点时间：
 
 ```text
-cta = pop_min_load_cta()
-start = cta.load
-finish = start + attention_work
-cta.load = finish
-push(cta)
+finish_progress = earliest_running_completion()
+now += (finish_progress - progress) * tau(number_of_running_ctas)
+progress = finish_progress
+finished_ctas = remove_all_completions_at(progress)
+for cta in finished_ctas_ordered_by_cta_id:
+    record_completion(cta, now)
+    start_next_task(cta, progress)
 ```
+
+同一工作进度的完成事件统一处理后再领取任务，保证同时完成时的 CTA 顺序确定。使用 min-heap 保存运行中的完成事件，复杂度为 `O(T log C)`。
 
 模型同时保留：
 
@@ -178,6 +185,8 @@ push(cta)
 - makespan CTA 最后处理的 history sequence 集合。
 
 最后一项构成 `critical_history_sequences`，用于识别下一轮值得继续拆分的序列。
+
+当前 `attention_task_overhead=32`、`bandwidth_floor=0.43`，以及下文的 combine 参数 `2.5` 和 `0.47`，来自 H800 上单个 D1 decode-only phased trace（`case_000003`，DCP=2）的暂定校准。Attention 固定开销由 5–14 tile 的任务拟合，其跨 workload 和硬件的预测能力仍需多 case 重测。后续校准应同步更新 Python 模型、C++ planner 和 native packed metadata 中对应的成本常量。
 
 ## 7. Q 解锁排序与 release-aware LPT
 
@@ -245,11 +254,12 @@ final token tile
 NoSplit 路径可以在一个 task 中复制多个 vector；split 路径每个 vector 独立 combine。每个 task 的无量纲成本为：
 
 ```text
-combine_work = combine_task_overhead + valid_vectors * actual_splits
-combine_task_overhead = 4
+combine_work = combine_task_overhead + partial_vector_cost * valid_vectors * actual_splits
+combine_task_overhead = 2.5
+partial_vector_cost = 0.47
 ```
 
-这同时计入固定 task 开销和随 partial vector 数增长的工作。
+这同时计入固定 task 开销和随 partial vector 数增长的工作。Combine 成本与 attention 使用相同的归一化时间单位，但不随活跃 attention CTA 数变化。
 
 ### 8.2 worker release 与依赖
 
@@ -272,7 +282,7 @@ finish_j = start_j + combine_work_j
 worker.available_time = finish_j
 ```
 
-先领取 task 再等待 dependency，模拟 device 端 FIFO claim 后 warp 被该 task 占住的行为。模型不允许同一个 warp 绕过未就绪 task 去执行后续 ready task。模型仍按独立 worker 推进，不计入 CTA 批量领取时的轮间等待与同步成本。
+先领取 task 再等待 dependency，模拟 device 端 FIFO claim 后 warp 被该 task 占住的行为。模型不允许同一个 warp 绕过未就绪 task 去执行后续 ready task。模型按独立 warp worker 的 FIFO 调度近似估算。当前内核每个 CTA 每轮领取 12 个任务，并在轮间同步；这些批量领取约束及轮间等待、同步成本尚未显式建模。
 
 最终评分为：
 
@@ -348,6 +358,18 @@ while true:
 2. descriptor 更少；
 3. split 总量更小；
 4. 字典序稳定的向量。
+
+C++ planner 使用保守下界提前剪枝。令 `W` 为 attention 总工作量、`longest` 为最长 attention task 工作量、`R` 为总 combine 成本、`warps=12`：
+
+```text
+lower_bound = max(
+    bandwidth_floor * longest,
+    W / C,
+    (bandwidth_floor * W * warps + R) / (C * warps),
+)
+```
+
+三项分别约束最快单任务、总带宽和 attention/combine 的总 worker 占用。下界比较保留浮点舍入余量；保留当前最佳候选的同分方案时，cutoff 使用 `nextafter(best.score, +inf)`，让完整 tie-break 决定结果。Python 与 native planner 的计划、成本及开启/关闭剪枝的结果必须一致。
 
 ### 9.4 最终选择和收益门槛
 
@@ -529,7 +551,7 @@ history_order_policy:
 - combine penalty 和完整 gain；
 - selected split vector、plan source 和 Q block order。
 
-这些字段用于解释决策和回归测试，不构成 device metadata ABI。
+这些字段用于解释决策和回归测试，不构成 device metadata ABI。任务数和 partial vector 数保持整数；work、makespan、combine penalty 和 score 使用 Python `float` / C++ `double`。`heuristic_*_makespan` 仍表示 attention makespan，完整 score 为该值加 combine penalty。Native planner 编译禁用浮点乘加融合（`-ffp-contract=off`），与 Python 保持相同运算顺序；测试要求两端结果精确一致。Metadata v7 的整数布局和 runner 参数保持不变。
 
 阶段时间戳中的 `history_combine_done` 和 `publish_done` 相同，表示本地 history send-buffer 写入及远端 ready 发布完成。`receive_done` 表示所有通信 CTA 完成 output pull 并发布本地 receive-ready；它可以晚于 final 消费最后一个 ready tile，因此不要求 `receive_done <= final_combine_done`，只要求二者均不晚于 `kernel_done`。`publish_done_to_receive_done` 比较本地 outgoing publication 与 incoming receive completion，可以为负值。
 
@@ -549,16 +571,17 @@ history_order_policy:
 
 ## 15. 当前模型边界
 
-critical-wave 已显式建模 attention descriptor、CTA wave、completion dependency 和 history combine overlap，但仍未包含：
+critical-wave 已显式建模 attention descriptor、CTA wave、活跃 attention CTA 间的带宽共享、completion dependency 和 history combine overlap，但仍未包含：
 
 - Q all-gather 的实际 ready timestamp；release epoch 只是离散近似；
-- HBM/L2 contention、TMA pipeline 状态和不同 task 间 cache reuse；
+- attention 与通信、combine 之间的 HBM 竞争，以及 L2、TMA pipeline 状态和不同 task 间 cache reuse；
+- history CTA 每轮 12 项领取的同步和等待；
 - atomic claim 的运行时非确定性和 warp scheduling 细节；
 - receive、remote publication 与 final combine 的完整成本模型；
 - BlockN=128/176 在不同 N-block 长度上的真实 kernel throughput 曲线；
 - 多节点通信和非 SM90 平台。
 
-因此模型适合做候选排序和保守过滤，不适合输出绝对 latency。任何阈值或默认策略变化都必须同时满足：
+因此模型适合做候选排序和保守过滤，不适合输出绝对 latency。实现验收要求 CPU 模型、metadata 及可用 GPU 拓扑上的正确性通过。当前单 case 参数的性能结论还需要多 case 重测，验证应覆盖：
 
 1. CPU metadata/依赖不变量测试通过；
 2. DCP=2/4/8 correctness 通过；

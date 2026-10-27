@@ -2,6 +2,8 @@
 
 import heapq
 import itertools
+import json
+from pathlib import Path
 import random
 import unittest
 from unittest.mock import patch
@@ -34,7 +36,9 @@ def expanded_combine(cu_q, splits, completions, heads, world, copy_vectors):
                         deps.update(completions[
                             (metadata.HISTORY, batch, token, rank * heads + head)
                         ])
-                    tasks.append((tuple(sorted(deps)), 4 + (last - first) * splits[batch]))
+                    tasks.append((tuple(sorted(deps)), metadata.HEURISTIC_COMBINE_TASK_OVERHEAD
+                                  + metadata.HEURISTIC_COMBINE_PARTIAL_VECTOR_COST
+                                  * (last - first) * splits[batch]))
                 begin = region_end
     return tasks
 
@@ -105,6 +109,55 @@ class PlannerTests(unittest.TestCase):
                 metadata._overlapped_attention_combine_makespan(attention, compact),
                 expanded_makespan(attention, reference),
             )
+
+    def test_attention_progress_shares_bandwidth_above_the_floor(self):
+        tasks = [(196, 0), (180, 1), (6, 2)]
+        for floor, expected in ((1.0, (196.0, 180.0, 6.0)),
+                                (0.75, (147.0, 135.0, 4.5)),
+                                (0.25, (95.5, 91.5, 4.5))):
+            with self.subTest(floor=floor), patch.object(
+                    metadata, "HEURISTIC_BANDWIDTH_FLOOR", floor):
+                profile = metadata._schedule_attention_tasks(tasks, 4)
+                self.assertEqual(profile.completion_finish_times, expected)
+                self.assertEqual(profile.makespan, expected[0])
+                self.assertEqual(profile.critical_history_sequences, (0,))
+
+    def test_freed_cta_takes_next_task_and_second_wave_runs_faster(self):
+        tasks = [(68, 0), (68, 0), (68, 0), (63, 1), (63, 1), (62, 1), (6, 2)]
+        with patch.object(metadata, "HEURISTIC_BANDWIDTH_FLOOR", 0.75):
+            profile = metadata._schedule_attention_tasks(tasks, 4)
+        self.assertEqual(profile.completion_finish_times,
+                         (68.0, 68.0, 68.0, 63.0, 111.5, 114.5, 72.5))
+        self.assertEqual(profile.cta_finish_times, (114.5, 72.5, 68.0, 111.5))
+        self.assertEqual(profile.critical_history_sequences, (1,))
+
+    def test_default_bandwidth_model_selects_nosplit_for_d1_decode_trace(self):
+        trace_path = Path(__file__).resolve().parents[2] / "dcp_test/mega_dcp_trace_cases.jsonl"
+        case = next(case for case in map(json.loads, trace_path.read_text().splitlines())
+                    if case["case_id"] == "case_000003")
+        q = tuple(case["q_lens"])
+        for rank in (0, 1):
+            history = tuple((length + 1 - rank) // 2 for length in case["history_lens"])
+            actual = metadata.build_dcp_mega_metadata(
+                offsets(q), offsets(history), hq_local=4, dcp_size=2,
+                num_sms=132, num_comm_sm=4,
+            )
+            with self.subTest(rank=rank):
+                self.assertEqual(actual.split_policy, "critical_wave")
+                self.assertEqual(actual.heuristic_plan_source, "nosplit")
+                self.assertEqual(actual.chunk_sequence_splits, (1,) * len(q))
+                self.assertEqual(actual.history_sequence_splits, (1,) * len(q))
+                self.assertEqual(actual.history_order_policy, "fifo")
+                self.assertEqual(actual.heuristic_q_block_order, tuple(range(42)))
+                self.assertEqual(actual.heuristic_model_block_n, 128)
+                self.assertEqual(actual.dispatch.block_n, 176)
+                self.assertFalse(actual.dispatch.split)
+                self.assertEqual(actual.heuristic_selected_attention_tasks, 84)
+                self.assertEqual(actual.heuristic_selected_combine_tasks, 1344)
+                self.assertAlmostEqual(actual.heuristic_selected_makespan, 70.24625)
+                self.assertAlmostEqual(actual.heuristic_selected_combine_work, 5886.72)
+                self.assertAlmostEqual(actual.heuristic_selected_combine_penalty, 4.38)
+                self.assertEqual(actual.heuristic_gain, 0.0)
 
     def plan(self, q=(1, 1), history=(10001, 20001), **overrides):
         args = dict(hq_local=8, dcp_size=4, block_n=128, num_sms=78,

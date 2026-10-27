@@ -16,6 +16,8 @@ namespace {
 using Ints = std::vector<int32_t>;
 using Row = std::array<int32_t, 8>;
 using Rows = std::vector<Row>;
+// Mirror HEURISTIC_TASK_OVERHEAD in dcp_mega_metadata.py.
+constexpr int32_t task_overhead = 32;
 int32_t ceil_div(int32_t a, int32_t b) { return (a + b - 1) / b; }
 
 Ints build_packed_queues(const Ints& cu, int32_t heads, int32_t world,
@@ -55,7 +57,7 @@ Ints build_packed_queues(const Ints& cu, int32_t heads, int32_t world,
         auto work = [&](const Row& row) {
             int32_t n = (*history_blocks)[row[1]], splits = history_splits[row[1]];
             int32_t width = ceil_div(n, splits);
-            return std::max(0, std::min(width, n - row[4] * width)) + 4;
+            return std::max(0, std::min(width, n - row[4] * width)) + task_overhead;
         };
         std::vector<double> unlock(token_blocks, 0.0);
         for (const auto& row : attention) if (row[0]) {

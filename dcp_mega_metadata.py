@@ -53,9 +53,17 @@ SPLIT_POLICY_CRITICAL_WAVE = "critical_wave"
 SPLIT_POLICY_FA3_NATIVE = "fa3_native"
 HISTORY_ORDER_POLICY_FIFO = "fifo"
 HISTORY_ORDER_POLICY_RELEASE_LPT = "release_lpt"
-HEURISTIC_TASK_OVERHEAD = 4
-HEURISTIC_COMBINE_TASK_OVERHEAD = HEURISTIC_TASK_OVERHEAD
-HEURISTIC_COMBINE_PARTIAL_VECTOR_COST = 1
+# Critical-wave cost model. Attention work is KV tiles plus a fixed per-task
+# overhead, and one time unit is one KV tile while every compute CTA reads KV.
+# While k of C compute CTAs run attention, each advances one unit of work every
+# max(HEURISTIC_BANDWIDTH_FLOOR, k / C) time units: running CTAs share HBM
+# bandwidth until fewer than HEURISTIC_BANDWIDTH_FLOOR * C remain. Combine
+# costs are in time units. Provisional values from the D1 decode-only trace
+# (H800, DCP=2); csrc/dcp_mega_planner.cpp mirrors them.
+HEURISTIC_TASK_OVERHEAD = 32
+HEURISTIC_BANDWIDTH_FLOOR = 0.43
+HEURISTIC_COMBINE_TASK_OVERHEAD = 2.5
+HEURISTIC_COMBINE_PARTIAL_VECTOR_COST = 0.47
 HEURISTIC_MIN_MAKESPAN_GAIN = 0.10
 HEURISTIC_SPLIT4_EXTRA_GAIN = 0.05
 
@@ -75,11 +83,11 @@ class DCPMegaDispatch:
 class _CriticalWavePlan:
     sequence_splits: tuple[int, ...]
     source: str
-    attention_makespan: int
+    attention_makespan: float
     attention_tasks: int
     combine_tasks: int
     combine_partial_vectors: int
-    combine_work: int
+    combine_work: float
     combine_penalty: float
     critical_history_sequences: tuple[int, ...]
     score: float
@@ -89,22 +97,22 @@ class _CriticalWavePlan:
 class _HistoryCombineProfile:
     task_count: int
     partial_vector_count: int
-    work: int
+    work: float
 
 
 @dataclass(frozen=True)
 class _AttentionScheduleProfile:
-    makespan: int
+    makespan: float
     task_count: int
     critical_history_sequences: tuple[int, ...]
-    cta_finish_times: tuple[int, ...] = ()
-    completion_finish_times: tuple[int, ...] = ()
+    cta_finish_times: tuple[float, ...] = ()
+    completion_finish_times: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
 class _HistoryCombineScheduleTask:
     dependencies: tuple[int, ...]
-    work: int
+    work: float
     repeats: int = 1
 
 
@@ -148,14 +156,14 @@ class DCPMegaMetadata:
     heuristic_selected_combine_tasks: int | None
     heuristic_baseline_combine_partial_vectors: int | None
     heuristic_selected_combine_partial_vectors: int | None
-    heuristic_baseline_combine_work: int | None
-    heuristic_selected_combine_work: int | None
+    heuristic_baseline_combine_work: float | None
+    heuristic_selected_combine_work: float | None
     heuristic_baseline_combine_penalty: float | None
     heuristic_selected_combine_penalty: float | None
     heuristic_split_sequence_idx: int | None
     heuristic_split_sequence_splits: int | None
-    heuristic_baseline_makespan: int | None
-    heuristic_selected_makespan: int | None
+    heuristic_baseline_makespan: float | None
+    heuristic_selected_makespan: float | None
     heuristic_gain: float | None
     heuristic_q_block_order: tuple[int, ...]
 
@@ -446,31 +454,56 @@ def _schedule_attention_tasks(
     task_costs: Sequence[tuple[int, int | None] | tuple[int, int | None, int]],
     num_compute_ctas: int,
 ) -> _AttentionScheduleProfile:
-    """List-schedule attention descriptors and retain completion times."""
+    """List-schedule attention descriptors under shared KV bandwidth.
+
+    The first CTA to become free takes the next descriptor. Running CTAs advance
+    together, so track per-CTA progress in work units and convert it to time
+    between completions with the current number of running CTAs.
+    """
     if num_compute_ctas <= 0:
         raise ValueError("num_compute_ctas must be positive")
-    worker_loads = [(0, worker) for worker in range(num_compute_ctas)]
-    heapq.heapify(worker_loads)
     final_sequence_by_worker: list[int | None] = [None] * num_compute_ctas
-    completion_finish_times = [0] * len(task_costs)
-    for ordinal, task in enumerate(task_costs):
+    completion_finish_times = [0.0] * len(task_costs)
+    cta_finish_times = [0.0] * num_compute_ctas
+    running: list[tuple[int, int, int]] = []
+    next_task = 0
+    progress = 0
+    now = 0.0
+
+    def start(worker: int) -> None:
+        nonlocal next_task
+        if next_task == len(task_costs):
+            return
+        task = task_costs[next_task]
         task_cost, sequence_idx = task[0], task[1]
-        completion_id = task[2] if len(task) == 3 else ordinal
-        load, worker = heapq.heappop(worker_loads)
-        load += task_cost
-        completion_finish_times[completion_id] = load
+        completion_id = task[2] if len(task) == 3 else next_task
         final_sequence_by_worker[worker] = sequence_idx
-        heapq.heappush(worker_loads, (load, worker))
-    makespan = max(load for load, _ in worker_loads)
-    cta_finish_times = [0] * num_compute_ctas
-    for load, worker in worker_loads:
-        cta_finish_times[worker] = load
+        heapq.heappush(running, (progress + task_cost, worker, completion_id))
+        next_task += 1
+
+    for worker in range(num_compute_ctas):
+        start(worker)
+    while running:
+        finish_progress = running[0][0]
+        now += (finish_progress - progress) * max(
+            HEURISTIC_BANDWIDTH_FLOOR, len(running) / num_compute_ctas
+        )
+        progress = finish_progress
+        finished: list[int] = []
+        while running and running[0][0] == finish_progress:
+            _, worker, completion_id = heapq.heappop(running)
+            completion_finish_times[completion_id] = now
+            cta_finish_times[worker] = now
+            finished.append(worker)
+        for worker in finished:
+            start(worker)
+    makespan = now
     critical_history_sequences = tuple(
         sorted(
             {
                 final_sequence_by_worker[worker]
-                for load, worker in worker_loads
-                if load == makespan
+                for worker in range(num_compute_ctas)
+                if cta_finish_times[worker] == makespan
                 and final_sequence_by_worker[worker] is not None
             }
         )
@@ -495,7 +528,7 @@ def _fifo_attention_makespan(
     split_sequence_idx: int | None = None,
     split_sequence_splits: int = 1,
     history_sequence_splits: Sequence[int] | None = None,
-) -> tuple[int, int]:
+) -> tuple[float, int]:
     profile = _fifo_attention_profile(
         q_lengths,
         history_n_blocks,
@@ -723,10 +756,11 @@ def _critical_wave_plan_python(
             dcp_size=dcp_size,
             copy_vectors_per_task=copy_vectors,
         )
-        if (
-            sum(task.repeats for task in combine_tasks) != combine_profile.task_count
-            or sum(task.work * task.repeats for task in combine_tasks)
-            != combine_profile.work
+        if sum(
+            task.repeats for task in combine_tasks
+        ) != combine_profile.task_count or not math.isclose(
+            sum(task.work * task.repeats for task in combine_tasks),
+            combine_profile.work,
         ):
             raise AssertionError("combine schedule/profile accounting mismatch")
         score = _overlapped_attention_combine_makespan(
@@ -1085,7 +1119,9 @@ def _history_combine_schedule_tasks(
                         dependencies = tuple(sorted(dependency_set))
                     tasks.append(_HistoryCombineScheduleTask(
                         dependencies=dependencies,
-                        work=HEURISTIC_COMBINE_TASK_OVERHEAD + valid_vectors * splits,
+                        work=HEURISTIC_COMBINE_TASK_OVERHEAD
+                        + HEURISTIC_COMBINE_PARTIAL_VECTOR_COST
+                        * valid_vectors * splits,
                         repeats=repeats,
                     ))
                     vector += valid_vectors * repeats
@@ -1097,7 +1133,7 @@ def _history_combine_schedule_tasks(
 def _overlapped_attention_combine_makespan(
     attention_profile: _AttentionScheduleProfile,
     combine_tasks: Sequence[_HistoryCombineScheduleTask],
-) -> int:
+) -> float:
     """List-schedule FIFO tasks, grouping workers with the same availability.
 
     Worker identity never affects a task's cost or dependencies. Grouping equal
@@ -1105,7 +1141,7 @@ def _overlapped_attention_combine_makespan(
     """
     if not combine_tasks:
         return attention_profile.makespan
-    workers_by_time: dict[int, int] = {}
+    workers_by_time: dict[float, int] = {}
     for available in attention_profile.cta_finish_times:
         workers_by_time[available] = (
             workers_by_time.get(available, 0) + MEGA_COMPUTE_WARPS

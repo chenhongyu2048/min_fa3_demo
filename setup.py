@@ -90,7 +90,8 @@ ext_modules = [
         sources=["csrc/dcp_mega_planner.cpp", "csrc/dcp_mega_metadata.cpp"],
         include_dirs=include_paths()[:1],
         language="c++",
-        extra_compile_args={"cxx": ["-O3", "-std=c++20"]},
+        # Exact float parity with the Python reference planner.
+        extra_compile_args={"cxx": ["-O3", "-std=c++20", "-ffp-contract=off"]},
     ),
     CUDAExtension(
         name="_min_fa3_op",

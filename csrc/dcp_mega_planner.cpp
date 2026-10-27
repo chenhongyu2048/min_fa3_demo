@@ -19,8 +19,13 @@ void bind_dcp_mega_metadata(py::module_& m);
 namespace {
 using I = int64_t;
 using Vec = std::vector<I>;
-constexpr I task_overhead = 4;
+// Cost model constants mirror dcp_mega_metadata.py (HEURISTIC_*).
+constexpr I task_overhead = 32;
+constexpr double bandwidth_floor = 0.43;
+constexpr double combine_overhead = 2.5;
+constexpr double partial_vector_cost = 0.47;
 constexpr I compute_warps = 12;
+constexpr double no_cutoff = std::numeric_limits<double>::infinity();
 constexpr double min_gain = 0.10;
 I ceil_div(I a, I b) { return (a + b - 1) / b; }
 I split_work(I n, I s, I i) {
@@ -33,11 +38,12 @@ using MinHeap = std::priority_queue<T, std::vector<T>, std::greater<T>>;
 struct Plan {
     Vec splits;
     std::string source;
-    I attention_span = 0, attention_tasks = 0;
-    I combine_tasks = 0, partial_vectors = 0, combine_work = 0;
-    I penalty = 0;
+    double attention_span = 0;
+    I attention_tasks = 0;
+    I combine_tasks = 0, partial_vectors = 0;
+    double combine_work = 0, penalty = 0;
     Vec critical;
-    I score = 0;
+    double score = 0;
     auto key() const {
         return std::make_tuple(score, attention_span, attention_tasks,
                               std::accumulate(splits.begin(), splits.end(), I{0}), splits);
@@ -54,7 +60,7 @@ struct Task {
     bool history;
 };
 
-struct CombineProfile { I tasks = 0, vectors = 0, work = 0; };
+struct CombineProfile { I tasks = 0, vectors = 0; double work = 0; };
 struct Stats {
     I candidates = 0, bound_pruned = 0, attention_pruned = 0;
     I combine_pruned = 0, scored = 0;
@@ -77,12 +83,12 @@ struct Planner {
         }
         p.tasks *= world;
         p.vectors *= world;
-        p.work = task_overhead * p.tasks + p.vectors;
+        p.work = combine_overhead * p.tasks + partial_vector_cost * p.vectors;
         return p;
     }
 
     std::optional<Plan> profile(const Vec& splits, const std::string& source,
-                                I cutoff = std::numeric_limits<I>::max()) {
+                                double cutoff = no_cutoff) {
         ++stats.candidates;
         const Vec& chunks = legacy_native && source == "legacy_dynamic" && !native_chunk.empty()
             ? native_chunk : chunk;
@@ -98,10 +104,12 @@ struct Planner {
                 break;
             }
         }
-        // Conservation of worker time is a lower bound on the final makespan.
-        // A CTA's attention occupies all of its combine warps. Dependencies can
-        // only increase this bound. Pruning at cutoff preserves strict improvement.
-        if (prune && cutoff != std::numeric_limits<I>::max()) {
+        // Lower bounds on the final makespan: attention work cannot finish
+        // faster than full bandwidth, no task runs faster than the floor, and
+        // a CTA's attention (at least floor time per unit) occupies all of its
+        // combine warps. Dependencies can only increase these bounds. Pruning at
+        // cutoff preserves strict improvement; the slack absorbs rounding.
+        if (prune && cutoff != no_cutoff) {
             I work = 0, longest = 0;
             for (size_t b = 0; b < q.size(); ++b) {
                 for (I m = 0; m < ceil_div(q[b] * heads, 128); ++m) {
@@ -112,9 +120,10 @@ struct Planner {
                 work += ceil_div(q[b] * heads * world, 128) * (history[b] + splits[b] * task_overhead);
                 longest = std::max(longest, split_work(history[b], splits[b], 0));
             }
-            I lower_bound = std::max(longest, ceil_div(work * compute_warps + combine.work,
-                                                     ctas * compute_warps));
-            if (lower_bound >= cutoff) { ++stats.bound_pruned; return std::nullopt; }
+            double lower_bound = std::max({
+                bandwidth_floor * longest, static_cast<double>(work) / ctas,
+                (bandwidth_floor * work * compute_warps + combine.work) / (ctas * compute_warps)});
+            if (lower_bound * (1 - 1e-9) >= cutoff) { ++stats.bound_pruned; return std::nullopt; }
         }
 
         std::vector<Task> tasks;
@@ -158,29 +167,47 @@ struct Planner {
             std::sort(first, tasks.end(), [&](const Task& a, const Task& b) { return key(a) < key(b); });
         }
 
-        MinHeap<std::pair<I, I>> attention_workers;
-        Vec last_sequence(ctas, -1), finish_times(ctas), completions(tasks.size());
-        for (I i = 0; i < ctas; ++i) attention_workers.emplace(0, i);
-        I attention_span = 0;
-        for (const auto& task : tasks) {
-            auto [available, worker] = attention_workers.top();
-            attention_workers.pop();
-            I finish = available + task.work;
-            completions[task.id] = finish;
-            finish_times[worker] = finish;
+        // The first CTA to become free takes the next task. Running CTAs advance
+        // together: track progress in work units and convert it to time between
+        // completions with the current number of running CTAs.
+        MinHeap<std::tuple<I, I, I>> running;
+        Vec last_sequence(ctas, -1);
+        std::vector<double> finish_times(ctas, 0.0), completions(tasks.size(), 0.0);
+        size_t next_task = 0;
+        I progress = 0;
+        double now = 0;
+        auto start = [&](I worker) {
+            if (next_task == tasks.size()) return;
+            const Task& task = tasks[next_task++];
             last_sequence[worker] = task.history ? task.batch : -1;
-            attention_workers.emplace(finish, worker);
-            attention_span = std::max(attention_span, finish);
-            if (prune && attention_span >= cutoff) { ++stats.attention_pruned; return std::nullopt; }
+            running.emplace(progress + task.work, worker, task.id);
+        };
+        for (I i = 0; i < ctas; ++i) start(i);
+        while (!running.empty()) {
+            I finish = std::get<0>(running.top());
+            now += static_cast<double>(finish - progress) *
+                std::max(bandwidth_floor, static_cast<double>(running.size()) / ctas);
+            progress = finish;
+            Vec finished;
+            while (!running.empty() && std::get<0>(running.top()) == finish) {
+                auto [_, worker, id] = running.top();
+                running.pop();
+                completions[id] = now;
+                finish_times[worker] = now;
+                finished.push_back(worker);
+            }
+            if (prune && now >= cutoff) { ++stats.attention_pruned; return std::nullopt; }
+            for (I worker : finished) start(worker);
         }
+        double attention_span = now;
         std::set<I> critical;
         for (I i = 0; i < ctas; ++i)
             if (finish_times[i] == attention_span && last_sequence[i] >= 0) critical.insert(last_sequence[i]);
 
         // Worker identities do not affect combine costs. Preserve FIFO repeats,
         // grouping equal availability just as the Python reference does.
-        MinHeap<std::pair<I, I>> workers;
-        Vec sorted_finish = finish_times;
+        MinHeap<std::pair<double, I>> workers;
+        std::vector<double> sorted_finish = finish_times;
         std::sort(sorted_finish.begin(), sorted_finish.end());
         for (size_t i = 0; i < sorted_finish.size();) {
             size_t j = i + 1;
@@ -188,7 +215,7 @@ struct Planner {
             workers.emplace(sorted_finish[i], (j - i) * compute_warps);
             i = j;
         }
-        I score = attention_span;
+        double score = attention_span;
         size_t batch = 0;
         for (I tile = 0; tile < cu.back(); tile += 16) {
             I tile_end = std::min(tile + 16, cu.back());
@@ -203,7 +230,8 @@ struct Planner {
                         I valid = std::min(step, region_end - vector);
                         I token = vector / heads, head = vector % heads;
                         I packed = (token - cu[b]) * heads * world + rank * heads + head;
-                        I repeats = 1, ready = 0;
+                        I repeats = 1;
+                        double ready = 0;
                         if (step == 1) {
                             repeats = std::min({region_end - vector, heads - head, 128 - packed % 128});
                             I first = bases[b] + packed / 128 * splits[b];
@@ -221,7 +249,8 @@ struct Planner {
                         while (remaining) {
                             auto [available, count] = workers.top(); workers.pop();
                             I used = std::min(remaining, count);
-                            I finish = std::max(available, ready) + task_overhead + valid * splits[b];
+                            double finish = std::max(available, ready) +
+                                (combine_overhead + partial_vector_cost * valid * splits[b]);
                             if (used < count) workers.emplace(available, count - used);
                             workers.emplace(finish, used);
                             score = std::max(score, finish);
@@ -261,8 +290,9 @@ struct Planner {
             }
             std::optional<Plan> best;
             for (const auto& splits : vectors) {
-                // Integer scores: retain ties with best for the original tie-break.
-                I cutoff = best && best->score < iterative.score ? best->score + 1 : iterative.score;
+                // Retain ties with best for the original tie-break.
+                double cutoff = best && best->score < iterative.score
+                    ? std::nextafter(best->score, no_cutoff) : iterative.score;
                 auto candidate = profile(splits, "iterative", cutoff);
                 if (candidate && (!best || candidate->key() < best->key())) best = std::move(candidate);
             }
@@ -275,7 +305,7 @@ struct Planner {
             Plan native = *profile(legacy, "legacy_dynamic");
             if (native.key() < selected.key()) selected = native;
         }
-        double gain = static_cast<double>(baseline.score - selected.score) / baseline.score;
+        double gain = (baseline.score - selected.score) / baseline.score;
         if (gain < min_gain || selected.score >= baseline.score) selected = baseline;
         return {baseline, selected};
     }
