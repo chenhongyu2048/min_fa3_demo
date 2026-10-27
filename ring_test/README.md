@@ -29,6 +29,12 @@ Transformer Engine import. CP1 uses local FA3, while CP>1 uses the existing
 ordinary/zigzag P2P FA3 rings. External FA3 is selected only when every rank
 can import it, otherwise all ranks use the local min-FA3 fallback.
 
+The [CP motivation experiment](../baseline/megatron_hybrid_cp/README.md#cp-motivation-experiment)
+compares `normal`, `compute-only`, and `one-step` under the same Megatron
+schedule on all five datasets. Run `bash scripts/benchmark_cp_motivation.sh`
+from the repository root; `DRY_RUN=1` prints its workloads without CUDA.
+It reports forward, backward, and directly measured forward+backward latency.
+
 The method executes every execution group and per-rank sample list in forward
 order, with exactly one world barrier between groups. Backward is causal-only
 and intentionally uses the same forward order after a complete retained

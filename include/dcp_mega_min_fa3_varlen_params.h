@@ -170,6 +170,9 @@ struct DCPMega_fwd_params {
     int32_t* queue_state = nullptr;
     uint64_t* phase_timestamps = nullptr;
     int32_t const* graph_post_phase = nullptr;
+    bool phased_execution = false;
+    // [6 phases, num_sms CTAs, 7]: SM, entry, start, end, exit, rank-in, rank-out.
+    int64_t* sm_trace = nullptr;
 
     int dcp_size = 0;
     int dcp_rank = 0;

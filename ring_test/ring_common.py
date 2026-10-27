@@ -252,7 +252,9 @@ def ring_varlen_forward(
     *,
     return_lse: bool = False,
     ring_members: tuple[int, ...] | None = None,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    execution_mode: str = "overlap",
+    gathered_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
     """Run a full Python-side ring attention forward for one backend.
 
     `block_attention` is the per-step attention implementation. For noncausal
@@ -260,6 +262,10 @@ def ring_varlen_forward(
     consumes only local/history blocks (`step <= r`); step 0 is the local block
     and uses the causal mask, while history blocks are noncausal.
     """
+    if execution_mode not in ("overlap", "serial", "comm_only", "comp_only"):
+        raise ValueError(f"unknown execution_mode: {execution_mode}")
+    if execution_mode == "comp_only" and gathered_kv is None:
+        raise ValueError("comp_only requires KV snapshots in ring-step order")
     comm = RingComm(process_group, ring_members)
     out = None
     lse = None
@@ -267,22 +273,29 @@ def ring_varlen_forward(
     cur_v = v.contiguous()
 
     for step in range(comm.world_size):
+        if execution_mode == "comp_only":
+            cur_k, cur_v = gathered_kv[step]
         # Start moving the current K/V block before computing on it, matching
         # the usual ring attention overlap pattern.
-        if step + 1 != comm.world_size:
+        if step + 1 != comm.world_size and execution_mode != "comp_only":
             next_k, next_v = comm.send_recv_kv(cur_k, cur_v)
+            if execution_mode == "serial":
+                comm.wait()
         else:
             next_k, next_v = None, None
 
-        if not is_causal or step <= comm.rank:
+        if execution_mode != "comm_only" and (not is_causal or step <= comm.rank):
             block_out, block_lse = block_attention(q, cur_k, cur_v, is_causal and step == 0)
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
-        if step + 1 != comm.world_size:
+        if step + 1 != comm.world_size and execution_mode != "comp_only":
             # The received block becomes the current block for the next step.
-            comm.wait()
+            if execution_mode != "serial":
+                comm.wait()
             cur_k, cur_v = next_k, next_v
 
+    if execution_mode == "comm_only":
+        return None
     if out is None:
         raise RuntimeError("ring attention produced no output blocks")
     output = out.to(q.dtype)
@@ -305,7 +318,9 @@ def zigzag_ring_varlen_forward(
     *,
     return_lse: bool = False,
     ring_members: tuple[int, ...] | None = None,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    execution_mode: str = "overlap",
+    gathered_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
     """Run load-balanced causal zigzag ring attention for one backend.
 
     Each rank-local sequence is interpreted as [front half | back half]. Step 0
@@ -313,9 +328,18 @@ def zigzag_ring_varlen_forward(
     full-Q/half-KV dense blocks, while later global KV ranks use half-Q/full-KV
     dense blocks and update only the back-half output rows.
     """
+    if execution_mode == "comm_only":
+        return ring_varlen_forward(
+            process_group, q, k, v, False, block_attention,
+            ring_members=ring_members, execution_mode="comm_only",
+        )
     if max_seqlen % 2 != 0:
         raise RuntimeError(f"zigzag causal ring requires an even max_seqlen, got {max_seqlen}")
 
+    if execution_mode not in ("overlap", "serial", "comm_only", "comp_only"):
+        raise ValueError(f"unknown execution_mode: {execution_mode}")
+    if execution_mode == "comp_only" and gathered_kv is None:
+        raise ValueError("comp_only requires KV snapshots in ring-step order")
     comm = RingComm(process_group, ring_members)
     half_index0 = get_half_index(cu_seqlens, front=True)
     half_index1 = get_half_index(cu_seqlens, front=False)
@@ -330,8 +354,12 @@ def zigzag_ring_varlen_forward(
     cur_v = v.contiguous()
 
     for step in range(comm.world_size):
-        if step + 1 != comm.world_size:
+        if execution_mode == "comp_only":
+            cur_k, cur_v = gathered_kv[step]
+        if step + 1 != comm.world_size and execution_mode != "comp_only":
             next_k, next_v = comm.send_recv_kv(cur_k, cur_v)
+            if execution_mode == "serial":
+                comm.wait()
         else:
             next_k, next_v = None, None
 
@@ -382,8 +410,9 @@ def zigzag_ring_varlen_forward(
             out[half_index1] = out1
             lse[half_index1] = lse1
 
-        if step + 1 != comm.world_size:
-            comm.wait()
+        if step + 1 != comm.world_size and execution_mode != "comp_only":
+            if execution_mode != "serial":
+                comm.wait()
             cur_k, cur_v = next_k, next_v
 
     if out is None:

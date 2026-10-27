@@ -23,6 +23,7 @@ from __future__ import annotations
 import threading
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+from functools import partial
 from typing import Callable, Iterable, Optional, Protocol, Sequence, Tuple, Union
 
 import torch
@@ -2281,6 +2282,8 @@ class DCPMegaAttentionRunner:
         num_comm_sm: int = 8,
         block_n_override: Optional[int] = None,
         record_phase_timestamps: bool = False,
+        execution_mode: str = "mixed",
+        record_sm_trace: bool = False,
     ) -> None:
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError(
@@ -2369,6 +2372,14 @@ class DCPMegaAttentionRunner:
         self.max_num_splits = max_num_splits
         self.num_comm_sm = num_comm_sm
         self.block_n_override = block_n_override
+        if execution_mode not in ("mixed", "phased"):
+            raise ValueError("execution_mode must be mixed or phased")
+        if record_sm_trace and execution_mode != "phased":
+            raise ValueError("record_sm_trace requires phased execution")
+        if execution_mode == "phased" and record_phase_timestamps:
+            raise ValueError("phased execution uses record_sm_trace instead of phase timestamps")
+        self.execution_mode = execution_mode
+        self.record_sm_trace = bool(record_sm_trace)
         self.record_phase_timestamps = bool(record_phase_timestamps)
         self.num_sms = props.multi_processor_count
         self._padded_total_q = ((max_total_q + 15) // 16) * 16
@@ -2405,7 +2416,7 @@ class DCPMegaAttentionRunner:
             False,
         )
         self._ipc_barrier = min_fa3_op.TKParallelTensor(
-            [1],
+            [3 if self.execution_mode == "phased" else 1],
             torch.int32,
             self.node_rank,
             self.node_world_size,
@@ -2540,6 +2551,10 @@ class DCPMegaAttentionRunner:
         self._phase_timestamps = torch.empty(
             len(self.PHASE_TIMESTAMP_NAMES), dtype=torch.int64, **cuda
         )
+        self._sm_trace = (
+            torch.empty((6, self.num_sms, 7), dtype=torch.int64, **cuda)
+            if self.record_sm_trace else None
+        )
         self._graph_post_phase = torch.empty(1, dtype=torch.int32, **cuda)
         self._graph_metadata_payload: bytes | None = None
         self._graph_metadata_host: torch.Tensor | None = None
@@ -2587,6 +2602,19 @@ class DCPMegaAttentionRunner:
     @property
     def last_queue_counts(self) -> dict[str, object] | None:
         return self._last_queue_counts
+
+    def copy_last_sm_trace(self, destination: torch.Tensor) -> None:
+        """Copy [phase, CTA, field] records after replay, outside timing.
+
+        Fields: sm_id, entry_ns, start_ns, end_ns, exit_ns, rank_in_ns,
+        rank_out_ns. The last two fields are populated only by CTA0 for Q/A2A.
+        CPU destinations are allowed; a synchronous copy waits for completion.
+        """
+        if self._sm_trace is None:
+            raise RuntimeError("record_sm_trace is disabled")
+        if destination.shape != self._sm_trace.shape or destination.dtype != torch.int64:
+            raise ValueError("destination must be int64 [6, num_sms, 7]")
+        destination.copy_(self._sm_trace)
 
     def copy_last_phase_timestamps(self, destination: torch.Tensor) -> None:
         """Copy the last raw ``%globaltimer`` milestones without synchronizing."""
@@ -2929,6 +2957,10 @@ class DCPMegaAttentionRunner:
                     "the installed _min_fa3_op extension does not contain the DCP mega "
                     "backend; rebuild the extension"
                 )
+            if self.execution_mode == "phased":
+                backend = partial(
+                    backend, execution_mode=self.execution_mode, sm_trace=self._sm_trace
+                )
             backend_args = self._backend_args(
                 q_local, k_history_local, v_history_local, k_chunk, v_chunk,
                 cu_seqlens_q, cu_seqlens_history_local, max_seqlen_q,
@@ -3079,6 +3111,8 @@ class DCPMegaAttentionRunner:
         Keep backend_args alive for the graph lifetime. Use this path for both
         warmup and replay so every invocation advances the same device phase.
         """
+        if self.execution_mode != "mixed":
+            raise RuntimeError("phased execution uses fixed-shape capture_last_forward()")
         min_fa3_op.forward_chunk_prefill_varlen_dcp_mega(
             *backend_args, True, 0, True, True, False, True, True
         )
@@ -3089,8 +3123,11 @@ class DCPMegaAttentionRunner:
         self,
         *,
         capture_warmup: int = 3,
+        run_pre_barrier: bool = True,
     ) -> DCPMegaAttentionCUDAGraph:
         """Capture the last fixed-shape forward for repeated graph replay."""
+        if not run_pre_barrier and self.execution_mode != "phased":
+            raise ValueError("only phased diagnostics can rely on the internal Q-entry barrier")
         if self._closed:
             raise RuntimeError("DCPMegaAttentionRunner is closed")
         if not isinstance(capture_warmup, int) or capture_warmup < 0:
@@ -3135,7 +3172,7 @@ class DCPMegaAttentionRunner:
                     True,
                     0,
                     True,
-                    True,
+                    run_pre_barrier,
                     False,
                     True,
                 )
@@ -3163,6 +3200,9 @@ class DCPMegaAttentionRunner:
                     "max_seqlen_q": replay.backend_args[7],
                     "max_seqlen_history_local": replay.backend_args[8],
                     "num_comm_sm": self.num_comm_sm,
+                    "execution_mode": self.execution_mode,
+                    "run_pre_barrier": run_pre_barrier,
+                    "record_sm_trace": self.record_sm_trace,
                     "record_phase_timestamps": self.record_phase_timestamps,
                     "dispatch": (
                         asdict(self._last_dispatch)

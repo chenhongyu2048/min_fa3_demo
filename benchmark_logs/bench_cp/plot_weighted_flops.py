@@ -49,8 +49,8 @@ METHOD_LABELS = {
     "megatron_hybrid_cp": "megatron_hybrid_cp",
     "magi_attention": "magi_attention",
     "zeppelin": "Zeppelin",
-    "mega_ring_all_cp": "mega_ring_all_cp",
-    "mega_ring_hybrid": "mega_ring_hybrid",
+    "mega_ring_all_cp": "MegaRing All CP",
+    "mega_ring_hybrid": "MegaRing Hybrid",
 }
 METHOD_COLORS = {
     "allgather_attention": "#4C78A8",

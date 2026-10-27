@@ -221,8 +221,9 @@ private:
     }
 
 public:
-    template <typename Params>
-    CUTLASS_DEVICE void operator()(Params const& params, char* smem_buf) {
+    template <bool Phased = false, typename Params>
+    CUTLASS_DEVICE void operator()(Params const& params, char* smem_buf,
+                                  int attention_kind = 0) {
         static constexpr int MmaThreadOffset
             = NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
@@ -233,7 +234,18 @@ public:
 
         SharedStorage& shared_storage
             = *reinterpret_cast<SharedStorage*>(smem_buf);
-        auto const scheduler_params = params.chunk.scheduler.resolve();
+        auto scheduler_params = params.chunk.scheduler.resolve();
+        if constexpr (Phased) {
+            // Metadata v7 stores chunk descriptors before history descriptors.
+            // Keep each descriptor's original completion ID for downstream work.
+            int const chunk_count = params.chunk_attention_count;
+            if (attention_kind == min_fa3_varlen_demo::dcp_mega::kHistory) {
+                scheduler_params.descriptors += chunk_count;
+                scheduler_params.attention_count -= chunk_count;
+            } else {
+                scheduler_params.attention_count = chunk_count;
+            }
+        }
 
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();
@@ -446,6 +458,14 @@ public:
                     smem_pipe_write,
                     shared_storage,
                     work_idx);
+                if constexpr (Phased) {
+                    // mma_init / the final MMA leaves one QueryEmpty arrival
+                    // for the next tile. Consume it before a new phase calls
+                    // mma_init again, including CTAs with no valid tile.
+                    cutlass::arch::NamedBarrier::sync(
+                        ChunkMainloop::QueryBarrierArrivalCount,
+                        static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty));
+                }
             }
         } else {
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
@@ -546,6 +566,13 @@ public:
                 }
             }
             epilogue.store_tail();
+            if constexpr (Phased && ChunkMainloop::UseSchedulerBarrier) {
+                // The last consumer warpgroup leaves the next-turn token
+                // for WG1. Drain it before reinitializing the warp scheduler.
+                if (warp_group_idx == 1) {
+                    chunk_mainloop.warp_scheduler_barrier_sync();
+                }
+            }
         }
     }
 };

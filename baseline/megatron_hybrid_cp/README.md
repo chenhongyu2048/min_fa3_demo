@@ -95,6 +95,83 @@ The baseline is invoked through the existing topology and dataset frontends
 with `--methods megatron_hybrid_cp`. Use `--check` only for small workloads
 because the dense reference materializes quadratic attention scores.
 
+## CP motivation experiment
+
+`ring_test/benchmark_cp_motivation.py` measures three progressive controls using
+the same causal Megatron plan, padded execution lengths, BF16 Q/K/V/dO, backend,
+sample order, and execution-group barriers:
+
+| Mode | KV / dKV transfer | Attention calls per CP sample and phase | Local reductions |
+| --- | --- | --- | --- |
+| `normal` | Original overlapped P2P ring | CP size | Original online O/LSE merge and FP32 gradient accumulation |
+| `compute-only` | None; KV is resident before timing | CP size | Same per-step O/LSE merge and FP32 gradient accumulation |
+| `one-step` | None; KV prefixes are resident before timing | One | Merge the two prefixes' overlapping dKV contributions |
+
+CP1 keeps the same local attention runner in every mode. All modes execute
+each original sample separately within its original execution group; no
+samples or groups are fused. The world barrier between adjacent execution
+groups remains inside each measured phase.
+
+`compute-only` gathers KV once during construction and replays the normal
+zigzag step order. Backward executes the same full-Q/half-KV and half-Q/full-KV
+blocks, dQ accumulation, and FP32 dKV additions, with zero incoming remote
+contributions. It retains this rank's partial dKV for every KV owner. Partial
+gradient buffers are reset before timing, representing ready receive buffers
+without their communication cost.
+
+`one-step` represents each rank's two zigzag Q halves as two varlen sequences
+inside one FA3 call. If a local half has `h` tokens, CP size is `p`, and CP rank
+is `r`, the front half attends to the first `(r+1)*h` global KV tokens and the
+back half to the first `(2*p-r)*h` tokens. Bottom-right causal masks preserve
+the same effective attention pairs as the ring. KV prefix packing and
+duplication happen before timing. Backward sums overlapping prefix gradients
+in FP32 and retains rank-local contributions in global KV order.
+
+`--check` compares O, LSE, dQ, dK, and dV against `normal` for every case.
+For the two compute controls, a separate untimed all-reduce assembles the
+complete owner dK/dV solely for this check. It is not part of any timed launch.
+The CPU numerical test independently checks both controls against dense
+causal attention and autograd at CP2/4/8 with MHA and GQA.
+
+The experiment reports `forward`, `backward`, and directly measured
+`forward+backward`. Backward-only timing prepares the complete forward outside
+the interval. Combined timing runs the complete forward phase followed by the
+complete backward phase. Each latency is the mean of per-iteration maximum
+rank wall times with CUDA synchronization. Phase-start synchronization,
+scheduling, input allocation, KV gathering/packing, gradient-buffer reset, and
+correctness collectives are excluded. The JSONL contains raw per-iteration
+rank maxima, rank means, workload assignments, padding, hardware/configuration,
+and per-dataset case means with `normal/compute-only` and
+`compute-only/one-step` ratios. These ratios measure the effect of removing
+communication and step splitting; differences are not additive standalone
+communication times because normal execution overlaps communication.
+
+Run all five datasets at 128K tokens, four cases each, on eight GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash scripts/benchmark_cp_motivation.sh
+```
+
+Inspect the same workloads locally without CUDA or a compiled extension
+(PyTorch is sufficient):
+
+```bash
+DRY_RUN=1 PYTHON=python bash scripts/benchmark_cp_motivation.sh
+python -m unittest ring_test.test_cp_motivation -v
+```
+
+The launcher also accepts `GPUS=2|4|8`, `TARGET_TOKENS`, `DATASETS`, `NUM_CASES`,
+`QHEAD`, `KVHEAD`, `SEED`, `WARMUP_ITERS`, `NUM_ITERS`,
+`MEGATRON_MAX_SEQLEN_PER_RANK`, `CHECK=0|1`, `TORCHRUN`, and `LOG_DIR`.
+Results default to `benchmark_logs/<timestamp>-cp-motivation/results.jsonl`
+and `console.log`. Controls keep resident global KV and partial dKV, so they
+use more memory than the normal ring. CUDA kernel correctness and performance
+must be validated on the target Hopper node.
+
+[Four-GPU H20 validation](SMOKE_H20.md) passes all five datasets at the default
+128K target, four cases per dataset, with `normal`, `compute-only`, and
+`one-step`. The record includes commands, correctness settings, and raw logs.
+
 ## Reporting and CP saturation
 
 Input allocation, `cu_seqlens`, correctness references, P2P communication,

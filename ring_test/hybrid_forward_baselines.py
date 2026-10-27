@@ -257,120 +257,144 @@ class VarlenAllGatherForward(_BlockBackend):
         for item in work:
             item.wait()  # type: ignore[attr-defined]
 
-    def _order_kv_chunk(self, buffer_idx: int) -> None:
+    def _order_kv_chunk(
+        self, buffer_idx: int,
+        gathered_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> None:
+        gathered = self.kv_gather[buffer_idx] if gathered_kv is None else gathered_kv
         torch.index_select(
-            self.kv_gather[buffer_idx, 0],
+            gathered[0],
             0,
             self.global_order,
             out=self.kv_ordered[buffer_idx, 0],
         )
         torch.index_select(
-            self.kv_gather[buffer_idx, 1],
+            gathered[1],
             0,
             self.global_order,
             out=self.kv_ordered[buffer_idx, 1],
         )
 
-    def forward(self) -> torch.Tensor:
+    def forward(
+        self, *, execution_mode: str = "overlap",
+        gathered_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ) -> torch.Tensor | None:
+        """T1 controls reuse the baseline packing, index_select and FA3 calls.
+
+        comp_only consumes rank-major snapshots prepared outside timing;
+        comm_only includes send packing and collectives, but no KV reorder.
+        """
+        if execution_mode not in ("overlap", "serial", "comm_only", "comp_only"):
+            raise ValueError(f"unknown execution_mode: {execution_mode}")
+        if execution_mode == "comp_only" and gathered_kv is None:
+            raise ValueError("comp_only requires pre-gathered KV chunks")
         current_buffer = 0
-        current_work = self._start_kv_all_gather(current_buffer, 0)
-        for kv_head_start in range(0, self.k.size(1), self.heads_k_stride):
-            self._wait_kv_all_gather(current_work)
-            self._order_kv_chunk(current_buffer)
-
-            q_head_slice = self._q_head_slice(kv_head_start)
-            self.q_chunk.copy_(self.q[:, q_head_slice])
+        current_work = None
+        if execution_mode != "comp_only":
+            current_work = self._start_kv_all_gather(current_buffer, 0)
+        for chunk, kv_head_start in enumerate(range(0, self.k.size(1), self.heads_k_stride)):
+            if current_work is not None:
+                self._wait_kv_all_gather(current_work)
+            if execution_mode != "comm_only":
+                self._order_kv_chunk(
+                    current_buffer,
+                    gathered_kv[chunk] if execution_mode == "comp_only" else None,
+                )
+                q_head_slice = self._q_head_slice(kv_head_start)
+                self.q_chunk.copy_(self.q[:, q_head_slice])
             next_kv_head_start = kv_head_start + self.heads_k_stride
-            if next_kv_head_start < self.k.size(1):
-                next_buffer = 1 - current_buffer
-                current_work = self._start_kv_all_gather(
-                    next_buffer, next_kv_head_start
-                )
-
-            if not self.is_causal:
-                out, _ = self.forward_block(
-                    self.q_chunk,
-                    self.kv_ordered[current_buffer, 0],
-                    self.kv_ordered[current_buffer, 1],
-                    self.local_cu,
-                    self.global_cu,
-                    self.local_cu_host,
-                    self.global_cu_host,
-                    self.max_local,
-                    self.max_global,
-                    False,
-                )
-                self.out[:, q_head_slice].copy_(out)
-                current_buffer = 1 - current_buffer
-                continue
-
-            torch.index_select(
-                self.q_chunk, 0, self.q_front_indices, out=self.q_front
-            )
-            torch.index_select(
-                self.q_chunk, 0, self.q_back_indices, out=self.q_back
-            )
-            torch.index_select(
-                self.kv_ordered[current_buffer, 0],
-                0,
-                self.k_front_indices,
-                out=self.k_front,
-            )
-            torch.index_select(
-                self.kv_ordered[current_buffer, 1],
-                0,
-                self.k_front_indices,
-                out=self.v_front,
-            )
-            torch.index_select(
-                self.kv_ordered[current_buffer, 0],
-                0,
-                self.k_back_indices,
-                out=self.k_back,
-            )
-            torch.index_select(
-                self.kv_ordered[current_buffer, 1],
-                0,
-                self.k_back_indices,
-                out=self.v_back,
-            )
-            out_front, _ = self.forward_block(
-                self.q_front,
-                self.k_front,
-                self.v_front,
-                self.half_cu,
-                self.front_k_cu,
-                self.half_cu_host,
-                self.front_k_cu_host,
-                max(self.local_lengths) // 2,
-                max(
-                    length * (self.rank + 1) // 2 for length in self.local_lengths
-                ),
-                True,
-            )
-            out_back, _ = self.forward_block(
-                self.q_back,
-                self.k_back,
-                self.v_back,
-                self.half_cu,
-                self.back_k_cu,
-                self.half_cu_host,
-                self.back_k_cu_host,
-                max(self.local_lengths) // 2,
-                max(
-                    length * (2 * self.world_size - self.rank) // 2
-                    for length in self.local_lengths
-                ),
-                True,
-            )
-            self.out[:, q_head_slice].index_copy_(
-                0, self.q_front_indices, out_front
-            )
-            self.out[:, q_head_slice].index_copy_(
-                0, self.q_back_indices, out_back
-            )
+            has_next = next_kv_head_start < self.k.size(1)
+            if has_next and execution_mode == "overlap":
+                current_work = self._start_kv_all_gather(1 - current_buffer, next_kv_head_start)
+            if execution_mode != "comm_only":
+                self._compute_chunk(current_buffer, q_head_slice)
+            if has_next and execution_mode in ("serial", "comm_only"):
+                current_work = self._start_kv_all_gather(1 - current_buffer, next_kv_head_start)
             current_buffer = 1 - current_buffer
-        return self.out
+        return None if execution_mode == "comm_only" else self.out
+
+    def _compute_chunk(self, current_buffer: int, q_head_slice: slice) -> None:
+        if not self.is_causal:
+            out, _ = self.forward_block(
+                self.q_chunk,
+                self.kv_ordered[current_buffer, 0],
+                self.kv_ordered[current_buffer, 1],
+                self.local_cu,
+                self.global_cu,
+                self.local_cu_host,
+                self.global_cu_host,
+                self.max_local,
+                self.max_global,
+                False,
+            )
+            self.out[:, q_head_slice].copy_(out)
+            return
+
+        torch.index_select(
+            self.q_chunk, 0, self.q_front_indices, out=self.q_front
+        )
+        torch.index_select(
+            self.q_chunk, 0, self.q_back_indices, out=self.q_back
+        )
+        torch.index_select(
+            self.kv_ordered[current_buffer, 0],
+            0,
+            self.k_front_indices,
+            out=self.k_front,
+        )
+        torch.index_select(
+            self.kv_ordered[current_buffer, 1],
+            0,
+            self.k_front_indices,
+            out=self.v_front,
+        )
+        torch.index_select(
+            self.kv_ordered[current_buffer, 0],
+            0,
+            self.k_back_indices,
+            out=self.k_back,
+        )
+        torch.index_select(
+            self.kv_ordered[current_buffer, 1],
+            0,
+            self.k_back_indices,
+            out=self.v_back,
+        )
+        out_front, _ = self.forward_block(
+            self.q_front,
+            self.k_front,
+            self.v_front,
+            self.half_cu,
+            self.front_k_cu,
+            self.half_cu_host,
+            self.front_k_cu_host,
+            max(self.local_lengths) // 2,
+            max(
+                length * (self.rank + 1) // 2 for length in self.local_lengths
+            ),
+            True,
+        )
+        out_back, _ = self.forward_block(
+            self.q_back,
+            self.k_back,
+            self.v_back,
+            self.half_cu,
+            self.back_k_cu,
+            self.half_cu_host,
+            self.back_k_cu_host,
+            max(self.local_lengths) // 2,
+            max(
+                length * (2 * self.world_size - self.rank) // 2
+                for length in self.local_lengths
+            ),
+            True,
+        )
+        self.out[:, q_head_slice].index_copy_(
+            0, self.q_front_indices, out_front
+        )
+        self.out[:, q_head_slice].index_copy_(
+            0, self.q_back_indices, out_back
+        )
 
 
 def fa3_ring_forward(
@@ -386,7 +410,9 @@ def fa3_ring_forward(
     ring_members: tuple[int, ...] | None = None,
     *,
     return_lse: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    execution_mode: str = "overlap",
+    gathered_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
     block_backend = _BlockBackend(backend)
     max_local_len = max(local_lengths)
     if is_causal:
@@ -401,6 +427,8 @@ def fa3_ring_forward(
             block_backend.forward_block,
             return_lse=return_lse,
             ring_members=ring_members,
+            execution_mode=execution_mode,
+            gathered_kv=gathered_kv,
         )
     return ring_varlen_forward(
         process_group,
@@ -422,6 +450,8 @@ def fa3_ring_forward(
         ),
         return_lse=return_lse,
         ring_members=ring_members,
+        execution_mode=execution_mode,
+        gathered_kv=gathered_kv,
     )
 
 
