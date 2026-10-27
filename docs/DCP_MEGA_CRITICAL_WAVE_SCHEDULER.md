@@ -26,7 +26,7 @@ DCP Mega 将一个 chunk-prefill batch 拆成两个 attention domain：
 1. `chunk attention`：本 rank 的 causal chunk K/V；
 2. `history attention`：DCP group 聚合后的 Q 对本 rank history K/V 做 noncausal attention。
 
-host 为两个 domain 构造统一的 attention descriptor 队列。初始 compute CTA 立即进入 attention，communication CTA 完成各自的 Q all-gather 工作后加入动态计算队列。每个 CTA 完成 attention 后由 3 个独立 WG 处理 history combine；结果通过 TMA 直接写入 Q 来源 rank 的 IPC inbox，各 WG 完成本组 history 工作后独立进入 final，无专用 output receive CTA。
+host 为两个 domain 构造统一的 attention descriptor 队列。compute CTA 完成 attention 后继续处理 history combine 和 final combine；专用 communication CTA 完成 Q all-gather 后，继续从远端 IPC send buffer 拉取 history O/LSE 到本地 receive buffer，并发布 receive-ready。计算与通信分别使用 `num_sms - num_comm_sm` 和 `num_comm_sm` 个 CTA。
 
 一个 batch 通常同时包含：
 
@@ -85,7 +85,7 @@ critical-wave 调度器的主要目标按优先级排列为：
 2. 改善 compute CTA 的负载均衡，减少最后一个未填满 wave 的尾部；
 3. 在收益接近时选择更少的 attention task 和更小的 split 向量；
 4. 保留 FA3 native dynamic split 作为候选和运行时回退；
-5. 不修改 CUDA attention 数学实现和 packed metadata descriptor 布局；
+5. 不修改 CUDA attention 数学实现和 packed metadata ABI；
 6. 保持 host 侧决策确定性，便于 CUDA Graph replay 和离线复现。
 
 非目标：
@@ -236,24 +236,24 @@ cost model 和最终 metadata 必须使用完全相同的顺序。history order 
 combine task 按实际 packed metadata 顺序构造：
 
 ```text
-16-token communication parent tile
+final token tile
     -> destination rank
         -> sequence region
-            -> four-warp history task
+            -> vector task
 ```
 
-每个 history task 由一个 4-warp group（WG）领取。`actual_splits > 1` 时，一个 task 包含同一 history M-tile 的 4 个 vector，每个 warp 独立 combine 一个 vector；`actual_splits == 1` 时，从 4/8/16/32 vectors/task 中选择 copy 粒度，4 个 warp 按 `warp_in_group + 4*k` 分担。task 均不跨 sequence 或 publish tile，copy 可以通过精确依赖并集覆盖多个 M-tile。每个 task 的无量纲成本为：
+NoSplit 路径可以在一个 task 中复制多个 vector；split 路径每个 vector 独立 combine。每个 task 的无量纲成本为：
 
 ```text
-combine_work = combine_task_overhead + ceil(valid_vectors / 4) * actual_splits
+combine_work = combine_task_overhead + valid_vectors * actual_splits
 combine_task_overhead = 4
 ```
 
-这同时计入固定 task 开销和 WG 内按 4 个 vector 并行执行的轮次。`partial_vector_count` 仍统计实际的 `sum(valid_vectors * actual_splits)`，与 WG 时间单位区分。copy 选择满足 `task_count >= ceil(0.8 * 3 * num_compute_ctas)` 的最大候选，不足时使用 4；计数包括 split task，并按 sequence/publish 边界截断。
+这同时计入固定 task 开销和随 partial vector 数增长的工作。
 
 ### 8.2 worker release 与依赖
 
-每个 compute CTA 保留 `MEGA_COMPUTE_WARPS = 12` 个物理 warp，提供 `HISTORY_WORKER_GROUPS = 3` 个独立 combine worker。每个 worker 是一个 4-warp WG，只有在所属 CTA 完成 attention 后才可用：
+每个 compute CTA 提供 `MEGA_COMPUTE_WARPS = 12` 个 combine worker。一个 CTA 的 combine worker 只有在该 CTA 完成 attention 后才可用：
 
 ```text
 worker.available_time = cta_attention_finish_time
@@ -272,7 +272,7 @@ finish_j = start_j + combine_work_j
 worker.available_time = finish_j
 ```
 
-先领取 task 再等待 dependency，模拟 device 端 FIFO claim 后 WG 被该 task 占住的行为。模型不允许同一个 WG 绕过未就绪 task 去执行后续 ready task。
+先领取 task 再等待 dependency，模拟 device 端 FIFO claim 后 warp 被该 task 占住的行为。模型不允许同一个 warp 绕过未就绪 task 去执行后续 ready task。模型仍按独立 worker 推进，不计入 CTA 批量领取时的轮间等待与同步成本。
 
 最终评分为：
 
@@ -282,10 +282,6 @@ combine_penalty = score - attention_makespan
 ```
 
 因此 attention 和 combine 可以出现在同一个时间区间，`combine_penalty` 只表示未被 attention 覆盖并落在关键路径上的尾部。
-
-native planner 的工作量剪枝同样使用 WG 单位：下界为 `max(longest_attention_task, ceil((3 * attention_work + combine_work) / (3 * num_compute_ctas)))`。
-
-当前模型继续使用初始 `num_compute_ctas = num_sms - num_comm_sm`，copy 粒度门槛也保持这一容量。运行时 Q CTA 稍后加入，最终可用 `3 * num_sms` 个 WG；模型未预测这些 CTA 的到达时间或 TMA push 成本，不能把全部 SM 视作时间 0 就可用。final 不参与上述候选评分。
 
 ## 9. 多序列迭代 split
 
@@ -454,7 +450,7 @@ else:
 
 ## 12. Metadata 构造与正确性约束
 
-调度不改变 attention 数学。metadata v9 沿用 40-int header 和 8-int history/final descriptor，`valid_vectors` 表示一个 WG task 的向量数；publish completion 计数记录 history WG task 数。`receive_count=0`，远端 inbox 的 `tile_ready_count` 仍为 `(DCP_size - 1) * ceil(total_q / 16)`。metadata 必须维持以下不变量。
+调度不改变 attention 数学。metadata v7 使用 40-int header 和 8-int history/final descriptor。`receive_count` 与 `tile_ready_count` 均为 `(DCP_size - 1) * ceil(total_q / 16)`；每个 receive task 拉取一个远端 source 的 16-token parent。metadata 必须维持以下不变量。
 
 ### 12.1 descriptor 完整覆盖
 
@@ -468,10 +464,6 @@ history descriptor 必须引用覆盖其全部有效 packed Q rows 的 Q-ready c
 
 每个 history combine task 必须依赖它读取的所有 history partial completion ID。排序后 dependency 仍按 completion ID 查找，不能按新的 queue ordinal 推断。
 
-split task 的 4 个 vector 共享同一 M-tile 的完整 split completion 集合，索引为 `base + m_block * actual_splits + split_idx`；copy task 保留所覆盖 vector 的精确依赖并集。每个 `(destination, vector)` 仍须恰好覆盖一次。
-
-final 固定每个 4-warp WG task 处理 4 个 vector，每个 warp 的 32 个线程处理一个 vector。H4 对应一个 token，H8 对应半个 token；`final_count = total_q * Hq_local / 4`。任务沿 Q parent 顺序生成，不跨 16-token parent，依赖其读取的全部 chunk completion 和该 parent 的所有来源数据就绪信号。`final_vectors_per_task=4` 是 host 诊断字段，不占用 header 槽；无需等待其他 parent 的 history 工作完成。
-
 ### 12.4 Q task 与 attention order 一致
 
 release-LPT 启用时：
@@ -484,6 +476,18 @@ FIFO 模式下两者都必须保持原 token-major/batch-major 顺序。
 ### 12.5 CUDA Graph 稳定性
 
 同一组 shape、host cu-seqlens 和策略输入必须生成完全确定的 metadata。所有 tie-break 都包含原始 ID 或完整坐标，禁止依赖 Python set/dict 的非确定遍历顺序。
+
+### 12.6 Combine 寄存器与任务分配
+
+每个 compute CTA 在完成 attention 并经过原有 CTA barrier 后，将三个 WG 的每线程寄存器配额从 `24/240/240` 统一为 `168/168/168`：producer WG 使用 `warpgroup_reg_alloc<168>()`，两个 MMA WG 使用 `warpgroup_reg_dealloc<168>()`。CTA 总配额仍为 64,512 个寄存器，寄存器切换不新增 barrier。
+
+History combine/copy 每轮由 thread 0 对现有 history counter 执行 `atomicAdd(..., 12)`，将起始票号写入 `shared.work_id`，通过顶部 CTA barrier 广播。Warp `w` 处理 `base + w`，独立等待原 descriptor 的依赖、计算并立即执行原有 completion/publication。底部 CTA barrier 等待本轮最慢 warp 完成后，才复用 shared 票号进入下一轮。`base >= history_count` 时整个 CTA 退出；最后不足 12 票时，无有效票的 warp 跳过计算并参加 barrier。Descriptor、任务粒度、数学和 publish 协议保持不变。
+
+Final combine 使用 metadata v7 和 4/8/16-token 自适应 descriptor，由 CTA 领取。令 `C = num_sms - num_comm_sm`、`F = final_count`，`F <= C` 时静态任务编号为 `compute_cta_id`；更大队列由 thread 0 从 counter 原子领取任务，通过 shared memory 和 CTA barrier 广播编号。
+
+Thread 0 等待本票的 chunk attention、本地 history publish 和远端 receive 依赖，随后经 CTA barrier 开始计算。Warp 0–7 每轮处理 16 个 vector，采用 16 threads/vector、每线程 8 维；其余线程参加同步。每票完成后全 CTA 同步，再进入下一票。History→final 的 CTA barrier 和 combine 数学计算保持原样。
+
+Attention/history 的 critical-wave 成本模型、metadata 数量和 runner 容量保持不变。Header 为 40 个整数，final descriptor 为 8 个整数。
 
 ## 13. 运行时接口与诊断
 
@@ -521,16 +525,13 @@ history_order_policy:
 - model/effective BlockN；
 - baseline/selected attention task 数；
 - combine task、partial vector 和 work；
-- history combine 的物理 warp 数、WG worker 数及按 WG worker 数计算的 task waves；
-- 初始计算 CTA 数、Q 完成后的计算 CTA 数和 planner 使用的 CTA 数；
-- `final_vectors_per_task=4`、零 receive task 数和保留的远端 ready signal 数；
 - baseline/selected attention makespan；
 - combine penalty 和完整 gain；
 - selected split vector、plan source 和 Q block order。
 
 这些字段用于解释决策和回归测试，不构成 device metadata ABI。
 
-阶段时间戳中的 `inbox_ready_observed_done` 表示全部 final task 已观察到输入就绪，不是网络数据抵达的精确时间。history/publish 仍共用完成时间，按全部 WG 完成计数；本地 outgoing publish 完成与 incoming inbox 就绪之间不保证先后顺序。
+阶段时间戳中的 `history_combine_done` 和 `publish_done` 相同，表示本地 history send-buffer 写入及远端 ready 发布完成。`receive_done` 表示所有通信 CTA 完成 output pull 并发布本地 receive-ready；它可以晚于 final 消费最后一个 ready tile，因此不要求 `receive_done <= final_combine_done`，只要求二者均不晚于 `kernel_done`。`publish_done_to_receive_done` 比较本地 outgoing publication 与 incoming receive completion，可以为负值。
 
 ## 14. 踩坑总结
 
@@ -553,7 +554,7 @@ critical-wave 已显式建模 attention descriptor、CTA wave、completion depen
 - Q all-gather 的实际 ready timestamp；release epoch 只是离散近似；
 - HBM/L2 contention、TMA pipeline 状态和不同 task 间 cache reuse；
 - atomic claim 的运行时非确定性和 warp scheduling 细节；
-- Q CTA 晚加入、TMA push、remote publication 与 final combine 的完整成本模型；
+- receive、remote publication 与 final combine 的完整成本模型；
 - BlockN=128/176 在不同 N-block 长度上的真实 kernel throughput 曲线；
 - 多节点通信和非 SM90 平台。
 

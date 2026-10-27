@@ -243,9 +243,7 @@ public:
 
         if (warp_idx == 0 && lane_predicate) {
             int const initial_idx
-                = TileScheduler::claim_initial_descriptor_idx(scheduler_params);
-            // Cache the claim for both producer prefetch and initial hand-off.
-            shared_storage.pipelines.smem_scheduler.y = initial_idx;
+                = TileScheduler::initial_descriptor_idx(scheduler_params);
             typename TileScheduler::WorkTileInfo const initial{initial_idx};
             if (initial.is_valid(scheduler_params)) {
                 if (initial.kind(scheduler_params)
@@ -375,7 +373,7 @@ public:
                 cutlass::arch::wait_on_dependent_grids();
 
                 int const initial_idx
-                    = scheduler.initial_descriptor_idx();
+                    = TileScheduler::initial_descriptor_idx(scheduler_params);
                 bool history_prefetched = initial_idx >= 0
                     && initial_idx < scheduler_params.attention_count
                     && scheduler_params.descriptors[initial_idx].kind

@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 
 import min_fa3_op
+from dcp_mega_metadata import MEGA_COMPUTE_WARPS
 from min_fa3_dcp import DCPMegaAttentionRunner
 
 
@@ -37,23 +38,26 @@ class CorrectnessCase:
     num_comm_sm: int
 
 
-def assert_inbox_aliases(runner: DCPMegaAttentionRunner) -> None:
-    assert (
-        runner._history_receive_o.data_ptr()
-        == runner._ipc_history_send_o.data_.data_ptr()
-    )
-    assert (
-        runner._history_receive_lse.data_ptr()
-        == runner._ipc_history_send_lse.data_.data_ptr()
-    )
+def assert_history_claims(runner: DCPMegaAttentionRunner) -> None:
+    history_tasks = runner.last_queue_counts["actual"]["history_combine_tasks"]
+    num_compute_ctas = runner.num_sms - runner.num_comm_sm
+    task_batches = (history_tasks + MEGA_COMPUTE_WARPS - 1) // MEGA_COMPUTE_WARPS
+    expected = MEGA_COMPUTE_WARPS * (task_batches + num_compute_ctas)
+    actual = int(runner._queue_state[1].item())  # kHistoryCombineCounter
+    if actual != expected:
+        raise AssertionError(f"history CTA claims: expected {expected}, got {actual}")
 
 
-def assert_phase_timestamps(timestamps: torch.Tensor) -> None:
-    values = timestamps.tolist()
-    assert len(values) == 8 and all(value > 0 for value in values), values
-    assert all(values[0] <= value <= values[7] for value in values), values
-    assert values[3] == values[4], "fused history/publish timestamps differ"
-    assert values[5] <= values[6] <= values[7], values
+def assert_final_claims(runner: DCPMegaAttentionRunner) -> None:
+    final_tasks = runner.last_queue_counts["actual"]["final_tasks"]
+    num_compute_ctas = runner.num_sms - runner.num_comm_sm
+    expected = (
+        0 if final_tasks <= num_compute_ctas
+        else final_tasks + num_compute_ctas
+    )
+    actual = int(runner._queue_state[2].item())  # kFinalCounter
+    if actual != expected:
+        raise AssertionError(f"final CTA claims: expected {expected}, got {actual}")
 
 
 def parse_lengths(value: str, name: str) -> list[int]:
@@ -182,7 +186,6 @@ def run_case(
         record_phase_timestamps=True,
     )
     try:
-        assert_inbox_aliases(runner)
         seed = 410_003 + group_index * 100_019
         q = runner.q_local(total_q)
         local_history_lengths = [
@@ -265,13 +268,16 @@ def run_case(
             )
             runner.copy_last_phase_timestamps(timestamps)
             torch.cuda.synchronize(device)
+            assert_history_claims(runner)
+            assert_final_claims(runner)
             torch.testing.assert_close(
                 actual_o, expected_o, atol=3.0e-2, rtol=3.0e-2
             )
             torch.testing.assert_close(
                 actual_lse, expected_lse, atol=3.0e-2, rtol=3.0e-2
             )
-            assert_phase_timestamps(timestamps)
+            if timestamps[3].item() != timestamps[4].item():
+                raise AssertionError("fused history/publish timestamps differ")
             expected_phase = runner._phase - 1
             ready = runner._ipc_tile_ready.data_[
                 : case.dcp_size, : (total_q + 15) // 16
@@ -289,13 +295,16 @@ def run_case(
             replay_o, replay_lse = runner.replay_last_forward()
             runner.copy_last_phase_timestamps(timestamps)
             torch.cuda.synchronize(device)
+            assert_history_claims(runner)
+            assert_final_claims(runner)
             torch.testing.assert_close(
                 replay_o, expected_o, atol=3.0e-2, rtol=3.0e-2
             )
             torch.testing.assert_close(
                 replay_lse, expected_lse, atol=3.0e-2, rtol=3.0e-2
             )
-            assert_phase_timestamps(timestamps)
+            if timestamps[3].item() != timestamps[4].item():
+                raise AssertionError("fused replay history/publish timestamps differ")
             replay_phase = runner._phase - 1
             for source in range(case.dcp_size):
                 if source != dcp_rank:
@@ -308,17 +317,23 @@ def run_case(
 
             graph = runner.capture_last_forward(capture_warmup=1)
             try:
-                for _ in range(2):
+                for graph_replay in range(2):
                     graph_o, graph_lse = graph.replay()
                     runner.copy_last_phase_timestamps(timestamps)
                     torch.cuda.synchronize(device)
+                    assert_history_claims(runner)
+                    assert_final_claims(runner)
                     torch.testing.assert_close(
                         graph_o, expected_o, atol=3.0e-2, rtol=3.0e-2
                     )
                     torch.testing.assert_close(
                         graph_lse, expected_lse, atol=3.0e-2, rtol=3.0e-2
                     )
-                    assert_phase_timestamps(timestamps)
+                    if timestamps[3].item() != timestamps[4].item():
+                        raise AssertionError(
+                            "fused CUDA Graph history/publish timestamps differ "
+                            f"at replay {graph_replay}"
+                        )
             finally:
                 graph.close()
             graph_phase = runner._phase - 1

@@ -63,30 +63,28 @@ Packed-varlen also accepts the explicit experimental category
 `--implementations mega`, reported as `dcp_mega_varlen`. It is chunk-only and
 supports both the default CUDA Graph mode and `--no-cuda-graph` eager mode.
 `--mega-block-n auto|128|176` selects the BlockN policy and
-`--mega-num-comm-sm N` selects the initial Q communication-CTA budget. The default auto
+`--mega-num-comm-sm N` selects the dedicated communication-CTA budget. The default auto
 policy uses BlockN=128 as the canonical critical-wave decision model, then
 dispatches NoSplit with BlockN=176 or a selected split plan with BlockN=128.
 Explicit 128 or 176 fixes both the model and dispatch. The split and queue-order
 axes are independently selectable with
 `--mega-scheduler-heuristic|--no-mega-scheduler-heuristic` and
 `--mega-history-order auto|fifo|release-lpt`. The communication path is fixed to
-PackGQA with `Hq_local` 4 or 8 and `[16,Hq_local,128]` Q tiles. Each history
-task runs on a four-warp group: split combine handles four vectors and NoSplit
-copy selects 4, 8, 16, or 32 vectors. A vector contains one query head's 128
-output elements and one LSE. Double-buffered history output is pushed by TMA
-directly into the Q source rank's IPC inbox. A tile-ready phase is published
-only after all its history tasks have completed their stores. After Q
-all-gather, communication CTAs join the attention queue, then history and final; there is no
-output receive queue or separate publish pass. Each final task handles four
-vectors on one four-warp group, with one warp per vector. Groups enter final
-independently after draining their history stores.
+PackGQA with `Hq_local` 4 or 8 and `[16,Hq_local,128]` Q/O tiles. Each history
+task runs on one warp: split combine handles one vector, while NoSplit copy
+selects from `1, Hq_local, 2*Hq_local, 4*Hq_local, min(8*Hq_local, 32)`
+vectors. A vector contains one query head's 128 output elements and one LSE.
+History tasks write local IPC send buffers and publish a tile-ready phase
+after all tasks for a 16-token parent finish. Dedicated communication CTAs
+complete Q all-gather, then pull ready remote O/LSE into separate local receive
+buffers and publish receive-ready flags. Compute CTAs run attention, history
+combine/copy, and final combine.
 
-For `S` device SMs and `R=--mega-num-comm-sm`, planning retains the initial
-`C=S-R` compute CTAs and `3C` history worker groups. Runtime can use all `S`
-CTAs and `3S` groups after Q communication finishes. Queue diagnostics label
-the modeled worker counts and task waves with `planner_`, report
-`initial_compute_ctas`, `planner_compute_ctas`, `runtime_compute_ctas`, and
-`runtime_worker_groups`, and use `final_vectors_per_task=4`.
+For `S` device SMs and `R=--mega-num-comm-sm`, planning and execution use
+`C=S-R` compute CTAs, with 12 history warp workers per compute CTA. Final
+descriptors contain 4, 8, or 16 tokens: 4 when the number of 16-token parents
+is below `C`, 8 below `2C`, and 16 otherwise. Queue diagnostics report the
+selected `final_tokens_per_task`. Metadata uses version 7.
 
 The existing default method list remains unchanged. Its first eager
 correctness call builds and uploads fixed-shape metadata. Benchmark replays
@@ -97,13 +95,14 @@ phase increment, pre/post IPC barriers, and the persistent kernel; external
 CUDA events time that complete graph replay. Add `--mega-phase-timestamps` to
 include optional `%globaltimer` milestones in JSON. Fused
 `history_combine_done` and
-`publish_done` are intentionally identical; `publish_done` means all history
-TMA stores have completed and every remote ready release has been issued.
-Slot 5 is `inbox_ready_observed_done`: all final tasks have
-observed their inputs ready, rather than a timestamp of the last network
-arrival. The tail `inbox_ready_observed_to_final_done` measures from that
-observation to final completion. Existing saved phase-summary CSVs retain
-their historical receive-stage semantics.
+`publish_done` are intentionally identical; `publish_done` means all local
+history send-buffer writes and remote ready releases have completed.
+Slot 5 is `receive_done`: all communication CTAs have completed output pull
+and published local receive-ready flags. Final combine can consume the last
+ready tile before the communication CTAs finish their final synchronization,
+so `receive_done` need not precede `final_combine_done`; both precede
+`kernel_done`. The tail `publish_done_to_receive_done` compares local outgoing
+publication with incoming receive completion and can be negative.
 
 A2A stage timing separates pack, `all_to_all_single`, and unpack/FP32 base-e
 LSE-weighted combine. `output_collective_ms` covers only the all-to-all. The
@@ -312,7 +311,7 @@ The arrival-4 phase and wave-timestamp scripts also use eager kernel-only
 timing for Mega. Uniform workloads use the same batch frontend: select
 `--no-cuda-graph` together with `--mega-num-comm-sms` to match this timing.
 The measured interval contains the persistent Mega kernel, including its Q
-communication, attention, history combine/push, and final combine. Metadata
+communication, attention, history combine, output pull, and final combine. Metadata
 preparation, workspace reset, and pre/post barriers are outside that interval.
 This matches historical Mega kernel-only results; it does not measure the same
 end-to-end boundary as the baseline graph runs.
@@ -404,6 +403,34 @@ model and dispatch choices above. FA3 native and fixed split counts from 2
 through 128 keep the BlockN=128 fallback when BlockN is `auto`. See
 [`DCP_MEGA_CRITICAL_WAVE_SCHEDULER.md`](../DCP_MEGA_CRITICAL_WAVE_SCHEDULER.md)
 for the model, thresholds, and measured A/B results.
+
+After each compute CTA completes attention and its existing CTA barrier,
+the producer warpgroup increases its per-thread register budget from 24 to
+168, while both MMA warpgroups reduce theirs from 240 to 168. This preserves
+the CTA's total register budget. The transition uses CUTLASS `setmaxnreg`
+wrappers with no additional barrier.
+
+History combine/copy claims 12 existing descriptors per CTA round. Thread 0
+increments the history counter by 12 and broadcasts the base ticket through
+`shared.work_id` and a CTA barrier. Warp `w` handles ticket `base + w`,
+independently waits for its descriptor's dependencies, computes the result,
+and immediately performs the existing per-task publication. A second CTA
+barrier waits for the slowest warp before reusing the shared ticket for the
+next round. If the base reaches the history task count, the entire CTA exits;
+warps beyond the last partial batch skip computation and join the barrier.
+Descriptor granularity, combine arithmetic, and the publication protocol are
+unchanged.
+
+Final combine uses metadata v7 and adaptive 4/8/16-token descriptors claimed
+by each CTA. With `C = num_sms - num_comm_sm` and `F` final descriptors,
+`F <= C` assigns task `compute_cta_id` statically; larger queues use thread 0
+to claim a task atomically and broadcast its ID through shared memory.
+Thread 0 waits for the task's chunk attention, local history publication,
+and remote receive dependencies before a CTA barrier releases computation.
+Warp IDs 0-7 process 16 vectors per round, using 16 threads per vector and
+eight dimensions per thread. Every CTA thread joins the task-completion
+barrier before the next task. History-to-final synchronization, metadata
+counts, workspace capacity, and combine arithmetic remain unchanged.
 
 The fixed eight-GPU correctness matrix runs DCP 2/4/8, Hq-local 4/8,
 BlockN 128/176, split/nosplit, and auto-split cases in a single process group.
